@@ -1,11 +1,13 @@
 mod S = import("slice");
 mod D = import("lexer_diag");
 mod T = import("token");
+mod E = import("escape");
 
 typedef slice = S.Slice;
 typedef DEng = D.DiagnosticEngine;
 typedef Token = T.Token;
 typedef TokenKind = T.TokenKind;
+typedef EscapeResult = E.EscapeResult;
 
 pub struct Lexer {
     DEng* diag;
@@ -124,9 +126,95 @@ pub struct Lexer {
                     } else {
                         return; // multi line comments not yet handled
                     }
+                    break;
                 }
+                default: return;
             }
         }
     }
-    
+
+    Token lexString(u8* start)
+    {
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == '\"') {
+                self.cur++;
+                return self.makeToken(TokenKind::String, start);
+            }
+            if (c == '\\') {
+                EscapeResult esc = EscapeResult::decodeEscapeSequence(self.cur, self.bufEnd);
+                if (!esc.isValid)
+                    self.diag.reportError(*self, self.cur, "unknown escape sequence");
+                self.cur += esc.bytesConsumed; // this, i know is very wrong.
+                continue;
+            }
+            if (c =='\n') {
+                self.line++;
+                self.lineStart = self.cur + 1;
+            }
+            self.cur++;
+        }
+        self.diag.reportError(self, start, "unterminated string literal");
+        return self.makeToken(TokenKind::Eof, start);
+    }
+
+    Token lexNumber(u8* start)
+    {
+        bool is float = false;
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c >= '0' && c <= '9') {
+                self.cur++;
+            } else if (c == '.'
+                      && !isFloat
+                      && self.cur + 1 < self.bufEnd
+                      && self.cur[1] >= '0'
+                      && self.cur[1] <= '9')
+            {
+                isFloat = true;
+                self.cur++;
+            } else {
+                break;
+            }
+        }
+        if (isFloat) return self.makeToken(TokenKind::Float, start);
+    }
+
+    Token nextToken()
+    {
+        self.skipWsCmts();
+        u8* start = self.cur;
+        if (self.isAtEnd()) return self.makeToken(TokenKind::Eof, start);
+        u8 c = self.ur[0];
+        self.cur++;
+        
+        // identifiers and/keywords
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')
+        {
+            while (!self.isAtEnd())
+            {
+                u8 p = self.cur[0];
+                if ((p >= 'a' && p <= 'z')
+                    || (p >= 'A' && p <= 'Z')
+                    || (p >= '0' && p <= '9')
+                    || p == '_')
+                {
+                    self.cur++;
+                } else {
+                    break;
+                }
+            }
+            var s = slice::from(self.cur, (usize)(self.cur - self.start));
+            return self.makeToken(self.classifyIdentifier(s), start);
+        }
+        // numeric literals
+        if (c >= '0' && c <= '9')
+            return self.lexNumber(start);
+        // string literals
+        if (c == '"')
+            return self.lexString(start);
+        // single char literals
+    }
 }
