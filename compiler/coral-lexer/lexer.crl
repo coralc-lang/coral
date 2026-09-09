@@ -27,17 +27,17 @@ pub struct Lexer {
         self.diag = dEng;
     }
 
-    boot isAtEnd()
+    bool isAtEnd()
     {
         return self.cur >= self.bufEnd;
     }
 
     Token makeToken(TokenKind kind, u8* start)
     {
-        Token T;
+        Token t;
         t.kind = kind;
         t.data.ptr = start;
-        t.data.len = (usize)(self.cur - (u32)start);
+        t.data.len = (usize)(self.cur - start);
         t.line = self.line;
         t.col = (usize)(start - self.lineStart) + 1;
         return t;
@@ -58,6 +58,7 @@ pub struct Lexer {
                 if (s.eq("for")) return TokenKind::For;
                 if (s.eq("asm")) return TokenKind::Asm;
                 if (s.eq("var")) return TokenKind::Var;
+                break;
             }
             case 4: {
                 if (s.eq("enum")) return TokenKind::Enum;
@@ -92,10 +93,10 @@ pub struct Lexer {
                 if (s.eq("typedef")) return TokenKind::Typedef;
                 break;
             }
-            case: 8 {
+            case 8: {
                 if (s.eq("distinct")) return TokenKind::Distinct;
                 if (s.eq("continue")) return TokenKind::Continue;
-                if (s.eq("comptime")) return TokenKind::Compitime;
+                if (s.eq("comptime")) return TokenKind::Comptime;
                 if (s.eq("volatile")) return TokenKind::Volatile;
                 break;
             }
@@ -124,7 +125,7 @@ pub struct Lexer {
                 }
                 case: '/' {
                     // line comment
-                    if (self.cur + 1 < self.bufEnd && self.cur[1] = '/') {
+                    if (self.cur + 1 < self.bufEnd && self.cur[1] == '/') {
                         self.cur += 2;
                         while (!self.isAtEnd() && self.cur[0] != '\n') { self.cur++ }
                     }
@@ -172,7 +173,7 @@ pub struct Lexer {
             if (c == '\\') {
                 EscapeResult esc = EscapeResult::decodeEscapeSequence(self.cur, self.bufEnd);
                 if (!esc.isValid)
-                    self.diag.reportError(*self, self.cur, "unknown escape sequence");
+                    self.diag.reportError(self.bufStart, self.bufEnd, self.cur, "unknown escape sequence");
                 self.cur += esc.bytesConsumed; // this, i know is very wrong.
                 continue;
             }
@@ -182,13 +183,13 @@ pub struct Lexer {
             }
             self.cur++;
         }
-        self.diag.reportError(self, start, "unterminated string literal");
+        self.diag.reportError(self.bufStart, self.bufEnd, start, "unterminated string literal");
         return self.makeToken(TokenKind::Eof, start);
     }
 
     Token lexNumber(u8* start)
     {
-        bool is float = false;
+        bool isFloat = false;
         while (!self.isAtEnd())
         {
             u8 c = self.cur[0];
@@ -207,6 +208,7 @@ pub struct Lexer {
             }
         }
         if (isFloat) return self.makeToken(TokenKind::Float, start);
+        return self.makeToken(TokenKind::Dec, start);
     }
 
     Token nextToken()
@@ -233,8 +235,8 @@ pub struct Lexer {
                     break;
                 }
             }
-            var s = slice::from(self.cur, (usize)(self.cur - self.start));
-            return self.makeToken(self.classifyIdentifier(&`s), start);
+            var s = slice::from(start, (usize)(self.cur - start));
+            return self.makeToken(self.classifyIdentifier(&s), start);
         }
         // numeric literals
         if (c >= '0' && c <= '9')
@@ -242,7 +244,89 @@ pub struct Lexer {
         // string literals
         if (c == '"')
             return self.lexString(start);
-        // single char literals
-        // if (c >= '\'' && (c[1] >= '\0' || c <= 20 )
+        // char literals
+        if (c == '\'')
+        {
+            while (!self.isAtEnd() && self.cur[0] != '\'')
+            {
+                if (self.cur[0] == '\\') self.cur++;
+                if (!self.isAtEnd()) self.cur++;
+            }
+            if (!self.isAtEnd()) self.cur++;
+            return self.makeToken(TokenKind::Char, start);
+        }
+
+        Token op = self.lexOperator(c, start);
+        if (op.kind != TokenKind::Eof) return op;
+
+        return self.makeToken(TokenKind::Eof, start);
+    }
+
+    Token lexOperator(u8 c, u8* start)
+    {
+        if (!self.isAtEnd())
+        {
+            u8 next = self.cur[0];
+
+            // compound assignment operators
+            if (c == '+' && next == '+') { self.cur++; return self.makeToken(TokenKind::PlusPlus, start); }
+            if (c == '-' && next == '-') { self.cur++; return self.makeToken(TokenKind::MinusMinus, start); }
+            if (c == '=' && next == '=') { self.cur++; return self.makeToken(TokenKind::EqualEqual, start); }
+            if (c == '!' && next == '=') { self.cur++; return self.makeToken(TokenKind::NotEqual, start); }
+            if (c == '<' && next == '=') { self.cur++; return self.makeToken(TokenKind::LessEqual, start); }
+            if (c == '>' && next == '=') { self.cur++; return self.makeToken(TokenKind::GreaterEqual, start); }
+            if (c == '&' && next == '&') { self.cur++; return self.makeToken(TokenKind::And, start); }
+            if (c == '|' && next == '|') { self.cur++; return self.makeToken(TokenKind::Or, start); }
+            if (c == '+' && next == '=') { self.cur++; return self.makeToken(TokenKind::PlusEqual, start); }
+            if (c == '-' && next == '=') { self.cur++; return self.makeToken(TokenKind::MinusEqual, start); }
+            if (c == '*' && next == '=') { self.cur++; return self.makeToken(TokenKind::StarEqual, start); }
+            if (c == '/' && next == '=') { self.cur++; return self.makeToken(TokenKind::SlashEqual, start); }
+            if (c == '|' && next == '=') { self.cur++; return self.makeToken(TokenKind::PipeEqual, start); }
+            if (c == '^' && next == '=') { self.cur++; return self.makeToken(TokenKind::CaretEqual, start); }
+            if (c == '&' && next == '=') { self.cur++; return self.makeToken(TokenKind::AmpEqual, start); }
+            if (c == '~' && next == '=') { self.cur++; return self.makeToken(TokenKind::NegEqual, start); }
+            if (c == '=' && next == '>') { self.cur++; return self.makeToken(TokenKind::FatArrow, start); }
+            if (c == ':' && next == ':') { self.cur++; return self.makeToken(TokenKind::ColonColon, start); }
+            if (c == '*' && next == '.') { self.cur++; return self.makeToken(TokenKind::StarDot, start); }
+            if (c == '.' && next == '.' && self.cur + 1 < self.bufEnd && self.cur[1] == '.')
+            {
+                self.cur += 2;
+                return self.makeToken(TokenKind::Ellipsis, start);
+            }
+        }
+
+        return self.lexPunctuation(c, start);
+    }
+
+    Token lexPunctuation(u8 c, u8* start)
+    {
+        switch (c)
+        {
+            case '+': return self.makeToken(TokenKind::Plus, start);
+            case '-': return self.makeToken(TokenKind::Minus, start);
+            case '*': return self.makeToken(TokenKind::Star, start);
+            case '/': return self.makeToken(TokenKind::Slash, start);
+            case '<': return self.makeToken(TokenKind::Less, start);
+            case '>': return self.makeToken(TokenKind::Greater, start);
+            case '~': return self.makeToken(TokenKind::Neg, start);
+            case '!': return self.makeToken(TokenKind::Not, start);
+            case ':': return self.makeToken(TokenKind::Colon, start);
+            case ';': return self.makeToken(TokenKind::Semicolon, start);
+            case ',': return self.makeToken(TokenKind::Comma, start);
+            case '#': return self.makeToken(TokenKind::Hash, start);
+            case '.': return self.makeToken(TokenKind::Dot, start);
+            case '&': return self.makeToken(TokenKind::Ampersand, start);
+            case '^': return self.makeToken(TokenKind::Caret, start);
+            case '|': return self.makeToken(TokenKind::Pipe, start);
+            case '=': return self.makeToken(TokenKind::Equal, start);
+            case '(': return self.makeToken(TokenKind::LParen, start);
+            case ')': return self.makeToken(TokenKind::Rparen, start);
+            case '{': return self.makeToken(TokenKind::LBrace, start);
+            case '}': return self.makeToken(TokenKind::RBrace, start);
+            case '[': return self.makeToken(TokenKind::LBracket, start);
+            case ']': return self.makeToken(TokenKind::RBracket, start);
+            case '@': return self.makeToken(TokenKind::At, start);
+        }
+        return self.makeToken(TokenKind::Eof, start);
     }
 }
