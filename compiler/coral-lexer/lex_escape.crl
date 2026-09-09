@@ -1,5 +1,5 @@
 pub struct EscapeResult {
-    u8 character;
+    u32 codepoint;
     usize bytesConsumed;
     bool isValid;
 
@@ -8,6 +8,7 @@ pub struct EscapeResult {
         EscapeResult esc;
         esc.isValid = true;
         esc.bytesConsumed = 2;
+        esc.codepoint = 0;
 
         if (ptr >= end || ptr[0] != '\\')
             esc.isValid = false;
@@ -15,13 +16,13 @@ pub struct EscapeResult {
         u8 next = ptr[1];
         switch (next)
         {
-            case 'n': esc.character = '\n'; break;
-            case 'r': esc.character = '\r'; break;
-            case 't': esc.character = '\t'; break;
-            case '\\': esc.character = '\\'; break;
-            case '\'': esc.character = '\''; break;
-            case '\"': esc.character = '\"'; break;
-            case '0': esc.character = '\0'; break;
+            case 'n': esc.codepoint = '\n'; break;
+            case 'r': esc.codepoint = '\r'; break;
+            case 't': esc.codepoint = '\t'; break;
+            case '\\': esc.codepoint = '\\'; break;
+            case '\'': esc.codepoint = '\''; break;
+            case '\"': esc.codepoint = '\"'; break;
+            case '0': esc.codepoint = '\0'; break;
             case 'x': 
             {
                 if (ptr + 3 >= end)
@@ -41,14 +42,62 @@ pub struct EscapeResult {
 
                 u8 hi = (h1 >= 'a') ? (h1 - 'a' + 10) : (h1 >= 'A') ? (h1 - 'A' + 10) : (h1 - '0');
                 u8 lo = (h2 >= 'a') ? (h2 - 'a' + 10) : (h2 >= 'A') ? (h2 - 'A' + 10) : (h2 - '0');
-                esc.character = (u8)((hi << 4) | lo);
+                esc.codepoint = (u32)((hi << 4) | lo);
                 esc.bytesConsumed = 4;
+                break;
+            }
+            case 'u':
+            {
+                // \uXXXX - exactly 4 hex digits (UTF-16 code unit)
+                if (ptr + 5 >= end)
+                {
+                    esc.isValid = false;
+                    break;
+                }
+                u32 cp = 0;
+                for (usize i = 0; i < 4; i++)
+                {
+                    u8 h = ptr[2 + i];
+                    u8 val;
+                    if (h >= '0' && h <= '9') val = h - '0';
+                    else if (h >= 'a' && h <= 'f') val = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') val = h - 'A' + 10;
+                    else { esc.isValid = false; break; }
+                    cp = (cp << 4) | val;
+                }
+                if (!esc.isValid) break;
+                esc.codepoint = cp;
+                esc.bytesConsumed = 6;
+                break;
+            }
+            case 'U':
+            {
+                // \UXXXXXXXX - exactly 8 hex digits (UTF-32 codepoint)
+                if (ptr + 9 >= end)
+                {
+                    esc.isValid = false;
+                    break;
+                }
+                u32 cp = 0;
+                for (usize i = 0; i < 8; i++)
+                {
+                    u8 h = ptr[2 + i];
+                    u8 val;
+                    if (h >= '0' && h <= '9') val = h - '0';
+                    else if (h >= 'a' && h <= 'f') val = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') val = h - 'A' + 10;
+                    else { esc.isValid = false; break; }
+                    cp = (cp << 4) | val;
+                }
+                if (!esc.isValid) break;
+                esc.codepoint = cp;
+                esc.bytesConsumed = 10;
                 break;
             }
             default:
             {
                 esc.isValid = false;
-                esc.character = next;
+                esc.codepoint = next;
             }
         }
         return esc;

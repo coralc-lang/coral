@@ -5,13 +5,16 @@ mod IDT = import("ident_table");
 mod _skip = import("skip_ws");
 mod _num = import("lex_number");
 mod _str = import("lex_string");
+mod _esc = import("lex_escape");
 mod _op = import("lex_operator");
+mod _ident = import("lex_ident");
 
 typedef slice = S.Slice;
 typedef DEng = D.DiagnosticEngine;
 typedef Token = T.Token;
 typedef TokenKind = T.TokenKind;
 typedef IdentifierTable = IDT.IdentifierTable;
+typedef EscapeResult = _esc.EscapeResult;
 
 pub struct Lexer {
     DEng* diag;
@@ -58,27 +61,38 @@ pub struct Lexer {
         u8 c = self.cur[0];
         self.cur++;
         
-        // identifiers and keywords
+        // raw string: R"..."
+        if (c == 'R' && !self.isAtEnd() && self.cur[0] == '"')
+        {
+            self.cur++;
+            return self.lexRawString(start);
+        }
+        // string prefixes: u"..." UTF-16, U"..." UTF-32, c"..." C string, u8"..." UTF-8
+        if ((c == 'u' || c == 'U' || c == 'c') && !self.isAtEnd() && self.cur[0] == '"')
+        {
+            self.cur++;
+            return self.lexString(start);
+        }
+        if (c == 'u' && !self.isAtEnd() && self.cur[0] == '8' &&
+            self.cur + 1 < self.bufEnd && self.cur[1] == '"')
+        {
+            self.cur += 2;
+            return self.lexString(start);
+        }
+        // identifiers and keywords (ASCII start)
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')
         {
-            while (!self.isAtEnd())
+            return self.lexIdentifier(start);
+        }
+        // identifiers and keywords (UTF-8 start: 0xC0-0xFD)
+        if (c >= 0xC0 && c <= 0xFD)
+        {
+            (u32 cp, usize bytes) = _ident.decodeUtf8(start, self.bufEnd);
+            if (bytes > 0 && _ident.isXidStart(cp))
             {
-                u8 p = self.cur[0];
-                if ((p >= 'a' && p <= 'z') || 
-                    (p >= 'A' && p <= 'Z') ||
-                    (p >= '0' && p <= '9') || 
-                    (p == '_'))
-                {
-                    self.cur++;
-                } else {
-                    break;
-                }
+                self.cur = start + bytes;
+                return self.lexIdentifier(start);
             }
-            usize len = (usize)(self.cur - start);
-            IdentifierInfo* ii = self.idents.get(start, len);
-            Token t = self.makeToken(ii.kind, start);
-            t.info = ii;
-            return t;
         }
         // numeric literals
         if (c >= '0' && c <= '9')
@@ -91,8 +105,15 @@ pub struct Lexer {
         {
             while (!self.isAtEnd() && self.cur[0] != '\'')
             {
-                if (self.cur[0] == '\\') self.cur++;
-                if (!self.isAtEnd()) self.cur++;
+                if (self.cur[0] == '\\')
+                {
+                    EscapeResult esc = EscapeResult::decodeEscapeSequence(self.cur, self.bufEnd);
+                    if (!esc.isValid)
+                        self.diag.reportError(self.bufStart, self.bufEnd, self.cur, "unknown escape sequence");
+                    self.cur += esc.bytesConsumed;
+                } else {
+                    self.cur++;
+                }
             }
             if (!self.isAtEnd()) self.cur++;
             return self.makeToken(TokenKind::Char, start);

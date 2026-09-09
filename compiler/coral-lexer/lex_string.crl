@@ -32,4 +32,66 @@ pub Lexer {
         self.diag.reportError(self.bufStart, self.bufEnd, start, "unterminated string literal");
         return self.makeToken(TokenKind::Eof, start);
     }
+
+    // R"delimiter(content)delimiter"
+    // empty delimiter: R"(content)"
+    Token lexRawString(u8* start)
+    {
+        // expect opening "
+        if (self.isAtEnd() || self.cur[0] != '"') {
+            self.diag.reportError(self.bufStart, self.bufEnd, start, "expected '\"' after R for raw string");
+            return self.makeToken(TokenKind::Eof, start);
+        }
+        self.cur++;
+
+        // read delimiter (everything up to opening paren)
+        u8* delimStart = self.cur;
+        while (!self.isAtEnd() && self.cur[0] != '(') {
+            self.cur++;
+        }
+        usize delimLen = (usize)(self.cur - delimStart);
+
+        // expect opening paren
+        if (self.isAtEnd() || self.cur[0] != '(') {
+            self.diag.reportError(self.bufStart, self.bufEnd, start, "expected '(' in raw string delimiter");
+            return self.makeToken(TokenKind::Eof, start);
+        }
+        self.cur++;
+
+        // scan for closing paren + delimiter + closing quote
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == '\n') {
+                self.line++;
+                self.lineStart = self.cur + 1;
+            }
+            if (c == ')') {
+                // check if delimiter matches
+                bool match = true;
+                for (usize i = 0; i < delimLen; i++) {
+                    usize idx = (usize)(self.cur + 1 + i - self.bufStart);
+                    if (idx >= (usize)(self.bufEnd - self.bufStart)) {
+                        match = false;
+                        break;
+                    }
+                    if (self.bufStart[idx] != delimStart[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    // check for closing quote after delimiter
+                    usize quoteIdx = (usize)(self.cur + 1 + delimLen - self.bufStart);
+                    if (quoteIdx < (usize)(self.bufEnd - self.bufStart) && self.bufStart[quoteIdx] == '"') {
+                        self.cur = (u8*)(self.bufStart + quoteIdx + 1);
+                        return self.makeToken(TokenKind::RawString, start);
+                    }
+                }
+            }
+            self.cur++;
+        }
+        self.diag.reportError(self.bufStart, self.bufEnd, start, "unterminated raw string literal");
+        return self.makeToken(TokenKind::Eof, start);
+    }
 }

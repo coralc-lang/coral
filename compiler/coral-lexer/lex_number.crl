@@ -7,19 +7,106 @@ typedef Lexer = lex.Lexer;
 pub Lexer {
     Token lexNumber(u8* start)
     {
+        // check for 0x hex prefix
+        if (!self.isAtEnd() && self.cur[0] == 'x' &&
+            (usize)(self.cur - start) == 1 && start[0] == '0')
+        {
+            self.cur++;
+            return self.lexHex(start);
+        }
+        // check for 0b binary prefix
+        if (!self.isAtEnd() && self.cur[0] == 'b' &&
+            (usize)(self.cur - start) == 1 && start[0] == '0')
+        {
+            self.cur++;
+            return self.lexBinary(start);
+        }
+        // check for 0o octal prefix
+        if (!self.isAtEnd() && self.cur[0] == 'o' &&
+            (usize)(self.cur - start) == 1 && start[0] == '0')
+        {
+            self.cur++;
+            return self.lexOctal(start);
+        }
+        // decimal or float
+        return self.lexDecimal(start);
+    }
+
+    // 0x[0-9a-fA-F][0-9a-fA-F_]*
+    Token lexHex(u8* start)
+    {
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if ((c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F') ||
+                c == '_')
+            {
+                self.cur++;
+            } else {
+                break;
+            }
+        }
+        return self.makeToken(TokenKind::Hex, start);
+    }
+
+    // 0b[01][01_]*
+    Token lexBinary(u8* start)
+    {
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == '0' || c == '1' || c == '_')
+            {
+                self.cur++;
+            } else {
+                break;
+            }
+        }
+        return self.makeToken(TokenKind::Bin, start);
+    }
+
+    // 0o[0-7][0-7_]*
+    Token lexOctal(u8* start)
+    {
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if ((c >= '0' && c <= '7') || c == '_')
+            {
+                self.cur++;
+            } else {
+                break;
+            }
+        }
+        return self.makeToken(TokenKind::Oct, start);
+    }
+
+    // [0-9][0-9_]*\.?[0-9_]*([eE][+-]?[0-9_]*)?
+    Token lexDecimal(u8* start)
+    {
         bool isFloat = false;
         while (!self.isAtEnd())
         {
             u8 c = self.cur[0];
             if (c >= '0' && c <= '9') {
                 self.cur++;
-            } else if (c == '.'
-                      && !isFloat
-                      && self.cur + 1 < self.bufEnd
-                      && self.cur[1] >= '0'
-                      && self.cur[1] <= '9')
-            {
+            } else if (c == '.' && !isFloat) {
+                // check for .. (range operator) - don't consume if so
+                if (self.cur + 1 < self.bufEnd && self.cur[1] == '.') {
+                    break;
+                }
                 isFloat = true;
+                self.cur++;
+            } else if ((c == 'e' || c == 'E') && !isFloat) {
+                isFloat = true;
+                self.cur++;
+                // optional sign
+                if (!self.isAtEnd() && (self.cur[0] == '+' || self.cur[0] == '-')) {
+                    self.cur++;
+                }
+            } else if (c == '_') {
                 self.cur++;
             } else {
                 break;
