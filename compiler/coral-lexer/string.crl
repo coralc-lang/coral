@@ -1,0 +1,90 @@
+mod lex = import("lexer");
+mod E = import("escape");
+mod T = import("token");
+
+typedef EscapeResult = E.EscapeResult;
+typedef TokenKind = T.TokenKind;
+typedef Lexer = lex.Lexer;
+typedef Token = T.Token;
+
+pub Lexer {
+    Token lexString(u8* start)
+    {
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == '\"') {
+                self.cur++;
+                return self.makeToken(TokenKind::String, start);
+            }
+            if (c == '\\') {
+                EscapeResult esc = EscapeResult::decodeEscapeSequence(self.cur, self.bufEnd);
+                if (!esc.isValid)
+                    self.diag.reportError(self.bufStart, self.bufEnd, self.cur, "unknown escape sequence");
+                self.cur += esc.bytesConsumed;
+                continue;
+            }
+            if (c =='\n') {
+                self.line++;
+                self.lineStart = self.cur + 1;
+            }
+            self.cur++;
+        }
+        self.diag.reportError(self.bufStart, self.bufEnd, start, "unterminated string literal");
+        return self.makeToken(TokenKind::Eof, start);
+    }
+
+    Token lexRawString(u8* start)
+    {
+        if (self.isAtEnd() || self.cur[0] != '"') {
+            self.diag.reportError(self.bufStart, self.bufEnd, start, "expected '\"' after R for raw string");
+            return self.makeToken(TokenKind::Eof, start);
+        }
+        self.cur++;
+
+        u8* delimStart = self.cur;
+        while (!self.isAtEnd() && self.cur[0] != '(') {
+            self.cur++;
+        }
+        usize delimLen = (usize)(self.cur - delimStart);
+
+        if (self.isAtEnd() || self.cur[0] != '(') {
+            self.diag.reportError(self.bufStart, self.bufEnd, start, "expected '(' in raw string delimiter");
+            return self.makeToken(TokenKind::Eof, start);
+        }
+        self.cur++;
+
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == '\n') {
+                self.line++;
+                self.lineStart = self.cur + 1;
+            }
+            if (c == ')') {
+                bool match = true;
+                for (usize i = 0; i < delimLen; i++) {
+                    usize idx = (usize)(self.cur + 1 + i - self.bufStart);
+                    if (idx >= (usize)(self.bufEnd - self.bufStart)) {
+                        match = false;
+                        break;
+                    }
+                    if (self.bufStart[idx] != delimStart[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    usize quoteIdx = (usize)(self.cur + 1 + delimLen - self.bufStart);
+                    if (quoteIdx < (usize)(self.bufEnd - self.bufStart) && self.bufStart[quoteIdx] == '"') {
+                        self.cur = (u8*)(self.bufStart + quoteIdx + 1);
+                        return self.makeToken(TokenKind::RawString, start);
+                    }
+                }
+            }
+            self.cur++;
+        }
+        self.diag.reportError(self.bufStart, self.bufEnd, start, "unterminated raw string literal");
+        return self.makeToken(TokenKind::Eof, start);
+    }
+}
