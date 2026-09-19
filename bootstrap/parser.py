@@ -690,12 +690,41 @@ class Parser:
         self.expect(TokenKind.LBrace)
         fields = []
         while self.peek().kind != TokenKind.RBrace:
+            if self.peek().kind in (TokenKind.Pub, TokenKind.Extern):
+                self.advance()
+            if self.peek().kind == TokenKind.Static:
+                self.advance()
+            if self.peek().kind == TokenKind.Extend:
+                break
             tp = self.parse_type()
-            name = self.expect(TokenKind.Ident).value
+            name_tok = self.advance()
+            name = name_tok.value
+            if self.peek().kind == TokenKind.LParen:
+                depth = 1
+                self.advance()
+                while depth > 0 and not self.is_at_end():
+                    if self.peek().kind == TokenKind.LParen:
+                        depth += 1
+                    elif self.peek().kind == TokenKind.Rparen:
+                        depth -= 1
+                    self.advance()
+                if self.peek().kind == TokenKind.LBrace:
+                    depth = 1
+                    self.advance()
+                    while depth > 0 and not self.is_at_end():
+                        if self.peek().kind == TokenKind.LBrace:
+                            depth += 1
+                        elif self.peek().kind == TokenKind.RBrace:
+                            depth -= 1
+                        self.advance()
+                continue
             fields.append(FieldDecl(tp, name))
             self.match(TokenKind.Semicolon)
         self.expect(TokenKind.RBrace)
         return fields
+
+    def is_at_end(self):
+        return self.peek().kind == TokenKind.Eof
 
     def parse_enum_variants(self):
         self.expect(TokenKind.LBrace)
