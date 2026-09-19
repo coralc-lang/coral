@@ -20,8 +20,17 @@ class CodeGen:
         self.out = []
         self.indent = 0
         self.struct_names = set()
+        self.enum_names = set()
         self.ext_methods = {}
         self.typedefs = {}
+        self.current_file = None
+        self.known_types = set()
+        self.suppress_main = False
+
+    def set_current_file(self, path):
+        self.current_file = path
+        self.out = []
+        self.indent = 0
 
     def emit(self, s):
         self.out.append(s)
@@ -36,13 +45,15 @@ class CodeGen:
             name = node.name
             if name in BUILTIN_TYPES:
                 return BUILTIN_TYPES[name]
-            return "_coral_" + name if name in self.struct_names else name
+            if name in self.struct_names or name in self.enum_names:
+                return name
+            return name
         if isinstance(node, PointerType):
             return self.gen_type(node.base) + "*"
         if isinstance(node, ConstType):
             return "const " + self.gen_type(node.base)
         if isinstance(node, SliceType):
-            return "_coral_slice"
+            return "Slice"
         if isinstance(node, ArrayType):
             return self.gen_type(node.base) + f"[{self.gen_expr(node.size)}]"
         if isinstance(node, TupleType):
@@ -91,6 +102,8 @@ class CodeGen:
             return f"{self.gen_expr(node.obj)}[{self.gen_expr(node.index)}]"
         if isinstance(node, Assign):
             return f"({self.gen_expr(node.target)} = {self.gen_expr(node.value)})"
+        if isinstance(node, TernaryExpr):
+            return f"({self.gen_expr(node.cond)} ? {self.gen_expr(node.then_expr)} : {self.gen_expr(node.else_expr)})"
         if isinstance(node, SizeofExpr):
             return f"sizeof({self.gen_type(node.type_node)})"
         if isinstance(node, CastExpr):
@@ -211,7 +224,7 @@ class CodeGen:
 
         if node.self_type:
             st = self.gen_type(node.self_type)
-            st_name = st.replace("_coral_", "")
+            st_name = st
             if st_name not in self.ext_methods:
                 self.ext_methods[st_name] = []
             self.ext_methods[st_name].append(node)
@@ -260,7 +273,23 @@ class CodeGen:
         self.emit("#include <stdlib.h>\n")
         self.emit("#include <stdio.h>\n\n")
 
+        for decl in ast.decls:
+            if isinstance(decl, StructDecl):
+                self.struct_names.add(decl.name)
+            elif isinstance(decl, EnumDecl):
+                self.enum_names.add(decl.name)
+            elif isinstance(decl, ExtendBlock):
+                tn = self.gen_type(decl.type_node)
+                self.struct_names.add(tn.replace("_coral_", ""))
+
         self.emit("typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n\n")
+
+        for name in self.struct_names:
+            self.emit(f"typedef struct {name} {name};\n")
+        for name in self.enum_names:
+            self.emit(f"typedef enum {name} {name};\n")
+        if self.struct_names or self.enum_names:
+            self.emit("\n")
 
         for decl in ast.decls:
             if isinstance(decl, StructDecl):
@@ -281,7 +310,7 @@ class CodeGen:
                 for m in decl.methods:
                     if not m.is_extern:
                         ret = self.gen_type(m.return_type)
-                        st = self.gen_type(decl.type_node).replace("_coral_", "")
+                        st = self.gen_type(decl.type_node)
                         params = [f"{self.gen_type(decl.type_node)} self"] + [
                             f"{self.gen_type(p.type_node)} {p.name}" for p in m.params if p.name != "self"
                         ]
@@ -307,7 +336,7 @@ class CodeGen:
             elif isinstance(decl, ExtendBlock):
                 for method in decl.methods:
                     st = self.gen_type(decl.type_node)
-                    st_name = st.replace("_coral_", "")
+                    st_name = st
                     method.self_type = decl.type_node
                     ret = self.gen_type(method.return_type)
                     params = [f"{st} self"] + [
@@ -323,11 +352,12 @@ class CodeGen:
                         self.gen_block(method.body)
                         self.emit("\n")
 
-        if "__main__" in [d.name for d in ast.decls if isinstance(d, FuncDecl)]:
-            pass
-        else:
-            self.emit("int main(int argc, char** argv) {\n")
-            self.emit("    return 0;\n")
-            self.emit("}\n")
+        if not self.suppress_main:
+            if "__main__" in [d.name for d in ast.decls if isinstance(d, FuncDecl)]:
+                pass
+            else:
+                self.emit("int main(int argc, char** argv) {\n")
+                self.emit("    return 0;\n")
+                self.emit("}\n")
 
         return "".join(self.out)

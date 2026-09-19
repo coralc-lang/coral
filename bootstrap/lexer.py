@@ -106,6 +106,7 @@ class TokenKind:
     LBracket = "LBracket"
     RBracket = "RBracket"
     At = "At"
+    Question = "Question"
     BuiltinSizeof = "BuiltinSizeof"
     BuiltinAssert = "BuiltinAssert"
     BuiltinAlignof = "BuiltinAlignof"
@@ -456,7 +457,7 @@ class Lexer:
             ".": TokenKind.Dot, "&": TokenKind.Ampersand, "^": TokenKind.Caret,
             "|": TokenKind.Pipe, "=": TokenKind.Equal, "(": TokenKind.LParen,
             ")": TokenKind.Rparen, "{": TokenKind.LBrace, "}": TokenKind.RBrace,
-            "[": TokenKind.LBracket, "]": TokenKind.RBracket, "@": TokenKind.At,
+            "[": TokenKind.LBracket, "]": TokenKind.RBracket,             "@": TokenKind.At, "?": TokenKind.Question,
         }
         kind = ops.get(c)
         if kind:

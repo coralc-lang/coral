@@ -261,6 +261,13 @@ class TypeIdent(Node):
         self.name = name
 
 
+class TernaryExpr(Node):
+    def __init__(self, cond, then_expr, else_expr):
+        self.cond = cond
+        self.then_expr = then_expr
+        self.else_expr = else_expr
+
+
 class Parser:
     def __init__(self, tokens, filename):
         self.tokens = tokens
@@ -322,6 +329,9 @@ class Parser:
                 size = self.parse_expr()
                 self.expect(TokenKind.RBracket)
                 return ArrayType(base, size)
+            if self.peek().kind == TokenKind.Star:
+                self.advance()
+                return PointerType(base)
             return base
         if t.kind in (TokenKind.Void, TokenKind.Bool, TokenKind.CharType,
                        TokenKind.U8, TokenKind.I8, TokenKind.U16, TokenKind.I16,
@@ -329,11 +339,19 @@ class Parser:
                        TokenKind.U128, TokenKind.I128, TokenKind.F32, TokenKind.F64,
                        TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str):
             self.advance()
-            return TypeIdent(t.value)
+            base = TypeIdent(t.value)
+            if self.peek().kind == TokenKind.Star:
+                self.advance()
+                return PointerType(base)
+            if self.peek().kind == TokenKind.LBracket:
+                size = self.parse_expr()
+                self.expect(TokenKind.RBracket)
+                return ArrayType(base, size)
+            return base
         raise SyntaxError(f"{self.filename}:{t.line}:{t.col}: unexpected token in type: {t.kind} ({t.value!r})")
 
     def parse_expr(self):
-        return self.parse_assign()
+        return self.parse_ternary()
 
     def parse_assign(self):
         left = self.parse_or()
@@ -343,6 +361,16 @@ class Parser:
             right = self.parse_or()
             return Assign(left, right)
         return left
+
+    def parse_ternary(self):
+        cond = self.parse_or()
+        if self.peek().kind == TokenKind.Question:
+            self.advance()
+            then_expr = self.parse_expr()
+            self.expect(TokenKind.Colon)
+            else_expr = self.parse_assign()
+            return TernaryExpr(cond, then_expr, else_expr)
+        return cond
 
     def parse_or(self):
         left = self.parse_and()
@@ -740,13 +768,18 @@ class Parser:
         ret_type = None
         name_token = self.peek()
         if self.is_type_start():
-            peek2 = self.peek2()
-            if peek2.kind == TokenKind.Ident:
+            if self.peek().kind == TokenKind.Struct and self.peek2().kind == TokenKind.LParen:
+                ret_type = self.parse_type()
+                name_token = self.advance()
+            elif self.peek2().kind == TokenKind.Ident:
                 ret_type = self.parse_type()
                 name_token = self.advance()
             elif name_token.kind == TokenKind.Ident:
                 name_token = self.advance()
                 ret_type = None
+            else:
+                ret_type = self.parse_type()
+                name_token = self.advance()
         else:
             name_token = self.advance()
 
@@ -789,10 +822,17 @@ class Parser:
                 is_lib = False
                 lib_path = None
                 if self.match(TokenKind.LParen):
-                    lib_token = self.expect(TokenKind.Ident)
+                    lib_token = self.advance()
                     lib_path = lib_token.value
                     self.expect(TokenKind.Rparen)
                     is_lib = True
+
+                if is_lib:
+                    while self.peek().kind not in (TokenKind.Semicolon, TokenKind.Eof):
+                        self.advance()
+                    self.match(TokenKind.Semicolon)
+                    decls.append(ImportDecl("", [], True, lib_path))
+                    continue
 
                 path_token = self.expect(TokenKind.String)
                 path = path_token.value.strip('"')
@@ -843,6 +883,10 @@ class Parser:
                     decls.append(EnumDecl(name, variants, True))
                     continue
                 if self.peek().kind == TokenKind.Struct:
+                    if self.tokens[self.pos + 1].kind == TokenKind.LParen:
+                        func = self.parse_func(True, False, False)
+                        decls.append(func)
+                        continue
                     self.advance()
                     name = self.expect(TokenKind.Ident).value
                     fields = self.parse_struct_fields()
