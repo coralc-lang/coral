@@ -1,0 +1,94 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+// Commutative canonicalization: canonicalize operand order for commutative ops
+// so that constants are on the right and variables are on the left. This
+// enables more CSE/GVN opportunities and simplifies pattern matching.
+pub struct CommCanonicalizePass
+{
+    u64 fixes;
+
+    CommCanonicalizePass new()
+    {
+        CommCanonicalizePass p;
+        p.fixes = 0;
+        return p;
+    }
+
+    bool run(wallvm::ir_types::IrFunc* func)
+    {
+        self.fixes = 0;
+
+        for (u32 bi = 0; bi < func*.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func*.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if (!isCommutative(inst.opcode) || inst.nops < 2) continue;
+
+                // Ensure constants go to ops[1]
+                if (inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstInt &&
+                    inst.ops[1].kind != wallvm::ir_types::IrValueKind::ConstInt)
+                {
+                    wallvm::ir_types::IrValue* tmp = inst.ops[0];
+                    inst.ops[0] = inst.ops[1];
+                    inst.ops[1] = tmp;
+                    self.fixes++;
+                }
+                else if (inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstFloat &&
+                    inst.ops[1].kind != wallvm::ir_types::IrValueKind::ConstFloat)
+                {
+                    wallvm::ir_types::IrValue* tmp = inst.ops[0];
+                    inst.ops[0] = inst.ops[1];
+                    inst.ops[1] = tmp;
+                    self.fixes++;
+                }
+                // If both are same kind, sort by ID for deterministic order
+                else if (inst.ops[0].id > inst.ops[1].id &&
+                    ((inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstInt &&
+                      inst.ops[1].kind == wallvm::ir_types::IrValueKind::ConstInt) ||
+                     (inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstFloat &&
+                      inst.ops[1].kind == wallvm::ir_types::IrValueKind::ConstFloat)))
+                {
+                    wallvm::ir_types::IrValue* tmp = inst.ops[0];
+                    inst.ops[0] = inst.ops[1];
+                    inst.ops[1] = tmp;
+                    self.fixes++;
+                }
+                // For same-kind non-constants, sort by ID
+                else if (inst.ops[0].kind == inst.ops[1].kind &&
+                    inst.ops[0].kind == wallvm::ir_types::IrValueKind::Inst &&
+                    inst.ops[0].id > inst.ops[1].id)
+                {
+                    wallvm::ir_types::IrValue* tmp = inst.ops[0];
+                    inst.ops[0] = inst.ops[1];
+                    inst.ops[1] = tmp;
+                    self.fixes++;
+                }
+            }
+        }
+
+        return self.fixes > 0;
+    }
+
+    bool isCommutative(wallvm::irOps::IrOpcode op)
+    {
+        return op == wallvm::irOps::IrOpcode::Add ||
+               op == wallvm::irOps::IrOpcode::Mul ||
+               op == wallvm::irOps::IrOpcode::And ||
+               op == wallvm::irOps::IrOpcode::Or  ||
+               op == wallvm::irOps::IrOpcode::Xor ||
+               op == wallvm::irOps::IrOpcode::SMin ||
+               op == wallvm::irOps::IrOpcode::SMax ||
+               op == wallvm::irOps::IrOpcode::UMin ||
+               op == wallvm::irOps::IrOpcode::UMax;
+    }
+}
+
+pub bool irPassCommCanonicalize(wallvm::ir_types::IrFunc* func, rawptr userdata)
+{
+    if (!func) return false;
+    CommCanonicalizePass pass = CommCanonicalizePass::new();
+    return pass.run(func);
+}

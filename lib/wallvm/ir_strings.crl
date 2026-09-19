@@ -1,0 +1,295 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+// String handling in IR
+// Provides string constants and string operations.
+
+// String constant - stored in IR as a global with embedded data
+pub struct IrString
+{
+    const u8* data;
+    u32 length;
+    wallvm::ir_types::IrValue* globalValue;
+}
+
+// Create a string constant in IR
+pub IrString createStringConstant(wallvm::ir_types::IrContext* ctx, wallvm::ir_types::IrModule* mod, str data)
+{
+    IrString s;
+    s.data = (const u8*)data.ptr;
+    s.length = data.len;
+
+    // Create global variable for string
+    wallvm::ir_types::IrType* i8Ty = ctx.tyInt(8);
+    wallvm::ir_types::IrType* arrayTy = ctx.tyArray(i8Ty, s.length + 1);
+    wallvm::ir_types::IrType* globalTy = ctx.tyPtr(arrayTy);
+
+    // Create global
+    wallvm::ir_types::IrGlobal* glob = ctx.createGlobal(".str", globalTy, true, false, null, 1);
+
+    // Initialize with string data
+    wallvm::ir_types::IrValue** initVals = std::mman::alloc<wallvm::ir_types::IrValue*>(s.length + 1);
+    for (u32 i = 0; i < s.length; i++)
+    {
+        initVals[i] = ctx.constInt(i8Ty, data.ptr[i]);
+    }
+    initVals[s.length] = ctx.constInt(i8Ty, 0);
+
+    wallvm::ir_types::IrValue* arrayVal = ctx.constArray(arrayTy, initVals, s.length + 1);
+    glob.initVal = arrayVal;
+    std::mman::dealloc<wallvm::ir_types::IrValue*>(initVals);
+
+    // Add to module
+    mod.addGlobal(glob);
+
+    s.globalValue = &glob.base;
+    return s;
+}
+
+// Create a string pointer (GEP into string constant)
+pub wallvm::ir_types::IrValue* getStringPointer(wallvm::ir_types::IrContext* ctx,
+                                              IrString* str, wallvm::ir_types::IrBlock* bb)
+{
+    if (!str || !str.globalValue) return null;
+
+    // Create GEP to get pointer to first element
+    wallvm::ir_types::IrValue** idxOps = std::mman::alloc<wallvm::ir_types::IrValue*>(2);
+    idxOps[0] = ctx.constInt(ctx.tyInt(32), 0);
+    idxOps[1] = ctx.constInt(ctx.tyInt(32), 0);
+
+    wallvm::ir_types::IrInst* gep = ctx.createInst(
+        wallvm::irOps::IrOpcode::Gep,
+        ctx.tyPtr(ctx.tyInt(8)),
+        idxOps,
+        2,
+        0,
+        0
+    );
+    std::mman::dealloc<wallvm::ir_types::IrValue*>(idxOps);
+
+    bb.addInst(gep);
+    return &gep.base;
+}
+
+// String comparison operations
+pub wallvm::ir_types::IrValue* createStringCompare(
+    wallvm::ir_types::IrContext* ctx,
+    wallvm::ir_types::IrBlock* bb,
+    wallvm::ir_types::IrValue* a,
+    wallvm::ir_types::IrValue* b,
+    u32 len
+)
+{
+    wallvm::ir_types::IrValue* result = null;
+
+    for (u32 i = 0; i < len; i++)
+    {
+        wallvm::ir_types::IrValue** aIdx = std::mman::alloc<wallvm::ir_types::IrValue*>(1);
+        aIdx[0] = ctx.constInt(ctx.tyInt(32), i);
+        wallvm::ir_types::IrInst* aGep = ctx.createInst(
+            wallvm::irOps::IrOpcode::Gep,
+            ctx.tyPtr(ctx.tyInt(8)),
+            aIdx,
+            1,
+            0,
+            0
+        );
+        std::mman::dealloc<wallvm::ir_types::IrValue*>(aIdx);
+        bb.addInst(aGep);
+
+        wallvm::ir_types::IrValue** aLoad = std::mman::alloc<wallvm::ir_types::IrValue*>(1);
+        aLoad[0] = &aGep.base;
+        wallvm::ir_types::IrInst* aVal = ctx.createInst(
+            wallvm::irOps::IrOpcode::Load,
+            ctx.tyInt(8),
+            aLoad,
+            1,
+            0,
+            0
+        );
+        std::mman::dealloc<wallvm::ir_types::IrValue*>(aLoad);
+        bb.addInst(aVal);
+
+        wallvm::ir_types::IrValue** bIdx = std::mman::alloc<wallvm::ir_types::IrValue*>(1);
+        bIdx[0] = ctx.constInt(ctx.tyInt(32), i);
+        wallvm::ir_types::IrInst* bGep = ctx.createInst(
+            wallvm::irOps::IrOpcode::Gep,
+            ctx.tyPtr(ctx.tyInt(8)),
+            bIdx,
+            1,
+            0,
+            0
+        );
+        std::mman::dealloc<wallvm::ir_types::IrValue*>(bIdx);
+        bb.addInst(bGep);
+
+        wallvm::ir_types::IrValue** bLoad = std::mman::alloc<wallvm::ir_types::IrValue*>(1);
+        bLoad[0] = &bGep.base;
+        wallvm::ir_types::IrInst* bVal = ctx.createInst(
+            wallvm::irOps::IrOpcode::Load,
+            ctx.tyInt(8),
+            bLoad,
+            1,
+            0,
+            0
+        );
+        std::mman::dealloc<wallvm::ir_types::IrValue*>(bLoad);
+        bb.addInst(bVal);
+
+        wallvm::ir_types::IrValue** cmpOps = std::mman::alloc<wallvm::ir_types::IrValue*>(2);
+        cmpOps[0] = &aVal.base;
+        cmpOps[1] = &bVal.base;
+        wallvm::ir_types::IrInst* cmp = ctx.createInst(
+            wallvm::irOps::IrOpcode::ICmp,
+            ctx.tyInt(1),
+            cmpOps,
+            2,
+            0,
+            0
+        );
+        cmp.icmpPred = wallvm::irOps::IrICmpPred::Ne;
+        std::mman::dealloc<wallvm::ir_types::IrValue*>(cmpOps);
+        bb.addInst(cmp);
+
+        if (result == null)
+        {
+            result = &cmp.base;
+        }
+        else
+        {
+            wallvm::ir_types::IrValue** orOps = std::mman::alloc<wallvm::ir_types::IrValue*>(2);
+            orOps[0] = result;
+            orOps[1] = &cmp.base;
+            wallvm::ir_types::IrInst* orInst = ctx.createInst(
+                wallvm::irOps::IrOpcode::Or,
+                ctx.tyInt(1),
+                orOps,
+                2,
+                0,
+                0
+            );
+            std::mman::dealloc<wallvm::ir_types::IrValue*>(orOps);
+            bb.addInst(orInst);
+            result = &orInst.base;
+        }
+    }
+
+    return result;
+}
+
+// String copy - returns newly allocated str
+pub str stringCopy(str src)
+{
+    if (src.isEmpty()) return "";
+    char* copy = std::mman::alloc<char>(src.len + 1);
+    for (u32 i = 0; i < src.len; i++)
+        copy[i] = src.ptr[i];
+    copy[src.len] = 0;
+    return str::fromParts(copy, src.len);
+}
+
+// String concatenation - returns newly allocated str
+pub str stringConcat(str a, str b)
+{
+    if (a.isEmpty()) return stringCopy(b);
+    if (b.isEmpty()) return stringCopy(a);
+
+    u32 totalLen = a.len + b.len;
+    char* result = std::mman::alloc<char>(totalLen + 1);
+    for (u32 i = 0; i < a.len; i++)
+        result[i] = a.ptr[i];
+    for (u32 i = 0; i < b.len; i++)
+        result[a.len + i] = b.ptr[i];
+    result[totalLen] = 0;
+    return str::fromParts(result, totalLen);
+}
+
+// String contains
+pub bool stringContains(str haystack, str needle)
+{
+    if (needle.isEmpty()) return true;
+    if (needle.len > haystack.len) return false;
+
+    for (u32 i = 0; i <= haystack.len - needle.len; i++)
+    {
+        bool found = true;
+        for (u32 j = 0; j < needle.len; j++)
+        {
+            if (haystack.ptr[i + j] != needle.ptr[j])
+            {
+                found = false;
+                break;
+            }
+        }
+        if (found) return true;
+    }
+    return false;
+}
+
+// String substring - returns newly allocated str
+pub str stringSubstring(str src, u32 start, u32 length)
+{
+    if (src.isEmpty() || start >= src.len) return "";
+    if (start + length > src.len) length = src.len - start;
+
+    char* sub = std::mman::alloc<char>(length + 1);
+    for (u32 i = 0; i < length; i++)
+        sub[i] = src.ptr[start + i];
+    sub[length] = 0;
+    return str::fromParts(sub, length);
+}
+
+// String to integer
+pub i64 stringToInt(str src)
+{
+    if (src.isEmpty()) return 0;
+    i64 result = 0;
+    bool negative = false;
+    u32 i = 0;
+
+    if (src.ptr[0] == '-')
+    {
+        negative = true;
+        i = 1;
+    }
+
+    while (i < src.len && src.ptr[i] >= '0' && src.ptr[i] <= '9')
+    {
+        result = result * 10 + (src.ptr[i] - '0');
+        i++;
+    }
+
+    return negative ? -result : result;
+}
+
+// Integer to string - returns newly allocated str
+pub str intToString(i64 val)
+{
+    char buf[32];
+    u32 i = 30;
+    buf[31] = 0;
+    bool negative = val < 0;
+    if (negative) val = -val;
+
+    if (val == 0)
+    {
+        buf[i--] = '0';
+    }
+    else
+    {
+        while (val > 0 && i > 0)
+        {
+            buf[i--] = '0' + (val % 10);
+            val /= 10;
+        }
+    }
+
+    if (negative) buf[i--] = '-';
+
+    u32 len = 30 - i;
+    char* result = std::mman::alloc<char>(len + 1);
+    for (u32 j = 0; j <= len; j++)
+        result[j] = buf[i + 1 + j];
+
+    return str::fromParts(result, len);
+}

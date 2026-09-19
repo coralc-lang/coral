@@ -1,0 +1,316 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+mod loopdetect = import file::loopdetect;
+mod alias = import file::alias_analysis;
+
+// Loop Distribution Pass
+//
+// Splits a loop body into multiple independent loops to enable vectorization
+// or improve data locality. For example:
+//
+//   for i = 0..n            for i = 0..n
+//     a[i] = b[i] + c[i]  →   a[i] = b[i] + c[i]
+//     d[i] = a[i] * 2          for i = 0..n
+//                               d[i] = a[i] * 2
+//
+// This is useful when:
+// 1. One part of the loop body is vectorizable but another isn't
+// 2. Different parts access different arrays (reducing cache pressure)
+// 3. One part has loop-carried dependencies but another doesn't
+//
+// Safety criteria:
+// 1. The loop must be a counted loop (has induction variable)
+// 2. The loop body can be partitioned into independent chains
+// 3. No loop-carried dependencies between the partitions
+// 4. The loop must have a single latch block
+
+const u32 MAX_PARTITIONS = 16;
+
+pub struct LoopPartition
+{
+    wallvm::ir_types::IrInst** insts;  // Instructions in this partition
+    u32 ninsts;
+    bool hasStore;                   // Partition contains a store
+    bool hasLoad;                    // Partition contains a load
+}
+
+pub struct LoopDistributePass
+{
+    wallvm::ir_types::IrContext* ctx;
+    u64 distributions;
+
+    LoopDistributePass new(wallvm::ir_types::IrContext* ctx)
+    {
+        LoopDistributePass p;
+        p.ctx = ctx;
+        p.distributions = 0;
+        return p;
+    }
+
+    bool run(wallvm::ir_types::IrFunc* func)
+    {
+        self.distributions = 0;
+
+        // Detect all natural loops
+        wallvm::passes::loopdetect.IrLoop** loops = wallvm::passes::loopdetect.irLoopDetectNatural(func);
+        if (!loops) return false;
+
+        // Check for cached AA
+        wallvm::ir_types::FunctionAnalysisCache* cache = ctx.getOrCreateAnalysisCache(func);
+        alias.AliasAnalysis* aaPtr = (alias.AliasAnalysis*)cache.aliasAnalysis;
+        alias.AliasAnalysis aa;
+        bool ownAA = false;
+        if (aaPtr)
+        {
+            aa = *aaPtr;
+        }
+        else
+        {
+            aa = alias.AliasAnalysis::new(ctx);
+            aa.analyze(func);
+            ownAA = true;
+        }
+
+        bool changed = false;
+
+        for (u32 li = 0; loops[li]; li++)
+        {
+            wallvm::passes::loopdetect.IrLoop* lp = loops[li];
+            if (self.canDistribute(lp, &aa))
+            {
+                if (self.distributeLoop(lp, func, &aa))
+                {
+                    changed = true;
+                    self.distributions++;
+                }
+            }
+        }
+
+        if (ownAA) aa.deinit();
+        std::mman::dealloc<wallvm::passes::loopdetect.IrLoop*>(loops);
+        return changed;
+    }
+
+    // Check if a loop can be distributed
+    bool canDistribute(wallvm::passes::loopdetect.IrLoop* lp, alias.AliasAnalysis* aa)
+    {
+        // Must be a natural loop with a header
+        if (!lp.header || !lp.latch) return false;
+
+        // Must have an induction variable
+        wallvm::ir_types::IrInst* phi = self.findInductionVar(lp);
+        if (!phi) return false;
+
+        // Must have at least 2 blocks (header + latch)
+        if (lp.nblocks < 2) return false;
+
+        // Check that the loop body has multiple independent chains
+        // by looking for instructions that don't depend on each other
+        u32 nLoads = 0;
+        u32 nStores = 0;
+
+        for (u32 bi = 0; bi < lp.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = lp.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if (inst.opcode == wallvm::irOps::IrOpcode::Load) nLoads++;
+                if (inst.opcode == wallvm::irOps::IrOpcode::Store) nStores++;
+            }
+        }
+
+        // Need at least 2 loads or 2 stores to benefit from distribution
+        if (nLoads < 2 && nStores < 2) return false;
+
+        // Check that there are no calls or inline assembly (may alias with anything)
+        for (u32 bi = 0; bi < lp.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = lp.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if (inst.opcode == wallvm::irOps::IrOpcode::Call ||
+                    inst.opcode == wallvm::irOps::IrOpcode::InlineAsm ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicStore ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicLoad ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicRmw ||
+                    inst.opcode == wallvm::irOps::IrOpcode::Fence)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Distribute a loop into multiple independent loops
+    bool distributeLoop(wallvm::passes::loopdetect.IrLoop* lp, wallvm::ir_types::IrFunc* func, alias.AliasAnalysis* aa)
+    {
+        wallvm::ir_types::IrBlock* header = lp.header;
+        if (!header) return false;
+
+        // Partition the loop body into independent chains
+        LoopPartition partitions[MAX_PARTITIONS];
+        u32 nPartitions = 0;
+
+        // Simple partitioning: separate loads and stores that don't alias
+        self.partitionLoopBody(header, partitions, &nPartitions, MAX_PARTITIONS, aa);
+
+        // Need at least 2 partitions to distribute
+        if (nPartitions < 2) return false;
+
+        // Create new loop bodies for each partition
+        wallvm::ir_types::IrBlock* lastBlock = null;
+
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            // Create a new block for this partition
+            wallvm::ir_types::IrBlock* newBlock = self.ctx.createBlock(null);
+            func.addBlock(newBlock);
+
+            // Copy instructions from the partition to the new block
+            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = partitions[pi].insts[ii];
+                // Clone the instruction
+                wallvm::ir_types::IrInst* clone = self.ctx.createInst(inst.opcode, inst.base.type, null, 0, 0, 0);
+                clone.nops = inst.nops;
+                for (u32 oi = 0; oi < inst.nops; oi++)
+                {
+                    clone.ops[oi] = inst.ops[oi];
+                    if (inst.ops[oi] && inst.ops[oi].kind == wallvm::ir_types::IrValueKind::Inst)
+                    {
+                        wallvm::ir_types::IrInst* opInst = (wallvm::ir_types::IrInst*)inst.ops[oi];
+                        opInst.addUser(clone);
+                    }
+                }
+                clone.parent = newBlock;
+                newBlock.addInst(clone);
+            }
+
+            // Add a branch to the next block or back to the header
+            wallvm::ir_types::IrInst* br = self.ctx.createInst(wallvm::irOps::IrOpcode::Br, self.ctx.tyVoid(), null, 0, 0, 0);
+            br.ops[0] = &header.base;
+            header.base.addUser(br);
+            br.nops = 1;
+            br.parent = newBlock;
+            newBlock.addInst(br);
+
+            if (lastBlock)
+            {
+                // Update the last block's terminator to point to this new block
+                wallvm::ir_types::IrInst* lastTerm = lastBlock.insts[lastBlock.ninsts - 1];
+                if (lastTerm.opcode == wallvm::irOps::IrOpcode::Br)
+                {
+                    lastTerm.ops[0] = &newBlock.base;
+                    newBlock.base.addUser(lastTerm);
+                }
+            }
+
+            lastBlock = newBlock;
+        }
+
+        // Remove original instructions from header (they've been copied to partitions)
+        for (u32 ii = 0; ii < header.ninsts; ii++)
+        {
+            wallvm::ir_types::IrInst* inst = header.insts[ii];
+            // Only remove non-PHI, non-terminator instructions
+            if (inst.opcode != wallvm::irOps::IrOpcode::Phi && ii < header.ninsts - 1)
+            {
+                inst.erase();
+            }
+        }
+
+        // Free partition allocations
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            if (partitions[pi].insts)
+                std::mman::dealloc<wallvm::ir_types::IrInst*>(partitions[pi].insts);
+        }
+
+        return true;
+    }
+
+    // Partition loop body into independent chains
+    void partitionLoopBody(wallvm::ir_types::IrBlock* header, LoopPartition* partitions, u32* nPartitions, u32 maxPartitions, alias.AliasAnalysis* aa)
+    {
+        *nPartitions = 0;
+
+        // Simple partitioning: each store gets its own partition,
+        // loads are grouped with the stores they feed
+        for (u32 ii = 0; ii < header.ninsts && *nPartitions < maxPartitions; ii++)
+        {
+            wallvm::ir_types::IrInst* inst = header.insts[ii];
+
+            if (inst.opcode == wallvm::irOps::IrOpcode::Store)
+            {
+                // Start a new partition for this store
+                LoopPartition* p = &partitions[*nPartitions];
+                p.insts = std::mman::alloc<wallvm::ir_types::IrInst*>(header.ninsts);
+                p.ninsts = 0;
+                p.hasStore = true;
+                p.hasLoad = false;
+
+                // Add this store
+                p.insts[p.ninsts++] = inst;
+
+                // Add any loads that this store depends on (that aren't in other partitions)
+                for (u32 oi = 0; oi < inst.nops; oi++)
+                {
+                    if (inst.ops[oi] && inst.ops[oi].kind == wallvm::ir_types::IrValueKind::Inst)
+                    {
+                        wallvm::ir_types::IrInst* opInst = (wallvm::ir_types::IrInst*)inst.ops[oi];
+                        if (opInst.opcode == wallvm::irOps::IrOpcode::Load && opInst.parent == header)
+                        {
+                            // Check if this load is already in another partition
+                            bool alreadyUsed = false;
+                            for (u32 pi = 0; pi < *nPartitions; pi++)
+                            {
+                                for (u32 jj = 0; jj < partitions[pi].ninsts; jj++)
+                                {
+                                    if (partitions[pi].insts[jj] == opInst)
+                                    {
+                                        alreadyUsed = true;
+                                        break;
+                                    }
+                                }
+                                if (alreadyUsed) break;
+                            }
+
+                            if (!alreadyUsed)
+                            {
+                                p.insts[p.ninsts++] = opInst;
+                                p.hasLoad = true;
+                            }
+                        }
+                    }
+                }
+
+                (*nPartitions)++;
+            }
+        }
+    }
+
+    // Find the induction variable (phi) of a loop
+    wallvm::ir_types::IrInst* findInductionVar(wallvm::passes::loopdetect.IrLoop* lp)
+    {
+        wallvm::ir_types::IrBlock* header = lp.header;
+        if (!header) return null;
+
+        for (u32 i = 0; i < header.ninsts; i++)
+        {
+            wallvm::ir_types::IrInst* inst = header.insts[i];
+            if (inst.opcode == wallvm::irOps::IrOpcode::Phi)
+                return inst;
+        }
+        return null;
+    }
+}
+
+pub bool irPassLoopDistribute(wallvm::ir_types::IrFunc* func, rawptr userdata)
+{
+    wallvm::ir_types::IrContext* ctx = (wallvm::ir_types::IrContext*)userdata;
+    if (!ctx || !func) return false;
+    LoopDistributePass pass = LoopDistributePass::new(ctx);
+    return pass.run(func);
+}

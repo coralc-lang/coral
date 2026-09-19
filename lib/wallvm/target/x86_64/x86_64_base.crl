@@ -1,0 +1,3368 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+pub str* X86_64_RESERVED_INT = {
+    "rsp", "rbp"
+};
+
+pub str* X86_64_RESERVED_FLOAT = {
+    "xmm0", "xmm1"
+};
+
+pub str* X86_64_INT_REGS = {
+    "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"
+};
+
+pub str* X86_64_FLOAT_REGS = {
+    "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14"
+};
+
+
+pub strvuct CpuFeatures
+{
+    bool sse;
+    bool sse2;
+    bool sse3;
+    bool ssse3;
+    bool sse41;
+    bool sse42;
+    bool avx;
+    bool avx2;
+    bool avx512f;
+    bool fma;
+    bool bmi1;
+    bool bmi2;
+    bool popcnt;
+    bool lzcnt;
+}
+
+pub CpuFeatures defaultCpuFeatures()
+{
+    CpuFeatures f;
+    f.sse = true;
+    f.sse2 = true;
+    f.sse3 = false;
+    f.ssse3 = false;
+    f.sse41 = false;
+    f.sse42 = false;
+    f.avx = false;
+    f.avx2 = false;
+    f.avx512f = false;
+    f.fma = false;
+    f.bmi1 = false;
+    f.bmi2 = false;
+    f.popcnt = false;
+    f.lzcnt = false;
+    return f;
+}
+
+pub strvuct ElfMetadata
+{
+    str section;
+    bool isGlobal;
+}
+
+pub ElfMetadata defaultFuncMeta()
+{
+    ElfMetadata m;
+    m.section = ".text";
+    m.isGlobal = true;
+    return m;
+}
+
+pub strvuct X86_64Emitter
+{
+    wallvm::ir_types::IrContext* ctx;
+    wallvm::ir_types::IrModule* modd;
+    CpuFeatures* features;
+    bool useAtt;
+    std::string::String output;
+    std::string::String dataSection;
+    u32 labelCounter;
+
+    void init(wallvm::ir_types::IrContext* ctx,
+              wallvm::ir_types::IrModule* modd,
+              bool useAtt, CpuFeatures* feats)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.features = feats;
+        self.useAtt = useAtt;
+        self.output = std::string::String::new();
+        self.dataSection = null;
+        self.data.len = 0;
+        self.data.cap = 0;
+        self.labelCounter = 0;
+    }
+
+    u32 nextLabel()
+    {
+        return self.labelCounter++;
+    }
+
+    void emit(str strv)
+    {
+        usize len = 0;
+        while (strv.ptr[len]) len++;
+        if (self.output.len + len + 1 > self.output.cap)
+        {
+            u32 newCap = self.output.cap ? self.output.cap * 2 : 8192;
+            std::cchar* newBuf = std::mman::alloc<std::cchar>(newCap);
+            if (self.output)
+            {
+                for (u32 i = 0; i < self.output.len; i++)
+                    newBuf[i] = self.output[i];
+                std::mman::dealloc<std::cchar>(self.output);
+            }
+            self.output = newBuf;
+            self.output.cap = newCap;
+        }
+        for (u32 i = 0; i < len; i++)
+            self.output[self.output.len + i] = strv[i];
+        self.output.len += len;
+        self.output[self.output.len] = 0;
+    }
+
+    void emitLine(str strv)
+    {
+        self.emit(strv);
+        self.emit("\n");
+    }
+
+    void emitTab(str instrv)
+    {
+        self.emit("\t");
+        self.emitLine(instrv);
+    }
+
+    void emitComment(str comment)
+    {
+        self.emit("\t# ");
+        self.emitLine(comment);
+    }
+
+    void emitData(str strv)
+    {
+        u32 len = 0;
+        while (strv[len]) len++;
+        if (self.data.len + len + 1 > self.data.cap)
+        {
+            u32 newCap = self.data.cap ? self.data.cap * 2 : 4096;
+            std::cchar* newBuf = std::mman::alloc<std::cchar>(newCap);
+            if (self.dataSection)
+            {
+                for (u32 i = 0; i < self.data.len; i++)
+                    newBuf[i] = self.dataSection[i];
+                std::mman::dealloc<std::cchar>(self.dataSection);
+            }
+            self.dataSection = newBuf;
+            self.data.cap = newCap;
+        }
+        for (u32 i = 0; i < len; i++)
+            self.dataSection[self.data.len + i] = strv[i];
+        self.data.len += len;
+        self.dataSection[self.data.len] = 0;
+    }
+
+    void emitDataLine(str strv)
+    {
+        self.emitData(strv);
+        self.emitData("\n");
+    }
+
+    str getOutput() { return self.output; }
+}
+
+static std::cchar _r32buf[2][16];
+static int _r32i = 0;
+
+static str toReg32(str r)
+{
+    std::cchar* buf = _r32buf[_r32i++ & 1];
+    if (r[0] == 'r' && r[1] >= 'a' && r[1] <= 'z')
+    {
+        if (r[2] == 0)
+        {
+            buf[0] = r[1];
+            buf[1] = 0;
+            return buf;
+        }
+        buf[0] = 'e';
+        buf[1] = r[1];
+        buf[2] = r[2];
+        buf[3] = 0;
+        return buf;
+    }
+    u32 i = 0;
+    while (r[i]) { buf[i] = r[i]; i++; }
+    buf[i] = 'd';
+    buf[i + 1] = 0;
+    return buf;
+}
+
+static std::cchar _r16buf[2][16];
+static int _r16i = 0;
+
+static str toReg16(str r)
+{
+    std::cchar* buf = _r16buf[_r16i++ & 1];
+    if (r[0] == 'r' && r[1] >= 'a' && r[1] <= 'z')
+    {
+        if (r[2] == 0)
+        {
+            buf[0] = r[1];
+            buf[1] = 0;
+            return buf;
+        }
+        buf[0] = r[1];
+        buf[1] = r[2];
+        buf[2] = 0;
+        return buf;
+    }
+    u32 i = 0;
+    while (r[i]) { buf[i] = r[i]; i++; }
+    buf[i] = 'w';
+    buf[i + 1] = 0;
+    return buf;
+}
+
+static std::cchar _r8buf[2][16];
+static int _r8i = 0;
+
+static str toReg8(str r)
+{
+    std::cchar* buf = _r8buf[_r8i++ & 1];
+    if (r[0] == 'r' && r[1] >= 'a' && r[1] <= 'z')
+    {
+        if (r[2] == 0)
+        {
+            buf[0] = r[1];
+            buf[1] = 'l';
+            buf[2] = 0;
+            return buf;
+        }
+        buf[0] = r[1];
+        buf[1] = r[2];
+        buf[2] = 'l';
+        buf[3] = 0;
+        return buf;
+    }
+    u32 i = 0;
+    while (r[i]) { buf[i] = r[i]; i++; }
+    buf[i] = 'b';
+    buf[i + 1] = 0;
+    return buf;
+}
+
+pub strvuct X86_64CodeGen
+{
+    wallvm::ir_types::IrContext* ctx;
+    wallvm::ir_types::IrModule* modd;
+    X86_64Emitter emitter;
+    bool isWindows;
+    bool currentFuncHasFrame;
+    bool useRedZone;
+    bool savedCalleeSaves[16];
+    u32 numCalleeSaves;
+    u32 redZoneSpillOffset;
+    str lastCallTarget;
+    wallvm::ir_types::IrValue* lastCallResult;
+    bool omitFramePointer;
+    u32 varargAllocSize;
+    u32 shadowAllocSize;
+    bool calleeSavesPushed;
+    u32 shrinkWrapFirstUseBlock;
+    bool hasDeferredFrame;
+
+    void init(wallvm::ir_types::IrContext* ctx,
+              wallvm::ir_types::IrModule* modd,
+              bool isWindows, bool useAtt,
+              CpuFeatures* feats)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.isWindows = isWindows;
+        self.omitFramePointer = true;
+        self.emitter.init(ctx, modd, useAtt, feats);
+    }
+
+    static bool isCalleeSaved(str reg, bool isWin)
+    {
+        if (strEq(reg, "rbx")) return true;
+        if (strEq(reg, "rbp")) return true;
+        if (strEq(reg, "r12")) return true;
+        if (strEq(reg, "r13")) return true;
+        if (strEq(reg, "r14")) return true;
+        if (strEq(reg, "r15")) return true;
+        if (isWin)
+        {
+            if (strEq(reg, "rdi")) return true;
+            if (strEq(reg, "rsi")) return true;
+        }
+        return false;
+    }
+
+    str getRegName(wallvm::ir_types::IrValue* val)
+    {
+        if (!val) return "rax";
+        u64 vd = val.valData;
+        if (vd & 0x80000000UL)
+            return "rax";
+        if (vd & 0x40000000UL)
+        {
+            u32 reg = (u32)(vd & 0x3FFFFFFF);
+            if (reg < 13) return X86_64_FLOAT_REGS[reg];
+            return "xmm0";
+        }
+        u32 reg = (u32)(vd & 0x3FFFFFFF);
+        if (reg < 12) return X86_64_INT_REGS[reg];
+        return "rax";
+    }
+
+    bool funcUsesReg(wallvm::ir_types::IrFunc* func, str reg)
+    {
+        for (u32 bi = 0; bi < func*.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func*.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                str dst = getRegName(&inst.base);
+                if (strEq(dst, reg)) return true;
+                for (u32 oi = 0; oi < inst.nops; oi++)
+                {
+                    str op = getRegName(inst.ops[oi]);
+                    if (strEq(op, reg)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool blockUsesReg(wallvm::ir_types::IrBlock* bb, str reg)
+    {
+        for (u32 ii = 0; ii < bb.ninsts; ii++)
+        {
+            wallvm::ir_types::IrInst* inst = bb.insts[ii];
+            str dst = getRegName(&inst.base);
+            if (strEq(dst, reg)) return true;
+            for (u32 oi = 0; oi < inst.nops; oi++)
+            {
+                str op = getRegName(inst.ops[oi]);
+                if (strEq(op, reg)) return true;
+            }
+        }
+        return false;
+    }
+
+    void emitPushCalleeSave(str reg)
+    {
+        if (self.emitter.useAtt)
+        {
+            self.emitter.emit("\tpushq %");
+            self.emitter.emit(reg);
+            self.emitter.emit("\n");
+        }
+        else
+        {
+            self.emitter.emit("\tpush ");
+            self.emitter.emit(reg);
+            self.emitter.emit("\n");
+        }
+    }
+
+    void emitDeferredCalleeSaves(wallvm::ir_types::IrBlock* bb)
+    {
+        if (self.calleeSavesPushed) return;
+
+        str calleeSaveRegs[6] = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+        bool needed = false;
+        for (u32 i = 0; i < 6; i++)
+        {
+            if (self.savedCalleeSaves[i])
+            {
+                if (self.blockUsesReg(bb, calleeSaveRegs[i]))
+                {
+                    needed = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needed) return;
+
+        self.calleeSavesPushed = true;
+        for (u32 i = 0; i < 6; i++)
+        {
+            if (self.savedCalleeSaves[i])
+                self.emitPushCalleeSave(calleeSaveRegs[i]);
+        }
+
+        if (self.hasDeferredFrame)
+        {
+            self.hasDeferredFrame = false;
+            self.currentFuncHasFrame = true;
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushq %rbp");
+                self.emitter.emitTab("movq %rsp, %rbp");
+            }
+            else
+            {
+                self.emitter.emitTab("push rbp");
+                self.emitter.emitTab("mov rbp, rsp");
+            }
+        }
+    }
+
+    void emitElfPrologue()
+    {
+        self.emitter.emitLine(".section .text");
+    }
+
+    void emitPrologue(wallvm::ir_types::IrFunc* func, ElfMetadata* meta)
+    {
+        if (meta && meta.isGlobal)
+        {
+            if (self.isWindows)
+            {
+                self.emitter.emit("public ");
+                self.emitter.emitLine(func*.name);
+            }
+            else
+            {
+                self.emitter.emit(".globl ");
+                self.emitter.emitLine(func*.name);
+            }
+        }
+        if (!self.isWindows)
+        {
+            self.emitter.emit(".type ");
+            self.emitter.emit(func*.name);
+            self.emitter.emitLine(", @function");
+        }
+
+        self.emitter.emit(func*.name);
+        self.emitter.emitLine(":");
+
+        self.useRedZone = false;
+        self.numCalleeSaves = 0;
+        self.redZoneSpillOffset = 0;
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        self.varargAllocSize = 0;
+        self.shadowAllocSize = 0;
+
+        bool isLeaf = func*.isLeaf();
+        bool isVararg = func*.base.type && func*.base.type.isVararg;
+
+        if (isVararg)
+            isLeaf = false;
+
+        if (isLeaf && !self.isWindows)
+        {
+            self.currentFuncHasFrame = false;
+            self.useRedZone = true;
+            return;
+        }
+
+        if (isVararg)
+        {
+            // System V ABI: Save registers to a dedicated register save area
+            // using rbp-relative offsets. Conditionally save XMM based on AL.
+            // Windows x64: va_list is just a pointer to the stack - shadow
+            // space handles argument passing.
+            if (!self.isWindows)
+            {
+                // System V: allocate 176 bytes (48 GP save + 128 XMM save)
+                // Layout: [gp_save:48] [xmm_save:128]
+                self.varargAllocSize = 176;
+                self.emitter.emitTab("subq $176, %rsp");
+
+                // Save GP registers to register save area (rbp-relative)
+                // Note: rbp is not set yet, so use rsp-relative offsets
+                // that will remain valid after frame setup
+                self.emitter.emit("\tmovq %rdi, ");
+                self.emitter.emitU32(self.varargAllocSize);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rsi, ");
+                self.emitter.emitU32(self.varargAllocSize + 8);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rdx, ");
+                self.emitter.emitU32(self.varargAllocSize + 16);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %rcx, ");
+                self.emitter.emitU32(self.varargAllocSize + 24);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %r8, ");
+                self.emitter.emitU32(self.varargAllocSize + 32);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovq %r9, ");
+                self.emitter.emitU32(self.varargAllocSize + 40);
+                self.emitter.emitLine("(%rsp)");
+
+                // Conditionally save XMM registers based on AL (count of FP args)
+                self.emitter.emitLine("testb %al, %al");
+                u32 xmmSkip = self.emitter.nextLabel();
+                self.emitter.emit("\tje .Lskip_xmm_");
+                self.emitter.emitU32(xmmSkip);
+                self.emitter.emitLine("");
+
+                u32 xmmBase = self.varargAllocSize + 48;
+                self.emitter.emit("\tmovaps %xmm0, ");
+                self.emitter.emitU32(xmmBase);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm1, ");
+                self.emitter.emitU32(xmmBase + 16);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm2, ");
+                self.emitter.emitU32(xmmBase + 32);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm3, ");
+                self.emitter.emitU32(xmmBase + 48);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm4, ");
+                self.emitter.emitU32(xmmBase + 64);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm5, ");
+                self.emitter.emitU32(xmmBase + 80);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm6, ");
+                self.emitter.emitU32(xmmBase + 96);
+                self.emitter.emitLine("(%rsp)");
+                self.emitter.emit("\tmovaps %xmm7, ");
+                self.emitter.emitU32(xmmBase + 112);
+                self.emitter.emitLine("(%rsp)");
+
+                self.emitter.emit(".Lskip_xmm_");
+                self.emitter.emitU32(xmmSkip);
+                self.emitter.emitLine(":");
+            }
+            else
+            {
+                // Windows x64: va_list is just a pointer to the stack.
+                // Arguments are passed via shadow space (32 bytes).
+                // We save all 4 GP + 4 XMM registers to the shadow area.
+                self.varargAllocSize = 32;
+                self.emitter.emitTab("subq $32, %rsp");
+                self.emitter.emitTab("movq %rcx, 0(%rsp)");
+                self.emitter.emitTab("movq %rdx, 8(%rsp)");
+                self.emitter.emitTab("movq %r8, 16(%rsp)");
+                self.emitter.emitTab("movq %r9, 24(%rsp)");
+            }
+        }
+
+        str calleeSaveRegs[6] = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+        bool hasFrame = !isLeaf && !self.omitFramePointer;
+        bool usesAnyCalleeSave = false;
+        bool usesRbp = false;
+        for (u32 i = 0; i < 6; i++)
+        {
+            str reg = calleeSaveRegs[i];
+            if (hasFrame && strEq(reg, "rbp"))
+                continue;
+            if (self.funcUsesReg(func, reg))
+            {
+                self.savedCalleeSaves[i] = true;
+                self.numCalleeSaves++;
+                usesAnyCalleeSave = true;
+                if (strEq(reg, "rbp")) usesRbp = true;
+            }
+            else
+            {
+                self.savedCalleeSaves[i] = false;
+            }
+        }
+
+        self.calleeSavesPushed = false;
+        self.hasDeferredFrame = false;
+
+        bool canShrinkWrap = !isVararg && usesAnyCalleeSave && !hasFrame;
+        if (canShrinkWrap)
+        {
+            self.currentFuncHasFrame = false;
+            if (self.isWindows)
+                self.shadowAllocSize = 32;
+        }
+        else if (!isLeaf && self.omitFramePointer)
+        {
+            self.currentFuncHasFrame = false;
+            if (self.isWindows)
+                self.shadowAllocSize = 32;
+        }
+        else if (!isLeaf)
+        {
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emitTab("pushq %rbp");
+                self.emitter.emitTab("movq %rsp, %rbp");
+            }
+            else
+            {
+                self.emitter.emitTab("push rbp");
+                self.emitter.emitTab("mov rbp, rsp");
+            }
+            self.currentFuncHasFrame = true;
+        }
+        else
+        {
+            self.currentFuncHasFrame = false;
+        }
+
+        if (!canShrinkWrap && !isLeaf)
+        {
+            self.calleeSavesPushed = true;
+            for (u32 i = 0; i < 6; i++)
+            {
+                if (self.savedCalleeSaves[i])
+                    self.emitPushCalleeSave(calleeSaveRegs[i]);
+            }
+        }
+
+        if (!isVararg && func*.nblocks > 0 && func*.base.type && func*.base.type.nparams > 0)
+        {
+            str sysvIntRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+            str win64IntRegs[4] = {"rcx", "rdx", "r8", "r9"};
+            str sysvFpRegs[8] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
+            str win64FpRegs[4] = {"xmm0", "xmm1", "xmm2", "xmm3"};
+
+            u32 maxIntRegs = self.isWindows ? 4 : 6;
+            u32 maxFpRegs = self.isWindows ? 4 : 8;
+
+            str* intRegs = self.isWindows ? win64IntRegs : sysvIntRegs;
+            str* fpRegs = self.isWindows ? win64FpRegs : sysvFpRegs;
+
+            wallvm::ir_types::IrBlock* eb = func*.blocks[0];
+            u32 intIdx = 0;
+            u32 fpIdx = 0;
+
+            for (u32 i = 0; i < eb.ninsts && (intIdx < maxIntRegs || fpIdx < maxFpRegs); i++)
+            {
+                wallvm::ir_types::IrInst* inst = eb.insts[i];
+                if (inst.opcode != wallvm::irOps::IrOpcode::Store || inst.nops < 1) continue;
+                wallvm::ir_types::IrValue* src = inst.ops[0];
+                if (!src || src.kind != wallvm::ir_types::IrValueKind::Inst) continue;
+
+                bool srcDefined = false;
+                for (u32 b = 0; b < func*.nblocks && !srcDefined; b++)
+                {
+                    wallvm::ir_types::IrBlock* bb = func*.blocks[b];
+                    for (u32 j = 0; j < bb.ninsts && !srcDefined; j++)
+                    {
+                        if (b == 0 && j == i) continue;
+                        wallvm::ir_types::IrInst* other = bb.insts[j];
+                        if (other.base.id == src.id) srcDefined = true;
+                    }
+                }
+                if (srcDefined) continue;
+
+                bool isFloat = src.type && src.type.kind == wallvm::ir_types::IrTypeKind::Float;
+                bool isStruct = src.type && src.type.kind == wallvm::ir_types::IrTypeKind::Struct;
+                u64 vd = src.valData;
+                bool assignedToReg = (vd != 0 && (vd & 0x80000000UL) == 0 && (vd & 0x40000000UL) == 0);
+                u32 assignedRegIdx = (u32)(vd & 0x3FFFFFFF);
+
+                if (isStruct && !isFloat)
+                {
+                    u32 sz = src.type.width;
+
+                    wallvm::ir_types::IrValue* dst = inst.nops > 1 ? inst.ops[1] : null;
+                    str destAddr = dst ? getRegForValue(dst) : "rax";
+
+                    if (sz <= 8)
+                    {
+                        if (intIdx < maxIntRegs)
+                        {
+                            str srcReg = intRegs[intIdx];
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(srcReg);
+                            self.emitter.emit(", (");
+                            self.emitter.emit(destAddr);
+                            self.emitter.emitLine(")");
+                            intIdx++;
+                        }
+                    }
+                    else if (sz <= 16)
+                    {
+                        if (intIdx < maxIntRegs)
+                        {
+                            str srcReg = intRegs[intIdx];
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(srcReg);
+                            self.emitter.emit(", (");
+                            self.emitter.emit(destAddr);
+                            self.emitter.emitLine(")");
+                            intIdx++;
+                        }
+
+                        if (intIdx < maxIntRegs)
+                        {
+                            str srcReg = intRegs[intIdx];
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(srcReg);
+                            self.emitter.emit(", 8(");
+                            self.emitter.emit(destAddr);
+                            self.emitter.emitLine(")");
+                            intIdx++;
+                        }
+                    }
+                }
+                else if (isFloat && fpIdx < maxFpRegs)
+                {
+                    str abiReg = fpRegs[fpIdx];
+                    if (assignedToReg && assignedRegIdx < 13)
+                    {
+                        str destReg = X86_64_FLOAT_REGS[assignedRegIdx];
+                        if (!strEq(abiReg, destReg))
+                        {
+                            self.emitter.emit("\tmovsd ");
+                            self.emitter.emit(abiReg);
+                            self.emitter.emit(", ");
+                            self.emitter.emitLine(destReg);
+                        }
+                    }
+                    fpIdx++;
+                }
+                else if (!isFloat && !isStruct && intIdx < maxIntRegs)
+                {
+                    str abiReg = intRegs[intIdx];
+                    if (assignedToReg && assignedRegIdx < 12)
+                    {
+                        str destReg = X86_64_INT_REGS[assignedRegIdx];
+                        if (!strEq(abiReg, destReg))
+                        {
+                            self.emitter.emit("\tmovq ");
+                            self.emitter.emit(abiReg);
+                            self.emitter.emit(", ");
+                            self.emitter.emitLine(destReg);
+                        }
+                    }
+                    intIdx++;
+                }
+            }
+        }
+    }
+
+    void emitEpilogue()
+    {
+        if (self.currentFuncHasFrame)
+        {
+            self.emitter.emitTab("leave");
+        }
+        // Note: shadow space is allocated/deallocated at each call site on Windows,
+        // not in the prologue/epilogue, so no stack adjustment is needed here.
+
+        if (self.calleeSavesPushed)
+        {
+            str calleeSaveRegs[6] = {"rbx", "r12", "r13", "r14", "r15", "rbp"};
+            for (u32 i = 6; i > 0; i--)
+            {
+                u32 idx = i - 1;
+                if (self.savedCalleeSaves[idx])
+                {
+                    str reg = calleeSaveRegs[idx];
+                    if (self.emitter.useAtt)
+                    {
+                        self.emitter.emit("\tpopq %");
+                        self.emitter.emit(reg);
+                        self.emitter.emit("\n");
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpop ");
+                        self.emitter.emit(reg);
+                        self.emitter.emit("\n");
+                    }
+                }
+            }
+        }
+
+        if (self.varargAllocSize > 0)
+        {
+            u8 buf2[16];
+            u32ToStr(self.varargAllocSize, buf2);
+            if (self.emitter.useAtt)
+            {
+                self.emitter.emit("\taddq $");
+                self.emitter.emit(buf2);
+                self.emitter.emit(", %rsp\n");
+            }
+            else
+            {
+                self.emitter.emit("\tadd rsp, ");
+                self.emitter.emit(buf2);
+                self.emitter.emit("\n");
+            }
+        }
+
+        self.emitter.emitTab("ret");
+    }
+
+    void emitRet(wallvm::ir_types::IrInst* inst)
+    {
+        bool isTail = isTailCall(inst);
+
+        if (inst.nops > 0 && inst.ops[0])
+        {
+            wallvm::ir_types::IrValue* retVal = inst.ops[0];
+            bool isStruct = retVal.type && retVal.type.kind == wallvm::irTypes::IrTypeKind::Struct;
+
+            if (isStruct)
+            {
+                u32 sz = retVal.type.width;
+                str src = getRegForValue(retVal);
+
+                if (sz <= 8)
+                {
+                    self.emitter.emit("\tmovq (");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rax");
+                }
+                else if (sz <= 16)
+                {
+                    self.emitter.emit("\tmovq (");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rax");
+                    self.emitter.emit("\tmovq 8(");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine("), %rdx");
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine(", %rax");
+                }
+            }
+            else if (valueIsFloat(retVal))
+            {
+                str src = getRegForValue(retVal);
+                if (!strvEq(src, "xmm0"))
+                {
+                    self.emitter.emit("\tmovsd ");
+                    self.emitter.emit(src);
+                    self.emitter.emitLine(", %xmm0");
+                }
+            }
+            else
+            {
+                str src = getRegForValue(retVal);
+                if (!strvEq(src, "rax"))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src);
+                    self.emitter.emit(", %rax\n");
+                }
+            }
+        }
+        if (isTail)
+        {
+            self.emitter.emit("\tjmp ");
+            self.emitter.emitLine(self.lastCallTarget);
+        }
+        else
+        {
+            emitEpilogue();
+        }
+    }
+
+    // Instruction Selection (ISEL)
+    // Pattern-matched emission of optimal x86 instruction sequences.
+    // Called from emitInst BEFORE the generic fallback.
+    // All methods take pre-fetched register names to avoid side effects.
+
+    static bool iselIsConstInt(wallvm::ir_types::IrValue* val, u64* out)
+    {
+        if (!val) return false;
+        if (val.kind != wallvm::ir_types::IrValueKind::ConstInt) return false;
+        *out = val.valData;
+        return true;
+    }
+
+    static bool iselIsPow2(u64 v) { return v != 0 && (v & (v - 1)) == 0; }
+
+    static u32 iselLog2(u64 v)
+    {
+        u32 r = 0;
+        while (v > 1) { v >>= 1; r++; }
+        return r;
+    }
+
+    bool iselEmitMulConst(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+
+        if (c == 0)
+        {
+            self.emitter.emit("\txorq ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (c == 1)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            return true;
+        }
+        if (c == 0xFFFFFFFFFFFFFFFFUL)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tnegq ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (iselIsPow2(c))
+        {
+            u32 shift = iselLog2(c);
+            if (shift == 1)
+            {
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(src1);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                if (!strEq(src1, dst))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                u8 buf[8];
+                u32ToStr(shift, buf);
+                self.emitter.emit("\tshlq $");
+                self.emitter.emit(buf);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            return true;
+        }
+        if (c == 3)
+        {
+            self.emitter.emit("\tleaq (");
+            self.emitter.emit(src1);
+            self.emitter.emit(",");
+            self.emitter.emit(src1);
+            self.emitter.emit(",2), ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (c == 5)
+        {
+            self.emitter.emit("\tleaq (");
+            self.emitter.emit(src1);
+            self.emitter.emit(",");
+            self.emitter.emit(src1);
+            self.emitter.emit(",4), ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (c == 6)
+        {
+            if (strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tshlq $1, ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(dst);
+                self.emitter.emit(",");
+                self.emitter.emit(dst);
+                self.emitter.emit(",2), ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(src1);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit(",2), ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\taddq ");
+                self.emitter.emit(dst);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            return true;
+        }
+        if (c == 7)
+        {
+            if (strEq(src1, dst))
+            {
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(src1);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit(",4), ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tsubq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(src1);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit(",2), ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(dst);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit(",4), ");
+                self.emitter.emitLine(dst);
+            }
+            return true;
+        }
+        if (c == 9)
+        {
+            self.emitter.emit("\tleaq (");
+            self.emitter.emit(src1);
+            self.emitter.emit(",");
+            self.emitter.emit(src1);
+            self.emitter.emit(",8), ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (c == 10)
+        {
+            self.emitter.emit("\tleaq (");
+            self.emitter.emit(src1);
+            self.emitter.emit(",");
+            self.emitter.emit(src1);
+            self.emitter.emit(",4), ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\taddq ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (c == 12)
+        {
+            if (strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tshlq $1, ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(dst);
+                self.emitter.emit(",");
+                self.emitter.emit(dst);
+                self.emitter.emit(",2), ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tleaq (");
+                self.emitter.emit(src1);
+                self.emitter.emit(",");
+                self.emitter.emit(src1);
+                self.emitter.emit(",2), ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tshlq $2, ");
+                self.emitter.emitLine(dst);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool iselEmitSDivPow2(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+        if (!iselIsPow2(c) || c <= 1) return false;
+        u32 shift = iselLog2(c);
+        u8 buf[8];
+
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+
+        u32ToStr(64 - shift, buf);
+        self.emitter.emit("\tsarq $63, ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tshrq $");
+        self.emitter.emit(buf);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\taddq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        u32ToStr(shift, buf);
+        self.emitter.emit("\tsarq $");
+        self.emitter.emit(buf);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        return true;
+    }
+
+    bool iselEmitUDivPow2(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+        if (!iselIsPow2(c) || c <= 1) return false;
+        u32 shift = iselLog2(c);
+        u8 buf[8];
+        if (!strEq(src1, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        u32ToStr(shift, buf);
+        self.emitter.emit("\tshrq $");
+        self.emitter.emit(buf);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        return true;
+    }
+
+    bool iselEmitAddSelf(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.nops < 2) return false;
+        if (inst.ops[0] != inst.ops[1]) return false;
+        self.emitter.emit("\tleaq (");
+        self.emitter.emit(src1);
+        self.emitter.emit(",");
+        self.emitter.emit(src1);
+        self.emitter.emit("), ");
+        self.emitter.emitLine(dst);
+        return true;
+    }
+
+    bool iselEmitIdentityConst(wallvm::ir_types::IrInst* inst, str dst, str src1, u64 identityVal)
+    {
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+        if (c != identityVal) return false;
+        if (!strEq(src1, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        return true;
+    }
+
+    // Main ISEL dispatch. Returns true if pattern matched.
+    bool trySelect(wallvm::ir_types::IrInst* inst, str dst, str src1, str src2)
+    {
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Add:
+        {
+            if (iselEmitIdentityConst(inst, dst, src1, 0))
+                return true;
+            if (iselEmitAddSelf(inst, dst, src1))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Sub:
+        {
+            if (iselEmitIdentityConst(inst, dst, src1, 0))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Mul:
+        {
+            if (iselEmitMulConst(inst, dst, src1))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::SDiv:
+        {
+            if (iselEmitSDivPow2(inst, dst, src1))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::UDiv:
+        {
+            if (iselEmitUDivPow2(inst, dst, src1))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::And:
+        {
+            if (iselEmitIdentityConst(inst, dst, src1, 0xFFFFFFFFFFFFFFFFUL))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Or:
+        case wallvm::irOps::IrOpcode::Xor:
+        {
+            if (iselEmitIdentityConst(inst, dst, src1, 0))
+                return true;
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Shl:
+        case wallvm::irOps::IrOpcode::Ashr:
+        case wallvm::irOps::IrOpcode::Lshr:
+        {
+            if (iselEmitIdentityConst(inst, dst, src1, 0))
+                return true;
+            break;
+        }
+        default:
+            break;
+        }
+        return false;
+    }
+
+    // Width-aware load/store helpers
+
+    void emitLoadWidth(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        u32 width = inst.base.type ? inst.base.type.width : 64;
+        switch (width)
+        {
+        case 8:
+            self.emitter.emit("\tmovb (");
+            self.emitter.emit(src);
+            self.emitter.emit("), ");
+            self.emitter.emitLine(toReg8(dst));
+            break;
+        case 16:
+            self.emitter.emit("\tmovzwl (");
+            self.emitter.emit(src);
+            self.emitter.emit("), ");
+            self.emitter.emitLine(toReg32(dst));
+            break;
+        case 32:
+            self.emitter.emit("\tmovl (");
+            self.emitter.emit(src);
+            self.emitter.emit("), ");
+            self.emitter.emitLine(toReg32(dst));
+            break;
+        default:
+            self.emitter.emit("\tmovq (");
+            self.emitter.emit(src);
+            self.emitter.emit("), ");
+            self.emitter.emitLine(dst);
+            break;
+        }
+    }
+
+    void emitStoreWidth(wallvm::ir_types::IrInst* inst)
+    {
+        str src = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rax";
+        str dst = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rbx";
+        u32 width = inst.ops[1] && inst.ops[1].type ? inst.ops[1].type.width : 64;
+        switch (width)
+        {
+        case 8:
+            self.emitter.emit("\tmovb ");
+            self.emitter.emit(toReg8(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(")");
+            break;
+        case 16:
+            self.emitter.emit("\tmovw ");
+            self.emitter.emit(toReg16(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(")");
+            break;
+        case 32:
+            self.emitter.emit("\tmovl ");
+            self.emitter.emit(toReg32(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(")");
+            break;
+        default:
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", (");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(")");
+            break;
+        }
+    }
+
+    // Extension folding into load
+    // Zext(load byte ptr addr) → movb (addr), reg8; movzbl reg8, reg32
+    // Sext(load byte ptr addr) → movsbq (addr), dst (sign-extend in load)
+    // Zext(load word ptr addr) → movzwl (addr), dst
+    // Sext(load word ptr addr) → movswq (addr), dst
+    // self eliminates a separate extension instruction.
+
+    bool iselTryFoldExtLoad(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.nops < 1 || !inst.ops[0]) return false;
+        wallvm::ir_types::IrValue* srcVal = inst.ops[0];
+        if (srcVal.kind != wallvm::ir_types::IrValueKind::Inst) return false;
+        wallvm::ir_types::IrInst* srcInst = (wallvm::ir_types::IrInst*)srcVal;
+        if (srcInst.opcode != wallvm::irOps::IrOpcode::Load) return false;
+        if (srcInst.nops < 1 || !srcInst.ops[0]) return false;
+
+        str dst = getRegForValue(&inst.base);
+        str addr = getRegForValue(srcInst.ops[0]);
+        u32 srcWidth = srcInst.base.type ? srcInst.base.type.width : 8;
+
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Zext:
+        {
+            switch (srcWidth)
+            {
+            case 8:
+                self.emitter.emit("\tmovzbl (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(toReg32(dst));
+                return true;
+            case 16:
+                self.emitter.emit("\tmovzwl (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(toReg32(dst));
+                return true;
+            case 32:
+                self.emitter.emit("\tmovl (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(toReg32(dst));
+                return true;
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Sext:
+        {
+            switch (srcWidth)
+            {
+            case 8:
+                self.emitter.emit("\tmovsbq (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(dst);
+                return true;
+            case 16:
+                self.emitter.emit("\tmovswq (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(dst);
+                return true;
+            case 32:
+                self.emitter.emit("\tmovslq (");
+                self.emitter.emit(addr);
+                self.emitter.emit("), ");
+                self.emitter.emitLine(dst);
+                return true;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        return false;
+    }
+
+    // Load-Op-Store fusion
+    // Pattern: load ptr → op val → store ptr → same ptr
+    // Emits: op val, (ptr)  — single memory-operand instruction.
+    // Only safe when the Store's address is the same value as the Load's
+    // address (same IR value, no GEP in between).
+
+    bool iselTryFoldLoadOpStore(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.opcode != wallvm::irOps::IrOpcode::Store) return false;
+        if (inst.nops < 2) return false;
+
+        wallvm::ir_types::IrValue* addrVal = inst.ops[0];
+        wallvm::ir_types::IrValue* srcVal = inst.ops[1];
+        if (!srcVal || srcVal.kind != wallvm::ir_types::IrValueKind::Inst) return false;
+
+        wallvm::ir_types::IrInst* srcInst = (wallvm::ir_types::IrInst*)srcVal;
+
+        wallvm::irOps::IrOpcode binOp;
+        switch (srcInst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Add:  binOp = wallvm::irOps::IrOpcode::Add; break;
+        case wallvm::irOps::IrOpcode::Sub:  binOp = wallvm::irOps::IrOpcode::Sub; break;
+        case wallvm::irOps::IrOpcode::And:  binOp = wallvm::irOps::IrOpcode::And; break;
+        case wallvm::irOps::IrOpcode::Or:   binOp = wallvm::irOps::IrOpcode::Or; break;
+        case wallvm::irOps::IrOpcode::Xor:  binOp = wallvm::irOps::IrOpcode::Xor; break;
+        default: return false;
+        }
+
+        if (srcInst.nops < 2) return false;
+
+        wallvm::ir_types::IrValue* loadVal = srcInst.ops[0];
+        if (!loadVal || loadVal.kind != wallvm::ir_types::IrValueKind::Inst) return false;
+        wallvm::ir_types::IrInst* loadInst = (wallvm::ir_types::IrInst*)loadVal;
+        if (loadInst.opcode != wallvm::irOps::IrOpcode::Load) return false;
+        if (loadInst.nops < 1) return false;
+
+        if (loadInst.ops[0] != addrVal) return false;
+
+        str addr = getRegForValue(addrVal);
+        str operand = getRegForValue(srcInst.ops[1]);
+        u32 width = loadInst.base.type ? loadInst.base.type.width : 64;
+
+        str opName;
+        switch (binOp)
+        {
+        case wallvm::irOps::IrOpcode::Add: opName = "add"; break;
+        case wallvm::irOps::IrOpcode::Sub: opName = "sub"; break;
+        case wallvm::irOps::IrOpcode::And: opName = "and"; break;
+        case wallvm::irOps::IrOpcode::Or:  opName = "or"; break;
+        case wallvm::irOps::IrOpcode::Xor: opName = "xor"; break;
+        default: return false;
+        }
+
+        self.emitter.emit("\t");
+        self.emitter.emit(opName);
+        switch (width)
+        {
+        case 8:
+            self.emitter.emit("b ");
+            self.emitter.emit(toReg8(operand));
+            break;
+        case 16:
+            self.emitter.emit("w ");
+            self.emitter.emit(toReg16(operand));
+            break;
+        case 32:
+            self.emitter.emit("l ");
+            self.emitter.emit(toReg32(operand));
+            break;
+        default:
+            self.emitter.emit("q ");
+            self.emitter.emit(operand);
+            break;
+        }
+        self.emitter.emit(", (");
+        self.emitter.emit(addr);
+        self.emitter.emitLine(")");
+        return true;
+    }
+
+    // GEP + Load folding
+    // Pattern: GEP base, idx, scale → Load ptr
+    // Emit: load base + idx*scale directly via SIB addressing
+    // Only for simple cases: single GEP with constant scale.
+
+    bool iselTryFoldGepLoad(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.opcode != wallvm::irOps::IrOpcode::Load) return false;
+        if (inst.nops < 1 || !inst.ops[0]) return false;
+
+        wallvm::ir_types::IrValue* addrVal = inst.ops[0];
+        if (addrVal.kind != wallvm::ir_types::IrValueKind::Inst) return false;
+        wallvm::ir_types::IrInst* addrInst = (wallvm::ir_types::IrInst*)addrVal;
+        if (addrInst.opcode != wallvm::irOps::IrOpcode::Gep) return false;
+        if (addrInst.nops < 3) return false;
+
+        str dst = getRegForValue(&inst.base);
+        str base = getRegForValue(addrInst.ops[0]);
+        str idx = getRegForValue(addrInst.ops[1]);
+        u32 width = inst.base.type ? inst.base.type.width : 64;
+
+        self.emitter.emit("\t");
+        switch (width)
+        {
+        case 8:
+            self.emitter.emit("movb (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emit(", 1), ");
+            self.emitter.emitLine(toReg8(dst));
+            return true;
+        case 16:
+            self.emitter.emit("movzwl (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emit(", 2), ");
+            self.emitter.emitLine(toReg32(dst));
+            return true;
+        case 32:
+            self.emitter.emit("movl (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emit(", 4), ");
+            self.emitter.emitLine(toReg32(dst));
+            return true;
+        default:
+            self.emitter.emit("movq (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emit(", 8), ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+    }
+
+    // GEP + Store folding
+
+    bool iselTryFoldGepStore(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.opcode != wallvm::irOps::IrOpcode::Store) return false;
+        if (inst.nops < 2) return false;
+
+        wallvm::ir_types::IrValue* addrVal = inst.ops[0];
+        if (addrVal.kind != wallvm::ir_types::IrValueKind::Inst) return false;
+        wallvm::ir_types::IrInst* addrInst = (wallvm::ir_types::IrInst*)addrVal;
+        if (addrInst.opcode != wallvm::irOps::IrOpcode::Gep) return false;
+        if (addrInst.nops < 3) return false;
+
+        str src = getRegForValue(inst.ops[1]);
+        str base = getRegForValue(addrInst.ops[0]);
+        str idx = getRegForValue(addrInst.ops[1]);
+        u32 width = inst.ops[1] && inst.ops[1].type ? inst.ops[1].type.width : 64;
+
+        self.emitter.emit("\t");
+        switch (width)
+        {
+        case 8:
+            self.emitter.emit("movb ");
+            self.emitter.emit(toReg8(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emitLine(", 1)");
+            return true;
+        case 16:
+            self.emitter.emit("movw ");
+            self.emitter.emit(toReg16(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emitLine(", 2)");
+            return true;
+        case 32:
+            self.emitter.emit("movl ");
+            self.emitter.emit(toReg32(src));
+            self.emitter.emit(", (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emitLine(", 4)");
+            return true;
+        default:
+            self.emitter.emit("movq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", (");
+            self.emitter.emit(base);
+            self.emitter.emit(", ");
+            self.emitter.emit(idx);
+            self.emitter.emitLine(", 8)");
+            return true;
+        }
+    }
+
+    // Comparison folding: cmp x, 0 → test x, x
+    bool iselTryFoldCmpZero(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.nops < 2) return false;
+        if (inst.opcode != wallvm::irOps::IrOpcode::ICmp) return false;
+        wallvm::ir_types::IrValue* rhs = inst.ops[1];
+        if (!rhs) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(rhs, &c)) return false;
+        if (c != 0) return false;
+
+        str src1 = getRegForValue(inst.ops[0]);
+        self.emitter.emit("\ttestq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(src1);
+        return true;
+    }
+
+    // XOR -1 → NOT
+
+    bool iselTryFoldNot(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.opcode != wallvm::irOps::IrOpcode::Xor) return false;
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+        if (c != 0xFFFFFFFFFFFFFFFFUL) return false;
+        if (!strEq(src1, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        self.emitter.emit("\tnotq ");
+        self.emitter.emitLine(dst);
+        return true;
+    }
+
+    // ADD x, -1 → DEC; SUB x, 1 → DEC
+
+    bool iselTryFoldIncDec(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[1], &c)) return false;
+
+        if (inst.opcode == wallvm::irOps::IrOpcode::Add && c == 0xFFFFFFFFFFFFFFFFUL)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tdecq ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (inst.opcode == wallvm::irOps::IrOpcode::Sub && c == 1)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tdecq ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (inst.opcode == wallvm::irOps::IrOpcode::Add && c == 1)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tincq ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        if (inst.opcode == wallvm::irOps::IrOpcode::Sub && c == 0xFFFFFFFFFFFFFFFFUL)
+        {
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tincq ");
+            self.emitter.emitLine(dst);
+            return true;
+        }
+        return false;
+    }
+
+    // NEG: 0 - x → neg
+
+    bool iselTryFoldNeg(wallvm::ir_types::IrInst* inst, str dst, str src1)
+    {
+        if (inst.opcode != wallvm::irOps::IrOpcode::Sub) return false;
+        if (inst.nops < 2) return false;
+        u64 c = 0;
+        if (!iselIsConstInt(inst.ops[0], &c)) return false;
+        if (c != 0) return false;
+        str src2 = getRegForValue(inst.ops[1]);
+        if (!strEq(src2, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        self.emitter.emit("\tnegq ");
+        self.emitter.emitLine(dst);
+        return true;
+    }
+
+    str getRegForValue(wallvm::ir_types::IrValue* val)
+    {
+        if (!val) return "rax";
+        u64 vd = val.valData;
+        if (vd & 0x80000000UL)
+            return "rax";
+        if (vd & 0x40000000UL)
+        {
+            u32 reg = (u32)(vd & 0x3FFFFFFF);
+            if (reg < 13) return X86_64_FLOAT_REGS[reg];
+            return "xmm0";
+        }
+        u32 reg = (u32)(vd & 0x3FFFFFFF);
+        if (reg < 12) return X86_64_INT_REGS[reg];
+        return "rax";
+    }
+
+    bool valueIsFloat(wallvm::ir_types::IrValue* val)
+    {
+        if (!val) return false;
+        return (val.valData & 0x40000000UL) != 0;
+    }
+
+    bool valueIsSpill(wallvm::ir_types::IrValue* val)
+    {
+        if (!val) return false;
+        return (val.valData & 0x80000000UL) != 0;
+    }
+
+    void emitInst(wallvm::ir_types::IrInst* inst)
+    {
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Add:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!iselTryFoldIncDec(inst, dst, src1))
+            {
+                if (!trySelect(inst, dst, src1, src2))
+                    emitBinOp(inst, "addq", "addl");
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Sub:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            if (!iselTryFoldNeg(inst, dst, src1))
+            {
+                if (!iselTryFoldIncDec(inst, dst, src1))
+                {
+                    str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+                    if (!trySelect(inst, dst, src1, src2))
+                        emitBinOp(inst, "subq", "subl");
+                }
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Mul:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitBinOp(inst, "imulq", "imull");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::SDiv:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitDiv(inst, true);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::UDiv:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitDiv(inst, false);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::SRem:
+            emitRem(inst, true);
+            break;
+        case wallvm::irOps::IrOpcode::URem:
+            emitRem(inst, false);
+            break;
+        case wallvm::irOps::IrOpcode::And:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitBinOp(inst, "andq", "andl");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Or:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitBinOp(inst, "orq", "orl");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Xor:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!iselTryFoldNot(inst, dst, src1))
+            {
+                if (!trySelect(inst, dst, src1, src2))
+                    emitBinOp(inst, "xorq", "xorl");
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Shl:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitShift(inst, "shlq", "shll");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Ashr:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitShift(inst, "sarq", "sarl");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Lshr:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+            if (!trySelect(inst, dst, src1, src2))
+                emitShift(inst, "shrq", "shrl");
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Neg:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tnegq ");
+            self.emitter.emitLine(dst);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Not:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+            if (!strEq(src1, dst))
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            self.emitter.emit("\tnotq ");
+            self.emitter.emitLine(dst);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Load:
+        {
+            if (!iselTryFoldGepLoad(inst))
+                emitLoadWidth(inst);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Store:
+        {
+            if (!iselTryFoldLoadOpStore(inst))
+            {
+                if (!iselTryFoldGepStore(inst))
+                    emitStoreWidth(inst);
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Alloca:
+            emitAlloca(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Gep:
+            emitGep(inst);
+            break;
+        case wallvm::irOps::IrOpcode::ICmp:
+        {
+            if (!iselTryFoldCmpZero(inst))
+                emitICmp(inst);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::FCmp:
+            emitFCmp(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Br:
+            emitBr(inst);
+            break;
+        case wallvm::irOps::IrOpcode::CondBr:
+            emitCondBr(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Ret:
+            emitRet(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Trunc:
+        case wallvm::irOps::IrOpcode::Zext:
+        case wallvm::irOps::IrOpcode::Sext:
+        case wallvm::irOps::IrOpcode::Bitcast:
+        {
+            if (inst.opcode == wallvm::irOps::IrOpcode::Zext ||
+                inst.opcode == wallvm::irOps::IrOpcode::Sext)
+            {
+                if (iselTryFoldExtLoad(inst))
+                    break;
+            }
+            emitCast(inst);
+            break;
+        }
+        case wallvm::irOps::IrOpcode::SiToFp:
+            emitSiToFp(inst);
+            break;
+        case wallvm::irOps::IrOpcode::FpToSi:
+            emitFpToSi(inst);
+            break;
+        case wallvm::irOps::IrOpcode::FpTrunc:
+        case wallvm::irOps::IrOpcode::FpExt:
+        case wallvm::irOps::IrOpcode::UiToFp:
+        case wallvm::irOps::IrOpcode::FpToUi:
+            emitFcvt(inst);
+            break;
+        case wallvm::irOps::IrOpcode::FAdd:
+            emitFloatBinOp(inst, "addss", "addsd");
+            break;
+        case wallvm::irOps::IrOpcode::FSub:
+            emitFloatBinOp(inst, "subss", "subsd");
+            break;
+        case wallvm::irOps::IrOpcode::FMul:
+            emitFloatBinOp(inst, "mulss", "mulsd");
+            break;
+        case wallvm::irOps::IrOpcode::FDiv:
+            emitFloatBinOp(inst, "divss", "divsd");
+            break;
+        case wallvm::irOps::IrOpcode::Fma:
+            emitFma(inst);
+            break;
+        case wallvm::irOps::IrOpcode::FAbs:
+            emitFabs(inst);
+            break;
+        case wallvm::irOps::IrOpcode::FSqrt:
+            emitSqrt(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Call:
+            emitCall(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Select:
+            emitSelect(inst);
+            break;
+        case wallvm::irOps::IrOpcode::VecAdd:
+            emitVecBinOp(inst, "paddd", "paddq");
+            break;
+        case wallvm::irOps::IrOpcode::VecSub:
+            emitVecBinOp(inst, "psubd", "psubq");
+            break;
+        case wallvm::irOps::IrOpcode::VecMul:
+            emitVecBinOp(inst, "pmulld", "pmuludq");
+            break;
+        case wallvm::irOps::IrOpcode::VecDiv:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+            bool isDouble = inst.base.type && inst.base.type.elem && inst.base.type.elem.width == 64;
+            if (self.emitter.features && self.emitter.features.avx2)
+            {
+                self.emitter.emit("\tvpdivd ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tmovdqa ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tpdivd ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::VecFAdd:
+            emitVecFloatBinOp(inst, "addps", "addpd");
+            break;
+        case wallvm::irOps::IrOpcode::VecFSub:
+            emitVecFloatBinOp(inst, "subps", "subpd");
+            break;
+        case wallvm::irOps::IrOpcode::VecFMul:
+            emitVecFloatBinOp(inst, "mulps", "mulpd");
+            break;
+        case wallvm::irOps::IrOpcode::VecFDiv:
+            emitVecFloatBinOp(inst, "divps", "divpd");
+            break;
+        case wallvm::irOps::IrOpcode::VecMin:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+            bool isFloat = inst.base.type && inst.base.type.elem &&
+                           inst.base.type.elem.kind == wallvm::ir_types::IrTypeKind::Float;
+            if (isFloat)
+            {
+                if (self.emitter.features && self.emitter.features.avx)
+                {
+                    self.emitter.emit("\tvminps ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                else
+                {
+                    self.emitter.emit("\tmovaps ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                    self.emitter.emit("\tminps ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+            }
+            else
+            {
+                if (self.emitter.features && self.emitter.features.avx2)
+                {
+                    self.emitter.emit("\tpminud ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                else
+                {
+                    self.emitter.emit("\tmovdqa ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                    self.emitter.emit("\tpminud ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::VecMax:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+            bool isFloat = inst.base.type && inst.base.type.elem &&
+                           inst.base.type.elem.kind == wallvm::ir_types::IrTypeKind::Float;
+            if (isFloat)
+            {
+                if (self.emitter.features && self.emitter.features.avx)
+                {
+                    self.emitter.emit("\tvmaxps ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                else
+                {
+                    self.emitter.emit("\tmovaps ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                    self.emitter.emit("\tmaxps ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+            }
+            else
+            {
+                if (self.emitter.features && self.emitter.features.avx2)
+                {
+                    self.emitter.emit("\tpmaxud ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                else
+                {
+                    self.emitter.emit("\tmovdqa ");
+                    self.emitter.emit(src1);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                    self.emitter.emit("\tpmaxud ");
+                    self.emitter.emit(src2);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::VecBroadcast:
+            emitBroadcast(inst);
+            break;
+        case wallvm::irOps::IrOpcode::ShuffleVector:
+        {
+            str dst = getRegForValue(&inst.base);
+            str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+            str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+            if (self.emitter.features && self.emitter.features.avx)
+            {
+                self.emitter.emit("\tvshufps $0, ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tmovaps ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tshufps $0, ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        }
+        case wallvm::irOps::IrOpcode::Abs:
+            emitAbs(inst);
+            break;
+        case wallvm::irOps::IrOpcode::CtPop:
+            emitCtPop(inst);
+            break;
+        case wallvm::irOps::IrOpcode::CtLz:
+            emitCtLz(inst);
+            break;
+        case wallvm::irOps::IrOpcode::CtTz:
+            emitCtTz(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Bswap:
+            emitBswap(inst);
+            break;
+        case wallvm::irOps::IrOpcode::Rotl:
+            emitRot(inst, "rolq");
+            break;
+        case wallvm::irOps::IrOpcode::Rotr:
+            emitRot(inst, "rorq");
+            break;
+        case wallvm::irOps::IrOpcode::SMin:
+            emitMinMax(inst, "cmpnless", true, false);
+            break;
+        case wallvm::irOps::IrOpcode::SMax:
+            emitMinMax(inst, "cmpnless", false, false);
+            break;
+        case wallvm::irOps::IrOpcode::UMin:
+            emitMinMax(inst, "cmpnless", true, true);
+            break;
+        case wallvm::irOps::IrOpcode::UMax:
+            emitMinMax(inst, "cmpnless", false, true);
+            break;
+        default:
+            self.emitter.emitComment("unhandled opcode");
+            break;
+        }
+    }
+
+    void emitBinOp(wallvm::ir_types::IrInst* inst, str qOp, str lOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+        if (!strEq(src1, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(qOp);
+        self.emitter.emit(" ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitDiv(wallvm::ir_types::IrInst* inst, bool isSigned)
+    {
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rcx";
+        str dst = getRegForValue(&inst.base);
+
+        // If src2 is rax, we need to move it to rcx first to avoid clobbering
+        if (strEq(src2, "rax"))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src2);
+            self.emitter.emitLine(", %rcx");
+            src2 = "rcx";
+        }
+
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emitLine(", %rax");
+        self.emitter.emitTab("cqo");
+        self.emitter.emit("\t");
+        self.emitter.emit(isSigned ? "idivq" : "divq");
+        self.emitter.emit(" ");
+        self.emitter.emitLine(src2);
+        self.emitter.emit("\tmovq %rax, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitRem(wallvm::ir_types::IrInst* inst, bool isSigned)
+    {
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rcx";
+        str dst = getRegForValue(&inst.base);
+
+        // If src2 is rax, we need to move it to rcx first to avoid clobbering
+        if (strEq(src2, "rax"))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src2);
+            self.emitter.emitLine(", %rcx");
+            src2 = "rcx";
+        }
+
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emitLine(", %rax");
+        self.emitter.emitTab("cqo");
+        self.emitter.emit("\t");
+        self.emitter.emit(isSigned ? "idivq" : "divq");
+        self.emitter.emit(" ");
+        self.emitter.emitLine(src2);
+        self.emitter.emit("\tmovq %rdx, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitShift(wallvm::ir_types::IrInst* inst, str qOp, str lOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rcx";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        if (!strEq(src2, "rcx"))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src2);
+            self.emitter.emitLine(", %rcx");
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(qOp);
+        self.emitter.emit(" %cl, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitUnOp(wallvm::ir_types::IrInst* inst, str qOp, str lOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        if (!strEq(src, dst))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(qOp);
+        self.emitter.emit(" ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitLoad(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        self.emitter.emit("\tmovq (");
+        self.emitter.emit(src);
+        self.emitter.emit("), ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitStore(wallvm::ir_types::IrInst* inst)
+    {
+        str src = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rax";
+        str dst = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rbx";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", (");
+        self.emitter.emit(dst);
+        self.emitter.emitLine(")");
+    }
+
+    void emitAlloca(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        self.emitter.emit("\tsubq $8, %rsp");
+        self.emitter.emit("\tmovq %rsp, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitGep(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str base = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str idx = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+        u32 scale = 8;
+        if (inst.ops[0] && inst.ops[0].type)
+        {
+            u32 w = inst.ops[0].type.width;
+            scale = (w > 0) ? (w / 8) : 8;
+            if (scale < 1) scale = 1;
+            if (scale > 8) scale = 8;
+        }
+        u8 scaleBuf[16];
+        u32ToStr(scale, scaleBuf);
+        self.emitter.emit("\tleaq (");
+        self.emitter.emit(base);
+        self.emitter.emit(", ");
+        self.emitter.emit(idx);
+        self.emitter.emit(", ");
+        self.emitter.emit(scaleBuf);
+        self.emitter.emit("), ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitICmp(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rdx";
+        self.emitter.emit("\tcmpq ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(src1);
+        str setOp;
+        switch (inst.icmpPred)
+        {
+        case wallvm::irOps::IrICmpPred::Eq: setOp = "sete"; break;
+        case wallvm::irOps::IrICmpPred::Ne: setOp = "setne"; break;
+        case wallvm::irOps::IrICmpPred::Slt: setOp = "setl"; break;
+        case wallvm::irOps::IrICmpPred::Sle: setOp = "setle"; break;
+        case wallvm::irOps::IrICmpPred::Sgt: setOp = "setg"; break;
+        case wallvm::irOps::IrICmpPred::Sge: setOp = "setge"; break;
+        case wallvm::irOps::IrICmpPred::Ult: setOp = "setb"; break;
+        case wallvm::irOps::IrICmpPred::Ule: setOp = "setbe"; break;
+        case wallvm::irOps::IrICmpPred::Ugt: setOp = "seta"; break;
+        case wallvm::irOps::IrICmpPred::Uge: setOp = "setae"; break;
+        default: setOp = "sete"; break;
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(setOp);
+        self.emitter.emit(" %al");
+        self.emitter.emitLine("");
+        self.emitter.emit("\tmovzbq %al, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitFCmp(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        bool isDouble = inst.ops[0].type && inst.ops[0].type.width == 64;
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? "ucomisd" : "ucomiss");
+        self.emitter.emit("\t");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(src1);
+        str setOp;
+        switch (inst.fcmpPred)
+        {
+        case wallvm::irOps::IrFCmpPred::Oeq: setOp = "sete"; break;
+        case wallvm::irOps::IrFCmpPred::One: setOp = "setne"; break;
+        case wallvm::irOps::IrFCmpPred::Olt: setOp = "setb"; break;
+        case wallvm::irOps::IrFCmpPred::Ole: setOp = "setbe"; break;
+        case wallvm::irOps::IrFCmpPred::Ogt: setOp = "seta"; break;
+        case wallvm::irOps::IrFCmpPred::Oge: setOp = "setae"; break;
+        default: setOp = "sete"; break;
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(setOp);
+        self.emitter.emitLine(" %al");
+        self.emitter.emit("\tmovzbq %al, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitBr(wallvm::ir_types::IrInst* inst)
+    {
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        if (inst.nops > 0 && inst.ops[0])
+        {
+            str target = inst.ops[0].name;
+            self.emitter.emit("\tjmp .L");
+            self.emitter.emitLine(target);
+        }
+    }
+
+    void emitCondBr(wallvm::ir_types::IrInst* inst)
+    {
+        self.lastCallTarget = "";
+        self.lastCallResult = null;
+        if (inst.nops >= 3)
+        {
+            str cond = getRegForValue(inst.ops[0]);
+            str trueTarget = inst.ops[1].name;
+            str falseTarget = inst.ops[2].name;
+            self.emitter.emit("\ttestq ");
+            self.emitter.emit(cond);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(cond);
+            self.emitter.emit("\tjne .L");
+            self.emitter.emitLine(trueTarget);
+            self.emitter.emit("\tjmp .L");
+            self.emitter.emitLine(falseTarget);
+        }
+    }
+
+    void emitCast(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        u32 srcWidth = inst.ops[0] && inst.ops[0].type ? inst.ops[0].type.width : 64;
+        u32 dstWidth = inst.base.type ? inst.base.type.width : 64;
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Trunc:
+            if (dstWidth == 32)
+            {
+                self.emitter.emit("\tmovl ");
+                self.emitter.emit(toReg32(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else if (dstWidth == 16)
+            {
+                self.emitter.emit("\tmovzwl ");
+                self.emitter.emit(toReg16(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else if (dstWidth == 8)
+            {
+                self.emitter.emit("\tmovzbl ");
+                self.emitter.emit(toReg8(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        case wallvm::irOps::IrOpcode::Zext:
+            if (srcWidth == 32)
+            {
+                self.emitter.emit("\tmovl ");
+                self.emitter.emit(toReg32(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else if (srcWidth == 16)
+            {
+                self.emitter.emit("\tmovzwl ");
+                self.emitter.emit(toReg16(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else if (srcWidth == 8)
+            {
+                self.emitter.emit("\tmovzbl ");
+                self.emitter.emit(toReg8(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg32(dst));
+            }
+            else
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        case wallvm::irOps::IrOpcode::Sext:
+            if (srcWidth == 32)
+            {
+                self.emitter.emit("\tmovslq ");
+                self.emitter.emit(toReg32(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else if (srcWidth == 16)
+            {
+                self.emitter.emit("\tmovswq ");
+                self.emitter.emit(toReg16(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else if (srcWidth == 8)
+            {
+                self.emitter.emit("\tmovsbq ");
+                self.emitter.emit(toReg8(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        case wallvm::irOps::IrOpcode::Bitcast:
+            if (srcWidth == 64)
+            {
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else if (srcWidth == 32)
+            {
+                self.emitter.emit("\tmovd ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            else if (srcWidth == 16)
+            {
+                self.emitter.emit("\tmovw ");
+                self.emitter.emit(toReg16(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg16(dst));
+            }
+            else if (srcWidth == 8)
+            {
+                self.emitter.emit("\tmovb ");
+                self.emitter.emit(toReg8(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(toReg8(dst));
+            }
+            break;
+        default:
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            break;
+        }
+    }
+
+    void emitSiToFp(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        bool isDouble = inst.base.type && inst.base.type.width == 64;
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? "cvtsi2sd " : "cvtsi2ss ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitFpToSi(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        bool isDouble = inst.ops[0] && inst.ops[0].type && inst.ops[0].type.width == 64;
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? "cvttsd2si " : "cvttss2si ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitFloatBinOp(wallvm::ir_types::IrInst* inst, str ssOp, str sdOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        bool isDouble = inst.ops[0].type && inst.ops[0].type.width == 64;
+        self.emitter.emit("\tmov");
+        self.emitter.emit(isDouble ? "sd" : "ss");
+        self.emitter.emit("\t");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? sdOp : ssOp);
+        self.emitter.emit("\t");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitFma(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        str src3 = (inst.nops > 2) ? getRegForValue(inst.ops[2]) : "xmm2";
+
+        bool isDouble = inst.base.type && inst.base.type.width == 64;
+
+        if (self.emitter.features && self.emitter.features.fma)
+        {
+            if (isDouble)
+            {
+                self.emitter.emit("\tmovsd ");
+                self.emitter.emit(src3);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tvfmadd231sd ");
+            }
+            else
+            {
+                self.emitter.emit("\tmovss ");
+                self.emitter.emit(src3);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tvfmadd231ss ");
+            }
+            self.emitter.emit(src2);
+            self.emitter.emit(", ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            if (isDouble)
+            {
+                self.emitter.emit("\tmovsd ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tmulsd ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\taddsd ");
+            }
+            else
+            {
+                self.emitter.emit("\tmovss ");
+                self.emitter.emit(src1);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\tmulss ");
+                self.emitter.emit(src2);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\taddss ");
+            }
+            self.emitter.emit(src3);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitFabs(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        bool isDouble = inst.ops[0] && inst.ops[0].type && inst.ops[0].type.width == 64;
+        // Float: mask off sign bit of lower 32-bit element
+        // Double: mask off sign bit of lower 64-bit element
+        if (isDouble)
+            self.emitter.emitDataLine(".Lfabs_mask: .quad 0x7fffffffffffffff");
+        else
+            self.emitter.emitDataLine(".Lfabs_mask: .long 0x7fffffff, 0, 0, 0");
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? "andpd " : "andps ");
+        self.emitter.emit(".Lfabs_mask, ");
+        self.emitter.emitLine(src);
+        if (!strvEq(src, dst))
+        {
+            self.emitter.emit("\t");
+            self.emitter.emit(isDouble ? "movsd " : "movss ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitFcvt(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        u32 srcWidth = inst.ops[0] && inst.ops[0].type ? inst.ops[0].type.width : 64;
+        u32 dstWidth = inst.base.type ? inst.base.type.width : 64;
+        bool dstIsDouble = dstWidth == 64;
+        bool srcIsDouble = srcWidth == 64;
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::FpTrunc:
+            self.emitter.emit("\tcvtsd2ss ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            break;
+        case wallvm::irOps::IrOpcode::FpExt:
+            self.emitter.emit("\tcvtss2sd ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            break;
+        case wallvm::irOps::IrOpcode::UiToFp:
+            if (srcWidth == 64)
+            {
+                self.emitter.emit("\ttestq ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(src);
+                self.emitter.emitTab("js .Lui_to_fp_neg");
+                self.emitter.emit("\t");
+                self.emitter.emit(dstIsDouble ? "cvtsi2sd " : "cvtsi2ss ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emitTab("jmp .Lui_to_fp_done");
+                self.emitter.emitTab(".Lui_to_fp_neg:");
+                self.emitter.emit("\tmovq ");
+                self.emitter.emit(src);
+                self.emitter.emitLine(", %r10");
+                self.emitter.emitTab("andq $1, %r10");
+                self.emitter.emit("\tshrq $1, ");
+                self.emitter.emitLine(src);
+                self.emitter.emit("\t");
+                self.emitter.emit(dstIsDouble ? "cvtsi2sd " : "cvtsi2ss ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emit("\t");
+                self.emitter.emit(dstIsDouble ? "addsd " : "addss ");
+                self.emitter.emit(dst);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emitTab("testq %r10, %r10");
+                self.emitter.emitTab("je .Lui_to_fp_done");
+                self.emitter.emitDataLine(".Lui_to_fp_one: .double 1.0");
+                self.emitter.emit("\t");
+                self.emitter.emit(dstIsDouble ? "addsd .Lui_to_fp_one" : "addss .Lui_to_fp_one");
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+                self.emitter.emitTab(".Lui_to_fp_done:");
+            }
+            else
+            {
+                if (srcWidth == 32)
+                {
+                    self.emitter.emit("\tmovl ");
+                    self.emitter.emit(toReg32(src));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(toReg32(src));
+                }
+                else if (srcWidth == 16)
+                {
+                    self.emitter.emit("\tmovzwl ");
+                    self.emitter.emit(toReg16(src));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(toReg32(src));
+                }
+                else if (srcWidth == 8)
+                {
+                    self.emitter.emit("\tmovzbl ");
+                    self.emitter.emit(toReg8(src));
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(toReg32(src));
+                }
+                self.emitter.emit("\t");
+                self.emitter.emit(dstIsDouble ? "cvtsi2sd " : "cvtsi2ss ");
+                self.emitter.emit(toReg32(src));
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        case wallvm::irOps::IrOpcode::FpToUi:
+            if (dstWidth == 64)
+            {
+                self.emitter.emit("\t");
+                self.emitter.emit(srcIsDouble ? "cvttsd2si " : "cvttss2si ");
+                self.emitter.emit(src);
+                self.emitter.emitLine(", %r10");
+                self.emitter.emitTab("movq %r10, %rax");
+                self.emitter.emitTab("shrq $63, %rax");
+                self.emitter.emitTab("addq %rax, %r10");
+                self.emitter.emit("\tmovq %r10, ");
+                self.emitter.emitLine(dst);
+            }
+            else
+            {
+                self.emitter.emit("\t");
+                self.emitter.emit(srcIsDouble ? "cvttsd2si " : "cvttss2si ");
+                self.emitter.emit(src);
+                self.emitter.emit(", ");
+                self.emitter.emitLine(dst);
+            }
+            break;
+        default:
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            break;
+        }
+    }
+
+    void emitSqrt(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        bool isDouble = inst.ops[0] && inst.ops[0].type && inst.ops[0].type.width == 64;
+        self.emitter.emit("\t");
+        self.emitter.emit(isDouble ? "sqrtsd " : "sqrtss ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitCallSetup(wallvm::ir_types::IrInst* inst)
+    {
+        u32 nargs = (inst.nops > 1) ? inst.nops - 1 : 0;
+        if (nargs == 0) return;
+
+        str sysvIntRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        str win64IntRegs[4] = {"rcx", "rdx", "r8", "r9"};
+        str sysvFpRegs[8] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
+        str win64FpRegs[4] = {"xmm0", "xmm1", "xmm2", "xmm3"};
+
+        u32 maxIntRegs = self.isWindows ? 4 : 6;
+        u32 maxFpRegs = self.isWindows ? 4 : 8;
+
+        str* intRegs = self.isWindows ? win64IntRegs : sysvIntRegs;
+        str* fpRegs = self.isWindows ? win64FpRegs : sysvFpRegs;
+
+        u32 intIdx = 0;
+        u32 fpIdx = 0;
+
+        for (u32 i = 1; i < inst.nops; i++)
+        {
+            wallvm::ir_types::IrValue* arg = inst.ops[i];
+            if (!arg) continue;
+
+            bool isFloat = valueIsFloat(arg);
+            bool isStruct = arg.type && arg.type.kind == wallvm::irTypes::IrTypeKind::Struct;
+
+            if (isStruct && !isFloat)
+            {
+                u32 sz = arg.type.width;
+
+                if (sz <= 8)
+                {
+                    if (intIdx < maxIntRegs)
+                    {
+                        str reg = intRegs[intIdx];
+                        self.emitter.emit("\tmovq (");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emit("), ");
+                        self.emitter.emitLine(reg);
+                        intIdx++;
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpushq (");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emitLine(")");
+                    }
+                }
+                else if (sz <= 16)
+                {
+                    bool firstIsInt = true;
+                    bool secondIsInt = true;
+
+                    if (intIdx < maxIntRegs)
+                    {
+                        str reg = intRegs[intIdx];
+                        self.emitter.emit("\tmovq (");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emit("), ");
+                        self.emitter.emitLine(reg);
+                        intIdx++;
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpushq (");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emitLine(")");
+                    }
+
+                    if (intIdx < maxIntRegs)
+                    {
+                        str reg = intRegs[intIdx];
+                        self.emitter.emit("\tmovq 8(");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emit("), ");
+                        self.emitter.emitLine(reg);
+                        intIdx++;
+                    }
+                    else
+                    {
+                        self.emitter.emit("\tpushq 8(");
+                        self.emitter.emit(getRegForValue(arg));
+                        self.emitter.emitLine(")");
+                    }
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(getRegForValue(arg));
+                    self.emitter.emitLine(", %rdi");
+                }
+            }
+            else if (isFloat && fpIdx < maxFpRegs)
+            {
+                str reg = fpRegs[fpIdx];
+                str src = getRegForValue(arg);
+                if (!strEq(src, reg))
+                {
+                    self.emitter.emit("\tmovsd ");
+                    self.emitter.emit(src);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(reg);
+                }
+                fpIdx++;
+            }
+            else if (!isFloat && !isStruct && intIdx < maxIntRegs)
+            {
+                str reg = intRegs[intIdx];
+                str src = getRegForValue(arg);
+                if (!strEq(src, reg))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(src);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(reg);
+                }
+                intIdx++;
+            }
+            else
+            {
+                str src = getRegForValue(arg);
+                self.emitter.emit("\tpushq ");
+                self.emitter.emitLine(src);
+            }
+        }
+    }
+
+    void emitCall(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.nops > 0 && inst.ops[0])
+        {
+            wallvm::ir_types::IrValue* callee = inst.ops[0];
+            str calleeName = callee.name;
+
+            self.lastCallTarget = calleeName;
+            self.lastCallResult = &inst.base;
+
+            emitCallSetup(inst);
+
+            if (self.isWindows)
+                self.emitter.emitTab("subq $32, %rsp");
+            self.emitter.emit("\tcall ");
+            self.emitter.emit(calleeName);
+            if (!self.isWindows && callee.kind == wallvm::ir_types::IrValueKind::Func)
+            {
+                wallvm::ir_types::IrFunc* fn = (wallvm::ir_types::IrFunc*)callee;
+                if (fn.isExtern)
+                    self.emitter.emit("@PLT");
+            }
+            self.emitter.emit("\n");
+            if (self.isWindows)
+                self.emitter.emitTab("addq $32, %rsp");
+
+            u32 nargs = (inst.nops > 1) ? inst.nops - 1 : 0;
+            u32 maxIntRegs = self.isWindows ? 4 : 6;
+            u32 maxFpRegs = self.isWindows ? 4 : 8;
+            u32 stackArgs = nargs;
+            if (stackArgs > maxIntRegs + maxFpRegs)
+                stackArgs = stackArgs - maxIntRegs - maxFpRegs;
+            else
+                stackArgs = 0;
+            if (stackArgs > 0)
+            {
+                u32 cleanup = stackArgs * 8;
+                u8 cleanupBuf[16];
+                u32ToStr(cleanup, cleanupBuf);
+                self.emitter.emit("\taddq $");
+                self.emitter.emitLine(cleanupBuf);
+                self.emitter.emit(", %rsp\n");
+            }
+        }
+    }
+
+    bool isTailCall(wallvm::ir_types::IrInst* retInst)
+    {
+        if (!self.lastCallTarget || self.lastCallTarget.len == 0) return false;
+        if (!retInst.nops || !retInst.ops[0]) return false;
+        if (self.lastCallResult != retInst.ops[0]) return false;
+        if (self.currentFuncHasFrame) return false;
+        if (self.numCalleeSaves > 0) return false;
+        if (self.varargAllocSize > 0) return false;
+        if (self.shadowAllocSize > 0) return false;
+        if (self.isWindows) return false;
+        return true;
+    }
+
+    void emitSelect(wallvm::ir_types::IrInst* inst)
+    {
+        if (inst.nops >= 3)
+        {
+            str dst = getRegForValue(&inst.base);
+            str cond = getRegForValue(inst.ops[0]);
+            str src1 = getRegForValue(inst.ops[1]);
+            str src2 = getRegForValue(inst.ops[2]);
+            self.emitter.emit("\ttestq ");
+            self.emitter.emit(cond);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(cond);
+            self.emitter.emit("\tcmovne ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\tcmovz ");
+            self.emitter.emit(src2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    str xmmToYmm(str xmmReg)
+    {
+        // Convert xmmN to ymmN by replacing first character
+        if (xmmReg.len >= 3 && xmmReg.ptr[0] == 'x' && xmmReg.ptr[1] == 'm' && xmmReg.ptr[2] == 'm')
+        {
+            // Build ymmN on stack: 'y' + "mm" + rest
+            u8 buf[8];
+            buf[0] = 'y';
+            for (u32 i = 1; i < xmmReg.len && i < 7; i++)
+                buf[i] = xmmReg.ptr[i];
+            buf[xmmReg.len] = 0;
+            return std::string::fromCStr(buf);
+        }
+        return xmmReg;
+    }
+
+    void emitVecBinOp(wallvm::ir_types::IrInst* inst, str dOp, str qOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        if (self.emitter.features && self.emitter.features.avx2)
+        {
+            str ymmDst = xmmToYmm(dst);
+            str ymmSrc1 = xmmToYmm(src1);
+            str ymmSrc2 = xmmToYmm(src2);
+            self.emitter.emit("\tv");
+            self.emitter.emit(dOp);
+            self.emitter.emit(" ");
+            self.emitter.emit(ymmSrc2);
+            self.emitter.emit(", ");
+            self.emitter.emit(ymmSrc1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(ymmDst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovdqa ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\t");
+            self.emitter.emit(dOp);
+            self.emitter.emit(" ");
+            self.emitter.emit(src2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitVecFloatBinOp(wallvm::ir_types::IrInst* inst, str psOp, str pdOp)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        if (self.emitter.features && self.emitter.features.avx)
+        {
+            str ymmDst = xmmToYmm(dst);
+            str ymmSrc1 = xmmToYmm(src1);
+            str ymmSrc2 = xmmToYmm(src2);
+            self.emitter.emit("\tv");
+            self.emitter.emit(psOp);
+            self.emitter.emit(" ");
+            self.emitter.emit(ymmSrc2);
+            self.emitter.emit(", ");
+            self.emitter.emit(ymmSrc1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(ymmDst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovaps ");
+            self.emitter.emit(src1);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\t");
+            self.emitter.emit(psOp);
+            self.emitter.emit(" ");
+            self.emitter.emit(src2);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitBroadcast(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        if (self.emitter.features && self.emitter.features.avx2)
+        {
+            str ymmDst = xmmToYmm(dst);
+            self.emitter.emit("\tvbroadcastss ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(ymmDst);
+        }
+        else
+        {
+            self.emitter.emit("\tmovss ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\tshufps $0, ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitAbs(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emitLine(", %r10");
+        self.emitter.emitTab("negq %r10");
+        self.emitter.emit("\tcmovns %r10, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitCtPop(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        if (self.emitter.features && self.emitter.features.popcnt)
+        {
+            self.emitter.emit("\tpopcntq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            // Software fallback: x &= x-1 pattern
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("xorq %r10, %r10");
+            self.emitter.emitTab(".Lctpop:");
+            self.emitter.emit("\ttestq ");
+            self.emitter.emit(dst);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("jz .Lctpop_done");
+            self.emitter.emitTab("incq %r10");
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(dst);
+            self.emitter.emitLine(", %rcx");
+            self.emitter.emitTab("decq %rcx");
+            self.emitter.emit("\tandq %rcx, ");
+            self.emitter.emitLine(dst);
+            self.emitter.emitTab("jmp .Lctpop");
+            self.emitter.emitTab(".Lctpop_done:");
+            self.emitter.emit("\tmovq %r10, ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitCtLz(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        if (self.emitter.features && self.emitter.features.lzcnt)
+        {
+            self.emitter.emit("\tlzcntq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+        else
+        {
+            // Fallback: use bsr (bit scan reverse)
+            self.emitter.emit("\tmovq $63, ");
+            self.emitter.emitLine(dst);
+            self.emitter.emit("\tbsrq ");
+            self.emitter.emit(src);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(dst);
+        }
+    }
+
+    void emitCtTz(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        self.emitter.emit("\tbsfq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitBswap(wallvm::ir_types::IrInst* inst)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tbswapq ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitRot(wallvm::ir_types::IrInst* inst, str op)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "rax";
+        str amt = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "rcx";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        // Rotate amount must be in %cl
+        if (!strEq(amt, "rcx") && !strEq(amt, "cl"))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(amt);
+            self.emitter.emitLine(", %rcx");
+        }
+        self.emitter.emit("\t");
+        self.emitter.emit(op);
+        self.emitter.emit(" %cl, ");
+        self.emitter.emitLine(dst);
+    }
+
+    void emitMinMax(wallvm::ir_types::IrInst* inst, str cmpOp, bool isMin, bool isUnsigned)
+    {
+        str dst = getRegForValue(&inst.base);
+        str src1 = (inst.nops > 0) ? getRegForValue(inst.ops[0]) : "xmm0";
+        str src2 = (inst.nops > 1) ? getRegForValue(inst.ops[1]) : "xmm1";
+        self.emitter.emit("\tmovq ");
+        self.emitter.emit(src1);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\tcmpq ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+        self.emitter.emit("\t");
+        // Use unsigned comparison for UMin/UMax
+        if (isUnsigned)
+            self.emitter.emit(isMin ? "cmovbe " : "cmovae ");
+        else
+            self.emitter.emit(isMin ? "cmovle " : "cmovge ");
+        self.emitter.emit(src2);
+        self.emitter.emit(", ");
+        self.emitter.emitLine(dst);
+    }
+}
+
+static void u32ToHex(u32 val, std::cchar* out)
+{
+    str hex = "0123456789abcdef";
+    out[0] = '0';
+    out[1] = 'x';
+    for (u32 i = 7; i >= 0; i--)
+        out[2 + (7 - i)] = hex[(val >> (i * 4)) & 0xF];
+    out[10] = 0;
+}

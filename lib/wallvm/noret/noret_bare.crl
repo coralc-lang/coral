@@ -1,0 +1,160 @@
+mod std = import(lib) std;
+
+pub struct NoretBare
+{
+    u64 exitCode;
+    char* out;
+    u32 outLen;
+    u32 outCap;
+
+    NoretBare new(u64 exitCode)
+    {
+        NoretBare n;
+        n.exitCode = exitCode;
+        n.out = null;
+        n.outLen = 0;
+        n.outCap = 0;
+        return n;
+    }
+
+    void ensureCap(u32 needed)
+    {
+        if (self.outLen + needed <= self.outCap) return;
+        u32 newCap = self.outCap ? self.outCap * 2 : 64;
+        while (self.outLen + needed > newCap) newCap *= 2;
+        char* newOut = std::mman::alloc<char>(newCap);
+        if (self.out)
+        {
+            std::mman::copy<char>(newOut, self.out, self.outLen);
+            std::mman::dealloc<char>(self.out);
+        }
+        self.out = newOut;
+        self.outCap = newCap;
+    }
+
+    void c(char ch)
+    {
+        self.ensureCap(1);
+        self.out[self.outLen++] = ch;
+    }
+
+    void s(str s)
+    {
+        self.ensureCap(s.len);
+        for (u32 i = 0; i < s.len; i++)
+            self.out[self.outLen++] = (char)s.ptr[i];
+    }
+
+    str getString()
+    {
+        self.ensureCap(1);
+        self.out[self.outLen] = 0;
+        return str::fromParts((const u8*)self.out, self.outLen);
+    }
+
+    void clear()
+    {
+        self.outLen = 0;
+    }
+
+    void destroy()
+    {
+        if (self.out) std::mman::dealloc<char>(self.out);
+    }
+
+    void emitHalt(str arch)
+    {
+        if (bareArchMatch(arch, str::fromCstr((const u8*)"x86_64")) || bareArchMatch(arch, str::fromCstr((const u8*)"x86")) || bareArchMatch(arch, str::fromCstr((const u8*)"x86_32")))
+        {
+            self.s("\tcli");
+            self.c('\n');
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\thlt");
+            self.c('\n');
+            self.s("\tjmp .halt");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"arm64")))
+        {
+            self.s("\tmsr daifset, #2");
+            self.c('\n');
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\twfi");
+            self.c('\n');
+            self.s("\tb .halt");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"arm")))
+        {
+            self.s("\tcpsid i");
+            self.c('\n');
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\twfi");
+            self.c('\n');
+            self.s("\tb .halt");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"riscv64")))
+        {
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\twfi");
+            self.c('\n');
+            self.s("\tj .halt");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"ppc64")) || bareArchMatch(arch, str::fromCstr((const u8*)"ppc")))
+        {
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\tb .halt");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"mips64")) || bareArchMatch(arch, str::fromCstr((const u8*)"mips")))
+        {
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\tj .halt");
+            self.c('\n');
+            self.s("\tnop");
+            self.c('\n');
+        }
+        else if (bareArchMatch(arch, str::fromCstr((const u8*)"sparcv9")) || bareArchMatch(arch, str::fromCstr((const u8*)"sparc64")))
+        {
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\tba .halt");
+            self.c('\n');
+            self.s("\tnop");
+            self.c('\n');
+        }
+        else
+        {
+            self.s("\tcli");
+            self.c('\n');
+            self.s(".halt:");
+            self.c('\n');
+            self.s("\thlt");
+            self.c('\n');
+            self.s("\tjmp .halt");
+            self.c('\n');
+        }
+    }
+}
+
+static bool bareArchMatch(str arch, str known)
+{
+    if (arch.isEmpty() || known.isEmpty()) return false;
+    if (arch.len != known.len) return false;
+    for (u32 i = 0; i < arch.len; i++)
+    {
+        char a = (char)arch.ptr[i];
+        char k = (char)known.ptr[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (a != k) return false;
+    }
+    return true;
+}

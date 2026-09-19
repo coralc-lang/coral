@@ -1,0 +1,687 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+// Points-to analysis and MemorySSA construction.
+//
+// This pass computes:
+// 1. Points-to sets: for each pointer value, which memory objects it may alias
+// 2. Alias queries: can two pointer values refer to the same memory?
+// 3. MemorySSA: a web of memory definitions and uses for efficient queries
+//
+// Memory objects are identified by:
+// - Alloca instructions (local variables)
+// - Global variables
+// - Unknown (returned by functions, loaded from pointers)
+//
+// The analysis is flow-insensitive within basic blocks but respects SSA form.
+// It handles:
+// - Alloca-based objects (distinct per alloca)
+// - GEP offsets (base object propagated)
+// - Bitcast (base object propagated)
+// - Phi nodes (union of incoming objects)
+// - Global variables (separate object per global)
+// - Function call returns (unknown provenance)
+// - Store through pointer (marks base object as modified)
+//
+// Integration: other passes query canAlias(a, b) or mayAlias(a, b) to
+// determine if two pointer operations can refer to the same memory.
+
+const u32 OBJECT_UNKNOWN = 0;
+const u32 OBJECT_MAX = 256;
+
+pub enum AliasResult
+{
+    NoAlias,    // Definitely don't alias
+    MayAlias,   // May alias (conservative)
+    MustAlias   // Definitely alias (same base, no offset difference)
+}
+
+pub struct MemoryObject
+{
+    u32 id;
+    wallvm::ir_types::IrValue* baseValue;  // The defining SSA value (alloca, global, etc.)
+    wallvm::ir_types::IrValue* baseAddr;   // The address (alloca result, global addr)
+    bool isGlobal;
+    bool isEscaped;   // Address taken or passed to callee
+    u32 sizeBytes;    // Known size (0 = unknown)
+}
+
+pub struct MemoryDef
+{
+    wallvm::ir_types::IrInst* inst;   // The store/atomicstore/fence/call that defines memory
+    u32 blockIndex;                  // Which block this is in
+    u32 instIndex;                   // Instruction index within block
+    u32 defId;                       // Unique ID for this definition
+    u32 objectCount;                 // Number of objects this def may modify
+    u32 objects[OBJECT_MAX];         // Object IDs this def may modify (or OBJECT_UNKNOWN for all)
+}
+
+pub struct MemoryUse
+{
+    wallvm::ir_types::IrInst* inst;   // The load/atomicload/call that reads memory
+    u32 blockIndex;
+    u32 instIndex;
+    u32 mayDefId;                    // The most recent MemoryDef this use may read past
+}
+
+pub struct MemoryPhi
+{
+    u32 blockIndex;
+    u32 defCount;                    // Number of incoming MemoryDefs
+    u32 incomingDefIds[16];          // Up to 16 predecessors
+}
+
+pub struct AliasAnalysis
+{
+    wallvm::ir_types::IrContext* ctx;
+    MemoryObject* objects;
+    u32 numObjects;
+    u32 capObjects;
+
+    MemoryDef* defs;
+    u32 numDefs;
+    u32 capDefs;
+
+    MemoryUse* uses;
+    u32 numUses;
+    u32 capUses;
+
+    MemoryPhi* phis;
+    u32 numPhis;
+    u32 capPhis;
+
+    u32 nextDefId;
+
+    // Mapping: SSA value id -> object id (or OBJECT_UNKNOWN)
+    u32* valToObject;
+    u32 valToObjectCap;
+
+    // Per-block: last MemoryDef that reaches the block start
+    u32* blockEntryDef;
+    u32 numBlocks;
+
+    AliasAnalysis new(wallvm::ir_types::IrContext* ctx)
+    {
+        AliasAnalysis a;
+        a.ctx = ctx;
+        a.objects = null;
+        a.numObjects = 0;
+        a.capObjects = 0;
+        a.defs = null;
+        a.numDefs = 0;
+        a.capDefs = 0;
+        a.uses = null;
+        a.numUses = 0;
+        a.capUses = 0;
+        a.phis = null;
+        a.numPhis = 0;
+        a.capPhis = 0;
+        a.nextDefId = 0;
+        a.valToObject = null;
+        a.valToObjectCap = 0;
+        a.blockEntryDef = null;
+        a.numBlocks = 0;
+        return a;
+    }
+
+    void deinit()
+    {
+        if (self.objects) std::mman::dealloc(self.objects);
+        if (self.defs) std::mman::dealloc(self.defs);
+        if (self.uses) std::mman::dealloc(self.uses);
+        if (self.phis) std::mman::dealloc(self.phis);
+        if (self.valToObject) std::mman::dealloc(self.valToObject);
+        if (self.blockEntryDef) std::mman::dealloc(self.blockEntryDef);
+    }
+
+    void ensureObjects(u32 needed)
+    {
+        if (needed <= self.capObjects) return;
+        u32 newCap = self.capObjects ? self.capObjects * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryObject* newArr = std::mman::alloc<MemoryObject>(newCap);
+        if (self.objects)
+        {
+            for (u32 i = 0; i < self.numObjects; i++)
+                newArr[i] = self.objects[i];
+            std::mman::dealloc(self.objects);
+        }
+        self.objects = newArr;
+        self.capObjects = newCap;
+    }
+
+    void ensureDefs(u32 needed)
+    {
+        if (needed <= self.capDefs) return;
+        u32 newCap = self.capDefs ? self.capDefs * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryDef* newArr = std::mman::alloc<MemoryDef>(newCap);
+        if (self.defs)
+        {
+            for (u32 i = 0; i < self.numDefs; i++)
+                newArr[i] = self.defs[i];
+            std::mman::dealloc(self.defs);
+        }
+        self.defs = newArr;
+        self.capDefs = newCap;
+    }
+
+    void ensureUses(u32 needed)
+    {
+        if (needed <= self.capUses) return;
+        u32 newCap = self.capUses ? self.capUses * 2 : 64;
+        while (newCap < needed) newCap *= 2;
+        MemoryUse* newArr = std::mman::alloc<MemoryUse>(newCap);
+        if (self.uses)
+        {
+            for (u32 i = 0; i < self.numUses; i++)
+                newArr[i] = self.uses[i];
+            std::mman::dealloc(self.uses);
+        }
+        self.uses = newArr;
+        self.capUses = newCap;
+    }
+
+    void ensurePhis(u32 needed)
+    {
+        if (needed <= self.capPhis) return;
+        u32 newCap = self.capPhis ? self.capPhis * 2 : 16;
+        while (newCap < needed) newCap *= 2;
+        MemoryPhi* newArr = std::mman::alloc<MemoryPhi>(newCap);
+        if (self.phis)
+        {
+            for (u32 i = 0; i < self.numPhis; i++)
+                newArr[i] = self.phis[i];
+            std::mman::dealloc(self.phis);
+        }
+        self.phis = newArr;
+        self.capPhis = newCap;
+    }
+
+    void ensureValToObject(u32 needed)
+    {
+        if (needed < self.valToObjectCap) return;
+        u32 newCap = self.valToObjectCap ? self.valToObjectCap * 2 : 256;
+        while (newCap <= needed) newCap *= 2;
+        u32* newArr = std::mman::alloc<u32>(newCap);
+        for (u32 i = 0; i < self.valToObjectCap; i++)
+            newArr[i] = self.valToObject[i];
+        for (u32 i = self.valToObjectCap; i < newCap; i++)
+            newArr[i] = OBJECT_UNKNOWN;
+        if (self.valToObject) std::mman::dealloc(self.valToObject);
+        self.valToObject = newArr;
+        self.valToObjectCap = newCap;
+    }
+
+    u32 getObjectForValue(wallvm::ir_types::IrValue* val)
+    {
+        if (!val) return OBJECT_UNKNOWN;
+        u32 id = val.id;
+        if (id >= self.valToObjectCap) return OBJECT_UNKNOWN;
+        return self.valToObject[id];
+    }
+
+    void setObjectForValue(wallvm::ir_types::IrValue* val, u32 objId)
+    {
+        if (!val) return;
+        self.ensureValToObject(val.id + 1);
+        self.valToObject[val.id] = objId;
+    }
+
+    u32 createObject(wallvm::ir_types::IrValue* baseValue, wallvm::ir_types::IrValue* baseAddr, bool isGlobal, u32 sizeBytes)
+    {
+        self.ensureObjects(self.numObjects + 1);
+        u32 id = self.numObjects;
+        MemoryObject* obj = &self.objects[self.numObjects];
+        obj.id = id;
+        obj.baseValue = baseValue;
+        obj.baseAddr = baseAddr;
+        obj.isGlobal = isGlobal;
+        obj.isEscaped = false;
+        obj.sizeBytes = sizeBytes;
+        self.numObjects++;
+        return id;
+    }
+
+    bool isWriteBarrier(wallvm::irOps::IrOpcode op)
+    {
+        switch (op)
+        {
+        case wallvm::irOps::IrOpcode::Store:
+        case wallvm::irOps::IrOpcode::AtomicStore:
+        case wallvm::irOps::IrOpcode::AtomicRmw:
+        case wallvm::irOps::IrOpcode::Fence:
+        case wallvm::irOps::IrOpcode::InlineAsm:
+        case wallvm::irOps::IrOpcode::Call:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool isMemoryRead(wallvm::irOps::IrOpcode op)
+    {
+        switch (op)
+        {
+        case wallvm::irOps::IrOpcode::Load:
+        case wallvm::irOps::IrOpcode::AtomicLoad:
+        case wallvm::irOps::IrOpcode::Call:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    u32 resolveObjectForInst(wallvm::ir_types::IrInst* inst)
+    {
+        if (!inst) return OBJECT_UNKNOWN;
+        wallvm::ir_types::IrValue base = inst.base;
+        u32 cached = self.getObjectForValue(&base);
+        if (cached != OBJECT_UNKNOWN) return cached;
+        return OBJECT_UNKNOWN;
+    }
+
+    // Walk the address operand to find the base object.
+    // Handles: alloca, global, GEP(base, ...), bitcast(x), phi(...)
+    u32 walkAddr(wallvm::ir_types::IrValue* addr)
+    {
+        if (!addr) return OBJECT_UNKNOWN;
+
+        if (addr.kind == wallvm::ir_types::IrValueKind::Global)
+        {
+            u32 cached = self.getObjectForValue(addr);
+            if (cached != OBJECT_UNKNOWN) return cached;
+            u32 objId = self.createObject(addr, addr, true, 0);
+            self.setObjectForValue(addr, objId);
+            return objId;
+        }
+
+        if (addr.kind != wallvm::ir_types::IrValueKind::Inst) return OBJECT_UNKNOWN;
+
+        wallvm::ir_types::IrInst* inst = (wallvm::ir_types::IrInst*)addr;
+        u32 cached = self.getObjectForValue(addr);
+        if (cached != OBJECT_UNKNOWN) return cached;
+
+        switch (inst.opcode)
+        {
+        case wallvm::irOps::IrOpcode::Alloca:
+        {
+            u32 sz = 0;
+            if (inst.nops > 0 && inst.ops[0] && inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstInt)
+                sz = (u32)inst.ops[0].valData;
+            u32 objId = self.createObject(&inst.base, &inst.base, false, sz);
+            self.setObjectForValue(&inst.base, objId);
+            return objId;
+        }
+        case wallvm::irOps::IrOpcode::Gep:
+            if (inst.nops > 0)
+                return self.walkAddr(inst.ops[0]);
+            return OBJECT_UNKNOWN;
+        case wallvm::irOps::IrOpcode::Bitcast:
+            if (inst.nops > 0)
+                return self.walkAddr(inst.ops[0]);
+            return OBJECT_UNKNOWN;
+        case wallvm::irOps::IrOpcode::Phi:
+        {
+            u32 numPairs = inst.nops / 2;
+            u32 result = OBJECT_UNKNOWN;
+            for (u32 i = 0; i < numPairs; i++)
+            {
+                wallvm::ir_types::IrValue* incoming = inst.ops[i];
+                if (!incoming)
+                    continue;
+                u32 incomingObj = self.walkAddr(incoming);
+                if (incomingObj == OBJECT_UNKNOWN)
+                {
+                    result = OBJECT_UNKNOWN;
+                    break;
+                }
+                if (result == OBJECT_UNKNOWN)
+                    result = incomingObj;
+                else if (result != incomingObj)
+                {
+                    result = OBJECT_UNKNOWN;
+                    break;
+                }
+            }
+            if (result != OBJECT_UNKNOWN)
+                self.setObjectForValue(addr, result);
+            return result;
+        }
+        case wallvm::irOps::IrOpcode::Load:
+        case wallvm::irOps::IrOpcode::Call:
+            return OBJECT_UNKNOWN;
+        default:
+            return OBJECT_UNKNOWN;
+        }
+    }
+
+    // Main analysis entry point.
+    // 1. Scan all allocas and globals to create objects
+    // 2. Walk all store/load addresses to build points-to sets
+    // 3. Build MemoryDef/MemoryUse chains
+    void analyze(wallvm::ir_types::IrFunc* func)
+    {
+        self.numObjects = 0;
+        self.numDefs = 0;
+        self.numUses = 0;
+        self.numPhis = 0;
+        self.nextDefId = 0;
+
+        self.numBlocks = func.nblocks;
+        self.blockEntryDef = std::mman::alloc<u32>(func.nblocks);
+        for (u32 i = 0; i < func.nblocks; i++)
+            self.blockEntryDef[i] = OBJECT_UNKNOWN;
+
+        // Pass 1: Create objects for all allocas
+        for (u32 bi = 0; bi < func.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if (inst.opcode == wallvm::irOps::IrOpcode::Alloca)
+                {
+                    u32 sz = 0;
+                    if (inst.nops > 0 && inst.ops[0] && inst.ops[0].kind == wallvm::ir_types::IrValueKind::ConstInt)
+                        sz = (u32)inst.ops[0].valData;
+                    u32 objId = self.createObject(&inst.base, &inst.base, false, sz);
+                    self.setObjectForValue(&inst.base, objId);
+                }
+            }
+        }
+
+        // Pass 2: Walk all store/load/call addresses to discover objects
+        for (u32 bi = 0; bi < func.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+
+                // Store: walk the address operand (ops[1])
+                if (inst.opcode == wallvm::irOps::IrOpcode::Store && inst.nops >= 2)
+                {
+                    wallvm::ir_types::IrValue* addr = inst.ops[1];
+                    u32 objId = self.walkAddr(addr);
+                    (void)objId;
+                }
+
+                // Load: walk the address operand (ops[0])
+                if (inst.opcode == wallvm::irOps::IrOpcode::Load && inst.nops >= 1)
+                {
+                    wallvm::ir_types::IrValue* addr = inst.ops[0];
+                    u32 objId = self.walkAddr(addr);
+                    (void)objId;
+                }
+
+                // Gep: walk base to discover pointed-to objects
+                if (inst.opcode == wallvm::irOps::IrOpcode::Gep && inst.nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst.ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst.base, objId);
+                }
+
+                // Bitcast: propagate
+                if (inst.opcode == wallvm::irOps::IrOpcode::Bitcast && inst.nops > 0)
+                {
+                    u32 objId = self.walkAddr(inst.ops[0]);
+                    if (objId != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst.base, objId);
+                }
+
+                // Phi: merge incoming objects
+                if (inst.opcode == wallvm::irOps::IrOpcode::Phi)
+                {
+                    u32 numPairs = inst.nops / 2;
+                    u32 firstObj = OBJECT_UNKNOWN;
+                    for (u32 j = 0; j < numPairs; j++)
+                    {
+                        wallvm::ir_types::IrValue* incoming = inst.ops[j];
+                        if (incoming && incoming.kind == wallvm::ir_types::IrValueKind::Inst)
+                        {
+                            u32 objId = self.walkAddr(incoming);
+                            if (firstObj == OBJECT_UNKNOWN && objId != OBJECT_UNKNOWN)
+                                firstObj = objId;
+                        }
+                    }
+                    if (firstObj != OBJECT_UNKNOWN)
+                        self.setObjectForValue(&inst.base, firstObj);
+                }
+            }
+        }
+
+        // Pass 3: Build MemoryDef and MemoryUse chains
+        // Walk each block in order. Track the last memory-def id.
+        u32* lastDefInBlock = std::mman::alloc<u32>(func.nblocks);
+        for (u32 i = 0; i < func.nblocks; i++)
+            lastDefInBlock[i] = OBJECT_UNKNOWN;
+
+        for (u32 bi = 0; bi < func.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func.blocks[bi];
+            u32 currentDefId = OBJECT_UNKNOWN;
+
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+
+                if (isMemoryRead(inst.opcode))
+                {
+                    self.ensureUses(self.numUses + 1);
+                    MemoryUse* mu = &self.uses[self.numUses];
+                    mu.inst = inst;
+                    mu.blockIndex = bi;
+                    mu.instIndex = ii;
+                    mu.mayDefId = currentDefId;
+                    self.numUses++;
+                }
+
+                if (isWriteBarrier(inst.opcode))
+                {
+                    self.ensureDefs(self.numDefs + 1);
+                    MemoryDef* md = &self.defs[self.numDefs];
+                    md.inst = inst;
+                    md.blockIndex = bi;
+                    md.instIndex = ii;
+                    md.defId = self.nextDefId++;
+                    md.objectCount = 0;
+
+                    // Determine which objects this def modifies
+                    if (inst.opcode == wallvm::irOps::IrOpcode::Store && inst.nops >= 2)
+                    {
+                        u32 objId = self.walkAddr(inst.ops[1]);
+                        if (objId != OBJECT_UNKNOWN && md.objectCount < OBJECT_MAX)
+                        {
+                            md.objects[md.objectCount++] = objId;
+                        }
+                    }
+                    else if (inst.opcode == wallvm::irOps::IrOpcode::AtomicStore && inst.nops >= 2)
+                    {
+                        u32 objId = self.walkAddr(inst.ops[1]);
+                        if (objId != OBJECT_UNKNOWN && md.objectCount < OBJECT_MAX)
+                        {
+                            md.objects[md.objectCount++] = objId;
+                        }
+                    }
+                    else
+                    {
+                        // Call, fence, asm: modifies everything
+                        md.objectCount = OBJECT_UNKNOWN;
+                    }
+
+                    currentDefId = md.defId;
+                    self.numDefs++;
+                }
+            }
+
+            lastDefInBlock[bi] = currentDefId;
+        }
+
+        // Pass 4: Build MemoryPhis at block entries with multiple predecessors
+        for (u32 bi = 0; bi < func.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = func.blocks[bi];
+            if (bi == 0) continue;
+
+            u32 predecessorCount = 0;
+            for (u32 pi = 0; pi < func.nblocks; pi++)
+            {
+                if (pi == bi) continue;
+                wallvm::ir_types::IrBlock* pred = func.blocks[pi];
+                for (u32 si = 0; si < pred.ninsts; si++)
+                {
+                    wallvm::ir_types::IrInst* term = pred.insts[si];
+                    if (term.opcode == wallvm::irOps::IrOpcode::Br && term.nops >= 1)
+                    {
+                        if (term.ops[0].id == bb.base.id)
+                            predecessorCount++;
+                    }
+                    if (term.opcode == wallvm::irOps::IrOpcode::CondBr && term.nops >= 3)
+                    {
+                        if (term.ops[1].id == bb.base.id) predecessorCount++;
+                        if (term.ops[2].id == bb.base.id) predecessorCount++;
+                    }
+                }
+            }
+
+            if (predecessorCount >= 2)
+            {
+                self.ensurePhis(self.numPhis + 1);
+                MemoryPhi* mph = &self.phis[self.numPhis];
+                mph.blockIndex = bi;
+                mph.defCount = 0;
+
+                for (u32 pi = 0; pi < func.nblocks && mph.defCount < 16; pi++)
+                {
+                    if (pi == bi) continue;
+                    wallvm::ir_types::IrBlock* pred = func.blocks[pi];
+                    for (u32 si = 0; si < pred.ninsts; si++)
+                    {
+                        wallvm::ir_types::IrInst* term = pred.insts[si];
+                        bool targets = false;
+                        if (term.opcode == wallvm::irOps::IrOpcode::Br && term.nops >= 1)
+                        {
+                            if (term.ops[0].id == bb.base.id) targets = true;
+                        }
+                        if (term.opcode == wallvm::irOps::IrOpcode::CondBr && term.nops >= 3)
+                        {
+                            if (term.ops[1].id == bb.base.id) targets = true;
+                            if (term.ops[2].id == bb.base.id) targets = true;
+                        }
+                        if (targets)
+                        {
+                            u32 predDefId = lastDefInBlock[pi];
+                            if (predDefId != OBJECT_UNKNOWN && mph.defCount < 16)
+                            {
+                                mph.incomingDefIds[mph.defCount++] = predDefId;
+                            }
+                        }
+                    }
+                }
+
+                if (mph.defCount > 0)
+                    self.numPhis++;
+            }
+        }
+
+        std::mman::dealloc(lastDefInBlock);
+    }
+
+    // Query: do two values definitely not alias?
+    bool isNoAlias(wallvm::ir_types::IrValue* a, wallvm::ir_types::IrValue* b)
+    {
+        if (!a || !b) return true;
+        if (a.id == b.id) return false;
+
+        u32 objA = self.walkAddr(a);
+        u32 objB = self.walkAddr(b);
+
+        if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA != objB)
+            return true;
+
+        if (objA != OBJECT_UNKNOWN && objB != OBJECT_UNKNOWN && objA == objB)
+            return false;
+
+        return false;
+    }
+
+    // Query: do two values definitely alias?
+    bool isMustAlias(wallvm::ir_types::IrValue* a, wallvm::ir_types::IrValue* b)
+    {
+        if (!a || !b) return false;
+        if (a.id == b.id) return true;
+        return false;
+    }
+
+    // Query: can a load at address 'loadAddr' be clobbered by a store at address 'storeAddr'?
+    // Returns true if the store may overwrite the memory read by the load.
+    bool mayClobber(wallvm::ir_types::IrValue* loadAddr, wallvm::ir_types::IrValue* storeAddr)
+    {
+        if (!loadAddr || !storeAddr) return true;
+        u32 loadObj = self.walkAddr(loadAddr);
+        u32 storeObj = self.walkAddr(storeAddr);
+
+        if (loadObj == OBJECT_UNKNOWN || storeObj == OBJECT_UNKNOWN) return true;
+        if (loadObj == storeObj) return true;
+        return false;
+    }
+
+    // Query: does a store to 'storeAddr' kill a prior load from 'loadAddr'?
+    // (i.e., do they definitely alias)
+    bool doesStoreKillLoad(wallvm::ir_types::IrValue* storeAddr, wallvm::ir_types::IrValue* loadAddr)
+    {
+        return self.isMustAlias(storeAddr, loadAddr);
+    }
+
+    // Get the MemoryDef that a given load may read from.
+    MemoryDef* getMayDefForUse(MemoryUse* mu)
+    {
+        if (!mu) return null;
+        for (u32 i = 0; i < self.numDefs; i++)
+        {
+            if (self.defs[i].defId == mu.mayDefId)
+                return &self.defs[i];
+        }
+        return null;
+    }
+
+    // Check if a store at the given MemoryDef may alias with a load at the given MemoryUse.
+    bool defMayAliasUse(MemoryDef* md, MemoryUse* mu)
+    {
+        if (!md || !mu) return true;
+        if (!mu.inst || !md.inst) return true;
+
+        if (md.inst.opcode == wallvm::irOps::IrOpcode::Call || md.inst.opcode == wallvm::irOps::IrOpcode::Fence
+            || md.inst.opcode == wallvm::irOps::IrOpcode::InlineAsm)
+            return true;
+
+        if (md.inst.opcode == wallvm::irOps::IrOpcode::Store && md.inst.nops >= 2
+            && mu.inst.opcode == wallvm::irOps::IrOpcode::Load && mu.inst.nops >= 1)
+        {
+            return self.mayClobber(mu.inst.ops[0], md.inst.ops[1]);
+        }
+
+        return true;
+    }
+}
+
+pub bool irAliasAnalysis(wallvm::ir_types::IrFunc* func, rawptr userdata)
+{
+    wallvm::ir_types::IrContext* ctx = (wallvm::ir_types::IrContext*)userdata;
+    if (!ctx || !func) return false;
+
+    // Check if we already have cached results for this function
+    wallvm::ir_types::FunctionAnalysisCache* cache = ctx.getOrCreateAnalysisCache(func);
+    if (cache.aliasAnalysis) return false;
+
+    AliasAnalysis aa = AliasAnalysis::new(ctx);
+    aa.analyze(func);
+
+    // Store in cache (heap-allocated copy)
+    AliasAnalysis* cached = std::mman::alloc<AliasAnalysis>(1);
+    *cached = aa;
+    cache.aliasAnalysis = cached;
+    return false;
+}

@@ -1,0 +1,325 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+// IR Annotations/Metadata System
+// Attaches debug info and metadata to IR instructions and values.
+
+// Metadata kinds
+pub enum MetadataKind
+{
+    DebugInfo,
+    Profiling,
+    Alignment,
+    NoAlias,
+    NoCapture,
+    NoFree,
+    NoUnwind,
+    ReadNone,
+    ReadOnly,
+    WriteOnly,
+    InlineHint,
+    VectorWidth,
+    LoopInfo,
+    Range,
+    BranchWeights,
+    Custom
+}
+
+// Metadata value - can hold different types of metadata
+pub struct MetadataValue
+{
+    MetadataKind kind;
+    usize intVal;
+    str strVal;
+    wallvm::ir_types::IrValue* irVal;
+}
+
+// Metadata entry - key-value pair
+pub struct MetadataEntry
+{
+    str key;
+    MetadataValue value;
+}
+
+// Metadata set - collection of metadata attached to an IR element
+pub struct MetadataSet
+{
+    MetadataEntry* entries;
+    u32 numEntries;
+    u32 capEntries;
+}
+
+pub MetadataSet newMetadataSet()
+{
+    MetadataSet s;
+    s.entries = null;
+    s.numEntries = 0;
+    s.capEntries = 0;
+    return s;
+}
+
+pub void addInt(MetadataSet* self, str key, usize val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = std::mman::alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) std::mman::dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e*.key = key;
+    e*.value.kind = MetadataKind::Custom;
+    e*.value.intVal = val;
+    e*.value.strVal = std::text::string::str::empty();
+    e*.value.irVal = null;
+}
+
+pub void addString(MetadataSet* self, str key, str val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = std::mman::alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) std::mman::dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e.key = key;
+    e.value.kind = MetadataKind::Custom;
+    e.value.intVal = 0;
+    e.value.strVal = val;
+    e.value.irVal = null;
+}
+
+pub void addIRValue(MetadataSet* self, str key, wallvm::ir_types::IrValue* val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = std::mman::alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) std::mman::dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e.key = key;
+    e.value.kind = MetadataKind::Custom;
+    e.value.intVal = 0;
+    e.value.strVal = std::text::string::str::empty();
+    e.value.irVal = val;
+}
+
+pub MetadataEntry* find(MetadataSet* self, str key)
+{
+    for (u32 i = 0; i < self.numEntries; i++)
+    {
+        if (self.entries[i].key.equals(key))
+            return &self.entries[i];
+    }
+    return null;
+}
+
+pub void free(MetadataSet* self)
+{
+    if (self.entries) std::mman::dealloc<MetadataEntry>(self.entries);
+    self.entries = null;
+    self.numEntries = 0;
+    self.capEntries = 0;
+}
+
+// Debug info source location
+pub struct DebugLocation
+{
+    str filename;
+    u32 line;
+    u32 column;
+    str scope;
+}
+
+// Debug info for functions
+pub struct DebugFuncInfo
+{
+    str name;
+    str linkageName;
+    DebugLocation loc;
+    wallvm::ir_types::IrType* type;
+}
+
+// Debug info for variables
+pub struct DebugVarInfo
+{
+    str name;
+    str linkageName;
+    DebugLocation loc;
+    wallvm::ir_types::IrType* type;
+    wallvm::ir_types::IrValue* address;
+}
+
+// Metadata store - global metadata table
+pub struct MetadataStore
+{
+    MetadataSet* funcMetadata;
+    u32 numFuncs;
+    u32 capFuncs;
+
+    MetadataSet* instMetadata;
+    u32 numInsts;
+    u32 capInsts;
+
+    DebugFuncInfo* funcDebugInfo;
+    DebugVarInfo* varDebugInfo;
+    u32 numVars;
+    u32 capVars;
+}
+
+static MetadataStore gMetadataStore;
+
+pub void metadataInit()
+{
+    MetadataStore* s = &gMetadataStore;
+    s.funcMetadata = null;
+    s.numFuncs = 0;
+    s.capFuncs = 0;
+    s.instMetadata = null;
+    s.numInsts = 0;
+    s.capInsts = 0;
+    s.funcDebugInfo = null;
+    s.varDebugInfo = null;
+    s.numVars = 0;
+    s.capVars = 0;
+}
+
+pub void metadataShutdown()
+{
+    MetadataStore* s = &gMetadataStore;
+    for (u32 i = 0; i < s.numFuncs; i++)
+        free(&s.funcMetadata[i]);
+    if (s.funcMetadata) std::mman::dealloc<MetadataSet>(s.funcMetadata);
+
+    for (u32 i = 0; i < s.numInsts; i++)
+        free(&s.instMetadata[i]);
+    if (s.instMetadata) std::mman::dealloc<MetadataSet>(s.instMetadata);
+
+    if (s.funcDebugInfo) std::mman::dealloc<DebugFuncInfo>(s.funcDebugInfo);
+    if (s.varDebugInfo) std::mman::dealloc<DebugVarInfo>(s.varDebugInfo);
+}
+
+// Attach metadata to a function
+pub MetadataSet* attachFuncMetadata(wallvm::ir_types::IrFunc* func)
+{
+    MetadataStore* s = &gMetadataStore;
+    if (s.numFuncs >= s.capFuncs)
+    {
+        u32 newCap = s.capFuncs ? s.capFuncs * 2 : 16;
+        MetadataSet* newSets = std::mman::alloc<MetadataSet>(newCap);
+        for (u32 i = 0; i < s.numFuncs; i++)
+            newSets[i] = s.funcMetadata[i];
+        if (s.funcMetadata) std::mman::dealloc<MetadataSet>(s.funcMetadata);
+        s.funcMetadata = newSets;
+        s.capFuncs = newCap;
+    }
+
+    MetadataSet* set = &s.funcMetadata[s.numFuncs++];
+    *set = newMetadataSet();
+    return set;
+}
+
+// Attach metadata to an instruction
+pub MetadataSet* attachInstMetadata(wallvm::ir_types::IrInst* inst)
+{
+    MetadataStore* s = &gMetadataStore;
+    if (s.numInsts >= s.capInsts)
+    {
+        u32 newCap = s.capInsts ? s.capInsts * 2 : 64;
+        MetadataSet* newSets = std::mman::alloc<MetadataSet>(newCap);
+        for (u32 i = 0; i < s.numInsts; i++)
+            newSets[i] = s.instMetadata[i];
+        if (s.instMetadata) std::mman::dealloc<MetadataSet>(s.instMetadata);
+        s.instMetadata = newSets;
+        s.capInsts = newCap;
+    }
+
+    MetadataSet* set = &s.instMetadata[s.numInsts++];
+    *set = newMetadataSet();
+    return set;
+}
+
+// Add debug location to instruction
+pub void setDebugLocation(wallvm::ir_types::IrInst* inst, str file, u32 line, u32 col)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addString(md, std::text::string::str::fromParts("debug.file", 10), file);
+    addInt(md, std::text::string::str::fromParts("debug.line", 10), line);
+    addInt(md, std::text::string::str::fromParts("debug.col", 9), col);
+}
+
+// Add alignment metadata
+pub void setAlignment(wallvm::ir_types::IrInst* inst, u32 align)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("alignment", 9), align);
+}
+
+// Add noalias metadata
+pub void setNoAlias(wallvm::ir_types::IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("noalias", 7), 1);
+}
+
+// Add nocapture metadata
+pub void setNoCapture(wallvm::ir_types::IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("nocapture", 9), 1);
+}
+
+// Add readonly metadata
+pub void setReadOnly(wallvm::ir_types::IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("readonly", 8), 1);
+}
+
+// Add inline hint
+pub void setInlineHint(wallvm::ir_types::IrInst* inst, u32 hint)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("inlinehint", 10), hint);
+}
+
+// Add branch weights
+pub void setBranchWeights(wallvm::ir_types::IrInst* inst, u32 trueWeight, u32 falseWeight)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("weight.true", 11), trueWeight);
+    addInt(md, std::text::string::str::fromParts("weight.false", 12), falseWeight);
+}
+
+// Add range metadata
+pub void setRange(wallvm::ir_types::IrInst* inst, isize min, isize max)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, std::text::string::str::fromParts("range.min", 9), min);
+    addInt(md, std::text::string::str::fromParts("range.max", 9), max);
+}
+
+// Get metadata for instruction
+pub MetadataSet* getInstMetadata(wallvm::ir_types::IrInst* inst)
+{
+    // Would need to map inst pointer to metadata index
+    // Simplified: return null
+    return null;
+}

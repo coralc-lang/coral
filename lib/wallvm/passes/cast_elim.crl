@@ -1,0 +1,193 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+
+// Redundant Type Cast and Extension Elimination
+// Eliminates nested, redundant casting operations.
+
+enum CastKind
+{
+    Identity,
+    Trunc,
+    Zext,
+    Sext,
+    FpTrunc,
+    FpExt,
+    IntToFp,
+    FpToInt,
+    Unknown
+}
+
+static CastKind classifyCast(wallvm::irOps::IrOpcode op)
+{
+    switch (op)
+    {
+    case wallvm::irOps::IrOpcode::Bitcast: return CastKind::Identity;
+    case wallvm::irOps::IrOpcode::Trunc: return CastKind::Trunc;
+    case wallvm::irOps::IrOpcode::Zext: return CastKind::Zext;
+    case wallvm::irOps::IrOpcode::Sext: return CastKind::Sext;
+    case wallvm::irOps::IrOpcode::FpTrunc: return CastKind::FpTrunc;
+    case wallvm::irOps::IrOpcode::FpExt: return CastKind::FpExt;
+    case wallvm::irOps::IrOpcode::SiToFp: return CastKind::IntToFp;
+    case wallvm::irOps::IrOpcode::FpToSi: return CastKind::FpToInt;
+    case wallvm::irOps::IrOpcode::FpToUi: return CastKind::FpToInt;
+    case wallvm::irOps::IrOpcode::UiToFp: return CastKind::IntToFp;
+    default: return CastKind::Unknown;
+    }
+}
+
+pub bool irPassCastElimination(wallvm::ir_types::IrFunc* func, rawptr userdata)
+{
+    if (!func || func*.isExtern) return false;
+    bool changed = false;
+
+    for (u32 bi = 0; bi < func*.nblocks; bi++)
+    {
+        wallvm::ir_types::IrBlock* bb = func*.blocks[bi];
+        for (u32 ii = 0; ii < bb.ninsts; ii++)
+        {
+            wallvm::ir_types::IrInst* inst = bb.insts[ii];
+            CastKind outerKind = classifyCast(inst.opcode);
+            if (outerKind == CastKind::Unknown) continue;
+            if (inst.nops < 1 || !inst.ops[0]) continue;
+
+            // Pattern 9: Cast to same type -> no-op
+            if (outerKind == CastKind::Identity)
+            {
+                wallvm::ir_types::IrType* inputTy = inst.ops[0].type;
+                wallvm::ir_types::IrType* outputTy = inst.base.type;
+                if (inputTy && outputTy && inputTy == outputTy)
+                {
+                    // Intentional null-out: the cleanup loop below compacts the block
+                    bb.insts[ii] = null;
+                    changed = true;
+                }
+            }
+
+            // Patterns involving inner cast
+            if (inst.ops[0].kind == wallvm::ir_types::IrValueKind::Inst)
+            {
+                wallvm::ir_types::IrInst* inner = (wallvm::ir_types::IrInst*)inst.ops[0];
+                CastKind innerKind = classifyCast(inner.opcode);
+                if (inner.nops < 1 || !inner.ops[0]) continue;
+
+                // Pattern 8: Two identical casts
+                if (innerKind == outerKind && innerKind != CastKind::Unknown)
+                {
+                    wallvm::ir_types::IrType* innerIn = inner.ops[0].type;
+                    wallvm::ir_types::IrType* outerOut = inst.base.type;
+                    if (innerIn && outerOut && innerIn.width == outerOut.width)
+                    {
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        inst.base.type = outerOut;
+                        changed = true;
+                    }
+                }
+
+                // Pattern 2: trunc(zext(x)) or trunc(sext(x))
+                if (outerKind == CastKind::Trunc &&
+                    (innerKind == CastKind::Zext || innerKind == CastKind::Sext))
+                {
+                    wallvm::ir_types::IrType* origTy = inner.ops[0].type;
+                    wallvm::ir_types::IrType* outerOut = inst.base.type;
+                    if (origTy && outerOut && origTy.width == outerOut.width)
+                    {
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        inst.base.type = outerOut;
+                        changed = true;
+                    }
+                }
+
+                // Pattern 3/4: zext(sext(x)) or sext(zext(x))
+                if ((outerKind == CastKind::Zext || outerKind == CastKind::Sext) &&
+                    (innerKind == CastKind::Zext || innerKind == CastKind::Sext))
+                {
+                    wallvm::ir_types::IrType* innerOut = inner.base.type;
+                    wallvm::ir_types::IrType* outerOut = inst.base.type;
+                    if (innerOut && outerOut && innerOut.width == outerOut.width)
+                    {
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        inst.base.type = outerOut;
+                        changed = true;
+                    }
+                }
+
+                // Pattern 5/6: fpext(fptrunc(x)) or fptrunc(fpext(x))
+                if ((outerKind == CastKind::FpExt || outerKind == CastKind::FpTrunc) &&
+                    (innerKind == CastKind::FpExt || innerKind == CastKind::FpTrunc))
+                {
+                    wallvm::ir_types::IrType* innerOut = inner.base.type;
+                    wallvm::ir_types::IrType* outerOut = inst.base.type;
+                    if (innerOut && outerOut && innerOut.width == outerOut.width)
+                    {
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        inst.base.type = outerOut;
+                        changed = true;
+                    }
+                }
+
+                // Pattern 7: sitofp(fptosi(x)) or fptosi(sitofp(x))
+                if ((outerKind == CastKind::IntToFp && innerKind == CastKind::FpToInt) ||
+                    (outerKind == CastKind::FpToInt && innerKind == CastKind::IntToFp))
+                {
+                    wallvm::ir_types::IrType* origTy = inner.ops[0].type;
+                    wallvm::ir_types::IrType* outerOut = inst.base.type;
+                    if (origTy && outerOut && origTy.width == outerOut.width)
+                    {
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        inst.base.type = outerOut;
+                        changed = true;
+                    }
+                }
+
+                // Pattern 10: Bitcast of bitcast -> no-op
+                if (outerKind == CastKind::Identity &&
+                    inner.opcode == wallvm::irOps::IrOpcode::Bitcast)
+                {
+                    inner.removeUser(&inst);
+                    inst.ops[0] = inner.ops[0];
+                    inner.ops[0].addUser(&inst);
+                    changed = true;
+                }
+
+                // Pattern 11: trunc(trunc(x)) -> trunc(x) when inner output width >= outer output width
+                if (outerKind == CastKind::Trunc && innerKind == CastKind::Trunc)
+                {
+                    u32 innerOutW = inner.base.type ? inner.base.type.width : 64;
+                    u32 outerOutW = inst.base.type ? inst.base.type.width : 64;
+                    if (innerOutW >= outerOutW)
+                    {
+                        // Inner trunc already narrows to >= outer width, so it's redundant
+                        inner.removeUser(&inst);
+                        inst.ops[0] = inner.ops[0];
+                        inner.ops[0].addUser(&inst);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Remove null instructions
+        u32 writeIdx = 0;
+        for (u32 i = 0; i < bb.ninsts; i++)
+        {
+            if (bb.insts[i] != null)
+            {
+                bb.insts[writeIdx] = bb.insts[i];
+                writeIdx++;
+            }
+        }
+        bb.ninsts = writeIdx;
+    }
+
+    return changed;
+}

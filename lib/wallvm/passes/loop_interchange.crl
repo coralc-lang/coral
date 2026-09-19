@@ -1,0 +1,338 @@
+mod wallvm = import(lib) wallvm;
+mod std = import(lib) std;
+mod loopdetect = import file::loopdetect;
+mod alias = import file::alias_analysis;
+
+// Loop Interchange Pass
+//
+// Swaps the order of nested loops to improve data locality and enable
+// vectorization. For example:
+//
+//   for i = 0..n       for j = 0..m
+//     for j = 0..m  →    for i = 0..n
+//       a[i][j] = ...      a[i][j] = ...
+//
+// This improves cache performance when accessing column-major arrays
+// and can enable vectorization of the inner loop.
+//
+// Safety criteria for interchange:
+// 1. Both loops must be counted loops (phi, increment, compare with constant)
+// 2. No data dependencies that would break correctness
+// 3. The inner loop must not contain calls, stores to aliased addresses, or
+//    loop-carried dependencies that span iterations of the outer loop
+// 4. The interchange must not introduce new dependencies
+
+const u32 MAX_LOOPS = 32;
+
+pub struct NestedLoop
+{
+    wallvm::passes::loopdetect.IrLoop* inner;
+    wallvm::passes::loopdetect.IrLoop* outer;
+}
+
+pub struct LoopInterchangePass
+{
+    wallvm::ir_types::IrContext* ctx;
+    u64 interchanges;
+
+    LoopInterchangePass new(wallvm::ir_types::IrContext* ctx)
+    {
+        LoopInterchangePass p;
+        p.ctx = ctx;
+        p.interchanges = 0;
+        return p;
+    }
+
+    bool run(wallvm::ir_types::IrFunc* func)
+    {
+        self.interchanges = 0;
+
+        // Detect all natural loops
+        wallvm::passes::loopdetect.IrLoop** loops = wallvm::passes::loopdetect.irLoopDetectNatural(func);
+        if (!loops) return false;
+
+        // Find nested loop pairs (outer contains inner, immediately nested)
+        NestedLoop nested[MAX_LOOPS];
+        u32 nNested = 0;
+
+        for (u32 i = 0; loops[i] && nNested < MAX_LOOPS; i++)
+        {
+            for (u32 j = 0; loops[j] && nNested < MAX_LOOPS; j++)
+            {
+                if (i == j) continue;
+                wallvm::passes::loopdetect.IrLoop* outer = loops[i];
+                wallvm::passes::loopdetect.IrLoop* inner = loops[j];
+
+                // Check if inner is contained in outer
+                if (self.isLoopContained(inner, outer))
+                {
+                    // Check that inner is immediately nested (no other loop between them)
+                    bool immediatelyNested = true;
+                    for (u32 k = 0; loops[k]; k++)
+                    {
+                        if (k == i || k == j) continue;
+                        wallvm::passes::loopdetect.IrLoop* mid = loops[k];
+                        if (self.isLoopContained(inner, mid) && self.isLoopContained(mid, outer))
+                        {
+                            immediatelyNested = false;
+                            break;
+                        }
+                    }
+
+                    if (immediatelyNested)
+                    {
+                        nested[nNested].inner = inner;
+                        nested[nNested].outer = outer;
+                        nNested++;
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+
+        // Try to interchange each nested loop pair
+        for (u32 i = 0; i < nNested; i++)
+        {
+            if (self.canInterchange(nested[i].inner, nested[i].outer, func))
+            {
+                if (self.interchangeLoops(nested[i].inner, nested[i].outer, func))
+                {
+                    changed = true;
+                    self.interchanges++;
+                }
+            }
+        }
+
+        std::mman::dealloc<wallvm::passes::loopdetect.IrLoop*>(loops);
+        return changed;
+    }
+
+    // Check if loop 'inner' is fully contained within loop 'outer'
+    bool isLoopContained(wallvm::passes::loopdetect.IrLoop* inner, wallvm::passes::loopdetect.IrLoop* outer)
+    {
+        // The inner loop's header must be inside the outer loop
+        for (u32 i = 0; i < outer.nblocks; i++)
+        {
+            if (outer.blocks[i] == inner.header)
+                return true;
+        }
+        return false;
+    }
+
+    // Check if two loops can be safely interchanged
+    bool canInterchange(wallvm::passes::loopdetect.IrLoop* inner, wallvm::passes::loopdetect.IrLoop* outer, wallvm::ir_types::IrFunc* func)
+    {
+        // Both loops must be counted (have phi, increment, compare)
+        if (!inner.header || !outer.header) return false;
+
+        // Check inner loop has an induction variable
+        wallvm::ir_types::IrInst* innerPhi = self.findInductionVar(inner);
+        if (!innerPhi) return false;
+
+        // Check outer loop has an induction variable
+        wallvm::ir_types::IrInst* outerPhi = self.findInductionVar(outer);
+        if (!outerPhi) return false;
+
+        // Check that the inner loop doesn't contain any calls (may alias with anything)
+        for (u32 bi = 0; bi < inner.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = inner.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if (inst.opcode == wallvm::irOps::IrOpcode::Call ||
+                    inst.opcode == wallvm::irOps::IrOpcode::InlineAsm ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicStore ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicLoad ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicRmw ||
+                    inst.opcode == wallvm::irOps::IrOpcode::Fence)
+                    return false;
+            }
+        }
+
+        // Check that the outer loop's body (excluding the inner loop) doesn't
+        // contain stores that may alias with loads in the inner loop
+        for (u32 bi = 0; bi < outer.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = outer.blocks[bi];
+            // Skip blocks that are part of the inner loop
+            bool isInnerBlock = false;
+            for (u32 ii = 0; ii < inner.nblocks; ii++)
+            {
+                if (inner.blocks[ii] == bb) { isInnerBlock = true; break; }
+            }
+            if (isInnerBlock) continue;
+
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                // Stores in the outer loop body (outside inner loop) may alias
+                // with loads in the inner loop, preventing interchange
+                if (inst.opcode == wallvm::irOps::IrOpcode::Store ||
+                    inst.opcode == wallvm::irOps::IrOpcode::AtomicStore)
+                    return false;
+            }
+        }
+
+        // Check that the inner loop's induction variable doesn't depend on the outer loop's IV
+        // (i.e., the inner trip count must not depend on the outer loop)
+        wallvm::ir_types::IrInst* innerCompare = self.findLoopCompare(inner);
+        if (innerCompare && innerCompare.nops >= 2)
+        {
+            for (u32 i = 0; i < innerCompare.nops; i++)
+            {
+                if (innerCompare.ops[i].kind == wallvm::ir_types::IrValueKind::Inst)
+                {
+                    wallvm::ir_types::IrInst* opInst = (wallvm::ir_types::IrInst*)innerCompare.ops[i];
+                    // Check if this operand is defined inside the outer loop
+                    if (self.isInstInLoop(opInst, outer) && opInst != outerPhi)
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // Find the induction variable (phi) of a loop
+    wallvm::ir_types::IrInst* findInductionVar(wallvm::passes::loopdetect.IrLoop* lp)
+    {
+        wallvm::ir_types::IrBlock* header = lp.header;
+        if (!header) return null;
+
+        for (u32 i = 0; i < header.ninsts; i++)
+        {
+            wallvm::ir_types::IrInst* inst = header.insts[i];
+            if (inst.opcode == wallvm::irOps::IrOpcode::Phi)
+                return inst;
+        }
+        return null;
+    }
+
+    // Find the loop exit compare instruction
+    wallvm::ir_types::IrInst* findLoopCompare(wallvm::passes::loopdetect.IrLoop* lp)
+    {
+        for (u32 bi = 0; bi < lp.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = lp.blocks[bi];
+            wallvm::ir_types::IrInst* term = bb.insts[bb.ninsts - 1];
+            if (term && term.opcode == wallvm::irOps::IrOpcode::CondBr && term.nops >= 3)
+            {
+                // The condition is usually the last instruction before the terminator
+                // or it's embedded in the terminator
+                for (u32 i = 0; i < bb.ninsts; i++)
+                {
+                    if (bb.insts[i].opcode == wallvm::irOps::IrOpcode::ICmp ||
+                        bb.insts[i].opcode == wallvm::irOps::IrOpcode::FCmp)
+                        return bb.insts[i];
+                }
+            }
+        }
+        return null;
+    }
+
+    // Check if an instruction is defined within a loop
+    bool isInstInLoop(wallvm::ir_types::IrInst* inst, wallvm::passes::loopdetect.IrLoop* lp)
+    {
+        if (!inst.parent) return false;
+        for (u32 i = 0; i < lp.nblocks; i++)
+        {
+            if (lp.blocks[i] == inst.parent)
+                return true;
+        }
+        return false;
+    }
+
+    // Interchange two nested loops by swapping their headers and adjusting PHI nodes
+    bool interchangeLoops(wallvm::passes::loopdetect.IrLoop* inner, wallvm::passes::loopdetect.IrLoop* outer, wallvm::ir_types::IrFunc* func)
+    {
+        // Find the inner loop's preheader (the block that jumps to the inner header)
+        // and the outer loop's header
+        wallvm::ir_types::IrBlock* innerHeader = inner.header;
+        wallvm::ir_types::IrBlock* outerHeader = outer.header;
+
+        if (!innerHeader || !outerHeader) return false;
+
+        // Find the inner loop's phi and increment
+        wallvm::ir_types::IrInst* innerPhi = self.findInductionVar(inner);
+        wallvm::ir_types::IrInst* outerPhi = self.findInductionVar(outer);
+
+        if (!innerPhi || !outerPhi) return false;
+
+        // Find the inner loop's increment instruction
+        wallvm::ir_types::IrInst* innerInc = self.findIncrement(inner, innerPhi);
+        if (!innerInc) return false;
+
+        // Find the outer loop's increment instruction
+        wallvm::ir_types::IrInst* outerInc = self.findIncrement(outer, outerPhi);
+        if (!outerInc) return false;
+
+        // Swap the phi initial values
+        // The inner phi's initial value should be the outer phi's initial value
+        // and vice versa
+        if (innerPhi.nops >= 2 && outerPhi.nops >= 2)
+        {
+            wallvm::ir_types::IrValue* innerInit = innerPhi.ops[1]; // incoming from preheader
+            wallvm::ir_types::IrValue* outerInit = outerPhi.ops[1];
+
+            innerPhi.ops[1] = outerInit;
+            outerPhi.ops[1] = innerInit;
+        }
+
+        // Swap the increment operations' operands
+        // innerInc should use outerPhi, outerInc should use innerPhi
+        if (innerInc.nops >= 2 && outerInc.nops >= 2)
+        {
+            // Find which operand is the phi
+            for (u32 i = 0; i < innerInc.nops; i++)
+            {
+                if (innerInc.ops[i] == &innerPhi.base)
+                    innerInc.ops[i] = &outerPhi.base;
+            }
+            for (u32 i = 0; i < outerInc.nops; i++)
+            {
+                if (outerInc.ops[i] == &outerPhi.base)
+                    outerInc.ops[i] = &innerPhi.base;
+            }
+        }
+
+        // Swap the loop headers in the loop structures
+        wallvm::ir_types::IrBlock* tempHeader = inner.header;
+        inner.header = outer.header;
+        outer.header = tempHeader;
+
+        return true;
+    }
+
+    // Find the increment instruction for an induction variable
+    wallvm::ir_types::IrInst* findIncrement(wallvm::passes::loopdetect.IrLoop* lp, wallvm::ir_types::IrInst* phi)
+    {
+        for (u32 bi = 0; bi < lp.nblocks; bi++)
+        {
+            wallvm::ir_types::IrBlock* bb = lp.blocks[bi];
+            for (u32 ii = 0; ii < bb.ninsts; ii++)
+            {
+                wallvm::ir_types::IrInst* inst = bb.insts[ii];
+                if ((inst.opcode == wallvm::irOps::IrOpcode::Add || inst.opcode == wallvm::irOps::IrOpcode::Sub) && inst.nops == 2)
+                {
+                    // Check if one operand is the phi
+                    for (u32 i = 0; i < inst.nops; i++)
+                    {
+                        if (inst.ops[i] == &phi.base)
+                            return inst;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+}
+
+pub bool irPassLoopInterchange(wallvm::ir_types::IrFunc* func, rawptr userdata)
+{
+    wallvm::ir_types::IrContext* ctx = (wallvm::ir_types::IrContext*)userdata;
+    if (!ctx || !func) return false;
+    LoopInterchangePass pass = LoopInterchangePass::new(ctx);
+    return pass.run(func);
+}
