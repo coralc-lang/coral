@@ -129,7 +129,7 @@ class CodeGen:
         if isinstance(node, IndexExpr):
             return f"{self.gen_expr(node.obj)}[{self.gen_expr(node.index)}]"
         if isinstance(node, Assign):
-            return f"({self.gen_expr(node.target)} = {self.gen_expr(node.value)})"
+            return f"({self.gen_expr(node.target)} {node.op} {self.gen_expr(node.value)})"
         if isinstance(node, TernaryExpr):
             return f"({self.gen_expr(node.cond)} ? {self.gen_expr(node.then_expr)} : {self.gen_expr(node.else_expr)})"
         if isinstance(node, SizeofExpr):
@@ -215,21 +215,30 @@ class CodeGen:
         if isinstance(node, SwitchStmt):
             self.emit(f"switch ({self.gen_expr(node.expr)}) {{\n")
             self.indent += 1
-            for val, body in node.cases:
+            for pattern, body in node.cases:
                 self.emit_indent()
-                self.emit(f"case {self.gen_expr(val)}:\n")
+                if isinstance(pattern, DestructPattern):
+                    self.emit(f"case {pattern.name}:\n")
+                elif isinstance(pattern, OrPattern):
+                    for i, p in enumerate(pattern.patterns):
+                        self.emit_indent()
+                        self.emit(f"case {self.gen_expr(p)}:\n")
+                else:
+                    self.emit(f"case {self.gen_expr(pattern)}:\n")
                 self.indent += 1
                 for s in body.stmts:
                     self.gen_stmt(s)
                 self.emit_indent()
                 self.emit("break;\n")
                 self.indent -= 1
-            if node.default:
+            if node.else_body:
                 self.emit_indent()
                 self.emit("default:\n")
                 self.indent += 1
-                for s in node.default.stmts:
+                for s in node.else_body.stmts:
                     self.gen_stmt(s)
+                self.emit_indent()
+                self.emit("break;\n")
                 self.indent -= 1
             self.indent -= 1
             self.emit_indent()

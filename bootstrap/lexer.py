@@ -37,9 +37,8 @@ class TokenKind:
     Switch = "Switch"
     Return = "Return"
     Extend = "Extend"
-    Default = "Default"
-    Case = "Case"
     Typedef = "Typedef"
+    Variant = "Variant"
     Void = "Void"
     Bool = "Bool"
     CharType = "CharType"
@@ -142,9 +141,8 @@ KEYWORDS = {
     "switch": TokenKind.Switch,
     "return": TokenKind.Return,
     "extend": TokenKind.Extend,
-    "default": TokenKind.Default,
-    "case": TokenKind.Case,
     "typedef": TokenKind.Typedef,
+    "variant": TokenKind.Variant,
     "distinct": TokenKind.Distinct,
     "continue": TokenKind.Continue,
     "comptime": TokenKind.Comptime,

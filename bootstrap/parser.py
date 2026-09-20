@@ -95,9 +95,10 @@ class VarDecl(Node):
 
 
 class Assign(Node):
-    def __init__(self, target, value):
+    def __init__(self, target, value, op="="):
         self.target = target
         self.value = value
+        self.op = op
 
 
 class IfExpr(Node):
@@ -122,10 +123,21 @@ class ForStmt(Node):
 
 
 class SwitchStmt(Node):
-    def __init__(self, expr, cases, default):
+    def __init__(self, expr, cases, else_body):
         self.expr = expr
         self.cases = cases
-        self.default = default
+        self.else_body = else_body
+
+
+class DestructPattern(Node):
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields
+
+
+class OrPattern(Node):
+    def __init__(self, patterns):
+        self.patterns = patterns
 
 
 class BreakStmt(Node):
@@ -368,7 +380,14 @@ class Parser:
                                  TokenKind.AmpEqual, TokenKind.NegEqual):
             op = self.advance()
             right = self.parse_or()
-            return Assign(left, right)
+            op_map = {
+                TokenKind.Equal: "=", TokenKind.PlusEqual: "+=",
+                TokenKind.MinusEqual: "-=", TokenKind.StarEqual: "*=",
+                TokenKind.SlashEqual: "/=", TokenKind.PipeEqual: "|=",
+                TokenKind.CaretEqual: "^=", TokenKind.AmpEqual: "&=",
+                TokenKind.NegEqual: "~=",
+            }
+            return Assign(left, right, op_map.get(op.kind, "="))
         return left
 
     def parse_ternary(self):
@@ -702,6 +721,15 @@ class Parser:
             return VarDecl(tp, name, init_expr)
 
         if t.kind == TokenKind.Ident:
+            peek2 = self.peek2()
+            if peek2.kind == TokenKind.Ident:
+                tp = self.parse_type()
+                name = self.expect(TokenKind.Ident).value
+                init_expr = None
+                if self.match(TokenKind.Equal):
+                    init_expr = self.parse_expr()
+                self.match(TokenKind.Semicolon)
+                return VarDecl(tp, name, init_expr)
             expr = self.parse_expr()
             self.match(TokenKind.Semicolon)
             return ExprStmt(expr)
@@ -764,28 +792,46 @@ class Parser:
         self.expect(TokenKind.Rparen)
         self.expect(TokenKind.LBrace)
         cases = []
-        default = None
+        else_body = None
         while self.peek().kind != TokenKind.RBrace:
-            t = self.peek()
-            if t.kind == TokenKind.Default:
+            if self.peek().kind == TokenKind.Else:
                 self.advance()
-                self.expect(TokenKind.Colon)
-                stmts = []
-                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Case, TokenKind.Default):
-                    stmts.append(self.parse_stmt())
-                default = Block(stmts)
-            elif t.kind == TokenKind.Case:
-                self.advance()
-                val = self.parse_expr()
-                self.expect(TokenKind.Colon)
-                stmts = []
-                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Case, TokenKind.Default):
-                    stmts.append(self.parse_stmt())
-                cases.append((val, Block(stmts)))
+                self.expect(TokenKind.FatArrow)
+                if self.peek().kind == TokenKind.LBrace:
+                    else_body = self.parse_block()
+                else:
+                    else_body = Block([self.parse_stmt()])
+                self.match(TokenKind.Comma)
+                continue
+            pattern = self.parse_switch_pattern()
+            self.expect(TokenKind.FatArrow)
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block()
             else:
-                self.advance()
+                body = Block([self.parse_stmt()])
+            self.match(TokenKind.Comma)
+            cases.append((pattern, body))
         self.expect(TokenKind.RBrace)
-        return SwitchStmt(expr, cases, default)
+        return SwitchStmt(expr, cases, else_body)
+
+    def parse_switch_pattern(self):
+        parts = []
+        part = self.parse_primary()
+        if self.peek().kind == TokenKind.LBrace and isinstance(part, Ident):
+            self.advance()
+            fields = []
+            while self.peek().kind != TokenKind.RBrace:
+                fname = self.expect(TokenKind.Ident).value
+                fields.append(fname)
+                self.match(TokenKind.Comma)
+            self.expect(TokenKind.RBrace)
+            return DestructPattern(part.name, fields)
+        parts.append(part)
+        while self.match(TokenKind.Pipe):
+            parts.append(self.parse_primary())
+        if len(parts) == 1:
+            return parts[0]
+        return OrPattern(parts)
 
     def parse_struct_fields_and_methods(self):
         self.expect(TokenKind.LBrace)
@@ -925,8 +971,17 @@ class Parser:
                     decls.append(ImportDecl("", [], True, lib_path))
                     continue
 
-                path_token = self.expect(TokenKind.String)
-                path = path_token.value.strip('"')
+                if self.peek().kind == TokenKind.String:
+                    path_token = self.advance()
+                    path = path_token.value.strip('"')
+                elif self.peek().kind == TokenKind.Ident:
+                    path_parts = [self.advance().value]
+                    while self.match(TokenKind.ColonColon):
+                        path_parts.append(self.expect(TokenKind.Ident).value)
+                    path = "::".join(path_parts)
+                else:
+                    path_token = self.expect(TokenKind.String)
+                    path = path_token.value.strip('"')
 
                 symbols = []
                 if self.match(TokenKind.LBrace):
