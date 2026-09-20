@@ -38,6 +38,7 @@ class TokenKind:
     Return = "Return"
     Extend = "Extend"
     Default = "Default"
+    Case = "Case"
     Typedef = "Typedef"
     Void = "Void"
     Bool = "Bool"
@@ -142,6 +143,7 @@ KEYWORDS = {
     "return": TokenKind.Return,
     "extend": TokenKind.Extend,
     "default": TokenKind.Default,
+    "case": TokenKind.Case,
     "typedef": TokenKind.Typedef,
     "distinct": TokenKind.Distinct,
     "continue": TokenKind.Continue,

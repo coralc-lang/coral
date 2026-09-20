@@ -15,6 +15,18 @@ BUILTIN_TYPES = {
 }
 
 
+def tuple_type_name(types):
+    parts = []
+    for t in types:
+        if isinstance(t, TypeIdent):
+            parts.append(t.name)
+        elif isinstance(t, PointerType):
+            parts.append(tuple_type_name([t.base]) + "ptr")
+        else:
+            parts.append("any")
+    return "_coral_tuple_" + "_".join(parts)
+
+
 class CodeGen:
     def __init__(self):
         self.out = []
@@ -22,10 +34,11 @@ class CodeGen:
         self.struct_names = set()
         self.enum_names = set()
         self.ext_methods = {}
-        self.typedefs = {}
         self.current_file = None
-        self.known_types = set()
         self.suppress_main = False
+        self.tuple_types = {}
+        self.current_self_type = None
+        self.current_return_type = None
 
     def set_current_file(self, path):
         self.current_file = path
@@ -38,6 +51,12 @@ class CodeGen:
     def emit_indent(self):
         self.emit("    " * self.indent)
 
+    def get_tuple_type(self, types):
+        name = tuple_type_name(types)
+        if name not in self.tuple_types:
+            self.tuple_types[name] = types
+        return name
+
     def gen_type(self, node):
         if node is None:
             return "void"
@@ -45,8 +64,6 @@ class CodeGen:
             name = node.name
             if name in BUILTIN_TYPES:
                 return BUILTIN_TYPES[name]
-            if name in self.struct_names or name in self.enum_names:
-                return name
             return name
         if isinstance(node, PointerType):
             return self.gen_type(node.base) + "*"
@@ -57,7 +74,7 @@ class CodeGen:
         if isinstance(node, ArrayType):
             return self.gen_type(node.base) + f"[{self.gen_expr(node.size)}]"
         if isinstance(node, TupleType):
-            return "_coral_tuple"
+            return self.get_tuple_type(node.types)
         return "void*"
 
     def gen_expr(self, node):
@@ -87,11 +104,22 @@ class CodeGen:
                 return f"({self.gen_expr(node.expr)}{op})"
             return f"({node.op} {self.gen_expr(node.expr)})"
         if isinstance(node, CallExpr):
-            func = self.gen_expr(node.func)
+            func_name = self.gen_expr(node.func)
             args = ", ".join(self.gen_expr(a) for a in node.args)
-            return f"{func}({args})"
+            if isinstance(node.func, DotExpr) and isinstance(node.func.obj, Ident) and node.func.obj.name == "self":
+                obj_type = self.current_self_type or "Lexer"
+                method_name = self.gen_expr(node.func.field)
+                all_args = "self" + (", " + args if args else "")
+                return f"{obj_type}_{method_name}({all_args})"
+            return f"{func_name}({args})"
         if isinstance(node, DotExpr):
-            return f"{self.gen_expr(node.obj)}.{self.gen_expr(node.field)}"
+            obj_str = self.gen_expr(node.obj)
+            field_str = self.gen_expr(node.field)
+            if isinstance(node.obj, Ident) and node.obj.name == "self":
+                return f"self->{field_str}"
+            if isinstance(node.field, IntLit):
+                return f"{obj_str}._{field_str}"
+            return f"{obj_str}.{field_str}"
         if isinstance(node, ColonColonExpr):
             left = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
@@ -108,6 +136,10 @@ class CodeGen:
             return f"sizeof({self.gen_type(node.type_node)})"
         if isinstance(node, CastExpr):
             return f"(({self.gen_type(node.type_node)}){self.gen_expr(node.expr)})"
+        if isinstance(node, TupleExpr):
+            if self.current_return_type:
+                return f"({self.current_return_type}){{ " + ", ".join(self.gen_expr(e) for e in node.exprs) + " }"
+            return "{ " + ", ".join(self.gen_expr(e) for e in node.exprs) + " }"
         if isinstance(node, Block):
             return "(void)0"
         return "/* unhandled expr */"
@@ -221,6 +253,8 @@ class CodeGen:
     def gen_func(self, node):
         ret = self.gen_type(node.return_type)
         name = node.name
+        saved_return = self.current_return_type
+        self.current_return_type = ret
 
         if node.self_type:
             st = self.gen_type(node.self_type)
@@ -247,6 +281,7 @@ class CodeGen:
         self.emit(f"{ret} {name}({param_str}) ")
         self.gen_block(node.body)
         self.emit("\n")
+        self.current_return_type = saved_return
 
     def gen_struct(self, node):
         self.struct_names.add(node.name)
@@ -255,6 +290,28 @@ class CodeGen:
         for f in node.fields:
             self.emit(f"    {self.gen_type(f.type_node)} {f.name};\n")
         self.emit(f"}} {name};\n\n")
+        for method in node.methods:
+            st = name
+            method.self_type = TypeIdent(name)
+            saved = self.current_self_type
+            self.current_self_type = st
+            saved_return = self.current_return_type
+            ret = self.gen_type(method.return_type)
+            self.current_return_type = ret
+            params = [f"{st}* self"] + [
+                f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+            ]
+            param_str = ", ".join(params)
+            if method.is_extern:
+                self.emit_indent()
+                self.emit(f"extern {ret} {st}_{method.name}({param_str});\n")
+            else:
+                self.emit_indent()
+                self.emit(f"{ret} {st}_{method.name}({param_str}) ")
+                self.gen_block(method.body)
+                self.emit("\n")
+            self.current_self_type = saved
+            self.current_return_type = saved_return
 
     def gen_enum(self, node):
         self.emit(f"enum {node.name} {{\n")
@@ -265,6 +322,15 @@ class CodeGen:
                 self.emit(f"    {node.name}_{v},\n")
         self.emit(f"}};\n\n")
 
+    def gen_tuple_typedefs(self):
+        for name, types in self.tuple_types.items():
+            self.emit(f"typedef struct {name} {{\n")
+            for i, t in enumerate(types):
+                self.emit(f"    {self.gen_type(t)} _{i};\n")
+            self.emit(f"}} {name};\n")
+        if self.tuple_types:
+            self.emit("\n")
+
     def generate(self, ast):
         self.emit("#include <stdint.h>\n")
         self.emit("#include <stddef.h>\n")
@@ -272,15 +338,6 @@ class CodeGen:
         self.emit("#include <string.h>\n")
         self.emit("#include <stdlib.h>\n")
         self.emit("#include <stdio.h>\n\n")
-
-        for decl in ast.decls:
-            if isinstance(decl, StructDecl):
-                self.struct_names.add(decl.name)
-            elif isinstance(decl, EnumDecl):
-                self.enum_names.add(decl.name)
-            elif isinstance(decl, ExtendBlock):
-                tn = self.gen_type(decl.type_node)
-                self.struct_names.add(tn.replace("_coral_", ""))
 
         self.emit("typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n\n")
 
@@ -297,40 +354,9 @@ class CodeGen:
             elif isinstance(decl, EnumDecl):
                 self.gen_enum(decl)
 
-        forward = []
-        for decl in ast.decls:
-            if isinstance(decl, FuncDecl) and not decl.is_extern:
-                ret = self.gen_type(decl.return_type)
-                params = []
-                for p in decl.params:
-                    tp = self.gen_type(p.type_node)
-                    params.append(f"{tp} {p.name}")
-                forward.append(f"{ret} {decl.name}({', '.join(params)});")
-            elif isinstance(decl, ExtendBlock):
-                for m in decl.methods:
-                    if not m.is_extern:
-                        ret = self.gen_type(m.return_type)
-                        st = self.gen_type(decl.type_node)
-                        params = [f"{self.gen_type(decl.type_node)} self"] + [
-                            f"{self.gen_type(p.type_node)} {p.name}" for p in m.params if p.name != "self"
-                        ]
-                        forward.append(f"{ret} {st}_{m.name}({', '.join(params)});")
-
-        if forward:
-            self.emit("/* forward declarations */\n")
-            for f in forward:
-                self.emit(f"{f}\n")
-            self.emit("\n")
+        self.gen_tuple_typedefs()
 
         for decl in ast.decls:
-            if isinstance(decl, ImportDecl):
-                continue
-            if isinstance(decl, ModReexport):
-                continue
-            if isinstance(decl, StructDecl):
-                continue
-            if isinstance(decl, EnumDecl):
-                continue
             if isinstance(decl, FuncDecl):
                 self.gen_func(decl)
             elif isinstance(decl, ExtendBlock):
@@ -338,8 +364,10 @@ class CodeGen:
                     st = self.gen_type(decl.type_node)
                     st_name = st
                     method.self_type = decl.type_node
+                    saved = self.current_self_type
+                    self.current_self_type = st
                     ret = self.gen_type(method.return_type)
-                    params = [f"{st} self"] + [
+                    params = [f"{st}* self"] + [
                         f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
                     ]
                     param_str = ", ".join(params)
@@ -351,11 +379,11 @@ class CodeGen:
                         self.emit(f"{ret} {st_name}_{method.name}({param_str}) ")
                         self.gen_block(method.body)
                         self.emit("\n")
+                    self.current_self_type = saved
 
         if not self.suppress_main:
-            if "__main__" in [d.name for d in ast.decls if isinstance(d, FuncDecl)]:
-                pass
-            else:
+            has_main = any(isinstance(d, FuncDecl) and d.name == "main" for d in ast.decls)
+            if not has_main:
                 self.emit("int main(int argc, char** argv) {\n")
                 self.emit("    return 0;\n")
                 self.emit("}\n")

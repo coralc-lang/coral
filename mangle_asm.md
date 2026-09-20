@@ -1,4 +1,4 @@
-/* To anchor Coral's module and import system all the way down to the metal, we need a deterministic name-mangling scheme.
+To anchor Coral's module and import system all the way down to the metal, we need a deterministic name-mangling scheme.
 
 Because Coral supports local files, project-rooted modules (`file::`), and global library shelves (`import(lib)`), the linker needs a guarantee that two functions named `pow` or `sqrt` in different packages or paths never collide, while keeping the mangled output predictable and debug-friendly.
 
@@ -116,7 +116,7 @@ extern i32 puts(const cchar*);
 
 
 * **ABI-Specified Interop:**
-```c
+```crl
 extern("C") i32 sqlite3_open(const char* filename, sqlite3** pp);
 
 ```
@@ -129,5 +129,3 @@ extern("C") i32 sqlite3_open(const char* filename, sqlite3** pp);
 * `sqlite3_open` mangles to: **`sqlite3_open`**
 
 No `crl$` prefixes, scope tags, or module path components are injected into `extern` declarations, ensuring zero friction when linking against native C libraries.
-
-*/

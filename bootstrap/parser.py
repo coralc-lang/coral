@@ -27,10 +27,11 @@ class ModReexport(Node):
 
 
 class StructDecl(Node):
-    def __init__(self, name, fields, is_pub):
+    def __init__(self, name, fields, is_pub, methods=None):
         self.name = name
         self.fields = fields
         self.is_pub = is_pub
+        self.methods = methods or []
 
 
 class FieldDecl(Node):
@@ -194,6 +195,11 @@ class SizeofExpr(Node):
         self.type_node = type_node
 
 
+class TupleExpr(Node):
+    def __init__(self, exprs):
+        self.exprs = exprs
+
+
 class Ident(Node):
     def __init__(self, name):
         self.name = name
@@ -301,6 +307,7 @@ class Parser:
             TokenKind.U32, TokenKind.I32, TokenKind.U64, TokenKind.I64,
             TokenKind.U128, TokenKind.I128, TokenKind.F32, TokenKind.F64,
             TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str,
+            TokenKind.Struct,
         ) or k == TokenKind.Ident
 
     def parse_type(self):
@@ -351,12 +358,14 @@ class Parser:
         raise SyntaxError(f"{self.filename}:{t.line}:{t.col}: unexpected token in type: {t.kind} ({t.value!r})")
 
     def parse_expr(self):
-        return self.parse_ternary()
+        return self.parse_assign()
 
     def parse_assign(self):
-        left = self.parse_or()
+        left = self.parse_ternary()
         if self.peek().kind in (TokenKind.Equal, TokenKind.PlusEqual, TokenKind.MinusEqual,
-                                 TokenKind.StarEqual, TokenKind.SlashEqual):
+                                 TokenKind.StarEqual, TokenKind.SlashEqual,
+                                 TokenKind.PipeEqual, TokenKind.CaretEqual,
+                                 TokenKind.AmpEqual, TokenKind.NegEqual):
             op = self.advance()
             right = self.parse_or()
             return Assign(left, right)
@@ -483,7 +492,7 @@ class Parser:
         if t.kind == TokenKind.MinusMinus:
             self.advance()
             return UnaryExpr("--pre", self.parse_unary())
-        if t.kind == TokenKind.Sizeof or t.kind == TokenKind.BuiltinSizeof:
+        if t.kind == TokenKind.BuiltinSizeof:
             self.advance()
             if self.match(TokenKind.LParen):
                 tp = self.parse_type()
@@ -511,12 +520,22 @@ class Parser:
                 left = CallExpr(left, args)
             elif self.peek().kind == TokenKind.Dot:
                 self.advance()
-                field = self.expect(TokenKind.Ident)
-                left = DotExpr(left, Ident(field.value))
+                if self.peek().kind == TokenKind.Dec:
+                    field_tok = self.advance()
+                    left = DotExpr(left, IntLit(field_tok.value, "dec"))
+                elif self.peek().kind == TokenKind.Ident:
+                    field = self.advance()
+                    left = DotExpr(left, Ident(field.value))
+                else:
+                    raise SyntaxError(f"expected field name or index after '.', got {self.peek().kind}")
             elif self.peek().kind == TokenKind.StarDot:
                 self.advance()
-                field = self.expect(TokenKind.Ident)
-                left = StarDotExpr(left, Ident(field.value))
+                if self.peek().kind == TokenKind.Dec:
+                    field_tok = self.advance()
+                    left = StarDotExpr(left, IntLit(field_tok.value, "dec"))
+                else:
+                    field = self.expect(TokenKind.Ident)
+                    left = StarDotExpr(left, Ident(field.value))
             elif self.peek().kind == TokenKind.ColonColon:
                 self.advance()
                 right_name = self.expect(TokenKind.Ident)
@@ -565,7 +584,23 @@ class Parser:
             return Ident(t.value)
         if t.kind == TokenKind.LParen:
             self.advance()
+            if self.peek().kind in (TokenKind.Void, TokenKind.Bool, TokenKind.CharType,
+                                    TokenKind.U8, TokenKind.I8, TokenKind.U16, TokenKind.I16,
+                                    TokenKind.U32, TokenKind.I32, TokenKind.U64, TokenKind.I64,
+                                    TokenKind.U128, TokenKind.I128, TokenKind.F32, TokenKind.F64,
+                                    TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str,
+                                    TokenKind.Struct):
+                tp = self.parse_type()
+                self.expect(TokenKind.Rparen)
+                inner = self.parse_unary()
+                return CastExpr(tp, inner)
             expr = self.parse_expr()
+            if self.peek().kind == TokenKind.Comma:
+                exprs = [expr]
+                while self.match(TokenKind.Comma):
+                    exprs.append(self.parse_expr())
+                self.expect(TokenKind.Rparen)
+                return TupleExpr(exprs)
             self.expect(TokenKind.Rparen)
             return expr
         if t.kind == TokenKind.Self:
@@ -618,12 +653,18 @@ class Parser:
 
         if t.kind == TokenKind.While:
             self.advance()
+            self.match(TokenKind.LParen)
             cond = self.parse_expr()
-            body = self.parse_block()
+            self.expect(TokenKind.Rparen)
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block()
+            else:
+                body = Block([self.parse_stmt()])
             return WhileStmt(cond, body)
 
         if t.kind == TokenKind.For:
             self.advance()
+            self.match(TokenKind.LParen)
             init = None
             if self.peek().kind != TokenKind.Semicolon:
                 init = self.parse_stmt()
@@ -634,14 +675,36 @@ class Parser:
                 cond = self.parse_expr()
             self.expect(TokenKind.Semicolon)
             post = None
-            if self.peek().kind != TokenKind.RParen:
+            if self.peek().kind not in (TokenKind.Rparen, TokenKind.RBrace):
                 post = self.parse_expr()
             self.expect(TokenKind.Rparen)
-            body = self.parse_block()
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block()
+            else:
+                body = Block([self.parse_stmt()])
             return ForStmt(init, cond, post, body)
 
         if t.kind == TokenKind.Switch:
             return self.parse_switch()
+
+        if t.kind == TokenKind.Struct or t.kind in (
+                TokenKind.Void, TokenKind.Bool, TokenKind.CharType,
+                TokenKind.U8, TokenKind.I8, TokenKind.U16, TokenKind.I16,
+                TokenKind.U32, TokenKind.I32, TokenKind.U64, TokenKind.I64,
+                TokenKind.U128, TokenKind.I128, TokenKind.F32, TokenKind.F64,
+                TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str):
+            tp = self.parse_type()
+            name = self.expect(TokenKind.Ident).value
+            init_expr = None
+            if self.match(TokenKind.Equal):
+                init_expr = self.parse_expr()
+            self.match(TokenKind.Semicolon)
+            return VarDecl(tp, name, init_expr)
+
+        if t.kind == TokenKind.Ident:
+            expr = self.parse_expr()
+            self.match(TokenKind.Semicolon)
+            return ExprStmt(expr)
 
         if t.kind == TokenKind.Defer:
             self.advance()
@@ -672,13 +735,18 @@ class Parser:
     def parse_if(self):
         self.expect(TokenKind.If)
         cond = self.parse_expr()
-        then_body = self.parse_block()
+        if self.peek().kind == TokenKind.LBrace:
+            then_body = self.parse_block()
+        else:
+            then_body = Block([self.parse_stmt()])
         else_body = None
         if self.match(TokenKind.Else):
             if self.peek().kind == TokenKind.If:
                 else_body = Block([self.parse_if()])
-            else:
+            elif self.peek().kind == TokenKind.LBrace:
                 else_body = self.parse_block()
+            else:
+                else_body = Block([self.parse_stmt()])
         return IfExpr(cond, then_body, else_body)
 
     def parse_block(self):
@@ -691,7 +759,9 @@ class Parser:
 
     def parse_switch(self):
         self.expect(TokenKind.Switch)
+        self.match(TokenKind.LParen)
         expr = self.parse_expr()
+        self.expect(TokenKind.Rparen)
         self.expect(TokenKind.LBrace)
         cases = []
         default = None
@@ -701,22 +771,26 @@ class Parser:
                 self.advance()
                 self.expect(TokenKind.Colon)
                 stmts = []
-                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Default):
+                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Case, TokenKind.Default):
                     stmts.append(self.parse_stmt())
                 default = Block(stmts)
-            else:
+            elif t.kind == TokenKind.Case:
+                self.advance()
                 val = self.parse_expr()
                 self.expect(TokenKind.Colon)
                 stmts = []
-                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Default):
+                while self.peek().kind not in (TokenKind.RBrace, TokenKind.Case, TokenKind.Default):
                     stmts.append(self.parse_stmt())
                 cases.append((val, Block(stmts)))
+            else:
+                self.advance()
         self.expect(TokenKind.RBrace)
         return SwitchStmt(expr, cases, default)
 
-    def parse_struct_fields(self):
+    def parse_struct_fields_and_methods(self):
         self.expect(TokenKind.LBrace)
         fields = []
+        methods = []
         while self.peek().kind != TokenKind.RBrace:
             if self.peek().kind in (TokenKind.Pub, TokenKind.Extern):
                 self.advance()
@@ -724,31 +798,48 @@ class Parser:
                 self.advance()
             if self.peek().kind == TokenKind.Extend:
                 break
+
             tp = self.parse_type()
-            name_tok = self.advance()
-            name = name_tok.value
-            if self.peek().kind == TokenKind.LParen:
-                depth = 1
+            name_tok = self.peek()
+            if name_tok.kind == TokenKind.Ident:
                 self.advance()
-                while depth > 0 and not self.is_at_end():
-                    if self.peek().kind == TokenKind.LParen:
-                        depth += 1
-                    elif self.peek().kind == TokenKind.Rparen:
-                        depth -= 1
-                    self.advance()
-                if self.peek().kind == TokenKind.LBrace:
-                    depth = 1
-                    self.advance()
-                    while depth > 0 and not self.is_at_end():
-                        if self.peek().kind == TokenKind.LBrace:
-                            depth += 1
-                        elif self.peek().kind == TokenKind.RBrace:
-                            depth -= 1
+                name = name_tok.value
+            elif name_tok.kind in (TokenKind.LParen, TokenKind.Rparen):
+                break
+            else:
+                break
+
+            if self.peek().kind == TokenKind.LParen:
+                self.expect(TokenKind.LParen)
+                params = []
+                if self.peek().kind != TokenKind.Rparen:
+                    if self.peek().kind == TokenKind.Self:
                         self.advance()
+                        params.append(ParamDecl(TypeIdent("self"), "self"))
+                        while self.match(TokenKind.Comma):
+                            ptp = self.parse_type()
+                            pname = self.expect(TokenKind.Ident).value
+                            params.append(ParamDecl(ptp, pname))
+                    else:
+                        ptp = self.parse_type()
+                        pname = self.expect(TokenKind.Ident).value
+                        params.append(ParamDecl(ptp, pname))
+                        while self.match(TokenKind.Comma):
+                            ptp = self.parse_type()
+                            pname = self.expect(TokenKind.Ident).value
+                            params.append(ParamDecl(ptp, pname))
+                self.expect(TokenKind.Rparen)
+                body = self.parse_block()
+                methods.append(FuncDecl(name, params, tp, body, False, False, False, False, None))
                 continue
+
             fields.append(FieldDecl(tp, name))
             self.match(TokenKind.Semicolon)
         self.expect(TokenKind.RBrace)
+        return fields, methods
+
+    def parse_struct_fields(self):
+        fields, _ = self.parse_struct_fields_and_methods()
         return fields
 
     def is_at_end(self):
@@ -889,8 +980,8 @@ class Parser:
                         continue
                     self.advance()
                     name = self.expect(TokenKind.Ident).value
-                    fields = self.parse_struct_fields()
-                    decls.append(StructDecl(name, fields, True))
+                    fields, methods = self.parse_struct_fields_and_methods()
+                    decls.append(StructDecl(name, fields, True, methods))
                     continue
                 if self.peek().kind in (TokenKind.Extern, TokenKind.Static):
                     is_extern = self.peek().kind == TokenKind.Extern
@@ -944,8 +1035,8 @@ class Parser:
             if t.kind == TokenKind.Struct:
                 self.advance()
                 name = self.expect(TokenKind.Ident).value
-                fields = self.parse_struct_fields()
-                decls.append(StructDecl(name, fields, False))
+                fields, methods = self.parse_struct_fields_and_methods()
+                decls.append(StructDecl(name, fields, False, methods))
                 continue
 
             if t.kind in (TokenKind.Extern, TokenKind.Static):
