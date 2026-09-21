@@ -1027,7 +1027,13 @@ class Parser:
 
     def parse_builtin_call(self):
         self.expect(TokenKind.At)
-        name = self.expect(TokenKind.Ident).value
+        t = self.peek()
+        if t.kind in (TokenKind.BuiltinAssert, TokenKind.BuiltinSizeof,
+                      TokenKind.BuiltinAlignof, TokenKind.BuiltinTypeof):
+            self.advance()
+            name = t.value if t.value else t.kind.lower().replace("builtin", "")
+        else:
+            name = self.expect(TokenKind.Ident).value
         args = []
         if self.match(TokenKind.LParen):
             if self.peek().kind != TokenKind.Rparen:
