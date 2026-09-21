@@ -37,6 +37,7 @@ class CodeGen:
         self.current_file = None
         self.suppress_main = False
         self.tuple_types = {}
+        self.local_types = {}
         self.current_self_type = None
         self.current_return_type = None
         self.pointer_fields = {}
@@ -116,6 +117,13 @@ class CodeGen:
                 method_name = self.gen_expr(node.func.field)
                 all_args = "self" + (", " + args if args else "")
                 return f"{obj_type}_{method_name}({all_args})"
+            if isinstance(node.func, DotExpr) and isinstance(node.func.obj, Ident):
+                obj_name = node.func.obj.name
+                if obj_name in self.local_types:
+                    obj_type = self.local_types[obj_name]
+                    method_name = self.gen_expr(node.func.field)
+                    all_args = obj_name + (", " + args if args else "")
+                    return f"{obj_type}_{method_name}({all_args})"
             if isinstance(node.func, DotExpr) and isinstance(node.func.obj, DotExpr) and isinstance(node.func.obj.obj, Ident) and node.func.obj.obj.name == "self":
                 outer_field = self.gen_expr(node.func.obj.field)
                 method_name = self.gen_expr(node.func.field)
@@ -137,6 +145,22 @@ class CodeGen:
             left = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
             return f"{left}_{right}"
+        if isinstance(node, StructLiteral):
+            te = node.type_expr
+            if hasattr(te, 'left') and hasattr(te, 'right'):
+                tn = self.gen_expr(te.left)
+                vn = self.gen_expr(te.right)
+                fields = ", ".join(
+                    f".{fn} = {self.gen_expr(fv)}"
+                    for fn, fv in zip(node.field_names, node.field_values)
+                )
+                return f"({tn}){{ .tag = {tn}_{vn}, .payload.{vn} = {{{fields}}} }}"
+            tname = self.gen_expr(te)
+            fields = ", ".join(
+                f".{fn} = {self.gen_expr(fv)}"
+                for fn, fv in zip(node.field_names, node.field_values)
+            )
+            return f"({tname}){{{fields}}}"
         if isinstance(node, StarDotExpr):
             return f"{self.gen_expr(node.obj)}->{self.gen_expr(node.field)}"
         if isinstance(node, IndexExpr):
@@ -183,6 +207,8 @@ class CodeGen:
         if isinstance(node, VarDecl):
             tp = self.gen_type(node.type_node)
             name = node.name
+            base_tp = tp.rstrip('*').strip()
+            self.local_types[name] = base_tp
             if node.init_expr:
                 self.emit(f"{tp} {name} = {self.gen_expr(node.init_expr)};\n")
             else:
@@ -346,6 +372,8 @@ class CodeGen:
         name = node.name
         saved_return = self.current_return_type
         self.current_return_type = ret
+        saved_locals = self.local_types
+        self.local_types = {}
 
         if node.self_type:
             st = self.gen_type(node.self_type)
@@ -361,6 +389,8 @@ class CodeGen:
             else:
                 tp = self.gen_type(p.type_node)
                 params.append(f"{tp} {p.name}")
+                if p.name != "self":
+                    self.local_types[p.name] = tp.rstrip('*').strip()
 
         param_str = ", ".join(params)
 
@@ -376,6 +406,7 @@ class CodeGen:
         self.gen_block(node.body)
         self.emit("\n")
         self.current_return_type = saved_return
+        self.local_types = saved_locals
 
     def gen_struct(self, node):
         self.struct_names.add(node.name)
