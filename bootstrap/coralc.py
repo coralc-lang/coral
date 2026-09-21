@@ -80,7 +80,7 @@ def topological_sort(graph):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: coralc <file.crl> [-o output] [--no-compile]")
+        print("usage: coralc <file.crl> [-o output] [--no-compile] [--flag NAME=VALUE]")
         sys.exit(1)
 
     input_path = sys.argv[1]
@@ -89,6 +89,14 @@ def main():
     if "-o" in sys.argv:
         idx = sys.argv.index("-o")
         output_path = sys.argv[idx + 1]
+
+    flags = {}
+    for i, arg in enumerate(sys.argv):
+        if arg == "--flag" and i + 1 < len(sys.argv):
+            val = sys.argv[i + 1]
+            if "=" in val:
+                k, v = val.split("=", 1)
+                flags[k] = v
 
     from parser import StructDecl, EnumDecl, ExtendBlock
     from codegen import CodeGen
@@ -101,6 +109,7 @@ def main():
     ordered = topological_sort(dep_graph)
 
     gen = CodeGen()
+    gen.flags = flags
     for path in ordered:
         ast = all_asts[path]
         for d in ast.decls:

@@ -286,6 +286,98 @@ class TernaryExpr(Node):
         self.else_expr = else_expr
 
 
+class VariantDecl(Node):
+    def __init__(self, name, variants, is_pub=False, generic_params=None):
+        self.name = name
+        self.variants = variants
+        self.is_pub = is_pub
+        self.generic_params = generic_params or []
+
+
+class VariantVariant(Node):
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields
+
+
+class VariantField(Node):
+    def __init__(self, type_node, name):
+        self.type_node = type_node
+        self.name = name
+
+
+class UnionDecl(Node):
+    def __init__(self, name, fields, is_pub=False):
+        self.name = name
+        self.fields = fields
+        self.is_pub = is_pub
+
+
+class TraitDecl(Node):
+    def __init__(self, name, methods, is_pub=False):
+        self.name = name
+        self.methods = methods
+        self.is_pub = is_pub
+
+
+class ExtendTraitBlock(Node):
+    def __init__(self, type_node, trait_name, methods):
+        self.type_node = type_node
+        self.trait_name = trait_name
+        self.methods = methods
+
+
+class DistinctDecl(Node):
+    def __init__(self, name, base_type, is_pub=False):
+        self.name = name
+        self.base_type = base_type
+        self.is_pub = is_pub
+
+
+class FlagDecl(Node):
+    def __init__(self, flag_name, branches):
+        self.flag_name = flag_name
+        self.branches = branches
+
+
+class FlagBranch(Node):
+    def __init__(self, label, stmts):
+        self.label = label
+        self.stmts = stmts
+
+
+class ComptimeBlock(Node):
+    def __init__(self, stmts):
+        self.stmts = stmts
+
+
+class AsmStmt(Node):
+    def __init__(self, volatile, template, outputs, inputs, clobbers):
+        self.volatile = volatile
+        self.template = template
+        self.outputs = outputs
+        self.inputs = inputs
+        self.clobbers = clobbers
+
+
+class LoopStmt(Node):
+    def __init__(self, body):
+        self.body = body
+
+
+class ForInStmt(Node):
+    def __init__(self, binding, iter_expr, body):
+        self.binding = binding
+        self.iter_expr = iter_expr
+        self.body = body
+
+
+class BuiltinCall(Node):
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
+
+
 class Parser:
     def __init__(self, tokens, filename):
         self.tokens = tokens
@@ -684,6 +776,28 @@ class Parser:
         if t.kind == TokenKind.For:
             self.advance()
             self.match(TokenKind.LParen)
+            saved_pos = self.pos
+            has_var = self.match(TokenKind.Var)
+            if has_var or (self.peek().kind == TokenKind.Ident and self.peek2().kind in (TokenKind.Colon, TokenKind.Comma)):
+                if has_var:
+                    binding_name = self.expect(TokenKind.Ident).value
+                else:
+                    binding_name = self.expect(TokenKind.Ident).value
+                if self.peek().kind == TokenKind.Colon:
+                    self.advance()
+                    iter_expr = self.parse_expr()
+                    self.expect(TokenKind.Rparen)
+                    if self.peek().kind == TokenKind.LBrace:
+                        body = self.parse_block()
+                    else:
+                        body = Block([self.parse_stmt()])
+                    return ForInStmt(binding_name, iter_expr, body)
+                else:
+                    self.pos = saved_pos
+                    if has_var:
+                        self.pos -= 1
+            else:
+                self.pos = saved_pos
             init = None
             if self.peek().kind != TokenKind.Semicolon:
                 init = self.parse_stmt()
@@ -706,6 +820,28 @@ class Parser:
         if t.kind == TokenKind.Switch:
             return self.parse_switch()
 
+        if t.kind == TokenKind.Loop:
+            self.advance()
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block()
+            else:
+                body = Block([self.parse_stmt()])
+            return LoopStmt(body)
+
+        if t.kind == TokenKind.Comptime:
+            self.advance()
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block()
+            else:
+                body = Block([self.parse_stmt()])
+            return ComptimeBlock(body.stmts)
+
+        if t.kind == TokenKind.Asm:
+            return self.parse_asm()
+
+        if t.kind == TokenKind.At:
+            return self.parse_builtin_call()
+
         if t.kind == TokenKind.Struct or t.kind in (
                 TokenKind.Void, TokenKind.Bool, TokenKind.CharType,
                 TokenKind.U8, TokenKind.I8, TokenKind.U16, TokenKind.I16,
@@ -722,7 +858,7 @@ class Parser:
 
         if t.kind == TokenKind.Ident:
             peek2 = self.peek2()
-            if peek2.kind == TokenKind.Ident:
+            if peek2.kind in (TokenKind.Ident, TokenKind.Star):
                 tp = self.parse_type()
                 name = self.expect(TokenKind.Ident).value
                 init_expr = None
@@ -833,6 +969,69 @@ class Parser:
             return parts[0]
         return OrPattern(parts)
 
+    def parse_asm(self):
+        self.expect(TokenKind.Asm)
+        volatile = self.match(TokenKind.Volatile) is not None
+        self.expect(TokenKind.LBrace)
+        template = []
+        while self.peek().kind != TokenKind.RBrace:
+            if self.peek().kind == TokenKind.String:
+                template.append(self.advance().value)
+            else:
+                self.advance()
+        self.expect(TokenKind.RBrace)
+        self.match(TokenKind.Semicolon)
+        return AsmStmt(volatile, template, [], [], [])
+
+    def parse_builtin_call(self):
+        self.expect(TokenKind.At)
+        name = self.expect(TokenKind.Ident).value
+        args = []
+        if self.match(TokenKind.LParen):
+            if self.peek().kind != TokenKind.Rparen:
+                args.append(self.parse_expr())
+                while self.match(TokenKind.Comma):
+                    args.append(self.parse_expr())
+            self.expect(TokenKind.Rparen)
+        return BuiltinCall(name, args)
+
+    def parse_variant_decl(self, is_pub=False):
+        self.expect(TokenKind.Variant)
+        name = self.expect(TokenKind.Ident).value
+        generic_params = []
+        if self.match(TokenKind.Less):
+            while self.peek().kind != TokenKind.Greater:
+                gp = self.expect(TokenKind.Ident).value
+                generic_params.append(gp)
+                self.match(TokenKind.Comma)
+            self.expect(TokenKind.Greater)
+        self.expect(TokenKind.LBrace)
+        variants = []
+        while self.peek().kind != TokenKind.RBrace:
+            vname = self.expect(TokenKind.Ident).value
+            vfields = []
+            if self.peek().kind == TokenKind.LBrace:
+                self.advance()
+                while self.peek().kind != TokenKind.RBrace:
+                    ftp = self.parse_type()
+                    fname = self.expect(TokenKind.Ident).value
+                    vfields.append(VariantField(ftp, fname))
+                    self.match(TokenKind.Comma)
+                self.expect(TokenKind.RBrace)
+            variants.append(VariantVariant(vname, vfields))
+            self.match(TokenKind.Comma)
+        self.expect(TokenKind.RBrace)
+        methods = []
+        if self.peek().kind == TokenKind.LBrace:
+            self.expect(TokenKind.LBrace)
+            while self.peek().kind != TokenKind.RBrace:
+                is_mpub = self.match(TokenKind.Pub) is not None
+                is_mextern = self.match(TokenKind.Extern) is not None
+                is_mstatic = self.match(TokenKind.Static) is not None
+                methods.append(self.parse_func(is_mpub, is_mextern, is_mstatic))
+            self.expect(TokenKind.RBrace)
+        return VariantDecl(name, variants, is_pub, generic_params), methods
+
     def parse_struct_fields_and_methods(self):
         self.expect(TokenKind.LBrace)
         fields = []
@@ -843,6 +1042,8 @@ class Parser:
             if self.peek().kind == TokenKind.Static:
                 self.advance()
             if self.peek().kind == TokenKind.Extend:
+                break
+            if self.peek().kind == TokenKind.RBrace:
                 break
 
             tp = self.parse_type()
@@ -928,14 +1129,25 @@ class Parser:
                 self.advance()
                 params.append(ParamDecl(TypeIdent("self"), "self"))
                 while self.match(TokenKind.Comma):
+                    if self.peek().kind == TokenKind.Ellipsis:
+                        self.advance()
+                        params.append(ParamDecl(TypeIdent("..."), "..."))
+                        break
                     tp = self.parse_type()
                     pname = self.expect(TokenKind.Ident).value
                     params.append(ParamDecl(tp, pname))
+            elif self.peek().kind == TokenKind.Ellipsis:
+                self.advance()
+                params.append(ParamDecl(TypeIdent("..."), "..."))
             else:
                 tp = self.parse_type()
                 pname = self.expect(TokenKind.Ident).value
                 params.append(ParamDecl(tp, pname))
                 while self.match(TokenKind.Comma):
+                    if self.peek().kind == TokenKind.Ellipsis:
+                        self.advance()
+                        params.append(ParamDecl(TypeIdent("..."), "..."))
+                        break
                     tp = self.parse_type()
                     pname = self.expect(TokenKind.Ident).value
                     params.append(ParamDecl(tp, pname))
@@ -1038,6 +1250,41 @@ class Parser:
                     fields, methods = self.parse_struct_fields_and_methods()
                     decls.append(StructDecl(name, fields, True, methods))
                     continue
+                if self.peek().kind == TokenKind.Variant:
+                    variant, variant_methods = self.parse_variant_decl(True)
+                    decls.append(variant)
+                    for m in variant_methods:
+                        decls.append(m)
+                    continue
+                if self.peek().kind == TokenKind.Union:
+                    self.advance()
+                    name = self.expect(TokenKind.Ident).value
+                    fields, methods = self.parse_struct_fields_and_methods()
+                    decls.append(UnionDecl(name, fields, True))
+                    for m in methods:
+                        decls.append(m)
+                    continue
+                if self.peek().kind == TokenKind.Trait:
+                    self.advance()
+                    name = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.LBrace)
+                    methods = []
+                    while self.peek().kind != TokenKind.RBrace:
+                        is_mpub = self.match(TokenKind.Pub) is not None
+                        is_mextern = self.match(TokenKind.Extern) is not None
+                        is_mstatic = self.match(TokenKind.Static) is not None
+                        methods.append(self.parse_func(is_mpub, is_mextern, is_mstatic))
+                    self.expect(TokenKind.RBrace)
+                    decls.append(TraitDecl(name, methods, True))
+                    continue
+                if self.peek().kind == TokenKind.Distinct:
+                    self.advance()
+                    name = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.Equal)
+                    base = self.parse_type()
+                    self.match(TokenKind.Semicolon)
+                    decls.append(DistinctDecl(name, base, True))
+                    continue
                 if self.peek().kind in (TokenKind.Extern, TokenKind.Static):
                     is_extern = self.peek().kind == TokenKind.Extern
                     is_static = self.peek().kind == TokenKind.Static
@@ -1052,6 +1299,9 @@ class Parser:
             if t.kind == TokenKind.Extend:
                 self.advance()
                 tp = self.parse_type()
+                trait_name = None
+                if self.match(TokenKind.Colon):
+                    trait_name = self.expect(TokenKind.Ident).value
                 self.expect(TokenKind.LBrace)
                 methods = []
                 while self.peek().kind != TokenKind.RBrace:
@@ -1060,7 +1310,10 @@ class Parser:
                     is_static = self.match(TokenKind.Static) is not None
                     methods.append(self.parse_func(is_pub, is_extern, is_static, tp))
                 self.expect(TokenKind.RBrace)
-                decls.append(ExtendBlock(tp, methods))
+                if trait_name:
+                    decls.append(ExtendTraitBlock(tp, trait_name, methods))
+                else:
+                    decls.append(ExtendBlock(tp, methods))
                 continue
 
             if t.kind == TokenKind.Mod:
@@ -1094,10 +1347,71 @@ class Parser:
                 decls.append(StructDecl(name, fields, False, methods))
                 continue
 
+            if t.kind == TokenKind.Variant:
+                variant, variant_methods = self.parse_variant_decl(False)
+                decls.append(variant)
+                for m in variant_methods:
+                    decls.append(m)
+                continue
+
+            if t.kind == TokenKind.Union:
+                self.advance()
+                name = self.expect(TokenKind.Ident).value
+                fields, methods = self.parse_struct_fields_and_methods()
+                decls.append(UnionDecl(name, fields, False))
+                for m in methods:
+                    decls.append(m)
+                continue
+
+            if t.kind == TokenKind.Trait:
+                self.advance()
+                name = self.expect(TokenKind.Ident).value
+                self.expect(TokenKind.LBrace)
+                methods = []
+                while self.peek().kind != TokenKind.RBrace:
+                    is_mpub = self.match(TokenKind.Pub) is not None
+                    is_mextern = self.match(TokenKind.Extern) is not None
+                    is_mstatic = self.match(TokenKind.Static) is not None
+                    methods.append(self.parse_func(is_mpub, is_mextern, is_mstatic))
+                self.expect(TokenKind.RBrace)
+                decls.append(TraitDecl(name, methods, False))
+                continue
+
+            if t.kind == TokenKind.Distinct:
+                self.advance()
+                name = self.expect(TokenKind.Ident).value
+                self.expect(TokenKind.Equal)
+                base = self.parse_type()
+                self.match(TokenKind.Semicolon)
+                decls.append(DistinctDecl(name, base, False))
+                continue
+
+            if t.kind == TokenKind.Flag:
+                self.advance()
+                flag_name = self.expect(TokenKind.Ident).value
+                self.expect(TokenKind.LBrace)
+                branches = []
+                while self.peek().kind != TokenKind.RBrace:
+                    label = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.Colon)
+                    stmts = []
+                    while self.peek().kind not in (TokenKind.Ident, TokenKind.RBrace):
+                        stmts.append(self.parse_stmt())
+                    branches.append(FlagBranch(label, stmts))
+                self.expect(TokenKind.RBrace)
+                self.match(TokenKind.Semicolon)
+                decls.append(FlagDecl(flag_name, branches))
+                continue
+
             if t.kind in (TokenKind.Extern, TokenKind.Static):
                 is_extern = t.kind == TokenKind.Extern
                 is_static = t.kind == TokenKind.Static
                 self.advance()
+                if is_extern and self.peek().kind == TokenKind.LParen:
+                    self.advance()
+                    while self.peek().kind != TokenKind.Rparen:
+                        self.advance()
+                    self.expect(TokenKind.Rparen)
                 func = self.parse_func(False, is_extern, is_static)
                 decls.append(func)
                 continue

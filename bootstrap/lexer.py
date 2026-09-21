@@ -444,7 +444,7 @@ class Lexer:
                 self.advance()
                 return self.make_token(TokenKind.StarDot, start)
             if c == "." and nxt == ".":
-                if self.pos + 2 < len(self.source) and self.source[self.pos + 2] == ".":
+                if self.pos + 1 < len(self.source) and self.source[self.pos + 1] == ".":
                     self.advance()
                     self.advance()
                     return self.make_token(TokenKind.Ellipsis, start)

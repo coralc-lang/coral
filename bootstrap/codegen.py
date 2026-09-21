@@ -39,6 +39,9 @@ class CodeGen:
         self.tuple_types = {}
         self.current_self_type = None
         self.current_return_type = None
+        self.pointer_fields = {}
+        self.field_type_names = {}
+        self.flags = {}
 
     def set_current_file(self, path):
         self.current_file = path
@@ -111,6 +114,14 @@ class CodeGen:
                 method_name = self.gen_expr(node.func.field)
                 all_args = "self" + (", " + args if args else "")
                 return f"{obj_type}_{method_name}({all_args})"
+            if isinstance(node.func, DotExpr) and isinstance(node.func.obj, DotExpr) and isinstance(node.func.obj.obj, Ident) and node.func.obj.obj.name == "self":
+                outer_field = self.gen_expr(node.func.obj.field)
+                method_name = self.gen_expr(node.func.field)
+                st = self.current_self_type or "Lexer"
+                type_name = self.field_type_names.get((st, outer_field), outer_field.capitalize())
+                inner_arg = f"self->{outer_field}"
+                all_args = inner_arg + (", " + args if args else "")
+                return f"{type_name}_{method_name}({all_args})"
             return f"{func_name}({args})"
         if isinstance(node, DotExpr):
             obj_str = self.gen_expr(node.obj)
@@ -140,6 +151,18 @@ class CodeGen:
             if self.current_return_type:
                 return f"({self.current_return_type}){{ " + ", ".join(self.gen_expr(e) for e in node.exprs) + " }"
             return "{ " + ", ".join(self.gen_expr(e) for e in node.exprs) + " }"
+        if isinstance(node, BuiltinCall):
+            if node.name == "assert":
+                return f"assert({self.gen_expr(node.args[0]) if node.args else ''})"
+            elif node.name == "alignof":
+                return f"_Alignof({self.gen_expr(node.args[0])})"
+            elif node.name == "sizeof":
+                return f"sizeof({self.gen_expr(node.args[0])})"
+            elif node.name == "typeof":
+                return f"typeof({self.gen_expr(node.args[0])})"
+            elif node.name == "offsetof":
+                return f"__builtin_offsetof({self.gen_type(node.args[0])}, {self.gen_expr(node.args[1])})"
+            return f"/* @builtin {node.name} */"
         if isinstance(node, Block):
             return "(void)0"
         return "/* unhandled expr */"
@@ -212,6 +235,63 @@ class CodeGen:
             self.gen_block(node.body)
             self.emit("\n")
             return
+        if isinstance(node, ForInStmt):
+            self.emit(f"for (size_t _idx = 0; _idx < {self.gen_expr(node.iter_expr)}.len; _idx++) ")
+            if isinstance(node.body, Block):
+                self.emit("{\n")
+                self.indent_level += 1
+                self.emit_indent()
+                self.emit(f"{BUILTIN_TYPES.get('char', 'char')} {node.binding} = ")
+                self.emit(f"((char*){self.gen_expr(node.iter_expr)}.ptr)[_idx];\n")
+                for stmt in node.body.stmts:
+                    self.gen_stmt(stmt)
+                self.indent_level -= 1
+                self.emit_indent()
+                self.emit("}\n")
+            else:
+                self.emit("{\n")
+                self.indent_level += 1
+                self.emit_indent()
+                self.emit(f"{BUILTIN_TYPES.get('char', 'char')} {node.binding} = ")
+                self.emit(f"((char*){self.gen_expr(node.iter_expr)}.ptr)[_idx];\n")
+                self.gen_stmt(node.body)
+                self.indent_level -= 1
+                self.emit_indent()
+                self.emit("}\n")
+            return
+        if isinstance(node, LoopStmt):
+            self.emit("while (1) ")
+            self.gen_block(node.body)
+            self.emit("\n")
+            return
+        if isinstance(node, ComptimeBlock):
+            for s in node.stmts:
+                self.gen_stmt(s)
+            return
+        if isinstance(node, AsmStmt):
+            self.emit("asm ")
+            if node.volatile:
+                self.emit("volatile ")
+            self.emit("(\n")
+            self.indent_level += 1
+            self.emit_indent()
+            parts = " \\n ".join(f"\"{p}\"" for p in node.template)
+            self.emit(f"{parts}\n")
+            self.indent_level -= 1
+            self.emit_indent()
+            self.emit(");\n")
+            return
+        if isinstance(node, BuiltinCall):
+            if node.name == "assert":
+                self.emit(f"assert({self.gen_expr(node.args[0]) if node.args else ''});\n")
+            elif node.name == "alignof":
+                self.emit(f"_Alignof({self.gen_expr(node.args[0])});\n")
+            elif node.name == "typeof":
+                self.emit(f"typeof({self.gen_expr(node.args[0])});\n")
+            else:
+                self.emit(f"/* @builtin {node.name} */;\n")
+            return
+            return
         if isinstance(node, SwitchStmt):
             self.emit(f"switch ({self.gen_expr(node.expr)}) {{\n")
             self.indent += 1
@@ -274,8 +354,11 @@ class CodeGen:
 
         params = []
         for p in node.params:
-            tp = self.gen_type(p.type_node)
-            params.append(f"{tp} {p.name}")
+            if p.name == "...":
+                params.append("...")
+            else:
+                tp = self.gen_type(p.type_node)
+                params.append(f"{tp} {p.name}")
 
         param_str = ", ".join(params)
 
@@ -296,8 +379,16 @@ class CodeGen:
         self.struct_names.add(node.name)
         name = node.name
         self.emit(f"typedef struct {name} {{\n")
+        self.pointer_fields[name] = set()
         for f in node.fields:
             self.emit(f"    {self.gen_type(f.type_node)} {f.name};\n")
+            if isinstance(f.type_node, PointerType):
+                self.pointer_fields[name].add(f.name)
+                base = f.type_node.base
+                while isinstance(base, PointerType):
+                    base = base.base
+                if isinstance(base, TypeIdent):
+                    self.field_type_names[(name, f.name)] = base.name
         self.emit(f"}} {name};\n\n")
         for method in node.methods:
             st = name
@@ -307,9 +398,15 @@ class CodeGen:
             saved_return = self.current_return_type
             ret = self.gen_type(method.return_type)
             self.current_return_type = ret
-            params = [f"{st}* self"] + [
-                f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
-            ]
+            has_self = any(p.name == "self" for p in method.params)
+            if has_self:
+                params = [f"{st}* self"] + [
+                    f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                ]
+            else:
+                params = [
+                    f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                ]
             param_str = ", ".join(params)
             if method.is_extern:
                 self.emit_indent()
@@ -331,6 +428,61 @@ class CodeGen:
                 self.emit(f"    {node.name}_{v},\n")
         self.emit(f"}};\n\n")
 
+    def gen_variant(self, node):
+        name = node.name
+        tag_name = f"{name}_tag"
+        self.emit(f"enum {tag_name} {{\n")
+        for i, v in enumerate(node.variants):
+            if i == 0:
+                self.emit(f"    {name}_{v.name} = 0,\n")
+            else:
+                self.emit(f"    {name}_{v.name},\n")
+        self.emit(f"}};\n\n")
+        self.emit(f"typedef struct {name} {{\n")
+        self.emit(f"    enum {tag_name} tag;\n")
+        if any(len(v.fields) > 0 for v in node.variants):
+            self.emit(f"    union {{\n")
+            for v in node.variants:
+                if len(v.fields) > 0:
+                    self.emit(f"        struct {{\n")
+                    for f in v.fields:
+                        self.emit(f"            {self.gen_type(f.type_node)} {f.name};\n")
+                    self.emit(f"        }} {v.name};\n")
+            self.emit(f"    }} payload;\n")
+        self.emit(f"}} {name};\n\n")
+        for method in node.methods:
+            st = name
+            method.self_type = TypeIdent(name)
+            saved = self.current_self_type
+            self.current_self_type = st
+            ret = self.gen_type(method.return_type)
+            has_self = any(p.name == "self" for p in method.params)
+            if has_self:
+                params = [f"{st}* self"] + [
+                    f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                ]
+            else:
+                params = [
+                    f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                ]
+            param_str = ", ".join(params)
+            if method.is_extern:
+                self.emit_indent()
+                self.emit(f"extern {ret} {st}_{method.name}({param_str});\n")
+            else:
+                self.emit_indent()
+                self.emit(f"{ret} {st}_{method.name}({param_str}) ")
+                self.gen_block(method.body)
+                self.emit("\n")
+            self.current_self_type = saved
+
+    def gen_union(self, node):
+        name = node.name
+        self.emit(f"typedef union {name} {{\n")
+        for f in node.fields:
+            self.emit(f"    {self.gen_type(f.type_node)} {f.name};\n")
+        self.emit(f"}} {name};\n\n")
+
     def gen_tuple_typedefs(self):
         for name, types in self.tuple_types.items():
             self.emit(f"typedef struct {name} {{\n")
@@ -340,15 +492,60 @@ class CodeGen:
         if self.tuple_types:
             self.emit("\n")
 
+    def collect_tuple_types(self, node):
+        if isinstance(node, TupleType):
+            name = tuple_type_name(node.types)
+            if name not in self.tuple_types:
+                self.tuple_types[name] = node.types
+        elif isinstance(node, PointerType):
+            self.collect_tuple_types(node.base)
+        elif isinstance(node, ArrayType):
+            self.collect_tuple_types(node.base)
+        elif isinstance(node, ConstType):
+            self.collect_tuple_types(node.base)
+        elif isinstance(node, FuncDecl):
+            self.collect_tuple_types(node.return_type)
+            for p in node.params:
+                self.collect_tuple_types(p.type_node)
+        elif isinstance(node, ParamDecl):
+            self.collect_tuple_types(node.type_node)
+        elif isinstance(node, FieldDecl):
+            self.collect_tuple_types(node.type_node)
+        elif isinstance(node, StructDecl):
+            for f in node.fields:
+                self.collect_tuple_types(f)
+            for m in node.methods:
+                self.collect_tuple_types(m)
+        elif isinstance(node, ExtendBlock):
+            for m in node.methods:
+                self.collect_tuple_types(m)
+
+    def collect_ast_tuple_types(self, ast):
+        for decl in ast.decls:
+            self.collect_tuple_types(decl)
+
     def generate(self, ast):
         self.emit("#include <stdint.h>\n")
         self.emit("#include <stddef.h>\n")
         self.emit("#include <stdbool.h>\n")
         self.emit("#include <string.h>\n")
-        self.emit("#include <stdlib.h>\n")
-        self.emit("#include <stdio.h>\n\n")
+        self.emit("#include <stdlib.h>\n\n")
 
         self.emit("typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n\n")
+
+        self.collect_ast_tuple_types(ast)
+
+        for decl in ast.decls:
+            if isinstance(decl, StructDecl):
+                self.struct_names.add(decl.name)
+            elif isinstance(decl, EnumDecl):
+                self.enum_names.add(decl.name)
+            elif isinstance(decl, VariantDecl):
+                self.struct_names.add(decl.name)
+            elif isinstance(decl, UnionDecl):
+                self.struct_names.add(decl.name)
+            elif isinstance(decl, DistinctDecl):
+                self.struct_names.add(decl.name)
 
         for name in self.struct_names:
             self.emit(f"typedef struct {name} {name};\n")
@@ -358,10 +555,108 @@ class CodeGen:
             self.emit("\n")
 
         for decl in ast.decls:
+            if isinstance(decl, FuncDecl) and decl.is_extern:
+                ret = self.gen_type(decl.return_type)
+                params = []
+                for p in decl.params:
+                    if p.name == "...":
+                        params.append("...")
+                    else:
+                        tp = self.gen_type(p.type_node)
+                        params.append(f"{tp} {p.name}")
+                param_str = ", ".join(params)
+                self.emit(f"extern {ret} {decl.name}({param_str});\n")
+        self.emit("\n")
+
+        self.gen_tuple_typedefs()
+
+        for decl in ast.decls:
+            if isinstance(decl, FuncDecl):
+                if not decl.is_extern:
+                    ret = self.gen_type(decl.return_type)
+                    params = []
+                    for p in decl.params:
+                        if p.name == "...":
+                            params.append("...")
+                        else:
+                            tp = self.gen_type(p.type_node)
+                            params.append(f"{tp} {p.name}")
+                    param_str = ", ".join(params)
+                    self.emit(f"{ret} {decl.name}({param_str});\n")
+            elif isinstance(decl, StructDecl):
+                st = decl.name
+                for method in decl.methods:
+                    if method.is_extern:
+                        continue
+                    method.self_type = TypeIdent(st)
+                    ret = self.gen_type(method.return_type)
+                    has_self = any(p.name == "self" for p in method.params)
+                    if has_self:
+                        params = [f"{st}* self"] + [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                        ]
+                    else:
+                        params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
+                    param_str = ", ".join(params)
+                    self.emit(f"{ret} {st}_{method.name}({param_str});\n")
+            elif isinstance(decl, ExtendBlock):
+                st = self.gen_type(decl.type_node)
+                for method in decl.methods:
+                    if method.is_extern:
+                        continue
+                    ret = self.gen_type(method.return_type)
+                    has_self = any(p.name == "self" for p in method.params)
+                    if has_self:
+                        params = [f"{st}* self"] + [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                        ]
+                    else:
+                        params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
+                    param_str = ", ".join(params)
+                    self.emit(f"{ret} {st}_{method.name}({param_str});\n")
+            elif isinstance(decl, ExtendTraitBlock):
+                st = self.gen_type(decl.type_node)
+                for method in decl.methods:
+                    if method.is_extern:
+                        continue
+                    ret = self.gen_type(method.return_type)
+                    has_self = any(p.name == "self" for p in method.params)
+                    if has_self:
+                        params = [f"{st}* self"] + [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                        ]
+                    else:
+                        params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
+                    param_str = ", ".join(params)
+                    self.emit(f"{ret} {st}_{method.name}({param_str});\n")
+            elif isinstance(decl, VariantDecl):
+                pass
+            elif isinstance(decl, UnionDecl):
+                pass
+            elif isinstance(decl, DistinctDecl):
+                base = self.gen_type(decl.base_type)
+                self.emit(f"typedef {base} {decl.name};\n")
+            elif isinstance(decl, FlagDecl):
+                pass
+            elif isinstance(decl, TraitDecl):
+                pass
+        self.emit("\n")
+
+        for decl in ast.decls:
             if isinstance(decl, StructDecl):
                 self.gen_struct(decl)
             elif isinstance(decl, EnumDecl):
                 self.gen_enum(decl)
+            elif isinstance(decl, VariantDecl):
+                self.gen_variant(decl)
+            elif isinstance(decl, UnionDecl):
+                self.gen_union(decl)
 
         self.gen_tuple_typedefs()
 
@@ -376,9 +671,15 @@ class CodeGen:
                     saved = self.current_self_type
                     self.current_self_type = st
                     ret = self.gen_type(method.return_type)
-                    params = [f"{st}* self"] + [
-                        f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
-                    ]
+                    has_self = any(p.name == "self" for p in method.params)
+                    if has_self:
+                        params = [f"{st}* self"] + [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                        ]
+                    else:
+                        params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
                     param_str = ", ".join(params)
                     if method.is_extern:
                         self.emit_indent()
@@ -389,6 +690,51 @@ class CodeGen:
                         self.gen_block(method.body)
                         self.emit("\n")
                     self.current_self_type = saved
+            elif isinstance(decl, ExtendTraitBlock):
+                for method in decl.methods:
+                    st = self.gen_type(decl.type_node)
+                    st_name = st
+                    method.self_type = decl.type_node
+                    saved = self.current_self_type
+                    self.current_self_type = st
+                    ret = self.gen_type(method.return_type)
+                    has_self = any(p.name == "self" for p in method.params)
+                    if has_self:
+                        params = [f"{st}* self"] + [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
+                        ]
+                    else:
+                        params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
+                    param_str = ", ".join(params)
+                    if method.is_extern:
+                        self.emit_indent()
+                        self.emit(f"extern {ret} {st_name}_{method.name}({param_str});\n")
+                    else:
+                        self.emit_indent()
+                        self.emit(f"{ret} {st_name}_{method.name}({param_str}) ")
+                        self.gen_block(method.body)
+                        self.emit("\n")
+                    self.current_self_type = saved
+            elif isinstance(decl, FlagDecl):
+                target_branch = None
+                flag_val = self.flags.get(decl.flag_name)
+                if flag_val:
+                    for b in decl.branches:
+                        if b.label == flag_val:
+                            target_branch = b
+                            break
+                if target_branch is None:
+                    for b in decl.branches:
+                        if b.label == "default" or b.label == "else":
+                            target_branch = b
+                            break
+                if target_branch is None and decl.branches:
+                    target_branch = decl.branches[0]
+                if target_branch:
+                    for s in target_branch.stmts:
+                        self.gen_stmt(s)
 
         if not self.suppress_main:
             has_main = any(isinstance(d, FuncDecl) and d.name == "main" for d in ast.decls)
