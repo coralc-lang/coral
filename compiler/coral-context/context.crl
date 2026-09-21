@@ -1,0 +1,125 @@
+/* context/context.crl — AST context with arenas and interning
+ *
+ * Owns all compiler data: interned strings, uniqued types, AST nodes.
+ * Bump allocation: single large buffers, bump pointer, free all at once.
+ * Follows Clang's ASTContext + BumpPtrAllocator design.
+ */
+
+import "../coral-ast/id" { Str, SourceLoc, NodeId };
+import "../coral-ast/types" { Ty, TypeEntry };
+import "../coral-ast/node" { Node };
+
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr ptr);
+
+pub struct InternEntry
+{
+    u8* ptr;
+    usize len;
+    u32 id;
+}
+
+pub struct AstContext
+{
+    InternEntry* interns;
+    u32 internsLen;
+    u32 internsCap;
+    TypeEntry* types;
+    u32 typesLen;
+    u32 typesCap;
+    Node* nodes;
+    u32 nodesLen;
+    u32 nodesCap;
+}
+
+extend AstContext
+{
+    void init(u32 internCap, u32 typeCap, u32 nodeCap)
+    {
+        self.interns = malloc(internCap * 24);
+        self.internsLen = 1;
+        self.internsCap = internCap;
+        self.types = malloc(typeCap * 64);
+        self.typesLen = 1;
+        self.typesCap = typeCap;
+        self.nodes = malloc(nodeCap * 192);
+        self.nodesLen = 1;
+        self.nodesCap = nodeCap;
+    }
+
+    void deinit()
+    {
+        free(self.interns);
+        free(self.types);
+        free(self.nodes);
+    }
+
+    bool streq(u8* a, usize aLen, u8* b, usize bLen)
+    {
+        if (aLen != bLen) return false;
+        usize i = 0;
+        while (i < aLen)
+        {
+            u8* ap = a + i;
+            u8* bp = b + i;
+            if (ap[0] != bp[0]) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    u32 intern(u8* ptr, usize len)
+    {
+        u32 i = 0;
+        while (i < self.internsLen)
+        {
+            InternEntry* e = self.interns + i;
+            if (self.streq(e.ptr, e.len, ptr, len))
+            {
+                return e.id;
+            }
+            i = i + 1;
+        }
+        if (self.internsLen >= self.internsCap) return 0;
+        InternEntry* e = self.interns + self.internsLen;
+        e.ptr = ptr;
+        e.len = len;
+        e.id = self.internsLen;
+        self.internsLen = self.internsLen + 1;
+        return e.id;
+    }
+
+    Ty allocTypeSlot()
+    {
+        if (self.typesLen >= self.typesCap) return 0;
+        Ty id = self.typesLen;
+        self.typesLen = self.typesLen + 1;
+        return id;
+    }
+
+    NodeId allocNodeSlot()
+    {
+        if (self.nodesLen >= self.nodesCap)
+        {
+            NodeId n;
+            n.index = 0;
+            return n;
+        }
+        NodeId n;
+        n.index = self.nodesLen;
+        self.nodesLen = self.nodesLen + 1;
+        return n;
+    }
+
+    NodeId noneNode()
+    {
+        NodeId n;
+        n.index = 0;
+        return n;
+    }
+
+    u32 nodeCount()
+    {
+        return self.nodesLen;
+    }
+}
