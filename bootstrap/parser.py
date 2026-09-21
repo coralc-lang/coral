@@ -994,7 +994,7 @@ class Parser:
 
     def parse_switch_pattern(self):
         parts = []
-        part = self.parse_primary()
+        part = self.parse_postfix()
         if self.peek().kind == TokenKind.LBrace and isinstance(part, Ident):
             self.advance()
             fields = []
@@ -1006,7 +1006,7 @@ class Parser:
             return DestructPattern(part.name, fields)
         parts.append(part)
         while self.match(TokenKind.Pipe):
-            parts.append(self.parse_primary())
+            parts.append(self.parse_postfix())
         if len(parts) == 1:
             return parts[0]
         return OrPattern(parts)
