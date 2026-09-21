@@ -15,9 +15,10 @@
  *   Type { val, val2, val3 }
  *
  * Clang-inspired performance principles:
- *   - Flatten variants: split tag + data into parallel arrays
  *   - Sentinel NodeId: index=0 means absent, no NodeId* heap allocs
- *   - Move resolvedType to separate array (not inline in Expr)
+ *   - Bit-pack booleans: u8 flags instead of scattered bools
+ *   - Flatten variants: split tag + data into parallel arrays
+ *   - Ty is u32 (4 bytes) not inline TypeKind variant (64 bytes)
  */
 
 import "id" { Str, SourceLoc, NodeId }
@@ -28,11 +29,14 @@ pub variant ExprKind
 {
     IntLit {
         u64 value,
-        bool isNegative,
+        u8 flags,
+        /* flags bits:
+         *   bit 0 = isNegative
+         */
     },
 
     FloatLit {
-        f64 value,
+        Str value,
     },
 
     StringLit {
@@ -44,10 +48,14 @@ pub variant ExprKind
     },
 
     BoolLit {
-        bool value,
+        u8 flags,
+        /* flags bits:
+         *   bit 0 = value (true/false)
+         */
     },
 
     NullLit,
+
     Ident {
         Str name,
     },
@@ -58,7 +66,7 @@ pub variant ExprKind
     },
 
     Call {
-        NodeId func,
+        NodeId callee,
         NodeId* args,
         u32 argsLen,
     },
@@ -80,6 +88,11 @@ pub variant ExprKind
         Str field,
     },
 
+    Index {
+        NodeId obj,
+        NodeId index,
+    },
+
     StaticCall {
         Str typeName,
         Str method,
@@ -87,16 +100,24 @@ pub variant ExprKind
         u32 argsLen,
     },
 
-    Index {
-        NodeId obj,
-        NodeId index,
+    Cast {
+        NodeId expr,
+        Ty targetType,
     },
 
-    Not {
+    Sizeof {
+        Ty targetType,
+    },
+
+    Alignof {
+        Ty targetType,
+    },
+
+    Typeof {
         NodeId expr,
     },
 
-    Neg {
+    AddressOf {
         NodeId expr,
     },
 
@@ -104,7 +125,11 @@ pub variant ExprKind
         NodeId expr,
     },
 
-    AddrOf {
+    Neg {
+        NodeId expr,
+    },
+
+    Not {
         NodeId expr,
     },
 
@@ -198,72 +223,6 @@ pub variant ExprKind
         NodeId right,
     },
 
-    Cast {
-        Ty targetType,
-        NodeId expr,
-    },
-
-    Sizeof {
-        Ty targetType,
-    },
-
-    Alignof {
-        Ty targetType,
-    },
-
-    Typeof {
-        NodeId expr,
-    },
-
-    Ternary {
-        NodeId cond,
-        NodeId thenExpr,
-        NodeId elseExpr,
-    },
-
-    TupleField {
-        NodeId obj,
-        u32 index,
-    },
-
-    StructLiteral {
-        Ty typeNode,
-        Str* fieldNames,
-        NodeId* fieldValues,
-        u32 fieldValuesLen,
-    },
-
-    ArrayLiteral {
-        NodeId* elems,
-        u32 elemsLen,
-    },
-
-    BuiltinCall {
-        Str name,
-        NodeId* args,
-        u32 argsLen,
-    },
-
-    BlockExpr {
-        NodeId* stmts,
-        u32 stmtsLen,
-        NodeId* result,
-        bool hasResult,
-    },
-
-    IfExpr {
-        NodeId cond,
-        NodeId thenBody,
-        NodeId* elseBody,
-        bool hasElse,
-    },
-
-    SwitchExpr {
-        NodeId expr,
-        SwitchCase* cases,
-        u32 casesLen,
-    },
-
     Assign {
         NodeId target,
         NodeId value,
@@ -317,6 +276,47 @@ pub variant ExprKind
     AssignShr {
         NodeId target,
         NodeId value,
+    },
+
+    TupleField {
+        NodeId obj,
+        u32 index,
+    },
+
+    StructLiteral {
+        Ty typeNode,
+        Str* fieldNames,
+        NodeId* fieldValues,
+        u32 fieldValuesLen,
+    },
+
+    ArrayLiteral {
+        NodeId* elems,
+        u32 elemsLen,
+    },
+
+    BuiltinCall {
+        Str name,
+        NodeId* args,
+        u32 argsLen,
+    },
+
+    BlockExpr {
+        NodeId* stmts,
+        u32 stmtsLen,
+        NodeId result,
+    },
+
+    IfExpr {
+        NodeId cond,
+        NodeId thenBody,
+        NodeId elseBody,
+    },
+
+    SwitchExpr {
+        NodeId expr,
+        SwitchCase* cases,
+        u32 casesLen,
     }
 }
 
