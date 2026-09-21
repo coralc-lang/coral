@@ -336,6 +336,13 @@ class DistinctDecl(Node):
         self.is_pub = is_pub
 
 
+class TypedefDecl(Node):
+    def __init__(self, name, target_type, is_pub=False):
+        self.name = name
+        self.target_type = target_type
+        self.is_pub = is_pub
+
+
 class FlagDecl(Node):
     def __init__(self, flag_name, branches):
         self.flag_name = flag_name
@@ -1333,6 +1340,14 @@ class Parser:
                     base = self.parse_type()
                     self.match(TokenKind.Semicolon)
                     decls.append(DistinctDecl(name, base, True))
+                    continue
+                if self.peek().kind == TokenKind.Typedef:
+                    self.advance()
+                    name = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.Equal)
+                    target = self.parse_type()
+                    self.match(TokenKind.Semicolon)
+                    decls.append(TypedefDecl(name, target, True))
                     continue
                 if self.peek().kind in (TokenKind.Extern, TokenKind.Static):
                     is_extern = self.peek().kind == TokenKind.Extern

@@ -1,1 +1,334 @@
-// experssion parser for coralc
+/* parser/parse_expr.crl — expression parsing via precedence climbing
+ *
+ * Clang-style precedence climbing for binary expressions.
+ * Each precedence level is a function that handles operators
+ * at that level and above.
+ *
+ * Precedence (loosest to tightest):
+ *   1. Assignment (=, +=, -=, etc)
+ *   2. Or (||)
+ *   3. And (&&)
+ *   4. BitOr (|)
+ *   5. BitXor (^)
+ *   6. BitAnd (&)
+ *   7. Equality (==, !=)
+ *   8. Comparison (<, <=, >, >=)
+ *   9. Shift (<<, >>)
+ *  10. Additive (+, -)
+ *  11. Multiplicative (*, /, %)
+ *  12. Unary (!, -, *, &, ~)
+ *  13. Postfix (call, field, index)
+ *  14. Primary (literals, identifiers, parens)
+ */
+
+import "parser" { Parser }
+import "../coral-common/token" { TokenKind }
+import "../coral-ast/expr" { Expr, ExprKind }
+import "../coral-ast/id" { NodeId }
+
+extend Parser
+{
+    NodeId parseExpr()
+    {
+        return self.parseAssignExpr();
+    }
+
+    NodeId parseAssignExpr()
+    {
+        NodeId lhs = self.parseOrExpr();
+
+        if (self.check(TokenKind::Equal) ||
+            self.check(TokenKind::PlusEqual) ||
+            self.check(TokenKind::MinusEqual) ||
+            self.check(TokenKind::StarEqual) ||
+            self.check(TokenKind::SlashEqual))
+        {
+            Token op = self.advance();
+            NodeId rhs = self.parseAssignExpr();
+            /* TODO: create assign node */
+        }
+
+        return lhs;
+    }
+
+    NodeId parseOrExpr()
+    {
+        NodeId left = self.parseAndExpr();
+        while (self.check(TokenKind::Or))
+        {
+            self.advance();
+            NodeId right = self.parseAndExpr();
+            /* TODO: create Or node */
+        }
+        return left;
+    }
+
+    NodeId parseAndExpr()
+    {
+        NodeId left = self.parseBitOrExpr();
+        while (self.check(TokenKind::And))
+        {
+            self.advance();
+            NodeId right = self.parseBitOrExpr();
+            /* TODO: create And node */
+        }
+        return left;
+    }
+
+    NodeId parseBitOrExpr()
+    {
+        NodeId left = self.parseBitXorExpr();
+        while (self.check(TokenKind::Pipe))
+        {
+            self.advance();
+            NodeId right = self.parseBitXorExpr();
+            /* TODO: create BitOr node */
+        }
+        return left;
+    }
+
+    NodeId parseBitXorExpr()
+    {
+        NodeId left = self.parseBitAndExpr();
+        while (self.check(TokenKind::Caret))
+        {
+            self.advance();
+            NodeId right = self.parseBitAndExpr();
+            /* TODO: create BitXor node */
+        }
+        return left;
+    }
+
+    NodeId parseBitAndExpr()
+    {
+        NodeId left = self.parseEqExpr();
+        while (self.check(TokenKind::Ampersand))
+        {
+            self.advance();
+            NodeId right = self.parseEqExpr();
+            /* TODO: create BitAnd node */
+        }
+        return left;
+    }
+
+    NodeId parseEqExpr()
+    {
+        NodeId left = self.parseRelExpr();
+        while (self.check(TokenKind::EqualEqual) ||
+               self.check(TokenKind::NotEqual))
+        {
+            self.advance();
+            NodeId right = self.parseRelExpr();
+            /* TODO: create Eq/Ne node */
+        }
+        return left;
+    }
+
+    NodeId parseRelExpr()
+    {
+        NodeId left = self.parseShiftExpr();
+        while (self.check(TokenKind::Less) ||
+               self.check(TokenKind::LessEqual) ||
+               self.check(TokenKind::Greater) ||
+               self.check(TokenKind::GreaterEqual))
+        {
+            self.advance();
+            NodeId right = self.parseShiftExpr();
+            /* TODO: create Lt/Le/Gt/Ge node */
+        }
+        return left;
+    }
+
+    NodeId parseShiftExpr()
+    {
+        NodeId left = self.parseAddExpr();
+        /* TODO: << and >> operators */
+        return left;
+    }
+
+    NodeId parseAddExpr()
+    {
+        NodeId left = self.parseMulExpr();
+        while (self.check(TokenKind::Plus) ||
+               self.check(TokenKind::Minus))
+        {
+            self.advance();
+            NodeId right = self.parseMulExpr();
+            /* TODO: create Add/Sub node */
+        }
+        return left;
+    }
+
+    NodeId parseMulExpr()
+    {
+        NodeId left = self.parseUnaryExpr();
+        while (self.check(TokenKind::Star) ||
+               self.check(TokenKind::Slash))
+        {
+            self.advance();
+            NodeId right = self.parseUnaryExpr();
+            /* TODO: create Mul/Div node */
+        }
+        return left;
+    }
+
+    NodeId parseUnaryExpr()
+    {
+        if (self.check(TokenKind::Not))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            /* TODO: create Not node */
+            return expr;
+        }
+        if (self.check(TokenKind::Minus))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            /* TODO: create Neg node */
+            return expr;
+        }
+        if (self.check(TokenKind::Star))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            /* TODO: create Deref node */
+            return expr;
+        }
+        if (self.check(TokenKind::Ampersand))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            /* TODO: create AddressOf node */
+            return expr;
+        }
+        if (self.check(TokenKind::Neg))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            /* TODO: create BitNot node */
+            return expr;
+        }
+        return self.parsePostfixExpr();
+    }
+
+    NodeId parsePostfixExpr()
+    {
+        NodeId expr = self.parsePrimaryExpr();
+
+        while (true)
+        {
+            if (self.check(TokenKind::LParen))
+            {
+                /* function call */
+                self.advance();
+                /* TODO: parse args, expect RParen */
+                self.expect(TokenKind::RParen);
+            }
+            else if (self.check(TokenKind::Dot))
+            {
+                self.advance();
+                /* TODO: field access or method call */
+                self.expect(TokenKind::Ident);
+            }
+            else if (self.check(TokenKind::LBracket))
+            {
+                self.advance();
+                /* TODO: index expression */
+                self.parseExpr();
+                self.expect(TokenKind::RBracket);
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return expr;
+    }
+
+    NodeId parsePrimaryExpr()
+    {
+        if (self.check(TokenKind::Dec) ||
+            self.check(TokenKind::Hex) ||
+            self.check(TokenKind::Bin) ||
+            self.check(TokenKind::Oct))
+        {
+            Token tok = self.advance();
+            /* TODO: create IntLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::Float))
+        {
+            self.advance();
+            /* TODO: create FloatLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::String) ||
+            self.check(TokenKind::RawString))
+        {
+            self.advance();
+            /* TODO: create StringLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::Char))
+        {
+            self.advance();
+            /* TODO: create CharLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::True) ||
+            self.check(TokenKind::False))
+        {
+            self.advance();
+            /* TODO: create BoolLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::Null))
+        {
+            self.advance();
+            /* TODO: create NullLit node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::Ident))
+        {
+            self.advance();
+            /* TODO: create Ident node */
+            return self.noneNode();
+        }
+        if (self.check(TokenKind::LParen))
+        {
+            self.advance();
+            NodeId expr = self.parseExpr();
+            self.expect(TokenKind::RParen);
+            return expr;
+        }
+        if (self.check(TokenKind::LBrace))
+        {
+            /* block expression or struct literal */
+            /* TODO */
+        }
+        if (self.check(TokenKind::If))
+        {
+            /* if expression */
+            /* TODO */
+        }
+        if (self.check(TokenKind::Switch))
+        {
+            /* switch expression */
+            /* TODO */
+        }
+        /* builtin calls */
+        if (self.check(TokenKind::BuiltinSizeof) ||
+            self.check(TokenKind::BuiltinAlignof) ||
+            self.check(TokenKind::BuiltinTypeof) ||
+            self.check(TokenKind::BuiltinAssert))
+        {
+            /* TODO: parse builtin call */
+        }
+
+        /* error */
+        self.panicMode = 1;
+        return self.noneNode();
+    }
+}

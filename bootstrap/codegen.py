@@ -425,9 +425,13 @@ class CodeGen:
         self.emit(f"enum {node.name} {{\n")
         for i, v in enumerate(node.variants):
             if i == 0:
-                self.emit(f"    {node.name}_{v} = 0,\n")
+                self.emit(f"    {node.name}_{v} = 0")
             else:
-                self.emit(f"    {node.name}_{v},\n")
+                self.emit(f"    {node.name}_{v}")
+            if i < len(node.variants) - 1:
+                self.emit(",\n")
+            else:
+                self.emit("\n")
         self.emit(f"}};\n\n")
 
     def gen_variant(self, node):
@@ -436,9 +440,13 @@ class CodeGen:
         self.emit(f"enum {tag_name} {{\n")
         for i, v in enumerate(node.variants):
             if i == 0:
-                self.emit(f"    {name}_{v.name} = 0,\n")
+                self.emit(f"    {name}_{v.name} = 0")
             else:
-                self.emit(f"    {name}_{v.name},\n")
+                self.emit(f"    {name}_{v.name}")
+            if i < len(node.variants) - 1:
+                self.emit(",\n")
+            else:
+                self.emit("\n")
         self.emit(f"}};\n\n")
         self.emit(f"typedef struct {name} {{\n")
         self.emit(f"    enum {tag_name} tag;\n")
@@ -548,6 +556,8 @@ class CodeGen:
                 self.struct_names.add(decl.name)
             elif isinstance(decl, DistinctDecl):
                 self.struct_names.add(decl.name)
+            elif isinstance(decl, TypedefDecl):
+                self.struct_names.add(decl.name)
 
         for name in self.struct_names:
             self.emit(f"typedef struct {name} {name};\n")
@@ -644,6 +654,9 @@ class CodeGen:
             elif isinstance(decl, DistinctDecl):
                 base = self.gen_type(decl.base_type)
                 self.emit(f"typedef {base} {decl.name};\n")
+            elif isinstance(decl, TypedefDecl):
+                target = self.gen_type(decl.target_type)
+                self.emit(f"typedef {target} {decl.name};\n")
             elif isinstance(decl, FlagDecl):
                 pass
             elif isinstance(decl, TraitDecl):
