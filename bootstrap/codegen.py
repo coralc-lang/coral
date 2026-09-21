@@ -67,6 +67,8 @@ class CodeGen:
             name = node.name
             if name in BUILTIN_TYPES:
                 return BUILTIN_TYPES[name]
+            if node.generic_args:
+                return f"void*"
             return name
         if isinstance(node, PointerType):
             return self.gen_type(node.base) + "*"

@@ -275,8 +275,9 @@ class TupleType(Node):
 
 
 class TypeIdent(Node):
-    def __init__(self, name):
+    def __init__(self, name, generic_args=None):
         self.name = name
+        self.generic_args = generic_args or []
 
 
 class TernaryExpr(Node):
@@ -292,6 +293,7 @@ class VariantDecl(Node):
         self.variants = variants
         self.is_pub = is_pub
         self.generic_params = generic_params or []
+        self.methods = []
 
 
 class VariantVariant(Node):
@@ -414,6 +416,36 @@ class Parser:
             TokenKind.Struct,
         ) or k == TokenKind.Ident
 
+    def parse_generic_args(self):
+        self.expect(TokenKind.Less)
+        args = []
+        if self.peek().kind != TokenKind.Greater:
+            args.append(self.parse_type())
+            while self.match(TokenKind.Comma):
+                if self.peek().kind == TokenKind.Greater:
+                    break
+                args.append(self.parse_type())
+        self.expect(TokenKind.Greater)
+        return args
+
+    def parse_generic_params(self):
+        if self.peek().kind != TokenKind.Less:
+            return []
+        self.expect(TokenKind.Less)
+        params = []
+        while self.peek().kind != TokenKind.Greater:
+            name = self.expect(TokenKind.Ident).value
+            bounds = []
+            if self.peek().kind == TokenKind.Colon:
+                self.advance()
+                bounds.append(self.parse_type())
+                while self.match(TokenKind.Comma):
+                    bounds.append(self.parse_type())
+            params.append((name, bounds))
+            self.match(TokenKind.Comma)
+        self.expect(TokenKind.Greater)
+        return params
+
     def parse_type(self):
         t = self.peek()
         if t.kind == TokenKind.Const:
@@ -436,6 +468,9 @@ class Parser:
         if t.kind == TokenKind.Ident:
             self.advance()
             base = TypeIdent(t.value)
+            if self.peek().kind == TokenKind.Less:
+                generic_args = self.parse_generic_args()
+                base.generic_args = generic_args
             if self.match(TokenKind.LBracket):
                 size = self.parse_expr()
                 self.expect(TokenKind.RBracket)
@@ -1030,7 +1065,9 @@ class Parser:
                 is_mstatic = self.match(TokenKind.Static) is not None
                 methods.append(self.parse_func(is_mpub, is_mextern, is_mstatic))
             self.expect(TokenKind.RBrace)
-        return VariantDecl(name, variants, is_pub, generic_params), methods
+        v = VariantDecl(name, variants, is_pub, generic_params)
+        v.methods = methods
+        return v
 
     def parse_struct_fields_and_methods(self):
         self.expect(TokenKind.LBrace)
@@ -1082,6 +1119,7 @@ class Parser:
 
             fields.append(FieldDecl(tp, name))
             self.match(TokenKind.Semicolon)
+            self.match(TokenKind.Comma)
         self.expect(TokenKind.RBrace)
         return fields, methods
 
@@ -1222,6 +1260,7 @@ class Parser:
                     self.advance()
                     alias = self.expect(TokenKind.Ident).value
                     self.expect(TokenKind.Equal)
+                    self.match(TokenKind.Import)
                     is_lib = False
                     lib_path = None
                     if self.match(TokenKind.LParen):
@@ -1251,10 +1290,8 @@ class Parser:
                     decls.append(StructDecl(name, fields, True, methods))
                     continue
                 if self.peek().kind == TokenKind.Variant:
-                    variant, variant_methods = self.parse_variant_decl(True)
+                    variant = self.parse_variant_decl(True)
                     decls.append(variant)
-                    for m in variant_methods:
-                        decls.append(m)
                     continue
                 if self.peek().kind == TokenKind.Union:
                     self.advance()
@@ -1320,6 +1357,7 @@ class Parser:
                 self.advance()
                 alias = self.expect(TokenKind.Ident).value
                 self.expect(TokenKind.Equal)
+                self.match(TokenKind.Import)
                 is_lib = False
                 lib_path = None
                 if self.match(TokenKind.LParen):
@@ -1348,10 +1386,8 @@ class Parser:
                 continue
 
             if t.kind == TokenKind.Variant:
-                variant, variant_methods = self.parse_variant_decl(False)
+                variant = self.parse_variant_decl(False)
                 decls.append(variant)
-                for m in variant_methods:
-                    decls.append(m)
                 continue
 
             if t.kind == TokenKind.Union:
