@@ -711,8 +711,12 @@ class CodeGen:
                         params = [f"{st}* self"] + [
                             f"{self.gen_type(p.type_node)} {p.name}" for p in method.params if p.name != "self"
                         ]
-                    else:
+                    elif getattr(method, 'is_static', False):
                         params = [
+                            f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
+                        ]
+                    else:
+                        params = [f"{st}* self"] + [
                             f"{self.gen_type(p.type_node)} {p.name}" for p in method.params
                         ]
                     param_str = ", ".join(params)
