@@ -1070,7 +1070,8 @@ class Parser:
                         fname = ftok.value if ftok.value else ftok.kind
                         self.advance()
                     vfields.append(VariantField(ftp, fname))
-                    self.match(TokenKind.Comma)
+                    if not self.match(TokenKind.Comma):
+                        self.match(TokenKind.Semicolon)
                 self.expect(TokenKind.RBrace)
             variants.append(VariantVariant(vname, vfields))
             self.match(TokenKind.Comma)
@@ -1138,7 +1139,6 @@ class Parser:
 
             fields.append(FieldDecl(tp, name))
             self.match(TokenKind.Semicolon)
-            self.match(TokenKind.Comma)
         self.expect(TokenKind.RBrace)
         return fields, methods
 
