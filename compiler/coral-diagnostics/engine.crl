@@ -1,0 +1,239 @@
+/* diagnostics/engine.crl — multi-span diagnostic engine
+ *
+ * Diagnostic: code, severity, message, detail, labels, why, fix, learn.
+ * Label: span + text + primary/secondary.
+ * Renderer: groups by file, gutter, underlines (^ or ──┬──), connectors (╰─).
+ */
+
+import "code" { ErrorCode }
+import "error_msg" { Severity }
+import "span" { Span, Label, SourceMap }
+
+extern("C") i32 printf(u8* fmt, ...);
+extern("C") i32 write(i32 fd, u8* buf, usize len);
+
+pub struct Diagnostic
+{
+    ErrorCode code;
+    Severity severity;
+    Str message;
+    Str detail;
+    Label* labels;
+    u32 labelsLen;
+    Str why;
+    Str fix;
+    Str learn;
+}
+
+pub struct DiagnosticEngine
+{
+    usize errors;
+    usize warnings;
+    usize errorLimit;
+    u8* bufStart;
+    u8* bufEnd;
+    SourceMap* sourceMap;
+}
+
+extend DiagnosticEngine
+{
+    DiagnosticEngine init(u8* bufStart, u8* bufEnd)
+    {
+        DiagnosticEngine e;
+        e.errors = 0;
+        e.warnings = 0;
+        e.errorLimit = 20;
+        e.bufStart = bufStart;
+        e.bufEnd = bufEnd;
+        e.sourceMap = null;
+        return e;
+    }
+
+    bool hasErrors()
+    {
+        return self.errors > 0;
+    }
+
+    bool tooManyErrors()
+    {
+        return self.errors >= self.errorLimit;
+    }
+
+    void emitError(ErrorCode code, u8* errPtr, Str msg)
+    {
+        if (self.tooManyErrors()) return;
+        self.errors = self.errors + 1;
+        self.renderSimple(code, errPtr, msg, "error");
+    }
+
+    void emitWarning(ErrorCode code, u8* errPtr, Str msg)
+    {
+        self.warnings = self.warnings + 1;
+        self.renderSimple(code, errPtr, msg, "warning");
+    }
+
+    void emitNote(ErrorCode code, u8* errPtr, Str msg)
+    {
+        self.renderSimple(code, errPtr, msg, "note");
+    }
+
+    void emitFatal(ErrorCode code, u8* errPtr, Str msg)
+    {
+        self.errors = self.errors + 1;
+        self.renderSimple(code, errPtr, msg, "fatal error");
+    }
+
+    void renderSimple(ErrorCode code, u8* errPtr, Str msg, u8* level)
+    {
+        u8* lineStart = errPtr;
+        while (lineStart > self.bufStart)
+        {
+            u8* prev = lineStart - 1;
+            if (prev[0] == '\n') break;
+            lineStart = prev;
+        }
+
+        u8* lineEnd = errPtr;
+        while (lineEnd < self.bufEnd)
+        {
+            if (lineEnd[0] == '\n') break;
+            if (lineEnd[0] == '\r') break;
+            lineEnd = lineEnd + 1;
+        }
+
+        usize lineNum = 1;
+        u8* scan = self.bufStart;
+        while (scan < lineStart)
+        {
+            if (scan[0] == '\n') lineNum = lineNum + 1;
+            scan = scan + 1;
+        }
+
+        usize colNum = (usize)(errPtr - lineStart) + 1;
+
+        printf("%llu:%llu: %s: %s\n", lineNum, colNum, level, msg);
+
+        usize lineLen = (usize)(lineEnd - lineStart);
+        write(1, lineStart, lineLen);
+        write(1, "\n", 1);
+
+        i32 i = 1;
+        while (i < (i32)colNum)
+        {
+            write(1, " ", 1);
+            i = i + 1;
+        }
+        write(1, "^\n", 2);
+    }
+
+    void renderDiagnostic(Diagnostic* diag)
+    {
+        u8* sevStr = "error";
+        if (diag.severity == Severity::Warning) sevStr = "warning";
+        if (diag.severity == Severity::Note) sevStr = "note";
+        if (diag.severity == Severity::Fatal) sevStr = "fatal error";
+
+        printf("%s: %s\n", sevStr, diag.message);
+        printf("  %s\n", diag.detail);
+
+        u32 i = 0;
+        while (i < diag.labelsLen)
+        {
+            Label* lbl = diag.labels + i;
+            self.renderLabel(lbl);
+            i = i + 1;
+        }
+
+        printf("  why    %s\n", diag.why);
+        printf("  fix    %s\n", diag.fix);
+        printf("  learn  %s\n", diag.learn);
+    }
+
+    void renderLabel(Label* lbl)
+    {
+        u8* errPtr = self.bufStart + lbl.span.start;
+        u8* lineStart = errPtr;
+        while (lineStart > self.bufStart)
+        {
+            u8* prev = lineStart - 1;
+            if (prev[0] == '\n') break;
+            lineStart = prev;
+        }
+
+        u8* lineEnd = errPtr;
+        while (lineEnd < self.bufEnd)
+        {
+            if (lineEnd[0] == '\n') break;
+            if (lineEnd[0] == '\r') break;
+            lineEnd = lineEnd + 1;
+        }
+
+        usize lineNum = 1;
+        u8* scan = self.bufStart;
+        while (scan < lineStart)
+        {
+            if (scan[0] == '\n') lineNum = lineNum + 1;
+            scan = scan + 1;
+        }
+
+        usize startCol = (usize)(errPtr - lineStart);
+        u32 spanLen = lbl.span.end - lbl.span.start;
+
+        usize lineLen = (usize)(lineEnd - lineStart);
+        printf("  %llu | ", lineNum);
+        write(1, lineStart, lineLen);
+        write(1, "\n", 1);
+        printf("       | ");
+
+        usize j = 0;
+        while (j < startCol)
+        {
+            write(1, " ", 1);
+            j = j + 1;
+        }
+
+        if (spanLen <= 1)
+        {
+            write(1, "^", 1);
+        }
+        else
+        {
+            u32 k = 0;
+            u32 mid = spanLen / 2;
+            while (k < spanLen)
+            {
+                if (k == mid)
+                {
+                    write(1, "+", 1);
+                }
+                else
+                {
+                    write(1, "-", 1);
+                }
+                k = k + 1;
+            }
+        }
+        write(1, "\n", 1);
+
+        printf("       | ");
+        j = 0;
+        if (spanLen > 1)
+        {
+            u32 mid2 = spanLen / 2;
+            while (j < startCol + mid2)
+            {
+                write(1, " ", 1);
+                j = j + 1;
+            }
+        }
+        else
+        {
+            while (j < startCol)
+            {
+                write(1, " ", 1);
+                j = j + 1;
+            }
+        }
+        printf("`- %s\n", lbl.text);
+    }
+}

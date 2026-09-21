@@ -1,0 +1,402 @@
+/* parser/expr.crl — expression parsing
+ *
+ * Clang-style precedence climbing: one function handles all
+ * binary operators, parameterized by minimum precedence.
+ */
+
+import "parser" { Parser }
+import "../coral-common/token" { TokenKind }
+import "../coral-ast/id" { NodeId }
+
+extend Parser
+{
+    i32 prec(TokenKind kind)
+    {
+        switch (kind)
+        {
+            TokenKind::Equal => { return 1; },
+            TokenKind::PlusEqual => { return 1; },
+            TokenKind::MinusEqual => { return 1; },
+            TokenKind::StarEqual => { return 1; },
+            TokenKind::SlashEqual => { return 1; },
+            TokenKind::PercentEqual => { return 1; },
+            TokenKind::AmpEqual => { return 1; },
+            TokenKind::PipeEqual => { return 1; },
+            TokenKind::CaretEqual => { return 1; },
+            TokenKind::ShlEqual => { return 1; },
+            TokenKind::ShrEqual => { return 1; },
+            TokenKind::Or => { return 2; },
+            TokenKind::And => { return 3; },
+            TokenKind::Pipe => { return 4; },
+            TokenKind::Caret => { return 5; },
+            TokenKind::Ampersand => { return 6; },
+            TokenKind::EqualEqual => { return 7; },
+            TokenKind::NotEqual => { return 7; },
+            TokenKind::Less => { return 8; },
+            TokenKind::LessEqual => { return 8; },
+            TokenKind::Greater => { return 8; },
+            TokenKind::GreaterEqual => { return 8; },
+            TokenKind::Shl => { return 9; },
+            TokenKind::Shr => { return 9; },
+            TokenKind::Plus => { return 10; },
+            TokenKind::Minus => { return 10; },
+            TokenKind::Star => { return 11; },
+            TokenKind::Slash => { return 11; },
+            TokenKind::Percent => { return 11; },
+            else => { return 0; }
+        }
+    }
+
+    bool isAssignOp(TokenKind kind)
+    {
+        return kind == TokenKind::Equal ||
+               kind == TokenKind::PlusEqual ||
+               kind == TokenKind::MinusEqual ||
+               kind == TokenKind::StarEqual ||
+               kind == TokenKind::SlashEqual ||
+               kind == TokenKind::PercentEqual ||
+               kind == TokenKind::AmpEqual ||
+               kind == TokenKind::PipeEqual ||
+               kind == TokenKind::CaretEqual ||
+               kind == TokenKind::ShlEqual ||
+               kind == TokenKind::ShrEqual;
+    }
+
+    NodeId parseExpr()
+    {
+        NodeId cond = self.parseBinaryExpr(1);
+        if (self.match(TokenKind::Question))
+        {
+            self.parseExpr();
+            self.expect(TokenKind::Colon);
+            self.parseExpr();
+            return self.allocNode();
+        }
+        return cond;
+    }
+
+    NodeId parseBinaryExpr(i32 minPrec)
+    {
+        NodeId left = self.parseUnaryExpr();
+
+        while (true)
+        {
+            i32 p = self.prec(self.current.kind);
+            if (p <= minPrec) break;
+
+            Token op = self.advance();
+            bool rightAssoc = self.isAssignOp(op.kind);
+            NodeId right;
+            if (rightAssoc)
+            {
+                right = self.parseBinaryExpr(p);
+            }
+            else
+            {
+                right = self.parseBinaryExpr(p + 1);
+            }
+            NodeId n = self.allocNode();
+            left = n;
+        }
+
+        return left;
+    }
+
+    NodeId parseUnaryExpr()
+    {
+        if (self.check(TokenKind::Not) ||
+            self.check(TokenKind::Minus) ||
+            self.check(TokenKind::Star) ||
+            self.check(TokenKind::Ampersand) ||
+            self.check(TokenKind::Neg))
+        {
+            Token op = self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.allocNode();
+        }
+        if (self.check(TokenKind::PlusPlus) ||
+            self.check(TokenKind::MinusMinus))
+        {
+            Token op = self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.allocNode();
+        }
+        return self.parsePostfixExpr();
+    }
+
+    NodeId parsePostfixExpr()
+    {
+        NodeId expr = self.parsePrimaryExpr();
+
+        while (true)
+        {
+            if (self.check(TokenKind::LParen))
+            {
+                self.advance();
+                if (!self.check(TokenKind::RParen))
+                {
+                    self.parseExpr();
+                    while (self.match(TokenKind::Comma))
+                    {
+                        self.parseExpr();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+                expr = self.allocNode();
+            }
+            else if (self.check(TokenKind::Dot))
+            {
+                self.advance();
+                if (self.check(TokenKind::Dec))
+                {
+                    self.advance();
+                }
+                else
+                {
+                    self.expect(TokenKind::Ident);
+                    if (self.check(TokenKind::LParen))
+                    {
+                        self.advance();
+                        if (!self.check(TokenKind::RParen))
+                        {
+                            self.parseExpr();
+                            while (self.match(TokenKind::Comma))
+                            {
+                                self.parseExpr();
+                            }
+                        }
+                        self.expect(TokenKind::RParen);
+                    }
+                }
+                expr = self.allocNode();
+            }
+            else if (self.check(TokenKind::ColonColon))
+            {
+                self.advance();
+                self.expect(TokenKind::Ident);
+                expr = self.allocNode();
+            }
+            else if (self.check(TokenKind::Arrow))
+            {
+                self.advance();
+                self.expect(TokenKind::Ident);
+                expr = self.allocNode();
+            }
+            else if (self.check(TokenKind::LBracket))
+            {
+                self.advance();
+                self.parseExpr();
+                self.expect(TokenKind::RBracket);
+                expr = self.allocNode();
+            }
+            else if (self.check(TokenKind::PlusPlus) ||
+                     self.check(TokenKind::MinusMinus))
+            {
+                self.advance();
+                expr = self.allocNode();
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return expr;
+    }
+
+    NodeId parsePrimaryExpr()
+    {
+        TokenKind k = self.current.kind;
+
+        if (k == TokenKind::Dec || k == TokenKind::Hex ||
+            k == TokenKind::Bin || k == TokenKind::Oct ||
+            k == TokenKind::Float || k == TokenKind::String ||
+            k == TokenKind::RawString || k == TokenKind::Char ||
+            k == TokenKind::True || k == TokenKind::False ||
+            k == TokenKind::Null)
+        {
+            self.advance();
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::Ident)
+        {
+            self.advance();
+            if (self.check(TokenKind::ColonColon))
+            {
+                while (self.match(TokenKind::ColonColon))
+                {
+                    self.expect(TokenKind::Ident);
+                }
+            }
+            if (self.check(TokenKind::LBrace))
+            {
+                self.advance();
+                while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                {
+                    self.expect(TokenKind::Dot);
+                    self.expect(TokenKind::Ident);
+                    self.expect(TokenKind::Equal);
+                    self.parseExpr();
+                    if (!self.match(TokenKind::Comma)) break;
+                }
+                self.expect(TokenKind::RBrace);
+                return self.allocNode();
+            }
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::LParen)
+        {
+            self.advance();
+            NodeId expr = self.parseExpr();
+            self.expect(TokenKind::RParen);
+            return expr;
+        }
+
+        if (k == TokenKind::LBrace)
+        {
+            self.advance();
+            while (!self.check(TokenKind::RBrace) && !self.atEnd())
+            {
+                self.parseExpr();
+                self.match(TokenKind::Semicolon);
+            }
+            self.expect(TokenKind::RBrace);
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::If)
+        {
+            self.advance();
+            self.expect(TokenKind::LParen);
+            self.parseExpr();
+            self.expect(TokenKind::RParen);
+            self.parseExpr();
+            if (self.match(TokenKind::Else))
+            {
+                self.parseExpr();
+            }
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::Switch)
+        {
+            self.advance();
+            self.expect(TokenKind::LParen);
+            self.parseExpr();
+            self.expect(TokenKind::RParen);
+            self.expect(TokenKind::LBrace);
+            while (!self.check(TokenKind::RBrace) && !self.atEnd())
+            {
+                self.parseSwitchCase();
+            }
+            self.expect(TokenKind::RBrace);
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::BuiltinSizeof ||
+            k == TokenKind::BuiltinAlignof ||
+            k == TokenKind::BuiltinTypeof ||
+            k == TokenKind::BuiltinAssert)
+        {
+            self.advance();
+            self.expect(TokenKind::LParen);
+            self.parseExpr();
+            while (self.match(TokenKind::Comma))
+            {
+                self.parseExpr();
+            }
+            self.expect(TokenKind::RParen);
+            return self.allocNode();
+        }
+
+        if (k == TokenKind::At)
+        {
+            self.advance();
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::LParen);
+            if (!self.check(TokenKind::RParen))
+            {
+                self.parseExpr();
+                while (self.match(TokenKind::Comma))
+                {
+                    self.parseExpr();
+                }
+            }
+            self.expect(TokenKind::RParen);
+            return self.allocNode();
+        }
+
+        self.panicMode = 1;
+        return self.noneNode();
+    }
+
+    NodeId parseSwitchCase()
+    {
+        if (self.match(TokenKind::Else))
+        {
+            self.expect(TokenKind::FatArrow);
+            self.parseExpr();
+            self.match(TokenKind::Comma);
+            return self.allocNode();
+        }
+        self.parsePattern();
+        while (self.match(TokenKind::Pipe))
+        {
+            self.parsePattern();
+        }
+        if (self.match(TokenKind::If))
+        {
+            self.parseExpr();
+        }
+        self.expect(TokenKind::FatArrow);
+        self.parseExpr();
+        self.match(TokenKind::Comma);
+        return self.allocNode();
+    }
+
+    NodeId parsePattern()
+    {
+        TokenKind k = self.current.kind;
+        if (k == TokenKind::Ident)
+        {
+            self.advance();
+            if (self.check(TokenKind::ColonColon))
+            {
+                self.advance();
+                self.expect(TokenKind::Ident);
+            }
+            if (self.check(TokenKind::LBrace))
+            {
+                self.advance();
+                while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                {
+                    self.expect(TokenKind::Ident);
+                    if (!self.match(TokenKind::Comma)) break;
+                }
+                self.expect(TokenKind::RBrace);
+            }
+            return self.allocNode();
+        }
+        if (k == TokenKind::LParen)
+        {
+            self.advance();
+            while (!self.check(TokenKind::RParen) && !self.atEnd())
+            {
+                self.parsePattern();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.expect(TokenKind::RParen);
+            return self.allocNode();
+        }
+        self.parseExpr();
+        if (self.check(TokenKind::Dot) || self.check(TokenKind::Colon))
+        {
+            self.advance();
+            self.advance();
+            self.parseExpr();
+        }
+        return self.allocNode();
+    }
+}
