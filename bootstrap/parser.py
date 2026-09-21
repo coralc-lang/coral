@@ -1043,13 +1043,25 @@ class Parser:
         self.expect(TokenKind.LBrace)
         variants = []
         while self.peek().kind != TokenKind.RBrace:
-            vname = self.expect(TokenKind.Ident).value
+            vtok = self.peek()
+            if vtok.kind == TokenKind.Ident:
+                self.advance()
+                vname = vtok.value
+            else:
+                vname = vtok.value if vtok.value else vtok.kind
+                self.advance()
             vfields = []
             if self.peek().kind == TokenKind.LBrace:
                 self.advance()
                 while self.peek().kind != TokenKind.RBrace:
                     ftp = self.parse_type()
-                    fname = self.expect(TokenKind.Ident).value
+                    ftok = self.peek()
+                    if ftok.kind == TokenKind.Ident:
+                        self.advance()
+                        fname = ftok.value
+                    else:
+                        fname = ftok.value if ftok.value else ftok.kind
+                        self.advance()
                     vfields.append(VariantField(ftp, fname))
                     self.match(TokenKind.Comma)
                 self.expect(TokenKind.RBrace)
