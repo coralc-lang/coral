@@ -137,6 +137,23 @@ class CodeGen:
             left = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
             return f"{left}_{right}"
+        if isinstance(node, StructLiteral):
+            from parser import ColonColonExpr as CCE
+            if isinstance(node.type_expr, CCE):
+                tname = self.gen_expr(node.type_expr.left)
+                vname = self.gen_expr(node.type_expr.right)
+                fields = ", ".join(
+                    f".{fn} = {self.gen_expr(fv)}"
+                    for fn, fv in zip(node.field_names, node.field_values)
+                )
+                return f"({tname}){{ .tag = {tname}_{vname}, .payload.{vname} = {{{fields}}} }}"
+            else:
+                tname = self.gen_expr(node.type_expr)
+                fields = ", ".join(
+                    f".{fn} = {self.gen_expr(fv)}"
+                    for fn, fv in zip(node.field_names, node.field_values)
+                )
+                return f"({tname}){{{fields}}}"
         if isinstance(node, StarDotExpr):
             return f"{self.gen_expr(node.obj)}->{self.gen_expr(node.field)}"
         if isinstance(node, IndexExpr):

@@ -248,6 +248,13 @@ class NullLit(Node):
     pass
 
 
+class StructLiteral(Node):
+    def __init__(self, type_expr, field_names, field_values):
+        self.type_expr = type_expr
+        self.field_names = field_names
+        self.field_values = field_values
+
+
 class PointerType(Node):
     def __init__(self, base):
         self.base = base
@@ -698,6 +705,28 @@ class Parser:
                 idx = self.parse_expr()
                 self.expect(TokenKind.RBracket)
                 left = IndexExpr(left, idx)
+            elif self.peek().kind == TokenKind.LBrace:
+                self.advance()
+                field_names = []
+                field_values = []
+                if self.peek().kind != TokenKind.RBrace:
+                    self.expect(TokenKind.Dot)
+                    fname = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.Equal)
+                    fval = self.parse_expr()
+                    field_names.append(fname)
+                    field_values.append(fval)
+                    while self.match(TokenKind.Comma):
+                        if self.peek().kind == TokenKind.RBrace:
+                            break
+                        self.expect(TokenKind.Dot)
+                        fname = self.expect(TokenKind.Ident).value
+                        self.expect(TokenKind.Equal)
+                        fval = self.parse_expr()
+                        field_names.append(fname)
+                        field_values.append(fval)
+                self.expect(TokenKind.RBrace)
+                left = StructLiteral(left, field_names, field_values)
             elif self.peek().kind == TokenKind.PlusPlus:
                 self.advance()
                 left = UnaryExpr("++post", left)
