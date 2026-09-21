@@ -1,18 +1,26 @@
-/* parser/parse_decl.crl — declaration parsing */
+/* parser/decl.crl — declaration parsing */
 
 import "parser" { Parser }
 import "../coral-common/token" { TokenKind }
-import "../coral-ast/decl" { Decl, DeclKind }
 import "../coral-ast/id" { NodeId }
 
 extend Parser
 {
     NodeId parseDecl()
     {
-        /* parse optional attributes [[attr, attr2]] */
-        /* parse optional pub */
+        while (self.match(TokenKind::AttrOpen))
+        {
+            self.expect(TokenKind::Ident);
+            while (self.match(TokenKind::Comma))
+            {
+                self.expect(TokenKind::Ident);
+            }
+            self.expect(TokenKind::AttrClose);
+        }
+        self.match(TokenKind::Pub);
 
-        if (self.check(TokenKind::Fn) || self.check(TokenKind::Extern))
+        if (self.check(TokenKind::Fn) || self.check(TokenKind::Extern) ||
+            self.check(TokenKind::Static))
         {
             return self.parseFuncDecl();
         }
@@ -64,254 +72,377 @@ extend Parser
         {
             return self.parseComptimeDecl();
         }
-        /* constant: Type name = expr; */
-        /* TODO: disambiguate from expression */
-        self.panicMode = 1;
-        return self.noneNode();
+        self.parseType();
+        self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Equal);
+        self.parseExpr();
+        self.expect(TokenKind::Semicolon);
+        return self.allocNode();
+    }
+
+    NodeId parseGenericParams()
+    {
+        self.expect(TokenKind::Less);
+        self.expect(TokenKind::Ident);
+        if (self.match(TokenKind::Colon))
+        {
+            self.expect(TokenKind::Ident);
+            while (self.match(TokenKind::Comma))
+            {
+                self.expect(TokenKind::Ident);
+            }
+        }
+        while (self.match(TokenKind::Comma))
+        {
+            self.expect(TokenKind::Ident);
+            if (self.match(TokenKind::Colon))
+            {
+                self.expect(TokenKind::Ident);
+            }
+        }
+        if (self.check(TokenKind::Shr))
+        {
+            self.advance();
+            return self.allocNode();
+        }
+        self.expect(TokenKind::Greater);
+        return self.allocNode();
     }
 
     NodeId parseFuncDecl()
     {
-        bool isExtern = self.match(TokenKind::Extern);
-        bool isStatic = self.match(TokenKind::Static);
-        self.expect(TokenKind::Fn);
-        Token name = self.expect(TokenKind::Ident);
-
-        /* optional generic params <T> */
-        if (self.match(TokenKind::Less))
+        self.match(TokenKind::Extern);
+        if (self.check(TokenKind::LParen))
         {
-            /* TODO: parse generic params */
-            while (!self.check(TokenKind::Greater) && !self.atEnd())
-            {
-                self.advance();
-            }
-            self.expect(TokenKind::Greater);
+            self.advance();
+            self.expect(TokenKind::String);
+            self.expect(TokenKind::RParen);
         }
-
+        self.match(TokenKind::Static);
+        self.expect(TokenKind::Fn);
+        self.expect(TokenKind::Ident);
+        if (self.check(TokenKind::Less))
+        {
+            self.parseGenericParams();
+        }
         self.expect(TokenKind::LParen);
-        /* TODO: parse params */
+        if (!self.check(TokenKind::RParen))
+        {
+            self.parseParam();
+            while (self.match(TokenKind::Comma))
+            {
+                self.parseParam();
+            }
+        }
         self.expect(TokenKind::RParen);
-
-        /* optional return type -> Type */
         if (self.match(TokenKind::FatArrow))
         {
-            /* TODO: parse return type */
+            self.parseType();
         }
-
-        /* optional body */
-        if (self.check(TokenKind::LBrace))
+        if (self.match(TokenKind::Semicolon))
         {
-            /* TODO: parse function body */
+            return self.allocNode();
         }
+        self.expect(TokenKind::LBrace);
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            self.parseStmt();
+        }
+        self.expect(TokenKind::RBrace);
+        return self.allocNode();
+    }
 
-        /* TODO: create Func node */
-        return self.noneNode();
+    NodeId parseParam()
+    {
+        if (self.check(TokenKind::Self))
+        {
+            self.advance();
+            return self.allocNode();
+        }
+        self.parseType();
+        self.expect(TokenKind::Ident);
+        return self.allocNode();
     }
 
     NodeId parseStructDecl()
     {
         self.expect(TokenKind::Struct);
-        Token name = self.expect(TokenKind::Ident);
-
-        /* optional generic params <T> */
-        if (self.match(TokenKind::Less))
+        self.expect(TokenKind::Ident);
+        if (self.check(TokenKind::Less))
         {
-            while (!self.check(TokenKind::Greater) && !self.atEnd())
-            {
-                self.advance();
-            }
-            self.expect(TokenKind::Greater);
+            self.parseGenericParams();
         }
-
         self.expect(TokenKind::LBrace);
-        /* TODO: parse fields and methods */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            if (self.check(TokenKind::Fn) || self.check(TokenKind::Extern) ||
+                self.check(TokenKind::Static) || self.check(TokenKind::Pub))
+            {
+                self.match(TokenKind::Pub);
+                self.parseFuncDecl();
+                continue;
+            }
+            self.match(TokenKind::Pub);
+            self.parseType();
+            self.expect(TokenKind::Ident);
+            if (self.match(TokenKind::Equal))
+            {
+                self.parseExpr();
+            }
+            self.match(TokenKind::Comma);
+            self.match(TokenKind::Semicolon);
+        }
         self.expect(TokenKind::RBrace);
-
-        /* TODO: create Struct node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseEnumDecl()
     {
         self.expect(TokenKind::Enum);
-        Token name = self.expect(TokenKind::Ident);
-
-        /* optional backing type : Type */
+        self.expect(TokenKind::Ident);
         if (self.match(TokenKind::Colon))
         {
-            /* TODO: parse backing type */
+            self.parseType();
         }
-
         self.expect(TokenKind::LBrace);
-        /* TODO: parse variants */
+        if (!self.check(TokenKind::RBrace))
+        {
+            self.expect(TokenKind::Ident);
+            if (self.match(TokenKind::Equal))
+            {
+                self.parseExpr();
+            }
+            while (self.match(TokenKind::Comma))
+            {
+                if (self.check(TokenKind::RBrace)) break;
+                self.expect(TokenKind::Ident);
+                if (self.match(TokenKind::Equal))
+                {
+                    self.parseExpr();
+                }
+            }
+        }
         self.expect(TokenKind::RBrace);
-
-        /* TODO: create Enum node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseVariantDecl()
     {
         self.expect(TokenKind::Variant);
-        Token name = self.expect(TokenKind::Ident);
-
-        /* optional generic params <T> */
-        if (self.match(TokenKind::Less))
+        self.expect(TokenKind::Ident);
+        if (self.check(TokenKind::Less))
         {
-            while (!self.check(TokenKind::Greater) && !self.atEnd())
-            {
-                self.advance();
-            }
-            self.expect(TokenKind::Greater);
+            self.parseGenericParams();
         }
-
         self.expect(TokenKind::LBrace);
-        /* TODO: parse variant variants */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            if (self.check(TokenKind::Fn) || self.check(TokenKind::Pub))
+            {
+                self.match(TokenKind::Pub);
+                self.parseFuncDecl();
+                continue;
+            }
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::LBrace);
+            while (!self.check(TokenKind::RBrace) && !self.atEnd())
+            {
+                self.parseType();
+                self.expect(TokenKind::Ident);
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.expect(TokenKind::RBrace);
+            self.match(TokenKind::Comma);
+        }
         self.expect(TokenKind::RBrace);
-
-        /* TODO: create Variant node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseUnionDecl()
     {
         self.expect(TokenKind::Union);
-        Token name = self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Ident);
         self.expect(TokenKind::LBrace);
-        /* TODO: parse fields */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            if (self.check(TokenKind::Fn) || self.check(TokenKind::Pub))
+            {
+                self.match(TokenKind::Pub);
+                self.parseFuncDecl();
+                continue;
+            }
+            self.match(TokenKind::Pub);
+            self.parseType();
+            self.expect(TokenKind::Ident);
+            self.match(TokenKind::Comma);
+            self.match(TokenKind::Semicolon);
+        }
         self.expect(TokenKind::RBrace);
-        /* TODO: create Union node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseTraitDecl()
     {
         self.expect(TokenKind::Trait);
-        Token name = self.expect(TokenKind::Ident);
-
-        /* optional generic params <T> */
-        if (self.match(TokenKind::Less))
+        self.expect(TokenKind::Ident);
+        if (self.check(TokenKind::Less))
         {
-            while (!self.check(TokenKind::Greater) && !self.atEnd())
-            {
-                self.advance();
-            }
-            self.expect(TokenKind::Greater);
+            self.parseGenericParams();
         }
-
         self.expect(TokenKind::LBrace);
-        /* TODO: parse methods */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            self.parseFuncDecl();
+        }
         self.expect(TokenKind::RBrace);
-
-        /* TODO: create Trait node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseExtendDecl()
     {
         self.expect(TokenKind::Extend);
-        /* TODO: parse type */
-        /* optional : TraitName for trait impl */
+        self.parseType();
         if (self.match(TokenKind::Colon))
         {
-            /* TODO: parse trait name */
+            self.expect(TokenKind::Ident);
         }
         self.expect(TokenKind::LBrace);
-        /* TODO: parse methods */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            self.parseFuncDecl();
+        }
         self.expect(TokenKind::RBrace);
-        /* TODO: create Extend/ExtendTrait node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseTypedefDecl()
     {
         self.expect(TokenKind::Typedef);
-        Token name = self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Ident);
         self.expect(TokenKind::Equal);
-        /* TODO: parse target type */
+        self.parseType();
         self.expect(TokenKind::Semicolon);
-        /* TODO: create Typedef node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseDistinctDecl()
     {
         self.expect(TokenKind::Distinct);
-        Token name = self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Ident);
         self.expect(TokenKind::Equal);
-        /* TODO: parse base type */
+        self.parseType();
         self.expect(TokenKind::Semicolon);
-        /* TODO: create Distinct node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseFlagDecl()
     {
         self.expect(TokenKind::Flag);
         self.expect(TokenKind::LParen);
-        Token flagName = self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Ident);
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::LBrace);
-        /* TODO: parse branches (label => { stmts }) */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::FatArrow);
+            self.expect(TokenKind::LBrace);
+            while (!self.check(TokenKind::RBrace) && !self.atEnd())
+            {
+                self.parseStmt();
+            }
+            self.expect(TokenKind::RBrace);
+            self.match(TokenKind::Comma);
+        }
         self.expect(TokenKind::RBrace);
-        /* TODO: create Flag node */
-        return self.noneNode();
+        return self.allocNode();
     }
 
     NodeId parseImportDecl()
     {
         self.expect(TokenKind::Import);
-        /* three forms:
-         *   import "path" { symbols }
-         *   import file::module { symbols }
-         *   import(lib) package::module { symbols }
-         */
         if (self.match(TokenKind::LParen))
         {
-            /* import(lib) */
             self.expect(TokenKind::Ident);
             self.expect(TokenKind::RParen);
         }
-        /* TODO: parse import source and symbols */
         if (self.check(TokenKind::String))
         {
             self.advance();
         }
         else
         {
-            /* path form */
-            while (!self.check(TokenKind::LBrace) && !self.atEnd())
+            self.expect(TokenKind::Ident);
+            while (self.match(TokenKind::ColonColon))
             {
-                self.advance();
+                self.expect(TokenKind::Ident);
             }
         }
         if (self.match(TokenKind::LBrace))
         {
-            /* TODO: parse symbol list */
+            if (!self.check(TokenKind::RBrace))
+            {
+                self.expect(TokenKind::Ident);
+                if (self.match(TokenKind::As))
+                {
+                    self.expect(TokenKind::Ident);
+                }
+                while (self.match(TokenKind::Comma))
+                {
+                    if (self.check(TokenKind::RBrace)) break;
+                    if (self.match(TokenKind::Star))
+                    {
+                        break;
+                    }
+                    self.expect(TokenKind::Ident);
+                    if (self.match(TokenKind::As))
+                    {
+                        self.expect(TokenKind::Ident);
+                    }
+                }
+            }
             self.expect(TokenKind::RBrace);
         }
-        /* TODO: create Import node */
-        return self.noneNode();
+        self.match(TokenKind::Semicolon);
+        return self.allocNode();
     }
 
     NodeId parseModReexport()
     {
         self.expect(TokenKind::Mod);
-        Token alias = self.expect(TokenKind::Ident);
+        self.expect(TokenKind::Ident);
         self.expect(TokenKind::Equal);
         self.expect(TokenKind::Import);
-        /* TODO: parse import source */
-        /* TODO: create ModReexport node */
-        return self.noneNode();
+        if (self.match(TokenKind::LParen))
+        {
+            self.expect(TokenKind::Ident);
+            self.expect(TokenKind::RParen);
+        }
+        if (self.check(TokenKind::String))
+        {
+            self.advance();
+        }
+        else
+        {
+            self.expect(TokenKind::Ident);
+            while (self.match(TokenKind::ColonColon))
+            {
+                self.expect(TokenKind::Ident);
+            }
+        }
+        self.match(TokenKind::Semicolon);
+        return self.allocNode();
     }
 
     NodeId parseComptimeDecl()
     {
         self.expect(TokenKind::Comptime);
         self.expect(TokenKind::LBrace);
-        /* TODO: parse declarations */
+        while (!self.check(TokenKind::RBrace) && !self.atEnd())
+        {
+            self.parseDecl();
+        }
         self.expect(TokenKind::RBrace);
-        /* TODO: create Comptime node */
-        return self.noneNode();
+        return self.allocNode();
     }
 }
