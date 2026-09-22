@@ -1,0 +1,304 @@
+import "ir_types" { IrValue, IrType, IrFunc, IrInst };
+import(lib) std::mman { alloc, dealloc };
+
+pub enum MetadataKind
+{
+    DebugInfo,
+    Profiling,
+    Alignment,
+    NoAlias,
+    NoCapture,
+    NoFree,
+    NoUnwind,
+    ReadNone,
+    ReadOnly,
+    WriteOnly,
+    InlineHint,
+    VectorWidth,
+    LoopInfo,
+    Range,
+    BranchWeights,
+    Custom
+}
+
+pub struct MetadataValue
+{
+    MetadataKind kind;
+    usize intVal;
+    str strVal;
+    IrValue* irVal;
+}
+
+pub struct MetadataEntry
+{
+    str key;
+    MetadataValue value;
+}
+
+pub struct MetadataSet
+{
+    MetadataEntry* entries;
+    u32 numEntries;
+    u32 capEntries;
+}
+
+pub MetadataSet newMetadataSet()
+{
+    MetadataSet s;
+    s.entries = null;
+    s.numEntries = 0;
+    s.capEntries = 0;
+    return s;
+}
+
+pub void addInt(MetadataSet* self, str key, usize val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e*.key = key;
+    e*.value.kind = MetadataKind::Custom;
+    e*.value.intVal = val;
+    e*.value.strVal = str::empty();
+    e*.value.irVal = null;
+}
+
+pub void addString(MetadataSet* self, str key, str val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e.key = key;
+    e.value.kind = MetadataKind::Custom;
+    e.value.intVal = 0;
+    e.value.strVal = val;
+    e.value.irVal = null;
+}
+
+pub void addIRValue(MetadataSet* self, str key, IrValue* val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e.key = key;
+    e.value.kind = MetadataKind::Custom;
+    e.value.intVal = 0;
+    e.value.strVal = str::empty();
+    e.value.irVal = val;
+}
+
+pub MetadataEntry* find(MetadataSet* self, str key)
+{
+    for (u32 i = 0; i < self.numEntries; i++)
+    {
+        if (self.entries[i].key.equals(key))
+            return &self.entries[i];
+    }
+    return null;
+}
+
+pub void free(MetadataSet* self)
+{
+    if (self.entries) dealloc<MetadataEntry>(self.entries);
+    self.entries = null;
+    self.numEntries = 0;
+    self.capEntries = 0;
+}
+
+pub struct DebugLocation
+{
+    str filename;
+    u32 line;
+    u32 column;
+    str scope;
+}
+
+pub struct DebugFuncInfo
+{
+    str name;
+    str linkageName;
+    DebugLocation loc;
+    IrType* type;
+}
+
+pub struct DebugVarInfo
+{
+    str name;
+    str linkageName;
+    DebugLocation loc;
+    IrType* type;
+    IrValue* address;
+}
+
+pub struct MetadataStore
+{
+    MetadataSet* funcMetadata;
+    u32 numFuncs;
+    u32 capFuncs;
+
+    MetadataSet* instMetadata;
+    u32 numInsts;
+    u32 capInsts;
+
+    DebugFuncInfo* funcDebugInfo;
+    DebugVarInfo* varDebugInfo;
+    u32 numVars;
+    u32 capVars;
+}
+
+static MetadataStore gMetadataStore;
+
+pub void metadataInit()
+{
+    MetadataStore* s = &gMetadataStore;
+    s.funcMetadata = null;
+    s.numFuncs = 0;
+    s.capFuncs = 0;
+    s.instMetadata = null;
+    s.numInsts = 0;
+    s.capInsts = 0;
+    s.funcDebugInfo = null;
+    s.varDebugInfo = null;
+    s.numVars = 0;
+    s.capVars = 0;
+}
+
+pub void metadataShutdown()
+{
+    MetadataStore* s = &gMetadataStore;
+    for (u32 i = 0; i < s.numFuncs; i++)
+        free(&s.funcMetadata[i]);
+    if (s.funcMetadata) dealloc<MetadataSet>(s.funcMetadata);
+
+    for (u32 i = 0; i < s.numInsts; i++)
+        free(&s.instMetadata[i]);
+    if (s.instMetadata) dealloc<MetadataSet>(s.instMetadata);
+
+    if (s.funcDebugInfo) dealloc<DebugFuncInfo>(s.funcDebugInfo);
+    if (s.varDebugInfo) dealloc<DebugVarInfo>(s.varDebugInfo);
+}
+
+// Attach metadata to a function
+pub MetadataSet* attachFuncMetadata(IrFunc* func)
+{
+    MetadataStore* s = &gMetadataStore;
+    if (s.numFuncs >= s.capFuncs)
+    {
+        u32 newCap = s.capFuncs ? s.capFuncs * 2 : 16;
+        MetadataSet* newSets = alloc<MetadataSet>(newCap);
+        for (u32 i = 0; i < s.numFuncs; i++)
+            newSets[i] = s.funcMetadata[i];
+        if (s.funcMetadata) dealloc<MetadataSet>(s.funcMetadata);
+        s.funcMetadata = newSets;
+        s.capFuncs = newCap;
+    }
+
+    MetadataSet* set = &s.funcMetadata[s.numFuncs++];
+    *set = newMetadataSet();
+    return set;
+}
+
+pub MetadataSet* attachInstMetadata(IrInst* inst)
+{
+    MetadataStore* s = &gMetadataStore;
+    if (s.numInsts >= s.capInsts)
+    {
+        u32 newCap = s.capInsts ? s.capInsts * 2 : 64;
+        MetadataSet* newSets = alloc<MetadataSet>(newCap);
+        for (u32 i = 0; i < s.numInsts; i++)
+            newSets[i] = s.instMetadata[i];
+        if (s.instMetadata) dealloc<MetadataSet>(s.instMetadata);
+        s.instMetadata = newSets;
+        s.capInsts = newCap;
+    }
+
+    MetadataSet* set = &s.instMetadata[s.numInsts++];
+    *set = newMetadataSet();
+    return set;
+}
+
+pub void setDebugLocation(IrInst* inst, str file, u32 line, u32 col)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addString(md, str::fromParts("debug.file", 10), file);
+    addInt(md, str::fromParts("debug.line", 10), line);
+    addInt(md, str::fromParts("debug.col", 9), col);
+}
+
+pub void setAlignment(IrInst* inst, u32 align)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("alignment", 9), align);
+}
+
+pub void setNoAlias(IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("noalias", 7), 1);
+}
+
+pub void setNoCapture(IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("nocapture", 9), 1);
+}
+
+pub void setReadOnly(IrInst* inst)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("readonly", 8), 1);
+}
+
+pub void setInlineHint(IrInst* inst, u32 hint)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("inlinehint", 10), hint);
+}
+
+pub void setBranchWeights(IrInst* inst, u32 trueWeight, u32 falseWeight)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("weight.true", 11), trueWeight);
+    addInt(md, str::fromParts("weight.false", 12), falseWeight);
+}
+
+pub void setRange(IrInst* inst, isize min, isize max)
+{
+    MetadataSet* md = attachInstMetadata(inst);
+    addInt(md, str::fromParts("range.min", 9), min);
+    addInt(md, str::fromParts("range.max", 9), max);
+}
+
+pub MetadataSet* getInstMetadata(IrInst* inst)
+{
+    // Would need to map inst pointer to metadata index
+    // Simplified: return null
+    return null;
+}
