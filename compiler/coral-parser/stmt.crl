@@ -3,99 +3,91 @@
 import "parser" { Parser }
 import "../coral-common/token" { TokenKind }
 import "../coral-ast/id" { NodeId }
+import "../coral-ast/stmt" { Stmt, StmtKind }
+import "../coral-ast/node" { Node, NodeKind }
 
 extend Parser
 {
+    NodeId storeStmt(StmtKind kind)
+    {
+        NodeId id = self.ctx.allocNodeSlot();
+        if (id.index == 0) return id;
+        Stmt s;
+        s.kind = kind;
+        Node n;
+        n.kind = NodeKind::Stmt { .value = s };
+        return id;
+    }
+
     NodeId parseStmt()
     {
         if (self.check(TokenKind::Return))
-        {
             return self.parseReturnStmt();
-        }
         if (self.check(TokenKind::If))
-        {
             return self.parseIfStmt();
-        }
         if (self.check(TokenKind::While))
-        {
             return self.parseWhileStmt();
-        }
         if (self.check(TokenKind::For))
-        {
             return self.parseForStmt();
-        }
         if (self.check(TokenKind::Loop))
-        {
             return self.parseLoopStmt();
-        }
         if (self.check(TokenKind::Switch))
-        {
             return self.parseSwitchStmt();
-        }
         if (self.check(TokenKind::Defer))
-        {
             return self.parseDeferStmt();
-        }
         if (self.check(TokenKind::Break))
         {
             self.advance();
             self.expect(TokenKind::Semicolon);
-            return self.allocNode();
+            return self.storeStmt(StmtKind::Break);
         }
         if (self.check(TokenKind::Continue))
         {
             self.advance();
             self.expect(TokenKind::Semicolon);
-            return self.allocNode();
+            return self.storeStmt(StmtKind::Continue);
         }
         if (self.check(TokenKind::LBrace))
-        {
             return self.parseBlock();
-        }
         if (self.check(TokenKind::Comptime))
-        {
             return self.parseComptimeStmt();
-        }
         if (self.check(TokenKind::Asm) || self.check(TokenKind::Volatile))
-        {
             return self.parseAsmStmt();
-        }
         return self.parseExprOrDecl();
     }
 
     NodeId parseReturnStmt()
     {
         self.advance();
+        NodeId val = self.noneNode();
         if (!self.check(TokenKind::Semicolon))
-        {
-            self.parseExpr();
-        }
+            val = self.parseExpr();
         self.expect(TokenKind::Semicolon);
-        return self.allocNode();
+        return self.storeStmt(StmtKind::Return { .value = val });
     }
 
     NodeId parseIfStmt()
     {
         self.advance();
         self.expect(TokenKind::LParen);
-        self.parseExpr();
+        NodeId cond = self.parseExpr();
         self.expect(TokenKind::RParen);
-        self.parseStmt();
+        NodeId thenBody = self.parseStmt();
+        NodeId elseBody = self.noneNode();
+        
         if (self.match(TokenKind::Else))
-        {
-            self.parseStmt();
-        }
-        return self.allocNode();
+            elseBody = self.parseStmt();
+        return self.storeStmt(StmtKind::If { .cond = cond, .thenBody = thenBody, .elseBody = elseBody });
     }
 
     NodeId parseWhileStmt()
     {
         self.advance();
         self.expect(TokenKind::LParen);
-        self.parseExpr();
+        NodeId cond = self.parseExpr();
         self.expect(TokenKind::RParen);
-        self.parseStmt();
-        return self.allocNode();
+        NodeId body = self.parseStmt();
+        return self.storeStmt(StmtKind::While { .cond = cond, .body = body });
     }
 
     NodeId parseForStmt()
@@ -120,22 +112,16 @@ extend Parser
                 return self.allocNode();
             }
             if (self.match(TokenKind::Equal))
-            {
                 self.parseExpr();
-            }
             self.expect(TokenKind::Semicolon);
             if (!self.check(TokenKind::Semicolon))
-            {
                 self.parseExpr();
-            }
             self.expect(TokenKind::Semicolon);
             if (!self.check(TokenKind::RParen))
             {
                 self.parseExpr();
                 while (self.match(TokenKind::Comma))
-                {
                     self.parseExpr();
-                }
             }
             self.expect(TokenKind::RParen);
             self.parseStmt();
@@ -145,14 +131,10 @@ extend Parser
         {
             self.advance();
             if (!self.check(TokenKind::Semicolon))
-            {
                 self.parseExpr();
-            }
             self.expect(TokenKind::Semicolon);
             if (!self.check(TokenKind::RParen))
-            {
                 self.parseExpr();
-            }
             self.expect(TokenKind::RParen);
             self.parseStmt();
             return self.allocNode();
@@ -167,14 +149,10 @@ extend Parser
         }
         self.expect(TokenKind::Semicolon);
         if (!self.check(TokenKind::Semicolon))
-        {
             self.parseExpr();
-        }
         self.expect(TokenKind::Semicolon);
         if (!self.check(TokenKind::RParen))
-        {
             self.parseExpr();
-        }
         self.expect(TokenKind::RParen);
         self.parseStmt();
         return self.allocNode();
@@ -195,9 +173,7 @@ extend Parser
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::LBrace);
         while (!self.check(TokenKind::RBrace) && !self.atEnd())
-        {
             self.parseSwitchCase();
-        }
         self.expect(TokenKind::RBrace);
         return self.allocNode();
     }
@@ -213,13 +189,9 @@ extend Parser
         }
         self.parsePattern();
         while (self.match(TokenKind::Pipe))
-        {
             self.parsePattern();
-        }
         if (self.match(TokenKind::If))
-        {
             self.parseExpr();
-        }
         self.expect(TokenKind::FatArrow);
         self.parseExpr();
         self.match(TokenKind::Comma);
@@ -233,9 +205,7 @@ extend Parser
         {
             self.advance();
             if (self.match(TokenKind::ColonColon))
-            {
                 self.expect(TokenKind::Ident);
-            }
             if (self.check(TokenKind::LBrace))
             {
                 self.advance();
@@ -286,9 +256,7 @@ extend Parser
         self.advance();
         self.expect(TokenKind::LBrace);
         while (!self.check(TokenKind::RBrace) && !self.atEnd())
-        {
             self.parseStmt();
-        }
         self.expect(TokenKind::RBrace);
         return self.allocNode();
     }
@@ -303,8 +271,7 @@ extend Parser
             if (self.check(TokenKind::String) || self.check(TokenKind::RawString))
             {
                 self.advance();
-            }
-            else
+            } else
             {
                 self.parseExpr();
             }
@@ -331,16 +298,12 @@ extend Parser
         {
             self.advance();
             if (self.match(TokenKind::Equal))
-            {
                 self.parseExpr();
-            }
             self.expect(TokenKind::Semicolon);
             return self.allocNode();
         }
         if (self.match(TokenKind::Semicolon))
-        {
             return expr;
-        }
         self.expect(TokenKind::Semicolon);
         return expr;
     }

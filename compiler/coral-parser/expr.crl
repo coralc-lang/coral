@@ -5,8 +5,8 @@
  */
 
 import "parser" { Parser }
-import "../coral-common/token" { TokenKind }
-import "../coral-ast/id" { NodeId }
+import "../coral-common/token" { Token, TokenKind }
+import "../coral-ast/id" { NodeId, Str }
 import "../coral-ast/expr" { Expr, ExprKind }
 import "../coral-ast/node" { Node, NodeKind }
 
@@ -66,7 +66,8 @@ extend Parser
 
     NodeId storeExpr(ExprKind kind)
     {
-        NodeId id = self.allocNode();
+        NodeId id = self.ctx.allocNodeSlot();
+        if (id.index == 0) return id;
         Expr e;
         e.kind = kind;
         Node n;
@@ -108,30 +109,80 @@ extend Parser
             {
                 right = self.parseBinaryExpr(p + 1);
             }
-            left = self.allocNode();
+            left = self.makeBinOp(op.kind, left, right);
         }
 
         return left;
     }
 
+    NodeId makeBinOp(TokenKind op, NodeId left, NodeId right)
+    {
+        switch (op)
+        {
+            TokenKind::Plus => { return self.storeExpr(ExprKind::Add { .left = left, .right = right }); },
+            TokenKind::Minus => { return self.storeExpr(ExprKind::Sub { .left = left, .right = right }); },
+            TokenKind::Star => { return self.storeExpr(ExprKind::Mul { .left = left, .right = right }); },
+            TokenKind::Slash => { return self.storeExpr(ExprKind::Div { .left = left, .right = right }); },
+            TokenKind::Percent => { return self.storeExpr(ExprKind::Mod { .left = left, .right = right }); },
+            TokenKind::EqualEqual => { return self.storeExpr(ExprKind::Eq { .left = left, .right = right }); },
+            TokenKind::NotEqual => { return self.storeExpr(ExprKind::Ne { .left = left, .right = right }); },
+            TokenKind::Less => { return self.storeExpr(ExprKind::Lt { .left = left, .right = right }); },
+            TokenKind::LessEqual => { return self.storeExpr(ExprKind::Le { .left = left, .right = right }); },
+            TokenKind::Greater => { return self.storeExpr(ExprKind::Gt { .left = left, .right = right }); },
+            TokenKind::GreaterEqual => { return self.storeExpr(ExprKind::Ge { .left = left, .right = right }); },
+            TokenKind::And => { return self.storeExpr(ExprKind::And { .left = left, .right = right }); },
+            TokenKind::Or => { return self.storeExpr(ExprKind::Or { .left = left, .right = right }); },
+            TokenKind::Ampersand => { return self.storeExpr(ExprKind::BitAnd { .left = left, .right = right }); },
+            TokenKind::Pipe => { return self.storeExpr(ExprKind::BitOr { .left = left, .right = right }); },
+            TokenKind::Caret => { return self.storeExpr(ExprKind::BitXor { .left = left, .right = right }); },
+            TokenKind::Shl => { return self.storeExpr(ExprKind::Shl { .left = left, .right = right }); },
+            TokenKind::Shr => { return self.storeExpr(ExprKind::Shr { .left = left, .right = right }); },
+            TokenKind::Equal => { return self.storeExpr(ExprKind::Assign { .target = left, .value = right }); },
+            TokenKind::PlusEqual => { return self.storeExpr(ExprKind::AssignAdd { .target = left, .value = right }); },
+            TokenKind::MinusEqual => { return self.storeExpr(ExprKind::AssignSub { .target = left, .value = right }); },
+            TokenKind::StarEqual => { return self.storeExpr(ExprKind::AssignMul { .target = left, .value = right }); },
+            TokenKind::SlashEqual => { return self.storeExpr(ExprKind::AssignDiv { .target = left, .value = right }); },
+            TokenKind::PercentEqual => { return self.storeExpr(ExprKind::AssignMod { .target = left, .value = right }); },
+            TokenKind::AmpEqual => { return self.storeExpr(ExprKind::AssignBitAnd { .target = left, .value = right }); },
+            TokenKind::PipeEqual => { return self.storeExpr(ExprKind::AssignBitOr { .target = left, .value = right }); },
+            TokenKind::CaretEqual => { return self.storeExpr(ExprKind::AssignBitXor { .target = left, .value = right }); },
+            TokenKind::ShlEqual => { return self.storeExpr(ExprKind::AssignShl { .target = left, .value = right }); },
+            TokenKind::ShrEqual => { return self.storeExpr(ExprKind::AssignShr { .target = left, .value = right }); },
+            else => { return self.allocNode(); }
+        }
+    }
+
     NodeId parseUnaryExpr()
     {
-        if (self.check(TokenKind::Not) ||
-            self.check(TokenKind::Minus) ||
-            self.check(TokenKind::Star) ||
-            self.check(TokenKind::Ampersand) ||
-            self.check(TokenKind::Neg))
+        if (self.check(TokenKind::Not))
         {
-            Token op = self.advance();
+            self.advance();
             NodeId expr = self.parseUnaryExpr();
-            return self.allocNode();
+            return self.storeExpr(ExprKind::Not { .expr = expr });
         }
-        if (self.check(TokenKind::PlusPlus) ||
-            self.check(TokenKind::MinusMinus))
+        if (self.check(TokenKind::Minus))
         {
-            Token op = self.advance();
+            self.advance();
             NodeId expr = self.parseUnaryExpr();
-            return self.allocNode();
+            return self.storeExpr(ExprKind::Neg { .expr = expr });
+        }
+        if (self.check(TokenKind::Star))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::Deref { .expr = expr });
+        }
+        if (self.check(TokenKind::Ampersand))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::AddressOf { .expr = expr });
+        }
+        if (self.check(TokenKind::Neg))
+        {
+            self.advance();
+            NodeId expr = self.parseUnaryExpr();
+            return self.storeExpr(ExprKind::Neg { .expr = expr });
         }
         return self.parsePostfixExpr();
     }
@@ -169,9 +220,7 @@ extend Parser
                         {
                             self.parseExpr();
                             while (self.match(TokenKind::Comma))
-                            {
                                 self.parseExpr();
-                            }
                         }
                         self.expect(TokenKind::RParen);
                     }
@@ -210,129 +259,192 @@ extend Parser
     NodeId parsePrimaryExpr()
     {
         TokenKind k = self.current.kind;
-
-        if (k == TokenKind::Dec || k == TokenKind::Hex ||
-            k == TokenKind::Bin || k == TokenKind::Oct ||
-            k == TokenKind::Float || k == TokenKind::String ||
-            k == TokenKind::RawString || k == TokenKind::Char ||
-            k == TokenKind::True || k == TokenKind::False ||
-            k == TokenKind::Null)
+        switch (k)
         {
-            self.advance();
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::Ident)
-        {
-            self.advance();
-            if (self.check(TokenKind::ColonColon))
-            {
-                while (self.match(TokenKind::ColonColon))
+            TokenKind::Dec => {
+                self.advance();
+                return self.storeExpr(ExprKind::IntLit { .value = 0, .flags = 0 });
+            },
+            
+            TokenKind::Hex => {
+                self.advance();
+                return self.storeExpr(ExprKind::IntLit { .value = 0, .flags = 0 });
+            },
+            
+            TokenKind::Bin => {
+                self.advance();
+                return self.storeExpr(ExprKind::IntLit { .value = 0, .flags = 0 });
+            },
+            
+            TokenKind::Oct => {
+                self.advance();
+                return self.storeExpr(ExprKind::IntLit { .value = 0, .flags = 0 });
+            },
+            
+            TokenKind::Float => {
+                self.advance();
+                return self.storeExpr(ExprKind::FloatLit { .value = 0 });
+            },
+            
+            TokenKind::String => {
+                self.advance();
+                return self.storeExpr(ExprKind::StringLit { .value = 0 });
+            },
+            
+            TokenKind::RawString => {
+                self.advance();
+                return self.storeExpr(ExprKind::StringLit { .value = 0 });
+            },
+            
+            TokenKind::Char => {
+                self.advance();
+                return self.storeExpr(ExprKind::CharLit { .value = 0 });
+            },
+            
+            TokenKind::True => {
+                self.advance();
+                return self.storeExpr(ExprKind::BoolLit { .flags = 1 });
+            },
+            
+            TokenKind::False => {
+                self.advance();
+                return self.storeExpr(ExprKind::BoolLit { .flags = 0 });
+            },
+            
+            TokenKind::Null => {
+                self.advance();
+                return self.storeExpr(ExprKind::NullLit);
+            },
+            
+            TokenKind::Ident => {
+                Token nameTok = self.advance();
+                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                if (self.check(TokenKind::ColonColon))
                 {
-                    self.expect(TokenKind::Ident);
+                    while (self.match(TokenKind::ColonColon))
+                        self.expect(TokenKind::Ident);
+                    return self.allocNode();
                 }
-            }
-            if (self.check(TokenKind::LBrace))
-            {
+                if (self.check(TokenKind::LBrace))
+                {
+                    self.advance();
+                    while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                    {
+                        self.expect(TokenKind::Dot);
+                        self.expect(TokenKind::Ident);
+                        self.expect(TokenKind::Equal);
+                        self.parseExpr();
+                        if (!self.match(TokenKind::Comma)) break;
+                    }
+                    self.expect(TokenKind::RBrace);
+                    return self.allocNode();
+                }
+                return self.storeExpr(ExprKind::Ident { .name = name });
+            },
+            
+            TokenKind::LParen => {
+                self.advance();
+                NodeId expr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return expr;
+            },
+            
+            TokenKind::LBrace => {
                 self.advance();
                 while (!self.check(TokenKind::RBrace) && !self.atEnd())
                 {
-                    self.expect(TokenKind::Dot);
-                    self.expect(TokenKind::Ident);
-                    self.expect(TokenKind::Equal);
                     self.parseExpr();
-                    if (!self.match(TokenKind::Comma)) break;
+                    self.match(TokenKind::Semicolon);
                 }
                 self.expect(TokenKind::RBrace);
                 return self.allocNode();
-            }
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::LParen)
-        {
-            self.advance();
-            NodeId expr = self.parseExpr();
-            self.expect(TokenKind::RParen);
-            return expr;
-        }
-
-        if (k == TokenKind::LBrace)
-        {
-            self.advance();
-            while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            {
-                self.parseExpr();
-                self.match(TokenKind::Semicolon);
-            }
-            self.expect(TokenKind::RBrace);
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::If)
-        {
-            self.advance();
-            self.expect(TokenKind::LParen);
-            self.parseExpr();
-            self.expect(TokenKind::RParen);
-            self.parseExpr();
-            if (self.match(TokenKind::Else))
-            {
-                self.parseExpr();
-            }
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::Switch)
-        {
-            self.advance();
-            self.expect(TokenKind::LParen);
-            self.parseExpr();
-            self.expect(TokenKind::RParen);
-            self.expect(TokenKind::LBrace);
-            while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            {
-                self.parseSwitchCase();
-            }
-            self.expect(TokenKind::RBrace);
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::BuiltinSizeof ||
-            k == TokenKind::BuiltinAlignof ||
-            k == TokenKind::BuiltinTypeof ||
-            k == TokenKind::BuiltinAssert)
-        {
-            self.advance();
-            self.expect(TokenKind::LParen);
-            self.parseExpr();
-            while (self.match(TokenKind::Comma))
-            {
-                self.parseExpr();
-            }
-            self.expect(TokenKind::RParen);
-            return self.allocNode();
-        }
-
-        if (k == TokenKind::At)
-        {
-            self.advance();
-            self.expect(TokenKind::Ident);
-            self.expect(TokenKind::LParen);
-            if (!self.check(TokenKind::RParen))
-            {
+            },
+            
+            TokenKind::If => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeId cond = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                NodeId thenB = self.parseExpr();
+                NodeId elseB = self.noneNode();
+                if (self.match(TokenKind::Else))
+                {
+                    elseB = self.parseExpr();
+                }
+                return self.storeExpr(ExprKind::IfExpr { .cond = cond, .thenBody = thenB, .elseBody = elseB });
+            },
+            
+            TokenKind::Switch => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                NodeId sexpr = self.parseExpr();
+                self.expect(TokenKind::RParen);
+                self.expect(TokenKind::LBrace);
+                while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                    self.parseSwitchCase();
+                self.expect(TokenKind::RBrace);
+                return self.storeExpr(ExprKind::SwitchExpr { .expr = sexpr, .cases = null, .casesLen = 0 });
+            },
+            
+            TokenKind::BuiltinSizeof => {
+                self.advance();
+                self.expect(TokenKind::LParen);
                 self.parseExpr();
                 while (self.match(TokenKind::Comma))
+                    self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return self.allocNode();
+            },
+            
+            TokenKind::BuiltinAlignof => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                self.parseExpr();
+                while (self.match(TokenKind::Comma))
+                    self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return self.allocNode();
+            },
+            
+            TokenKind::BuiltinTypeof => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                self.parseExpr();
+                while (self.match(TokenKind::Comma))
+                    self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return self.allocNode();
+            },
+            
+            TokenKind::BuiltinAssert => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                self.parseExpr();
+                while (self.match(TokenKind::Comma))
+                    self.parseExpr();
+                self.expect(TokenKind::RParen);
+                return self.allocNode();
+            },
+            
+            TokenKind::At => {
+                self.advance();
+                self.expect(TokenKind::Ident);
+                self.expect(TokenKind::LParen);
+                if (!self.check(TokenKind::RParen))
                 {
                     self.parseExpr();
+                    while (self.match(TokenKind::Comma))
+                        self.parseExpr();
                 }
+                self.expect(TokenKind::RParen);
+                return self.allocNode();
+            },
+            
+            else => {
+                self.panicMode = 1;
+                return self.noneNode();
             }
-            self.expect(TokenKind::RParen);
-            return self.allocNode();
         }
-
-        self.panicMode = 1;
-        return self.noneNode();
     }
 
     NodeId parseSwitchCase()
@@ -346,13 +458,9 @@ extend Parser
         }
         self.parsePattern();
         while (self.match(TokenKind::Pipe))
-        {
             self.parsePattern();
-        }
         if (self.match(TokenKind::If))
-        {
             self.parseExpr();
-        }
         self.expect(TokenKind::FatArrow);
         self.parseExpr();
         self.match(TokenKind::Comma);

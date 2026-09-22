@@ -1,0 +1,286 @@
+import "allocator";
+import std::intrinsics::memory { mmap, munmap };
+
+const u64 MiArenaSize = 64 * 1024 * 1024;
+const u64 MiSegmentSize = 4 * 1024 * 1024;
+const u64 MiPageSize = 64 * 1024;
+const u64 MiSliceSize = 64 * 1024;
+const u32 MiAlign = 16;
+const u32 MiMaxBlockSize = 512 * 1024;
+const u32 MiSmallPageMax = 64 * 1024;
+const u32 MiMediumPageMax = 512 * 1024;
+const u32 MiHugeThreshold = 128 * 1024;
+const u32 MiInitialCapacity = 4;
+const u32 MiSegmentMapSize = 64; 
+const u32 MiSizeClassCount = 44;
+
+struct MiPage
+{
+    MiPage* next;
+    MiPage* prev;
+    u32 sizeClass;
+    u32 blockSize;
+    u32 capacity;
+    u32 used;
+    u32 freeCount;
+    u32 reserved;
+    u8* base;
+    MiBlock* free;
+    MiBlock* localFree;
+    MiBlock* xthreadFree;
+    u32 xthreadFreeCount;
+    MiSegment* segment;
+    u32 pageIdx;
+    bool retired;
+    u32 retireCount;
+    u64 key1;
+    u64 key2;
+}
+
+struct MiSegment
+{
+    MiSegment* next;
+    MiSegment* prev;
+    u8* base;
+    usize size;
+    u32 pageCount;
+    u32 usedCount;
+    MiPage* pages;
+    MiArena* arena;
+}
+
+struct MiArena
+{
+    MiArena* next;
+    u8* base;
+    usize size;
+    u64* bitmap;
+    u64 bitmapWords;
+    u32 sliceCount;
+    u32 usedSlices;
+}
+
+struct MiHeap
+{
+    MiPage* pages[MiSizeClassCount];
+    MiPage* freePages[MiSizeClassCount];
+    u32 pageCounts[MiSizeClassCount];
+    MiArena* arenas;
+    MiSegment* segments;
+    usize totalAllocated;
+    usize totalFreed;
+    usize mapped;
+    u32 pageSize[MiSizeClassCount];
+    u32 threadId;
+    MiSpinLock lock;
+    MiBlock* delayedFree;
+    MiPage* fullPages;
+    MiPage* hugePages;
+    MiSegmentMap segmentMap;
+
+    MiArena* _miArenaAlloc(usize minSize)
+    {
+        usize arenaSize = MiArenaSize;
+        if (arenaSize < minSize) arenaSize = minSize;
+    
+        u8* mem = (u8*)mmap(null, arenaSize, 3, 0x22, -1, 0);
+        if (mem == null) return null;
+    
+        MiArena* arena = (MiArena*)mem;
+        arena->base = mem;
+        arena->size = arenaSize;
+        arena->sliceCount = (u32)(arenaSize / MiSliceSize);
+        arena->bitmapWords = (arena->sliceCount + 63) / 64;
+        arena->bitmap = (u64*)(mem + sizeof(MiArena));
+        arena->usedSlices = 0;
+        arena->next = self.arenas;
+    
+        // Initialize bitmap to all free (0)
+        for (usize i = 0; i < arena->bitmapWords; i++)
+            arena->bitmap[i] = 0;
+        // Mark header slices as used
+        u32 headerSlices = (sizeof(MiArena) + arena->bitmapWords * 8 + MiSliceSize - 1) / MiSliceSize;
+        for (u32 i = 0; i < headerSlices && i < arena->sliceCount; i++)
+            arena->bitmap[i / 64] |= (1u << (i % 64));
+        arena->usedSlices = headerSlices;
+    
+        self.arenas = arena;
+        self.mapped += arenaSize;
+        return arena;
+    }
+}
+
+struct MiSegmentMapEntry
+{
+    u8* pageBase;
+    MiPage* page;
+    MiSegmentMapEntry* next;
+}
+
+struct MiBlock
+{
+    MiBlock* next;
+
+    void _miFreeBlockEncode(MiBlock* next,
+                                   u64 key1, u64 key2)
+    {
+        u64 raw = (u64)next;
+        u64 encoded = ((raw ^ key2) << key1) | ((raw ^ key2) >> (64 - key1));
+        self.next = (MiBlock*)encoded;
+    }
+
+    MiBlock* _miFreeBlockDecode(u64 key1, u64 key2)
+    {
+        u64 encoded = (u64)self.next;
+        u64 decoded = ((encoded >> key1) | (encoded << (64 - key1))) ^ key2;
+        return (MiBlock*)decoded;
+    }
+}
+
+struct MiSegmentMap
+{
+    MiSegmentMapEntry* buckets[MiSegmentMapSize];
+
+    MiPage* _miSegmentMapLookup(u8* addr)
+    {
+        u32 idx = _miSegmentMapHash(addr);
+        MiSegmentMapEntry* entry = &self.buckets[idx];
+        while (entry != null)
+        {
+            if (entry->pageBase == addr) return entry->page;
+            entry = entry->next;
+        }
+        return null;
+    }
+
+    void _miSegmentMapInsert(u8* pageBase, MiPage* page)
+    {
+        u32 idx = _miSegmentMapHash(pageBase);
+        MiSegmentMapEntry* entry =
+            (MiSegmentMapEntry*)mmap(null, sizeof(MiSegmentMapEntry), 3, 0x22, -1, 0);
+        if (entry == null) return;
+        entry->pageBase = pageBase;
+        entry->page = page;
+        entry->next = self.buckets[idx];
+        self.buckets[idx] = entry;
+    }
+
+    void _miSegmentMapRemove(u8* pageBase)
+    {
+        u32 idx = _miSegmentMapHash(pageBase);
+        MiSegmentMapEntry* prev = null;
+        MiSegmentMapEntry* entry = &self.buckets[idx];
+        while (entry != null)
+        {
+            if (entry->pageBase == pageBase)
+            {
+                if (prev != null) prev->next = entry->next;
+                else self.buckets[idx] = entry->next;
+                munmap((rawptr)entry, sizeof(MiSegmentMapEntry));
+                return;
+            }
+            prev = entry;
+            entry = entry->next;
+        }
+    }
+
+    MiPage* _miSegmentMapLookup(u8* addr)
+    {
+        u32 idx = _miSegmentMapHash(addr);
+        MiSegmentMapEntry* entry = self.buckets[idx];
+        while (entry != null)
+        {
+            if (entry->pageBase == addr) return entry->page;
+            entry = entry->next;
+        }
+        return null;
+    }
+
+    
+}
+
+const u32 MiBlockSizes[MiSizeClassCount] = {
+    8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 
+    112, 128, 160, 192, 224, 256, 320, 384, 
+    448, 512, 640, 768, 896, 1024, 1280, 
+    1536, 1792, 2048, 2560, 3072, 3584, 
+    4096, 5120, 6144, 7168, 8192, 10240, 
+    12288, 14336, 16384, 20480, 24576, 
+    28672, 32768
+};
+
+const u32 MiPageSizes[MiSizeClassCount] = {
+    4096, 4096, 4096, 4096, 4096, 4096, 
+    4096, 4096, 8192, 8192, 8192, 8192, 
+    16384, 16384, 16384, 16384, 32768, 
+    32768, 32768, 32768, 65536, 65536, 
+    65536, 65536, 65536, 65536, 65536, 
+    65536, 65536, 65536, 65536, 65536, 
+    65536, 65536, 65536, 65536, 65536, 
+    65536, 65536, 65536, 65536, 65536, 
+    65536, 65536
+};
+
+static const u8 MiSizeClassSmall[129] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 
+    2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 
+    4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 
+    6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 
+    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
+    10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 
+    11, 11, 11, 11, 11, 11, 11, 11, 11, 11
+};
+
+static u32 _miSizeClass(usize size)
+{
+    if (size == 0) return 0;
+    if (size <= 128)
+        return (u32)MiSizeClassSmall[size];
+    if (size <= 1024)
+        return 8 + (u32)((size - 129) / 16);
+    for (u32 i = 0; i < MiSizeClassCount; i++) {
+        if (size <= MiBlockSizes[i]) return i;
+    }
+    return MiSizeClassCount - 1;
+}
+
+static usize _miBlockSize(u32 sc) { return (usize)MiBlockSizes[sc]; }
+
+static u32 _miBlocksPerPage(u32 sc)
+{
+    usize blockSize = _miBlockSize(sc);
+    usize pageSize = MiPageSizes[sc];
+    usize metaSize = (sizeof(MiPage) + 255) & ~256u;
+    usize usable = pageSize - metaSize;
+    return (u32)(usable / blockSize);
+}
+
+static u64 _miRandomU64()
+{
+    static u64 state = 0x123456789ABCDEF0 *
+                       6364136223846793005 +
+                       1442695040888963407;
+    return state;
+}
+
+static u32 _miSegmentMapHash(u8* addr)
+{
+    u64 val = (u64)addr;
+    val = (val >> 12) ^ (val >> 24); // use page-aligned bits
+    return (u32)(val % MiSegmentMapSize);
+}
+
+struct MiSpinLock // requires implementation
+{
+    u32 locked;
+
+    void acquire()
+    {
+        while (self.locked == 1) { /* spin */ }
+        self.locked = 1;
+    }
+
+    void release() { self.locked = 0; }
+}
