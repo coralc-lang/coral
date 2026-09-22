@@ -26,12 +26,12 @@ So **A vs B is not about compiler speed** — both keep the compiler dumb. A vs 
 1. **Determinism.** With A, a stray `lib.crl` you accidentally leave in `compiler/` (backup folder, scratch dir, vendor dump) silently becomes a module. With B, you list what's real. The build graph can't be changed by accident.
 2. **Skip lists fall out naturally.** You said folders can be skipped. With A you need `skip = [...]` on top of the walk. With B, skipping = not listing it. One concept, not two.
 3. **Aliases need a home.** `import lexer::table` needs a mapping `lexer → coral-lexer`. Where does that mapping live? Naturally in the build file next to the module list. With A, aliases have no obvious anchor.
-4. **You can still `crl map` for discovery.** You said `crl map` re-scans and adds new `lib.crl` files. So the "don't want to hand-maintain the list" problem is solved by a *tool*, not by making the walk implicit. Explicit list + auto-update tool = best of both.
+4. **You can still `coralc map` for discovery.** You said `coralc map` re-scans and adds new `lib.crl` files. So the "don't want to hand-maintain the list" problem is solved by a *tool*, not by making the walk implicit. Explicit list + auto-update tool = best of both.
 5. **Incremental + cache-friendly.** Cache fingerprint = list of modules + their file hashes. Explicit list = stable fingerprint. A walk = fingerprint changes when unrelated folders change.
 
-**The one thing A does better:** zero-config for new projects. But you already planned `crl init` and `crl map`, which covers that.
+**The one thing A does better:** zero-config for new projects. But you already planned `coralc init` and `coralc map`, which covers that.
 
-So: **B is correct.** Compiler stays dumb, builder stays explicit, `crl map` keeps the list fresh.
+So: **B is correct.** Compiler stays dumb, builder stays explicit, `coralc map` keeps the list fresh.
 
 Now the full spec.
 
@@ -46,7 +46,7 @@ Now the full spec.
 | Source language | Coral | `.crl` |
 | Build file | Coral Build | `.crlb` |
 | Compiler | `coralc` | — |
-| Builder | `crl` | — |
+| Builder | `coralc` | — |
 | Module map | `modules.map` | — |
 | Cache dir | `.coral/` | — |
 
@@ -187,19 +187,19 @@ Plain text, line-oriented, stable, diff-friendly:
 ```
 # coral modules.map v1
 # <folder>::<export>  →  <resolved-path>
-coral-common::token       →  compiler/coral-common/token.crl
-coral-common::slice       →  compiler/coral-common/slice.crl
-coral-diagnostics::lexer_diag  →  compiler/coral-diagnostics/lexer_diag.crl
-coral-lexer::base         →  compiler/coral-lexer/base.crl
-coral-lexer::escape       →  compiler/coral-lexer/escape.crl
-coral-lexer::ident        →  compiler/coral-lexer/ident.crl
-coral-lexer::lexer        →  compiler/coral-lexer/lexer.crl
-coral-lexer::number       →  compiler/coral-lexer/number.crl
-coral-lexer::operator     →  compiler/coral-lexer/operator.crl
-coral-lexer::skip_ws      →  compiler/coral-lexer/skip_ws.crl
-coral-lexer::string       →  compiler/coral-lexer/string.crl
-coral-lexer::table        →  compiler/coral-lexer/table.crl
-coral-parser::expr        →  compiler/coral-parser/expr.crl
+common::token       →  compiler/coral-common/token.crl
+common::slice       →  compiler/coral-common/slice.crl
+diagnostics::lexer_diag  →  compiler/coral-diagnostics/lexer_diag.crl
+lexer::base         →  compiler/coral-lexer/base.crl
+lexer::escape       →  compiler/coral-lexer/escape.crl
+lexer::ident        →  compiler/coral-lexer/ident.crl
+lexer::lexer        →  compiler/coral-lexer/lexer.crl
+lexer::number       →  compiler/coral-lexer/number.crl
+lexer::operator     →  compiler/coral-lexer/operator.crl
+lexer::skip_ws      →  compiler/coral-lexer/skip_ws.crl
+lexer::string       →  compiler/coral-lexer/string.crl
+lexer::table        →  compiler/coral-lexer/table.crl
+parser::expr        →  compiler/coral-parser/expr.crl
 
 # aliases (from build file)
 @lexer::table             →  compiler/coral-lexer/table.crl
@@ -239,10 +239,10 @@ import coral-parser::expr { Expr };
 Aliases are declared in the build file:
 
 ```crlb
-alias lexer  = "coral-lexer";
-alias parser = "coral-parser";
-alias common = "coral-common";
-alias diag   = "coral-diagnostics";
+alias lexer  = "coral-lexer/lib.crl";
+alias parser = "coral-parser/lib.crl";
+alias common = "coral-common/lib.crl";
+alias diag   = "coral-diagnostics/lib.crl";
 ```
 
 The builder applies aliases when writing `modules.map`, so the compiler never sees `coral-lexer::` — it sees `lexer::` directly.
@@ -273,7 +273,7 @@ The compiler sees `import lexer::table` and asks the module map: "give me the pa
 ## 7. Build algorithm
 
 ```
-crl build
+coralc build
   1. read coral.crlb
   2. resolve `root`, `modules`, `skip`, `alias`
   3. for each module in `modules`:
@@ -285,7 +285,7 @@ crl build
   4. error E1002 on duplicate <module>::NAME
   5. error E1003 on alias pointing to missing module
   6. write .coral/modules.map   (unaliased + aliased entries)
-  7. for each module, for each .crl in it:
+  7. for each module, for each .crlin it:
        - scan for `import x::y` module-imports
        - resolve via map
        - add edge  <this-module> → <target-module>
@@ -293,7 +293,7 @@ crl build
   9. error E1006 on cycle (with trace)
  10. topo-sort modules
  11. for each module in order:
-       - fingerprint = hash(lib.crl + all .crl in folder + dep fingerprints)
+       - fingerprint = hash(lib.crl+ all .crlin folder + dep fingerprints)
        - if fingerprint in cache, skip
        - else:  coralc --emit-obj --module-map=.coral/modules.map <folder>/*.crl
  12. link entry module → output
@@ -310,7 +310,7 @@ Consistent, single-line first, details after:
 E1001  missing lib.crl
   module: coral-frontend
   path:   compiler/coral-frontend/lib.crl
-  hint:   run `crl init coral-frontend` or add a lib.crl
+  hint:   run `coralc init coral-frontend` or add a lib.crl
 
 E1002  duplicate module export
   name:   coral-lexer::table
@@ -346,25 +346,25 @@ E1006  dependency cycle
 ## 9. CLI spec
 
 ```
-crl init [dir]              scaffold empty project:
+coralc init [dir]              scaffold empty project:
                               dir/
                                 coral.crlb
                                 .coral/
                                 <module>/
                                   lib.crl
 
-crl build                   run full build (uses cache)
-crl build --force           ignore cache
-crl build --module NAME     build one module + deps
-crl build --emit-map        write modules.map only, no compile
+coralc build                   run full build (uses cache)
+coralc build --force           ignore cache
+coralc build --module NAME     build one module + deps
+coralc build --emit-map        write modules.map only, no compile
 
-crl map                     rescan tree; add any new lib.crl to `modules`
-crl map --dry               show what would be added, don't write
+coralc map                     rescan tree; add any new lib.crlto `modules`
+coralc map --dry               show what would be added, don't write
 
-crl run                     build entry, then exec output
-crl clean                   wipe .coral/cache and build/
-crl graph                   dump .coral/graph.dot
-crl doctor                  validate build file, aliases, cycles
+coralc run                     build entry, then exec output
+coralc clean                   wipe .coral/cache and build/
+coralc graph                   dump .coral/graph.dot
+coralc doctor                  validate build file, aliases, cycles
 ```
 
 ---
@@ -376,7 +376,7 @@ crl doctor                  validate build file, aliases, cycles
 ```crlb
 build "coralc" {
     root       = "compiler/"
-    entry      = "coral-frontend"
+    entry      = "coral-frontend/coral.crl"
     target     = "native-x86_64"
     opt        = "release"
     output     = "build/coralc"
@@ -405,14 +405,14 @@ build "coralc" {
 }
 
 # short names for imports
-alias lexer   = "coral-lexer";
-alias parser  = "coral-parser";
-alias common  = "coral-common";
-alias diag    = "coral-diagnostics";
-alias ast     = "coral-ast";
-alias ir      = "coral-ir";
-alias sem     = "coral-semantics";
-alias src     = "coral-source";
+alias lexer   = "coral-lexer/lib.crl";
+alias parser  = "coral-parser/lib.crl";
+alias common  = "coral-common/lib.crl";
+alias diag    = "coral-diagnostics/lib.crl";
+alias ast     = "coral-ast/lib.crl";
+alias ir      = "coral-ir/lib.crl";
+alias sem     = "coral-semantics/lib.crl";
+alias src     = "coral-source/lib.crl";
 
 # per-module overrides
 override "coral-lexer" {
@@ -482,7 +482,7 @@ Note:
 ### `.coral/modules.map` (generated)
 
 ```
-# coral modules.map v1 — generated by `crl build`, do not edit
+# coral modules.map v1 — generated by `coralc build`, do not edit
 common::token        →  compiler/coral-common/token.crl
 common::slice        →  compiler/coral-common/slice.crl
 diag::lexer_diag     →  compiler/coral-diagnostics/lexer_diag.crl
@@ -515,16 +515,16 @@ coral-ir ──→ coral-semantics
 
 ---
 
-## 11. `crl init` and `crl map`
+## 11. `coralc init` and `coralc map`
 
-### `crl init myproject`
+### `coralc init myproject`
 
 ```
 myproject/
 ├── coral.crlb
 ├── .coral/
 └── src/
-    └── lib.crl          # empty
+    └── lib.crl         # empty
 ```
 
 `coral.crlb`:
@@ -546,7 +546,7 @@ build "myproject" {
 # public surface of src
 ```
 
-### `crl map`
+### `coralc map`
 
 Walks `root/`, finds every folder containing `lib.crl`, and:
 
@@ -556,7 +556,7 @@ Walks `root/`, finds every folder containing `lib.crl`, and:
 - reports the diff
 
 ```
-$ crl map
+$ coralc map
 + added   coral-module
 + added   coral-context
 ~ updated modules.map  (14 entries, 3 aliases)
@@ -572,7 +572,7 @@ Each module gets a fingerprint:
 
 ```
 fingerprint(module) = hash(
-    hash(every .crl in module folder, sorted),
+    hash(every .crlin module folder, sorted),
     hash(lib.crl),
     for each dep in module: fingerprint(dep),
     build_flags_for(module),
@@ -585,7 +585,7 @@ Stored in `.coral/cache/<module>.fp`. On build:
 - fingerprint match → skip compilation
 - mismatch → recompile, cascade to dependents
 
-`crl clean` wipes `.coral/cache/`.
+`coralc clean` wipes `.coral/cache/`.
 
 ---
 
@@ -599,7 +599,7 @@ function build(build_file):
     skip = cfg.skip or []
     aliases = cfg.aliases or {}
 
-    # 1. scan lib.crl files
+    # 1. scan lib.crlfiles
     table = {}                       # "folder::name" → path
     for m in modules:
         libpath = join(root, m, "lib.crl")
@@ -681,7 +681,7 @@ function build(build_file):
 | Path imports | `import "x"` | Compiler-local, sibling files |
 | Module imports | `import x::y` | Builder-resolved via map |
 | Caching | Fingerprint per module | Cascades through deps |
-| Scaffolding | `crl init`, `crl map` | Zero to working project, auto-refresh |
+| Scaffolding | `coralc init`, `coralc map` | Zero to working project, auto-refresh |
 
 ---
 
