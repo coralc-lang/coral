@@ -455,6 +455,30 @@ class Lexer:
             if c == "*" and nxt == ".":
                 self.advance()
                 return self.make_token(TokenKind.StarDot, start)
+            if c == "[" and nxt == "[":
+                self.advance()
+                return self.make_token(TokenKind.AttrOpen, start)
+            if c == "]" and nxt == "]":
+                self.advance()
+                return self.make_token(TokenKind.AttrClose, start)
+            if c == "%" and nxt == "=":
+                self.advance()
+                return self.make_token(TokenKind.PercentEqual, start)
+            if c == "<" and nxt == "<":
+                self.advance()
+                if not self.is_at_end() and self.peek() == "=":
+                    self.advance()
+                    return self.make_token(TokenKind.ShlEqual, start)
+                return self.make_token(TokenKind.Shl, start)
+            if c == ">" and nxt == ">":
+                self.advance()
+                if not self.is_at_end() and self.peek() == "=":
+                    self.advance()
+                    return self.make_token(TokenKind.ShrEqual, start)
+                return self.make_token(TokenKind.Shr, start)
+            if c == "-" and nxt == ">":
+                self.advance()
+                return self.make_token(TokenKind.Arrow, start)
             if c == "." and nxt == ".":
                 if self.pos + 1 < len(self.source) and self.source[self.pos + 1] == ".":
                     self.advance()
@@ -463,7 +487,7 @@ class Lexer:
 
         ops = {
             "+": TokenKind.Plus, "-": TokenKind.Minus, "*": TokenKind.Star,
-            "/": TokenKind.Slash, "<": TokenKind.Less, ">": TokenKind.Greater,
+            "/": TokenKind.Slash, "%": TokenKind.Percent, "<": TokenKind.Less, ">": TokenKind.Greater,
             "~": TokenKind.Neg, "!": TokenKind.Not, ":": TokenKind.Colon,
             ";": TokenKind.Semicolon, ",": TokenKind.Comma, "#": TokenKind.Hash,
             ".": TokenKind.Dot, "&": TokenKind.Ampersand, "^": TokenKind.Caret,

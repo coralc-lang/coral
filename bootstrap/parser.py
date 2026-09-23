@@ -598,15 +598,21 @@ class Parser:
 
     def parse_shift(self):
         left = self.parse_add()
-        while self.peek().kind in (TokenKind.Less, TokenKind.Greater):
-            if self.peek().kind == TokenKind.Less and self.peek2().kind == TokenKind.Less:
-                self.advance()
-                self.advance()
+        while self.peek().kind in (TokenKind.Less, TokenKind.Greater, TokenKind.Shl, TokenKind.Shr):
+            if self.peek().kind == TokenKind.Shl or (self.peek().kind == TokenKind.Less and self.peek2().kind == TokenKind.Less):
+                if self.peek().kind == TokenKind.Shl:
+                    self.advance()
+                else:
+                    self.advance()
+                    self.advance()
                 right = self.parse_add()
                 left = BinaryExpr("<<", left, right)
-            elif self.peek().kind == TokenKind.Greater and self.peek2().kind == TokenKind.Greater:
-                self.advance()
-                self.advance()
+            elif self.peek().kind == TokenKind.Shr or (self.peek().kind == TokenKind.Greater and self.peek2().kind == TokenKind.Greater):
+                if self.peek().kind == TokenKind.Shr:
+                    self.advance()
+                else:
+                    self.advance()
+                    self.advance()
                 right = self.parse_add()
                 left = BinaryExpr(">>", left, right)
             else:
