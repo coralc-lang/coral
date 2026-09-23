@@ -691,4 +691,6 @@ If you want, next I can:
 - or write the **`modules.map` reader** that `coralc` uses,
 - or add a **`workspace`** concept (multiple `.crlb` files, one root).
 
-Which?
+
+// priority
+another thing, importing wia string paths, woulld require a binding to a module alias, because the item is nameless
