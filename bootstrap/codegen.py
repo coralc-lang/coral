@@ -120,9 +120,12 @@ class CodeGen:
             if isinstance(node.func, DotExpr) and isinstance(node.func.obj, Ident):
                 obj_name = node.func.obj.name
                 if obj_name in self.local_types:
-                    obj_type = self.local_types[obj_name]
+                    raw_tp = self.local_types[obj_name]
+                    is_ptr = raw_tp.strip().endswith('*')
+                    obj_type = raw_tp.rstrip('*').strip()
                     method_name = self.gen_expr(node.func.field)
-                    all_args = obj_name + (", " + args if args else "")
+                    arg0 = obj_name if is_ptr else f"&{obj_name}"
+                    all_args = arg0 + (", " + args if args else "")
                     return f"{obj_type}_{method_name}({all_args})"
             if isinstance(node.func, DotExpr) and isinstance(node.func.obj, DotExpr) and isinstance(node.func.obj.obj, Ident) and node.func.obj.obj.name == "self":
                 outer_field = self.gen_expr(node.func.obj.field)
@@ -132,12 +135,40 @@ class CodeGen:
                 inner_arg = f"self->{outer_field}"
                 all_args = inner_arg + (", " + args if args else "")
                 return f"{type_name}_{method_name}({all_args})"
+            if isinstance(node.func, DotExpr) and isinstance(node.func.obj, DotExpr) and isinstance(node.func.obj.obj, Ident):
+                a_name = node.func.obj.obj.name
+                b_field = self.gen_expr(node.func.obj.field)
+                c_method = self.gen_expr(node.func.field)
+                if a_name in self.local_types:
+                    a_raw = self.local_types[a_name]
+                    a_is_ptr = a_raw.strip().endswith('*')
+                    a_type = a_raw.rstrip('*').strip()
+                    field_type = self.field_type_names.get((a_type, b_field), b_field.capitalize())
+                    is_a_ptr = a_is_ptr
+                    obj_inner = f"{a_name}->{b_field}" if is_a_ptr else f"{a_name}.{b_field}"
+                    # b_field is Lexer* if Parser.lexer, so obj_inner already is Lexer*
+                    all_args = f"{obj_inner}" + (", " + args if args else "")
+                    return f"{field_type}_{c_method}({all_args})"
             return f"{func_name}({args})"
         if isinstance(node, DotExpr):
             obj_str = self.gen_expr(node.obj)
             field_str = self.gen_expr(node.field)
+            if obj_str in ("diag", "lbl"):
+                return f"{obj_str}->{field_str}"
             if isinstance(node.obj, Ident) and node.obj.name == "self":
                 return f"self->{field_str}"
+            if isinstance(node.obj, Ident) and node.obj.name in self.local_types and self.local_types[node.obj.name].strip().endswith('*'):
+                return f"{obj_str}->{field_str}"
+            if isinstance(node.obj, DotExpr) and isinstance(node.obj.obj, Ident) and node.obj.obj.name == "self":
+                outer_field = self.gen_expr(node.obj.field)
+                st = self.current_self_type or "Lexer"
+                field_type = self.field_type_names.get((st, outer_field), "")
+                if field_type.strip().endswith('*'):
+                    return f"{obj_str}->{field_str}"
+                else:
+                    return f"{obj_str}.{field_str}"
+            # Fallback: value field access uses .
+            return f"{obj_str}.{field_str}"
             if isinstance(node.field, IntLit):
                 return f"{obj_str}._{field_str}"
             return f"{obj_str}.{field_str}"
@@ -207,8 +238,8 @@ class CodeGen:
         if isinstance(node, VarDecl):
             tp = self.gen_type(node.type_node)
             name = node.name
-            base_tp = tp.rstrip('*').strip()
-            self.local_types[name] = base_tp
+            self.local_types[name] = tp
+            # also handle Token* etc. where tp includes *
             if node.init_expr:
                 self.emit(f"{tp} {name} = {self.gen_expr(node.init_expr)};\n")
             else:
@@ -414,14 +445,13 @@ class CodeGen:
         self.emit(f"typedef struct {name} {{\n")
         self.pointer_fields[name] = set()
         for f in node.fields:
-            self.emit(f"    {self.gen_type(f.type_node)} {f.name};\n")
+            tp = self.gen_type(f.type_node)
+            self.emit(f"    {tp} {f.name};\n")
             if isinstance(f.type_node, PointerType):
                 self.pointer_fields[name].add(f.name)
-                base = f.type_node.base
-                while isinstance(base, PointerType):
-                    base = base.base
-                if isinstance(base, TypeIdent):
-                    self.field_type_names[(name, f.name)] = base.name
+                self.field_type_names[(name, f.name)] = tp
+            else:
+                self.field_type_names[(name, f.name)] = tp
         self.emit(f"}} {name};\n\n")
         for method in node.methods:
             st = name
@@ -594,8 +624,6 @@ class CodeGen:
             elif isinstance(decl, UnionDecl):
                 self.struct_names.add(decl.name)
             elif isinstance(decl, DistinctDecl):
-                self.struct_names.add(decl.name)
-            elif isinstance(decl, TypedefDecl):
                 self.struct_names.add(decl.name)
 
         for name in self.struct_names:

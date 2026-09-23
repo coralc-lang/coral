@@ -1144,10 +1144,9 @@ class Parser:
         fields = []
         methods = []
         while self.peek().kind != TokenKind.RBrace:
-            if self.peek().kind in (TokenKind.Pub, TokenKind.Extern):
-                self.advance()
-            if self.peek().kind == TokenKind.Static:
-                self.advance()
+            is_pub = self.match(TokenKind.Pub) is not None
+            is_extern = self.match(TokenKind.Extern) is not None
+            is_static = self.match(TokenKind.Static) is not None
             if self.peek().kind == TokenKind.Extend:
                 break
             if self.peek().kind == TokenKind.RBrace:
@@ -1184,7 +1183,7 @@ class Parser:
                             params.append(ParamDecl(ptp, pname))
                 self.expect(TokenKind.Rparen)
                 body = self.parse_block()
-                methods.append(FuncDecl(name, params, tp, body, False, False, False, False, None))
+                methods.append(FuncDecl(name, params, tp, body, is_pub, is_extern, is_static, False, None))
                 continue
 
             fields.append(FieldDecl(tp, name))

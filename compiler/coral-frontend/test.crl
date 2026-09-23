@@ -8,8 +8,12 @@ import "../coral-common/slice" { Slice };
 import "../coral-common/token" { Token, TokenKind };
 import "../coral-lexer/lexer" { Lexer };
 import "../coral-lexer/table" { IdentifierTable };
-import "../coral-diagnostics/engine" { DiagnosticEngine };
+import "../coral-context/context" { AstContext };
 import "../coral-parser/parser" { Parser };
+import "../coral-parser/decl";
+import "../coral-parser/expr";
+import "../coral-parser/stmt";
+import "../coral-parser/type";
 
 extern("C") i32 printf(u8* fmt, ...);
 
@@ -30,17 +34,8 @@ extend TestResult
 
 TestResult runParser(u8* src, usize len)
 {
-    Slice s;
-    s.ptr = src;
-    s.len = len;
-
-    IdentifierTable table;
-    DiagnosticEngine diag;
-    diag.errors = 0;
-    diag.warnings = 0;
-    diag.errorLimit = 20;
-    diag.bufStart = src;
-    diag.bufEnd = src + len;
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
 
     Lexer lexer;
     lexer.bufStart = src;
@@ -48,28 +43,38 @@ TestResult runParser(u8* src, usize len)
     lexer.bufEnd = src + len;
     lexer.line = 1;
     lexer.lineStart = src;
-    lexer.diag = &diag;
+    lexer.diag = null;
 
     Parser p;
     p.lexer = &lexer;
+    p.ctx = &ctx;
     p.panicMode = 0;
-    p.nodeCount = 0;
+    p.pendingGreater = false;
     Lexer_nextToken(&lexer);
     p.current = lexer.token;
     p.previous = lexer.token;
 
-    u32 tokCount = 0;
+    u32 declCount = 0;
     while (!p.atEnd())
     {
-        p.advance();
-        tokCount = tokCount + 1;
-        if (tokCount > 100000) break;
+        TokenKind k = p.current.kind;
+        if (k == TokenKind::Eof) break;
+        if (k == TokenKind::Unknown)
+        {
+            p.advance();
+            continue;
+        }
+        p.parseDecl();
+        declCount = declCount + 1;
+        if (declCount > 1000) break;
+        if (p.panicMode == 1) break;
     }
 
     TestResult r;
-    r.tokens = tokCount;
-    r.nodes = p.nodeCount;
-    r.errors = diag.errors;
+    r.tokens = declCount;
+    r.nodes = ctx.nodeCount();
+    r.errors = p.panicMode;
+    ctx.deinit();
     return r;
 }
 
@@ -153,7 +158,7 @@ void testAttr()
     r.print();
 }
 
-pub i32 main()
+pub i32 runTests()
 {
     printf("=== coral parser self-test ===\n");
     testExpr();
