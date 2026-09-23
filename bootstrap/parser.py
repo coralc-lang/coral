@@ -1014,6 +1014,12 @@ class Parser:
                 self.match(TokenKind.Comma)
                 continue
             pattern = self.parse_switch_pattern()
+            while self.match(TokenKind.Comma):
+                nxt = self.parse_switch_pattern()
+                if isinstance(pattern, OrPattern):
+                    pattern.patterns.append(nxt)
+                else:
+                    pattern = OrPattern([pattern, nxt])
             self.expect(TokenKind.FatArrow)
             if self.peek().kind == TokenKind.LBrace:
                 body = self.parse_block()
@@ -1393,6 +1399,25 @@ class Parser:
                     self.advance()
                     func = self.parse_func(True, is_extern, is_static)
                     decls.append(func)
+                    continue
+                if self.peek().kind == TokenKind.Extend:
+                    self.advance()
+                    tp = self.parse_type()
+                    trait_name = None
+                    if self.match(TokenKind.Colon):
+                        trait_name = self.expect(TokenKind.Ident).value
+                    self.expect(TokenKind.LBrace)
+                    methods = []
+                    while self.peek().kind != TokenKind.RBrace:
+                        is_pub = self.match(TokenKind.Pub) is not None
+                        is_extern = self.match(TokenKind.Extern) is not None
+                        is_static = self.match(TokenKind.Static) is not None
+                        methods.append(self.parse_func(is_pub, is_extern, is_static, tp))
+                    self.expect(TokenKind.RBrace)
+                    if trait_name:
+                        decls.append(ExtendTraitBlock(tp, trait_name, methods))
+                    else:
+                        decls.append(ExtendBlock(tp, methods))
                     continue
                 func = self.parse_func(True, False, False)
                 decls.append(func)

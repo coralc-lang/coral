@@ -29,11 +29,16 @@ extend Parser
                 self.expect(TokenKind::Ident);
             self.expect(TokenKind::AttrClose);
         }
-        self.match(TokenKind::Pub);
+        bool isPub = self.match(TokenKind::Pub);
+        bool isExtern = self.match(TokenKind::Extern);
+        if (isExtern && self.check(TokenKind::LParen))
+        {
+            self.advance();
+            self.expect(TokenKind::String);
+            self.expect(TokenKind::RParen);
+        }
+        bool isStatic = self.match(TokenKind::Static);
 
-        if (self.check(TokenKind::Fn) || self.check(TokenKind::Extern) ||
-            self.check(TokenKind::Static))
-            return self.parseFuncDecl();
         if (self.check(TokenKind::Struct))
             return self.parseStructDecl();
         if (self.check(TokenKind::Enum))
@@ -58,8 +63,70 @@ extend Parser
             return self.parseModReexport();
         if (self.check(TokenKind::Comptime))
             return self.parseComptimeDecl();
-        self.parseType();
-        self.expect(TokenKind::Ident);
+
+        if (isExtern || isStatic || self.isTypeStart())
+            return self.parseFuncOrVarDecl(isPub, isExtern, isStatic);
+
+        self.panicMode = 1;
+        return self.noneNode();
+    }
+
+    bool isTypeStart()
+    {
+        TokenKind k = self.current.kind;
+        switch (k)
+        {
+            TokenKind::Void => { return true; },
+            TokenKind::Bool => { return true; },
+            TokenKind::Char => { return true; },
+            TokenKind::U8 => { return true; },
+            TokenKind::I8 => { return true; },
+            TokenKind::U16 => { return true; },
+            TokenKind::I16 => { return true; },
+            TokenKind::U32 => { return true; },
+            TokenKind::I32 => { return true; },
+            TokenKind::U64 => { return true; },
+            TokenKind::I64 => { return true; },
+            TokenKind::U128 => { return true; },
+            TokenKind::I128 => { return true; },
+            TokenKind::F32 => { return true; },
+            TokenKind::F64 => { return true; },
+            TokenKind::Usize => { return true; },
+            TokenKind::Isize => { return true; },
+            TokenKind::Rawptr => { return true; },
+            TokenKind::Str => { return true; },
+            TokenKind::Ident => { return true; },
+            TokenKind::LParen => { return true; },
+            TokenKind::Struct => { return true; },
+            else => { return false; }
+        }
+    }
+
+    NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
+    {
+        Ty retType = self.parseType();
+        Token nameTok = self.expect(TokenKind::Ident);
+        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        if (self.check(TokenKind::Less))
+            self.parseGenericParams();
+        if (self.check(TokenKind::LParen))
+        {
+            self.expect(TokenKind::LParen);
+            if (!self.check(TokenKind::RParen))
+            {
+                self.parseParam();
+                while (self.match(TokenKind::Comma))
+                    self.parseParam();
+            }
+            self.expect(TokenKind::RParen);
+            if (self.match(TokenKind::Semicolon))
+                return self.allocNode();
+            self.expect(TokenKind::LBrace);
+            while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                self.parseStmt();
+            self.expect(TokenKind::RBrace);
+            return self.allocNode();
+        }
         self.expect(TokenKind::Equal);
         self.parseExpr();
         self.expect(TokenKind::Semicolon);
@@ -93,15 +160,7 @@ extend Parser
 
     NodeId parseFuncDecl()
     {
-        self.match(TokenKind::Extern);
-        if (self.check(TokenKind::LParen))
-        {
-            self.advance();
-            self.expect(TokenKind::String);
-            self.expect(TokenKind::RParen);
-        }
-        self.match(TokenKind::Static);
-        self.expect(TokenKind::Fn);
+        Ty retType = self.parseType();
         self.expect(TokenKind::Ident);
         if (self.check(TokenKind::Less))
             self.parseGenericParams();
@@ -113,8 +172,6 @@ extend Parser
                 self.parseParam();
         }
         self.expect(TokenKind::RParen);
-        if (self.match(TokenKind::FatArrow))
-            self.parseType();
         if (self.match(TokenKind::Semicolon))
             return self.allocNode();
         self.expect(TokenKind::LBrace);
@@ -145,14 +202,28 @@ extend Parser
         self.expect(TokenKind::LBrace);
         while (!self.check(TokenKind::RBrace) && !self.atEnd())
         {
-            if (self.check(TokenKind::Fn) || self.check(TokenKind::Extern) ||
-                self.check(TokenKind::Static) || self.check(TokenKind::Pub))
+            if (self.check(TokenKind::Extern) ||
+                self.check(TokenKind::Static) || self.isTypeStart())
             {
-                self.match(TokenKind::Pub);
                 self.parseFuncDecl();
                 continue;
             }
-            self.match(TokenKind::Pub);
+            if (self.check(TokenKind::Pub))
+            {
+                self.advance();
+                if (self.check(TokenKind::Extern) || self.check(TokenKind::Static) || self.isTypeStart())
+                {
+                    self.parseFuncDecl();
+                    continue;
+                }
+                self.parseType();
+                self.expect(TokenKind::Ident);
+                if (self.match(TokenKind::Equal))
+                    self.parseExpr();
+                self.match(TokenKind::Comma);
+                self.match(TokenKind::Semicolon);
+                continue;
+            }
             self.parseType();
             self.expect(TokenKind::Ident);
             if (self.match(TokenKind::Equal))
@@ -197,9 +268,14 @@ extend Parser
         self.expect(TokenKind::LBrace);
         while (!self.check(TokenKind::RBrace) && !self.atEnd())
         {
-            if (self.check(TokenKind::Fn) || self.check(TokenKind::Pub))
+            if (self.check(TokenKind::Pub))
             {
-                self.match(TokenKind::Pub);
+                self.advance();
+                self.parseFuncDecl();
+                continue;
+            }
+            if (self.isTypeStart())
+            {
                 self.parseFuncDecl();
                 continue;
             }
@@ -225,9 +301,14 @@ extend Parser
         self.expect(TokenKind::LBrace);
         while (!self.check(TokenKind::RBrace) && !self.atEnd())
         {
-            if (self.check(TokenKind::Fn) || self.check(TokenKind::Pub))
+            if (self.check(TokenKind::Pub))
             {
-                self.match(TokenKind::Pub);
+                self.advance();
+                self.parseFuncDecl();
+                continue;
+            }
+            if (self.isTypeStart())
+            {
                 self.parseFuncDecl();
                 continue;
             }
