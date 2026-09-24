@@ -1,20 +1,21 @@
 /* parser/decl.crl — declaration parsing */
 
 mod base = import "base";
-import base { Parser, ParserMark };
-mod parser = import "parser";
-import parser { Parser };
-mod context = import "../coral-context/context";
-import context { AstContext, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
-mod token = import "../coral-common/token";
-import token { Token, TokenKind };
-mod id = import "../coral-ast/id";
-import id { NodeId, Str };
-mod decl_ast = import "../coral-ast/decl";
-import decl_ast { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol };
 mod node_ast = import "../coral-ast/node";
-import node_ast { Node, NodeKind };
+mod decl_ast = import "../coral-ast/decl";
 mod types_ast = import "../coral-ast/types";
+mod parser = import "parser";
+mod context = import "../coral-context/context";
+mod token = import "../coral-common/token";
+mod id = import "../coral-ast/id";
+
+import base { Parser, ParserMark };
+import parser { Parser };
+import context { AstContext, InternEntry, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
+import token { Token, TokenKind };
+import id { NodeId, Str };
+import decl_ast { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol };
+import node_ast { Node, NodeKind };
 import types_ast { Ty, TypeEntry, TypeKind };
 
 extern("C") rawptr malloc(usize size);
@@ -638,7 +639,8 @@ pub extend Parser
         u32 i = 0;
         while (i < count)
         {
-            total = total + self.ctx.interns[values[i]].len;
+            InternEntry* entry = self.ctx.interns + values[i];
+            total = total + entry*.len;
             if (i + 1 < count) total = total + 2;
             i = i + 1;
         }
@@ -652,8 +654,9 @@ pub extend Parser
         i = 0;
         while (i < count)
         {
-            usize len = self.ctx.interns[values[i]].len;
-            u8* source = self.ctx.interns[values[i]].ptr;
+            InternEntry* entry = self.ctx.interns + values[i];
+            usize len = entry*.len;
+            u8* source = entry*.ptr;
             usize j = 0;
             while (j < len)
             {
@@ -674,7 +677,7 @@ pub extend Parser
         return result;
     }
 
-    void parseImportSymbols(ImportSymbol** outSymbols, u32* outLen)
+    void parseImportSymbols(rawptr* outSymbols, u32* outLen)
     {
         *outSymbols = null;
         *outLen = 0;
@@ -723,7 +726,7 @@ pub extend Parser
         }
         self.expect(TokenKind::RBrace);
         if (symbols != null && !self.ctx.track((rawptr)symbols)) self.addError();
-        *outSymbols = symbols;
+        *outSymbols = (rawptr)symbols;
         *outLen = len;
     }
 
@@ -747,7 +750,7 @@ pub extend Parser
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;
         u32 symbolsLen = 0;
-        self.parseImportSymbols(&symbols, &symbolsLen);
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen);
         self.expect(TokenKind::Semicolon);
         return self.storeDecl(DeclKind::Import{ .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
@@ -773,9 +776,12 @@ pub extend Parser
             path = self.ctx.intern(pathToken.data.ptr + 1, pathToken.data.len - 2);
         }
         else path = self.parseNamespacePath();
+        ImportSymbol* symbols = null;
+        u32 symbolsLen = 0;
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen);
         self.expect(TokenKind::Semicolon);
         if (isPub) flags = flags | 2;
-        return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .flags = flags });
+        return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
 
     NodeId parseComptimeDecl()

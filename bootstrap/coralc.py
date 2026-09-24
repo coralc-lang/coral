@@ -32,11 +32,30 @@ def _import_name(import_path):
     parts = import_path.split("::")
     if any(not part for part in parts):
         return None
-    if parts[0] == "file":
-        parts = parts[1:]
     if not parts:
         return None
     return os.path.join(*parts)
+
+
+def _bound_namespace_path(namespace, bindings):
+    if namespace in bindings:
+        return bindings[namespace]
+    parts = namespace.split("::", 1)
+    if parts[0] in bindings:
+        return os.path.join(bindings[parts[0]], parts[1]) if len(parts) == 2 else bindings[parts[0]]
+    return None
+
+
+def _resolve_namespace_import(source_file, namespace, bindings, module_map):
+    bound = _bound_namespace_path(namespace, bindings)
+    if bound is not None:
+        return resolve_import_path(source_file, bound, module_map)
+    if module_map:
+        candidates = _module_map_candidates(namespace, module_map)
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
 
 def _search_roots(source_dir):
@@ -73,8 +92,6 @@ def _module_map_candidates(import_path, module_map):
     except OSError:
         return []
     keys = [import_path]
-    if import_path.startswith("file::"):
-        keys.append(import_path[6:])
     map_dir = os.path.dirname(_canonical_path(module_map))
     project_dir = os.path.dirname(map_dir)
     roots = [project_dir]
@@ -198,6 +215,12 @@ def parse_file(path, parsed, all_asts, dep_graph, active=None, module_map=None):
     ast = parser.parse()
     all_asts[abspath] = ast
 
+    bindings = {}
+    for decl in ast.decls:
+        alias = getattr(decl, "alias", None)
+        if alias:
+            bindings[alias] = decl.path
+
     deps = []
     active.append(abspath)
     try:
@@ -210,8 +233,13 @@ def parse_file(path, parsed, all_asts, dep_graph, active=None, module_map=None):
                     imp_path, getattr(decl, "lib_path", None), module_map
                 )
                 tried = [imp_path]
+            elif hasattr(decl, "alias"):
+                resolved = _resolve_namespace_import(abspath, imp_path, bindings, module_map)
+                if resolved is None:
+                    resolved = resolve_import_path(abspath, imp_path, module_map)
+                tried = _import_candidates(abspath, imp_path, module_map)
             else:
-                resolved = resolve_import_path(abspath, imp_path, module_map)
+                resolved = _resolve_namespace_import(abspath, imp_path, bindings, module_map)
                 tried = _import_candidates(abspath, imp_path, module_map)
             if resolved is None:
                 raise UnresolvedImportError(abspath, imp_path, tried)

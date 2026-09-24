@@ -22,11 +22,12 @@ class ImportDecl(Node):
 
 
 class ModReexport(Node):
-    def __init__(self, alias, path, is_lib, lib_path):
+    def __init__(self, alias, path, is_lib, lib_path, symbols=None):
         self.alias = alias
         self.path = path
         self.is_lib = is_lib
         self.lib_path = lib_path
+        self.symbols = symbols or []
 
 
 class StructDecl(Node):
@@ -540,7 +541,10 @@ class Parser:
             return TupleType(types)
         if t.kind == TokenKind.Ident:
             self.advance()
-            base = TypeIdent(t.value)
+            name_parts = [t.value]
+            while self.match(TokenKind.ColonColon):
+                name_parts.append(self.expect_name().value)
+            base = TypeIdent("::".join(name_parts))
             if self.peek().kind == TokenKind.Less:
                 generic_args = self.parse_generic_args()
                 base.generic_args = generic_args
@@ -1360,10 +1364,13 @@ class Parser:
 
             if t.kind == TokenKind.Import:
                 self.advance()
+                if self.peek().kind == TokenKind.String:
+                    token = self.peek()
+                    raise SyntaxError(f"{self.filename}:{token.line}:{token.col}: path import requires a namespace binding")
                 path, is_lib = self.parse_import_target()
                 lib_path = None
                 symbols = self.parse_import_symbols()
-                self.match(TokenKind.Semicolon)
+                self.expect(TokenKind.Semicolon)
                 if is_lib:
                     lib_path = path.split("::", 1)[0]
                 decls.append(ImportDecl(path, symbols, is_lib, lib_path))
@@ -1378,10 +1385,11 @@ class Parser:
                     self.match(TokenKind.Import)
                     path, is_lib = self.parse_import_target()
                     lib_path = None
-                    self.match(TokenKind.Semicolon)
+                    symbols = self.parse_import_symbols()
+                    self.expect(TokenKind.Semicolon)
                     if is_lib:
                         lib_path = path.split("::", 1)[0]
-                    decls.append(ModReexport(alias, path, is_lib, lib_path))
+                    decls.append(ModReexport(alias, path, is_lib, lib_path, symbols))
                     continue
                 if self.peek().kind == TokenKind.Enum:
                     self.advance()
@@ -1501,10 +1509,11 @@ class Parser:
                 self.match(TokenKind.Import)
                 path, is_lib = self.parse_import_target()
                 lib_path = None
-                self.match(TokenKind.Semicolon)
+                symbols = self.parse_import_symbols()
+                self.expect(TokenKind.Semicolon)
                 if is_lib:
                     lib_path = path.split("::", 1)[0]
-                decls.append(ModReexport(alias, path, is_lib, lib_path))
+                decls.append(ModReexport(alias, path, is_lib, lib_path, symbols))
                 continue
 
             if t.kind == TokenKind.Enum:

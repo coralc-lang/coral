@@ -385,11 +385,17 @@ class Lexer:
                     break
                 is_float = True
                 self.advance()
-            elif (c == "e" or c == "E") and not is_float:
+            elif c == "e" or c == "E":
+                digits = self.pos + 1
+                if digits < len(self.source) and self.source[digits] in "+-":
+                    digits += 1
+                first_digit = digits
+                while digits < len(self.source) and (self.source[digits].isdigit() or self.source[digits] == "_"):
+                    digits += 1
+                if digits == first_digit:
+                    break
                 is_float = True
-                self.advance()
-                if not self.is_at_end() and self.peek() in "+-":
-                    self.advance()
+                self.pos = digits
             elif c == "_":
                 self.advance()
             else:
