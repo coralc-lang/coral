@@ -1,6 +1,10 @@
 from parser import *
 from lexer import TokenKind
 
+def is_c_runtime_decl(name):
+    return name in {"printf", "write", "read", "malloc", "calloc", "realloc", "free", "memcpy", "memset", "strlen"}
+
+
 BUILTIN_TYPES = {
     "void": "void", "bool": "_Bool", "char": "char",
     "u8": "uint8_t", "i8": "int8_t",
@@ -162,6 +166,67 @@ class CodeGen:
                     return self.field_type_names.get((base, field_name), "")
         return ""
 
+    def infer_expr_type(self, node):
+        if isinstance(node, IntLit):
+            return "int32_t"
+        if isinstance(node, BoolLit):
+            return "_Bool"
+        if isinstance(node, FloatLit):
+            return "double"
+        if isinstance(node, StringLit):
+            return "const char*"
+        if isinstance(node, Block):
+            for stmt in reversed(node.stmts):
+                if isinstance(stmt, ExprStmt):
+                    return self.infer_expr_type(stmt.expr)
+        if isinstance(node, SwitchExpr):
+            for _, body, _ in node.cases:
+                return self.infer_expr_type(body)
+            if node.else_body is not None:
+                return self.infer_expr_type(node.else_body)
+        if isinstance(node, IfExpr):
+            return self.infer_expr_type(node.then_expr)
+        if self.local_types:
+            return "int32_t"
+        return "int32_t"
+
+    def gen_expr_value(self, node):
+        if isinstance(node, Block):
+            result = None
+            for stmt in node.stmts:
+                if isinstance(stmt, ExprStmt):
+                    result = stmt.expr
+            if result is not None:
+                return self.gen_expr(result)
+        return self.gen_expr(node)
+
+    def gen_switch_expr(self, node):
+        result_type = self.current_return_type or "int"
+        if result_type == "void":
+            result_type = "int"
+        lines = ["({", f"{result_type} __coral_switch_result;", f"switch ({self.gen_expr(node.expr)}) {{"]
+        for pattern, body, guard in node.cases:
+            if isinstance(pattern, OrPattern):
+                labels = [self.gen_expr(p) for p in pattern.patterns]
+            else:
+                labels = [self.gen_expr(pattern)]
+            for label in labels:
+                lines.append(f"case {label}:")
+            if guard is not None:
+                lines.append(f"if ({self.gen_expr(guard)}) {{")
+            lines.append(f"__coral_switch_result = ({self.gen_expr_value(body)});")
+            lines.append("break;")
+            if guard is not None:
+                lines.append("}")
+        if node.else_body is not None:
+            lines.append("default:")
+            lines.append(f"__coral_switch_result = ({self.gen_expr_value(node.else_body)});")
+            lines.append("break;")
+        lines.append("}")
+        lines.append("__coral_switch_result;")
+        lines.append("})")
+        return "\n".join(lines)
+
     def gen_expr(self, node):
         if isinstance(node, IntLit):
             return node.value
@@ -317,6 +382,11 @@ class CodeGen:
             elif node.name == "offsetof":
                 return f"__builtin_offsetof({self.gen_type(node.args[0])}, {self.gen_expr(node.args[1])})"
             return f"/* @builtin {node.name} */"
+        if isinstance(node, IfExpr):
+            else_value = self.gen_expr_value(node.else_body) if node.else_body is not None else "0"
+            return f"({self.gen_expr(node.cond)} ? {self.gen_expr_value(node.then_body)} : {else_value})"
+        if isinstance(node, SwitchExpr):
+            return self.gen_switch_expr(node)
         if isinstance(node, Block):
             return "(void)0"
         return "/* unhandled expr */"
@@ -334,6 +404,8 @@ class CodeGen:
             return
         if isinstance(node, VarDecl):
             tp = self.gen_type(node.type_node)
+            if node.type_node is None and node.init_expr is not None:
+                tp = self.infer_expr_type(node.init_expr)
             name = node.name
             self.local_types[name] = tp
             # also handle Token* etc. where tp includes *
@@ -375,6 +447,8 @@ class CodeGen:
             if node.init:
                 if isinstance(node.init, VarDecl):
                     tp = self.gen_type(node.init.type_node)
+                    if node.init.type_node is None and node.init.init_expr is not None:
+                        tp = self.infer_expr_type(node.init.init_expr)
                     self.emit(f"{tp} {node.init.name} = {self.gen_expr(node.init.init_expr)}")
                 else:
                     self.emit(self.gen_expr(node.init.expr) if isinstance(node.init, ExprStmt) else "")
@@ -395,23 +469,23 @@ class CodeGen:
             self.emit(f"for (size_t _idx = 0; _idx < {self.gen_expr(node.iter_expr)}.len; _idx++) ")
             if isinstance(node.body, Block):
                 self.emit("{\n")
-                self.indent_level += 1
+                self.indent += 1
                 self.emit_indent()
                 self.emit(f"{BUILTIN_TYPES.get('char', 'char')} {node.binding} = ")
                 self.emit(f"((char*){self.gen_expr(node.iter_expr)}.ptr)[_idx];\n")
                 for stmt in node.body.stmts:
                     self.gen_stmt(stmt)
-                self.indent_level -= 1
+                self.indent -= 1
                 self.emit_indent()
                 self.emit("}\n")
             else:
                 self.emit("{\n")
-                self.indent_level += 1
+                self.indent += 1
                 self.emit_indent()
                 self.emit(f"{BUILTIN_TYPES.get('char', 'char')} {node.binding} = ")
                 self.emit(f"((char*){self.gen_expr(node.iter_expr)}.ptr)[_idx];\n")
                 self.gen_stmt(node.body)
-                self.indent_level -= 1
+                self.indent -= 1
                 self.emit_indent()
                 self.emit("}\n")
             return
@@ -429,11 +503,11 @@ class CodeGen:
             if node.volatile:
                 self.emit("volatile ")
             self.emit("(\n")
-            self.indent_level += 1
+            self.indent += 1
             self.emit_indent()
             parts = " \\n ".join(f"\"{p}\"" for p in node.template)
             self.emit(f"{parts}\n")
-            self.indent_level -= 1
+            self.indent -= 1
             self.emit_indent()
             self.emit(");\n")
             return
@@ -531,8 +605,9 @@ class CodeGen:
         param_str = ", ".join(params)
 
         if node.is_extern:
-            self.emit_indent()
-            self.emit(f"extern {ret} {name}({param_str});\n")
+            if not is_c_runtime_decl(name):
+                self.emit_indent()
+                self.emit(f"extern {ret} {name}({param_str});\n")
             return
 
         self.emit_indent()
@@ -719,7 +794,10 @@ class CodeGen:
         self.emit("#include <stddef.h>\n")
         self.emit("#include <stdbool.h>\n")
         self.emit("#include <string.h>\n")
-        self.emit("#include <stdlib.h>\n\n")
+        self.emit("#include <stdlib.h>\n")
+        self.emit("#include <stdio.h>\n")
+        self.emit("#include <unistd.h>\n")
+        self.emit("#include <assert.h>\n\n")
 
         self.emit("typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n\n")
 
@@ -757,7 +835,8 @@ class CodeGen:
                         tp = self.gen_type(p.type_node)
                         params.append(f"{tp} {p.name}")
                 param_str = ", ".join(params)
-                self.emit(f"extern {ret} {decl.name}({param_str});\n")
+                if not is_c_runtime_decl(decl.name):
+                    self.emit(f"extern {ret} {decl.name}({param_str});\n")
         self.emit("\n")
 
         self.gen_tuple_typedefs()

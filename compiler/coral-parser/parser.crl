@@ -2,15 +2,12 @@
 
 import "../coral-common/token" { Token, TokenKind }
 import "../coral-lexer/lexer" { Lexer }
-import "../coral-context/context" { AstContext }
+import "../coral-context/context" { AstContext, NodeListBuilder };
+import "../coral-ast/decl" { File }
 import "../coral-ast/id" { NodeId, SourceLoc };
 import "../coral-ast/node" { Node, NodeKind };
 import "../coral-ast/pat" { Pat, PatKind };
 import "base" { Parser, ParserMark };
-import "../coral-parser/type";
-import "../coral-parser/expr";
-import "../coral-parser/stmt";
-import "../coral-parser/decl";
 
 extend Parser
 {
@@ -194,13 +191,51 @@ extend Parser
     bool atEnd() { return self.current.kind == TokenKind::Eof; }
     NodeId noneNode() { return self.ctx.noneNode(); }
 
+    File* parseFile(Str path)
+    {
+        NodeListBuilder decls;
+        self.ctx.nodeListInit(&decls);
+        while (!self.atEnd())
+        {
+            if (self.check(TokenKind::Unknown))
+            {
+                self.advance();
+                continue;
+            }
+            NodeId decl = self.parseDecl();
+            if (!self.ctx.nodeListAppend(&decls, decl)) self.panicMode = 1;
+            if (self.panicMode != 0) break;
+        }
+        u32 count = decls.len;
+        NodeId* values = self.ctx.nodeListFinish(&decls);
+        File* file = self.ctx.allocFile();
+        if (file == null)
+        {
+            self.panicMode = 1;
+            return null;
+        }
+        file*.path = path;
+        file*.decls = values;
+        file*.declsLen = count;
+        return file;
+    }
+
+    SourceLoc tokenLoc(Token token)
+    {
+        SourceLoc loc;
+        u32 line = (u32)token.line;
+        u32 col = (u32)token.col;
+        loc.data = (line << 16) | (col & 0xffff);
+        return loc;
+    }
+
     NodeId storeNode(NodeKind kind)
     {
         NodeId id = self.ctx.allocNodeSlot();
         if (id.index == 0) return id;
         Node* node = self.ctx.nodes + id.index;
         node.kind = kind;
-        node.loc.data = 0;
+        node.loc = self.tokenLoc(self.previous);
         return id;
     }
 
@@ -208,7 +243,7 @@ extend Parser
     {
         Pat p;
         p.kind = kind;
-        p.loc.data = 0;
+        p.loc = self.tokenLoc(self.previous);
         return self.storeNode(NodeKind::Pat { .value = p });
     }
 

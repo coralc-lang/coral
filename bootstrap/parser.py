@@ -132,6 +132,13 @@ class SwitchStmt(Node):
         self.else_body = else_body
 
 
+class SwitchExpr(Node):
+    def __init__(self, expr, cases, else_body):
+        self.expr = expr
+        self.cases = cases
+        self.else_body = else_body
+
+
 class DestructPattern(Node):
     def __init__(self, name, fields):
         self.name = name
@@ -428,6 +435,49 @@ class Parser:
             return self.advance()
         return None
 
+    def parse_name_path(self):
+        if self.peek().kind == TokenKind.String:
+            return self.advance().value.strip('"')
+        parts = [self.expect_name().value]
+        while self.match(TokenKind.ColonColon):
+            parts.append(self.expect_name().value)
+        return "::".join(parts)
+
+    def parse_import_target(self):
+        if not self.match(TokenKind.LParen):
+            return self.parse_name_path(), False
+        if self.peek().kind == TokenKind.String:
+            path = self.advance().value.strip('"')
+        elif self.peek2().kind == TokenKind.Comma:
+            self.advance()
+            self.advance()
+            path = self.expect(TokenKind.String).value.strip('"')
+        else:
+            path = self.parse_name_path()
+        self.expect(TokenKind.Rparen)
+        return path, True
+
+    def parse_import_symbols(self):
+        symbols = []
+        if not self.match(TokenKind.LBrace):
+            return symbols
+        if self.peek().kind != TokenKind.RBrace:
+            while True:
+                if self.match(TokenKind.Star):
+                    symbols.append(("*", None))
+                else:
+                    sym = self.expect_name().value
+                    alias = None
+                    if self.match(TokenKind.As):
+                        alias = self.expect_name().value
+                    symbols.append((sym, alias))
+                if not self.match(TokenKind.Comma):
+                    break
+                if self.peek().kind == TokenKind.RBrace:
+                    break
+        self.expect(TokenKind.RBrace)
+        return symbols
+
     def is_type_start(self):
         k = self.peek().kind
         return k in (
@@ -638,7 +688,7 @@ class Parser:
 
     def parse_mul(self):
         left = self.parse_unary()
-        while self.peek().kind in (TokenKind.Star, TokenKind.Slash):
+        while self.peek().kind in (TokenKind.Star, TokenKind.Slash, TokenKind.Percent):
             op = self.advance()
             right = self.parse_unary()
             left = BinaryExpr(op.value, left, right)
@@ -807,6 +857,8 @@ class Parser:
         if t.kind == TokenKind.Self:
             self.advance()
             return Ident("self")
+        if t.kind == TokenKind.Switch:
+            return self.parse_switch_expr()
         if t.kind == TokenKind.LBrace:
             return self.parse_block_expr()
         raise SyntaxError(f"{self.filename}:{t.line}:{t.col}: unexpected token: {t.kind} ({t.value!r})")
@@ -1011,6 +1063,46 @@ class Parser:
         self.expect(TokenKind.RBrace)
         return Block(stmts)
 
+    def parse_switch_expr(self):
+        self.expect(TokenKind.Switch)
+        self.expect(TokenKind.LParen)
+        expr = self.parse_expr()
+        self.expect(TokenKind.Rparen)
+        self.expect(TokenKind.LBrace)
+        cases = []
+        else_body = None
+        while self.peek().kind != TokenKind.RBrace:
+            if self.peek().kind == TokenKind.Else:
+                self.advance()
+                self.match(TokenKind.FatArrow)
+                if self.peek().kind == TokenKind.LBrace:
+                    else_body = self.parse_block_expr()
+                else:
+                    else_body = self.parse_expr()
+                self.match(TokenKind.Comma)
+                continue
+            pattern = self.parse_switch_pattern()
+            while self.match(TokenKind.Comma):
+                if self.peek().kind in (TokenKind.FatArrow, TokenKind.RBrace, TokenKind.Else):
+                    break
+                nxt = self.parse_switch_pattern()
+                if isinstance(pattern, OrPattern):
+                    pattern.patterns.append(nxt)
+                else:
+                    pattern = OrPattern([pattern, nxt])
+            guard = None
+            if self.match(TokenKind.If):
+                guard = self.parse_expr()
+            self.expect(TokenKind.FatArrow)
+            if self.peek().kind == TokenKind.LBrace:
+                body = self.parse_block_expr()
+            else:
+                body = self.parse_expr()
+            self.match(TokenKind.Comma)
+            cases.append((pattern, body, guard))
+        self.expect(TokenKind.RBrace)
+        return SwitchExpr(expr, cases, else_body)
+
     def parse_switch(self):
         self.expect(TokenKind.Switch)
         self.match(TokenKind.LParen)
@@ -1162,42 +1254,26 @@ class Parser:
             if self.peek().kind == TokenKind.RBrace:
                 break
 
+            saved = self.pos
             tp = self.parse_type()
-            name_tok = self.peek()
-            if name_tok.kind == TokenKind.Ident:
-                self.advance()
-                name = name_tok.value
-            elif name_tok.kind in (TokenKind.LParen, TokenKind.Rparen):
+            if self.peek().kind != TokenKind.Ident:
+                self.pos = saved
                 break
-            else:
-                break
-
+            name = self.advance().value
             if self.peek().kind == TokenKind.LParen:
-                self.expect(TokenKind.LParen)
-                params = []
-                if self.peek().kind != TokenKind.Rparen:
-                    if self.peek().kind == TokenKind.Self:
-                        self.advance()
-                        params.append(ParamDecl(TypeIdent("self"), "self"))
-                        while self.match(TokenKind.Comma):
-                            ptp = self.parse_type()
-                            pname = self.expect(TokenKind.Ident).value
-                            params.append(ParamDecl(ptp, pname))
-                    else:
-                        ptp = self.parse_type()
-                        pname = self.expect(TokenKind.Ident).value
-                        params.append(ParamDecl(ptp, pname))
-                        while self.match(TokenKind.Comma):
-                            ptp = self.parse_type()
-                            pname = self.expect(TokenKind.Ident).value
-                            params.append(ParamDecl(ptp, pname))
-                self.expect(TokenKind.Rparen)
-                body = self.parse_block()
-                methods.append(FuncDecl(name, params, tp, body, is_pub, is_extern, is_static, False, None))
+                self.pos = saved
+                methods.append(self.parse_func(is_pub, is_extern, is_static))
                 continue
-
-            fields.append(FieldDecl(tp, name))
+            if self.peek().kind == TokenKind.LBracket:
+                self.advance()
+                size = self.parse_expr()
+                self.expect(TokenKind.RBracket)
+                tp = ArrayType(tp, size)
+            if self.match(TokenKind.Equal):
+                self.parse_expr()
+            self.match(TokenKind.Comma)
             self.match(TokenKind.Semicolon)
+            fields.append(FieldDecl(tp, name))
         self.expect(TokenKind.RBrace)
         return fields, methods
 
@@ -1225,7 +1301,7 @@ class Parser:
             if self.peek().kind == TokenKind.Struct and self.peek2().kind == TokenKind.LParen:
                 ret_type = self.parse_type()
                 name_token = self.advance()
-            elif self.peek2().kind == TokenKind.Ident:
+            elif self.peek2().kind in (TokenKind.Ident, TokenKind.Star, TokenKind.LBracket, TokenKind.Less):
                 ret_type = self.parse_type()
                 name_token = self.advance()
             elif name_token.kind == TokenKind.Ident:
@@ -1284,51 +1360,12 @@ class Parser:
 
             if t.kind == TokenKind.Import:
                 self.advance()
-                is_lib = False
+                path, is_lib = self.parse_import_target()
                 lib_path = None
-                if self.match(TokenKind.LParen):
-                    lib_token = self.advance()
-                    lib_path = lib_token.value
-                    self.expect(TokenKind.Rparen)
-                    is_lib = True
-
-                if is_lib:
-                    while self.peek().kind not in (TokenKind.Semicolon, TokenKind.Eof):
-                        self.advance()
-                    self.match(TokenKind.Semicolon)
-                    decls.append(ImportDecl("", [], True, lib_path))
-                    continue
-
-                if self.peek().kind == TokenKind.String:
-                    path_token = self.advance()
-                    path = path_token.value.strip('"')
-                elif self.peek().kind == TokenKind.Ident:
-                    path_parts = [self.advance().value]
-                    while self.match(TokenKind.ColonColon):
-                        path_parts.append(self.expect(TokenKind.Ident).value)
-                    path = "::".join(path_parts)
-                else:
-                    path_token = self.expect(TokenKind.String)
-                    path = path_token.value.strip('"')
-
-                symbols = []
-                if self.match(TokenKind.LBrace):
-                    if self.peek().kind != TokenKind.RBrace:
-                        sym = self.expect(TokenKind.Ident).value
-                        as_name = None
-                        if self.match(TokenKind.As):
-                            as_name = self.expect(TokenKind.Ident).value
-                        symbols.append((sym, as_name))
-                        while self.match(TokenKind.Comma):
-                            if self.peek().kind == TokenKind.RBrace:
-                                break
-                            sym = self.expect(TokenKind.Ident).value
-                            as_name = None
-                            if self.match(TokenKind.As):
-                                as_name = self.expect(TokenKind.Ident).value
-                            symbols.append((sym, as_name))
-                    self.expect(TokenKind.RBrace)
+                symbols = self.parse_import_symbols()
                 self.match(TokenKind.Semicolon)
+                if is_lib:
+                    lib_path = path.split("::", 1)[0]
                 decls.append(ImportDecl(path, symbols, is_lib, lib_path))
                 continue
 
@@ -1339,16 +1376,11 @@ class Parser:
                     alias = self.expect(TokenKind.Ident).value
                     self.expect(TokenKind.Equal)
                     self.match(TokenKind.Import)
-                    is_lib = False
+                    path, is_lib = self.parse_import_target()
                     lib_path = None
-                    if self.match(TokenKind.LParen):
-                        lib_token = self.expect(TokenKind.Ident)
-                        lib_path = lib_token.value
-                        self.expect(TokenKind.Rparen)
-                        is_lib = True
-                    path_token = self.expect(TokenKind.String)
-                    path = path_token.value.strip('"')
                     self.match(TokenKind.Semicolon)
+                    if is_lib:
+                        lib_path = path.split("::", 1)[0]
                     decls.append(ModReexport(alias, path, is_lib, lib_path))
                     continue
                 if self.peek().kind == TokenKind.Enum:
@@ -1364,6 +1396,8 @@ class Parser:
                         continue
                     self.advance()
                     name = self.expect(TokenKind.Ident).value
+                    if self.match(TokenKind.Less):
+                        self.parse_generic_params()
                     fields, methods = self.parse_struct_fields_and_methods()
                     decls.append(StructDecl(name, fields, True, methods))
                     continue
@@ -1374,6 +1408,8 @@ class Parser:
                 if self.peek().kind == TokenKind.Union:
                     self.advance()
                     name = self.expect(TokenKind.Ident).value
+                    if self.match(TokenKind.Less):
+                        self.parse_generic_params()
                     fields, methods = self.parse_struct_fields_and_methods()
                     decls.append(UnionDecl(name, fields, True))
                     for m in methods:
@@ -1463,16 +1499,11 @@ class Parser:
                 alias = self.expect(TokenKind.Ident).value
                 self.expect(TokenKind.Equal)
                 self.match(TokenKind.Import)
-                is_lib = False
+                path, is_lib = self.parse_import_target()
                 lib_path = None
-                if self.match(TokenKind.LParen):
-                    lib_token = self.expect(TokenKind.Ident)
-                    lib_path = lib_token.value
-                    self.expect(TokenKind.Rparen)
-                    is_lib = True
-                path_token = self.expect(TokenKind.String)
-                path = path_token.value.strip('"')
                 self.match(TokenKind.Semicolon)
+                if is_lib:
+                    lib_path = path.split("::", 1)[0]
                 decls.append(ModReexport(alias, path, is_lib, lib_path))
                 continue
 
