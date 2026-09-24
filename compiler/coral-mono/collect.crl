@@ -32,8 +32,8 @@ extend MonoContext
         if (typeNode == 0) return false;
         TypeEntry* entry = self.typeEntryAt(typeNode);
         if (entry == null) return false;
-        if (entry*.kind.tag == TypeKind_TypeParam) return false;
-        if (entry*.kind.tag == TypeKind_Named)
+        if (entry*.kind.tag == TypeKind::TypeParam) return false;
+        if (entry*.kind.tag == TypeKind::Named)
         {
             NodeId declId = self.findDeclaration(entry*.kind.payload.Named.name);
             if (declId.index == 0) return false;
@@ -62,7 +62,6 @@ extend MonoContext
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
-            printf("mono arity error generic=%u args=%u kind=%u\\n", self.genericCount(declaration), argumentsLen, (u32)kind);
             self.errors = self.errors + 1;
             return false;
         }
@@ -99,7 +98,7 @@ extend MonoContext
         if (typeNode == 0) return true;
         TypeEntry* entry = self.typeEntryAt(typeNode);
         if (entry == null) return false;
-        if (entry*.kind.tag == TypeKind_Named)
+        if (entry*.kind.tag == TypeKind::Named)
         {
             NodeId declId = self.findDeclaration(entry*.kind.payload.Named.name);
             if (declId.index == 0) return true;
@@ -115,12 +114,12 @@ extend MonoContext
             }
             return true;
         }
-        if (entry*.kind.tag == TypeKind_Pointer) return self.collectType(entry*.kind.payload.Pointer.base);
-        if (entry*.kind.tag == TypeKind_Const) return self.collectType(entry*.kind.payload.Const.base);
-        if (entry*.kind.tag == TypeKind_Comptime) return self.collectType(entry*.kind.payload.Comptime.base);
-        if (entry*.kind.tag == TypeKind_Slice) return self.collectType(entry*.kind.payload.Slice.base);
-        if (entry*.kind.tag == TypeKind_Array) return self.collectType(entry*.kind.payload.Array.base);
-        if (entry*.kind.tag == TypeKind_FnPtr)
+        if (entry*.kind.tag == TypeKind::Pointer) return self.collectType(entry*.kind.payload.Pointer.base);
+        if (entry*.kind.tag == TypeKind::Const) return self.collectType(entry*.kind.payload.Const.base);
+        if (entry*.kind.tag == TypeKind::Comptime) return self.collectType(entry*.kind.payload.Comptime.base);
+        if (entry*.kind.tag == TypeKind::Slice) return self.collectType(entry*.kind.payload.Slice.base);
+        if (entry*.kind.tag == TypeKind::Array) return self.collectType(entry*.kind.payload.Array.base);
+        if (entry*.kind.tag == TypeKind::FnPtr)
         {
             if (!self.collectType(entry*.kind.payload.FnPtr.returnType)) return false;
             u32 i = 0;
@@ -130,7 +129,7 @@ extend MonoContext
                 i = i + 1;
             }
         }
-        if (entry*.kind.tag == TypeKind_Tuple)
+        if (entry*.kind.tag == TypeKind::Tuple)
         {
             u32 i = 0;
             while (i < entry*.kind.payload.Tuple.elemsLen)
@@ -166,7 +165,7 @@ extend MonoContext
             arguments[i] = self.sema.exprType(call*.kind.payload.Call.args[i]);
             i = i + 1;
         }
-        printf("mono call name=%s args=%u generic=%u\\n", callee*.kind.payload.Ident.name, call*.kind.payload.Call.argsLen, self.genericCount(declaration));
+        printf("mono call args=%u generic=%u\\n", call*.kind.payload.Call.argsLen, self.genericCount(declaration));
         bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, call*.kind.payload.Call.argsLen);
         free((rawptr)arguments);
         return ok;
@@ -181,6 +180,9 @@ extend MonoContext
         switch (expr*.kind.tag)
         {
             ExprKind::TypeRef => { return self.collectType(expr*.kind.payload.TypeRef.typeNode); },
+            ExprKind::Field => { return self.collectExpr(expr*.kind.payload.Field.obj); },
+            ExprKind::Cast => { return self.collectExpr(expr*.kind.payload.Cast.expr); },
+            
             ExprKind::StructLiteral => {
                 if (!self.collectType(expr*.kind.payload.StructLiteral.typeNode)) return false;
                 u32 i = 0;
@@ -191,6 +193,7 @@ extend MonoContext
                 }
                 return true;
             },
+            
             ExprKind::Call => {
                 if (!self.collectExpr(expr*.kind.payload.Call.callee)) return false;
                 u32 i = 0;
@@ -201,12 +204,12 @@ extend MonoContext
                 }
                 return self.collectCall(id);
             },
-            ExprKind::Field => { return self.collectExpr(expr*.kind.payload.Field.obj); },
+
             ExprKind::Index => {
                 if (!self.collectExpr(expr*.kind.payload.Index.obj)) return false;
                 return self.collectExpr(expr*.kind.payload.Index.index);
             },
-            ExprKind::Cast => { return self.collectExpr(expr*.kind.payload.Cast.expr); },
+
             ExprKind::Add => {
                 if (!self.collectExpr(expr*.kind.payload.Add.left)) return false;
                 return self.collectExpr(expr*.kind.payload.Add.right);
@@ -229,6 +232,8 @@ extend MonoContext
         {
             StmtKind::ExprStmt => { return self.collectExpr(stmt*.kind.payload.ExprStmt.expr); },
             StmtKind::VarDecl => { return self.collectExpr(stmt*.kind.payload.VarDecl.init); },
+            StmtKind::Return => { return self.collectExpr(stmt*.kind.payload.Return.value); },
+
             StmtKind::Block => {
                 u32 i = 0;
                 while (i < stmt*.kind.payload.Block.stmtsLen)
@@ -238,12 +243,13 @@ extend MonoContext
                 }
                 return true;
             },
-            StmtKind::Return => { return self.collectExpr(stmt*.kind.payload.Return.value); },
+
             StmtKind::If => {
                 if (!self.collectExpr(stmt*.kind.payload.If.cond)) return false;
                 if (!self.collectStmt(stmt*.kind.payload.If.thenBody)) return false;
                 return self.collectStmt(stmt*.kind.payload.If.elseBody);
             },
+
             StmtKind::While => {
                 if (!self.collectExpr(stmt*.kind.payload.While.cond)) return false;
                 return self.collectStmt(stmt*.kind.payload.While.body);

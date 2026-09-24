@@ -14,7 +14,7 @@ extend MonoContext
     Ty findSubstitution(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
     {
         TypeEntry* entry = self.typeEntryAt(typeNode);
-        if (entry == null || entry*.kind.tag != TypeKind_TypeParam) return 0;
+        if (entry == null || entry*.kind.tag != TypeKind::TypeParam) return 0;
         u32 i = 0;
         while (i < substitutionsLen)
         {
@@ -31,46 +31,54 @@ extend MonoContext
         if (typeNode == 0) return 0;
         TypeEntry* entry = self.typeEntryAt(typeNode);
         if (entry == null) return 0;
-        if (entry*.kind.tag == TypeKind_TypeParam)
-            return self.findSubstitution(typeNode, substitutions, substitutionsLen);
-        if (entry*.kind.tag == TypeKind_Named)
+        switch (entry*.kind.tag)
         {
-            Ty* args = self.copyTypes(entry*.kind.payload.Named.genericArgs, entry*.kind.payload.Named.genericArgsLen);
-            u32 i = 0;
-            while (i < entry*.kind.payload.Named.genericArgsLen)
-            {
-                args[i] = self.substituteType(args[i], substitutions, substitutionsLen);
-                i = i + 1;
-            }
-            TypeKind kind = TypeKind::Named{ .name = entry*.kind.payload.Named.name, .genericArgs = args, .genericArgsLen = entry*.kind.payload.Named.genericArgsLen };
-            return self.sema.allocType(kind);
+            TypeKind::TypeParam => { return self.findSubstitution(typeNode, substitutions, substitutionsLen); },
+            TypeKind::Named => {
+                u32 i = 0;
+                while (i < substitutionsLen)
+                {
+                    if (substitutions[i].parameter == entry*.kind.payload.Named.name && entry*.kind.payload.Named.genericArgsLen == 0)
+                        return substitutions[i].typeNode;
+                    i = i + 1;
+                }
+                Ty* args = self.copyTypes(entry*.kind.payload.Named.genericArgs, entry*.kind.payload.Named.genericArgsLen);
+                u32 j = 0;
+                while (j < entry*.kind.payload.Named.genericArgsLen)
+                {
+                    args[j] = self.substituteType(args[j], substitutions, substitutionsLen);
+                    j = j + 1;
+                }
+                TypeKind kind = TypeKind::Named{ .name = entry*.kind.payload.Named.name, .genericArgs = args, .genericArgsLen = entry*.kind.payload.Named.genericArgsLen };
+                return self.sema.allocType(kind);
+            },
+            
+            TypeKind::Pointer => {
+                TypeKind kind = TypeKind::Pointer{ .base = self.substituteType(entry*.kind.payload.Pointer.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Const => {
+                TypeKind kind = TypeKind::Const{ .base = self.substituteType(entry*.kind.payload.Const.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Comptime => {
+                TypeKind kind = TypeKind::Comptime{ .base = self.substituteType(entry*.kind.payload.Comptime.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Slice => {
+                TypeKind kind = TypeKind::Slice{ .base = self.substituteType(entry*.kind.payload.Slice.base, substitutions, substitutionsLen) };
+                return self.sema.allocType(kind);
+            },
+
+            TypeKind::Array => {
+                TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry*.kind.payload.Array.base, substitutions, substitutionsLen), .len = entry*.kind.payload.Array.len };
+                return self.sema.allocType(kind);
+            },
+            else => { return typeNode; },
         }
-        if (entry*.kind.tag == TypeKind_Pointer)
-        {
-            TypeKind kind = TypeKind::Pointer{ .base = self.substituteType(entry*.kind.payload.Pointer.base, substitutions, substitutionsLen) };
-            return self.sema.allocType(kind);
-        }
-        if (entry*.kind.tag == TypeKind_Const)
-        {
-            TypeKind kind = TypeKind::Const{ .base = self.substituteType(entry*.kind.payload.Const.base, substitutions, substitutionsLen) };
-            return self.sema.allocType(kind);
-        }
-        if (entry*.kind.tag == TypeKind_Comptime)
-        {
-            TypeKind kind = TypeKind::Comptime{ .base = self.substituteType(entry*.kind.payload.Comptime.base, substitutions, substitutionsLen) };
-            return self.sema.allocType(kind);
-        }
-        if (entry*.kind.tag == TypeKind_Slice)
-        {
-            TypeKind kind = TypeKind::Slice{ .base = self.substituteType(entry*.kind.payload.Slice.base, substitutions, substitutionsLen) };
-            return self.sema.allocType(kind);
-        }
-        if (entry*.kind.tag == TypeKind_Array)
-        {
-            TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry*.kind.payload.Array.base, substitutions, substitutionsLen), .len = entry*.kind.payload.Array.len };
-            return self.sema.allocType(kind);
-        }
-        return typeNode;
     }
 
     MonoSubstitution* buildSubstitutions(NodeId declaration, Ty* arguments, u32 argumentsLen)
@@ -88,30 +96,33 @@ extend MonoContext
         if (decl == null) return result;
         NodeId* params = null;
         u32 paramCount = 0;
-        if (decl*.kind.tag == DeclKind::Struct)
+        switch (decl*.kind.tag)
         {
-            params = decl*.kind.payload.Struct.genericParams;
-            paramCount = decl*.kind.payload.Struct.genericParamsLen;
-        }
-        else if (decl*.kind.tag == DeclKind::Variant)
-        {
-            params = decl*.kind.payload.Variant.genericParams;
-            paramCount = decl*.kind.payload.Variant.genericParamsLen;
-        }
-        else if (decl*.kind.tag == DeclKind::Union)
-        {
-            params = decl*.kind.payload.Union.genericParams;
-            paramCount = decl*.kind.payload.Union.genericParamsLen;
-        }
-        else if (decl*.kind.tag == DeclKind::Trait)
-        {
-            params = decl*.kind.payload.Trait.genericParams;
-            paramCount = decl*.kind.payload.Trait.genericParamsLen;
-        }
-        else if (decl*.kind.tag == DeclKind::Func)
-        {
-            params = decl*.kind.payload.Func.genericParams;
-            paramCount = decl*.kind.payload.Func.genericParamsLen;
+            DeclKind::Struct => {
+                params = decl*.kind.payload.Struct.genericParams;
+                paramCount = decl*.kind.payload.Struct.genericParamsLen;
+            },
+
+            DeclKind::Variant => {
+                params = decl*.kind.payload.Variant.genericParams;
+                paramCount = decl*.kind.payload.Variant.genericParamsLen;
+            },
+
+            DeclKind::Union => {
+                params = decl*.kind.payload.Union.genericParams;
+                paramCount = decl*.kind.payload.Union.genericParamsLen;
+            },
+
+            DeclKind::Trait => {
+                params = decl*.kind.payload.Trait.genericParams;
+                paramCount = decl*.kind.payload.Trait.genericParamsLen;
+            },
+
+            DeclKind::Func => {
+                params = decl*.kind.payload.Func.genericParams;
+                paramCount = decl*.kind.payload.Func.genericParamsLen;
+            },
+            else => {}
         }
         u32 i = 0;
         while (i < paramCount && next < argumentsLen)
