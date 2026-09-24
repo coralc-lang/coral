@@ -187,11 +187,12 @@ KEYWORDS = {
 
 
 class Token:
-    def __init__(self, kind, line, col, value):
+    def __init__(self, kind, line, col, value, number=0):
         self.kind = kind
         self.line = line
         self.col = col
         self.value = value
+        self.number = number
 
     def __repr__(self):
         return f"Token({self.kind}, {self.line}:{self.col}, {self.value!r})"
@@ -310,6 +311,24 @@ class Lexer:
             self.advance()
         return self.make_token(TokenKind.RawString, start)
 
+    def parse_integer(self, value, base):
+        result = 0
+        for c in value:
+            if c == "_":
+                continue
+            if "0" <= c <= "9":
+                digit = ord(c) - ord("0")
+            elif "a" <= c <= "f":
+                digit = ord(c) - ord("a") + 10
+            elif "A" <= c <= "F":
+                digit = ord(c) - ord("A") + 10
+            else:
+                raise ValueError(f"invalid digit {c!r} for base {base}")
+            if digit >= base:
+                raise ValueError(f"invalid digit {c!r} for base {base}")
+            result = result * base + digit
+        return result
+
     def lex_number(self, start):
         if self.peek() == "x" and (self.pos - start) == 1 and self.source[start] == "0":
             self.advance()
@@ -329,7 +348,9 @@ class Lexer:
                 self.advance()
             else:
                 break
-        return self.make_token(TokenKind.Hex, start)
+        token = self.make_token(TokenKind.Hex, start)
+        token.number = self.parse_integer(token.value[2:], 16)
+        return token
 
     def lex_binary(self, start):
         while not self.is_at_end():
@@ -338,7 +359,9 @@ class Lexer:
                 self.advance()
             else:
                 break
-        return self.make_token(TokenKind.Bin, start)
+        token = self.make_token(TokenKind.Bin, start)
+        token.number = self.parse_integer(token.value[2:], 2)
+        return token
 
     def lex_octal(self, start):
         while not self.is_at_end():
@@ -347,7 +370,9 @@ class Lexer:
                 self.advance()
             else:
                 break
-        return self.make_token(TokenKind.Oct, start)
+        token = self.make_token(TokenKind.Oct, start)
+        token.number = self.parse_integer(token.value[2:], 8)
+        return token
 
     def lex_decimal(self, start):
         is_float = False
@@ -370,7 +395,10 @@ class Lexer:
             else:
                 break
         kind = TokenKind.Float if is_float else TokenKind.Dec
-        return self.make_token(kind, start)
+        token = self.make_token(kind, start)
+        if not is_float:
+            token.number = self.parse_integer(token.value, 10)
+        return token
 
     def lex_ident(self, start):
         while not self.is_at_end():

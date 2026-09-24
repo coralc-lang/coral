@@ -4,10 +4,37 @@
 // flag if not handles anywhere in the compiler.
 
 import "../coral-common/token" { TokenKind, Token };
+import "../coral-common/slice" { Slice };
 import "base" { Lexer };
 
 pub extend Lexer
 {
+    u64 parseInteger(Slice data, u32 base)
+    {
+        u64 value = 0;
+        usize i = 0;
+        while (i < data.len)
+        {
+            u8 c = data.ptr[i];
+            u32 digit = 0;
+            if (c >= '0' && c <= '9') digit = (u32)(c - '0');
+            else if (c >= 'a' && c <= 'f') digit = (u32)(c - 'a') + 10;
+            else if (c >= 'A' && c <= 'F') digit = (u32)(c - 'A') + 10;
+            else if (c == '_') { i = i + 1; continue; }
+            else {
+                self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "invalid integer literal");
+                break;
+            }
+            if (digit >= base) {
+                self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "invalid digit for integer base");
+                break;
+            }
+            value = value * (u64)base + (u64)digit;
+            i = i + 1;
+        }
+        return value;
+    }
+
     Token lexNumber(u8* start)
     {
         if (!self.isAtEnd() && self.cur[0] == 'x' &&
@@ -36,6 +63,15 @@ pub extend Lexer
         Token token = self.makeToken(kind, start);
         token.data.ptr = start + 2;
         token.data.len = self.cur - (start + 2);
+        u32 base = 0;
+        switch (kind)
+        {
+            TokenKind::Hex => { base = 16; },
+            TokenKind::Bin => { base = 2; },
+            TokenKind::Oct => { base = 8; },
+            else => {}
+        }
+        if (base != 0) token.number = self.parseInteger(token.data, base);
         return token;
     }
 
@@ -130,7 +166,10 @@ pub extend Lexer
                 break;
             }
         }
-        if (isFloat) return self.makeToken(TokenKind::Float, start);
-        return self.makeToken(TokenKind::Dec, start);
+        Token token;
+        if (isFloat) token = self.makeToken(TokenKind::Float, start);
+        else token = self.makeToken(TokenKind::Dec, start);
+        if (!isFloat) token.number = self.parseInteger(token.data, 10);
+        return token;
     }
 }

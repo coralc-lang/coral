@@ -229,7 +229,7 @@ class CodeGen:
 
     def gen_expr(self, node):
         if isinstance(node, IntLit):
-            return node.value
+            return str(node.value)
         if isinstance(node, FloatLit):
             return node.value
         if isinstance(node, StringLit):

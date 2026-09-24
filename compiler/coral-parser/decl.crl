@@ -1,13 +1,24 @@
 /* parser/decl.crl — declaration parsing */
 
-import "base" { Parser, ParserMark };
-import "parser" { Parser };
-import "../coral-context/context" { AstContext, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
-import "../coral-common/token" { Token, TokenKind };
-import "../coral-ast/id" { NodeId, Str };
-import "../coral-ast/decl" { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant };
-import "../coral-ast/node" { Node, NodeKind };
-import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
+mod base = import "base";
+import base { Parser, ParserMark };
+mod parser = import "parser";
+import parser { Parser };
+mod context = import "../coral-context/context";
+import context { AstContext, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
+mod token = import "../coral-common/token";
+import token { Token, TokenKind };
+mod id = import "../coral-ast/id";
+import id { NodeId, Str };
+mod decl_ast = import "../coral-ast/decl";
+import decl_ast { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol };
+mod node_ast = import "../coral-ast/node";
+import node_ast { Node, NodeKind };
+mod types_ast = import "../coral-ast/types";
+import types_ast { Ty, TypeEntry, TypeKind };
+
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
 
 pub extend Parser
 {
@@ -102,8 +113,8 @@ pub extend Parser
             return self.parseFlagDecl();
         if (self.check(TokenKind::Import))
             return self.parseImportDecl();
-        if (self.check(TokenKind::Mod))
-            return self.parseModReexport();
+         if (self.check(TokenKind::Mod))
+             return self.parseModReexport(isPub);
         if (self.check(TokenKind::Comptime))
             return self.parseComptimeDecl();
 
@@ -604,64 +615,167 @@ pub extend Parser
         return self.allocNode();
     }
 
+    Str parseNamespacePath()
+    {
+        StrListBuilder parts;
+        self.ctx.strListInit(&parts);
+        while (true)
+        {
+            Token tok = self.expectName();
+            Str part = self.ctx.intern(tok.data.ptr, tok.data.len);
+            if (!self.ctx.strListAppend(&parts, part))
+            {
+                self.addError();
+                break;
+            }
+            if (!self.match(TokenKind::ColonColon)) break;
+        }
+        u32 count = parts.len;
+        Str* values = self.ctx.strListFinish(&parts);
+        if (count == 0 || values == null) return 0;
+        if (count == 1) return values[0];
+        usize total = 0;
+        u32 i = 0;
+        while (i < count)
+        {
+            total = total + self.ctx.interns[values[i]].len;
+            if (i + 1 < count) total = total + 2;
+            i = i + 1;
+        }
+        u8* text = (u8*)malloc(total);
+        if (text == null)
+        {
+            self.addError();
+            return 0;
+        }
+        usize offset = 0;
+        i = 0;
+        while (i < count)
+        {
+            usize len = self.ctx.interns[values[i]].len;
+            u8* source = self.ctx.interns[values[i]].ptr;
+            usize j = 0;
+            while (j < len)
+            {
+                text[offset + j] = source[j];
+                j = j + 1;
+            }
+            offset = offset + len;
+            if (i + 1 < count)
+            {
+                text[offset] = ':';
+                text[offset + 1] = ':';
+                offset = offset + 2;
+            }
+            i = i + 1;
+        }
+        Str result = self.ctx.intern(text, total);
+        if (!self.ctx.track((rawptr)text)) self.addError();
+        return result;
+    }
+
+    void parseImportSymbols(ImportSymbol** outSymbols, u32* outLen)
+    {
+        *outSymbols = null;
+        *outLen = 0;
+        if (!self.match(TokenKind::LBrace)) return;
+        ImportSymbol* symbols = null;
+        u32 len = 0;
+        u32 cap = 0;
+        if (!self.check(TokenKind::RBrace))
+        {
+            while (true)
+            {
+                ImportSymbol value;
+                value.name = 0;
+                value.alias = 0;
+                value.flags = 0;
+                if (self.match(TokenKind::Star)) value.flags = 2;
+                else
+                {
+                    Token name = self.expectName();
+                    value.name = self.ctx.intern(name.data.ptr, name.data.len);
+                    if (self.match(TokenKind::As))
+                    {
+                        Token alias = self.expectName();
+                        value.alias = self.ctx.intern(alias.data.ptr, alias.data.len);
+                        value.flags = value.flags | 1;
+                    }
+                }
+                if (len >= cap)
+                {
+                    u32 newCap = cap * 2;
+                    if (newCap == 0) newCap = 4;
+                    rawptr raw = realloc((rawptr)symbols, (usize)newCap * sizeof(ImportSymbol));
+                    if (raw == null)
+                    {
+                        self.addError();
+                        break;
+                    }
+                    symbols = (ImportSymbol*)raw;
+                    cap = newCap;
+                }
+                symbols[len] = value;
+                len = len + 1;
+                if (!self.match(TokenKind::Comma)) break;
+                if (self.check(TokenKind::RBrace)) break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        if (symbols != null && !self.ctx.track((rawptr)symbols)) self.addError();
+        *outSymbols = symbols;
+        *outLen = len;
+    }
+
     NodeId parseImportDecl()
     {
         self.expect(TokenKind::Import);
+        u8 flags = 0;
         if (self.match(TokenKind::LParen))
         {
             self.expect(TokenKind::Ident);
             self.expect(TokenKind::RParen);
+            flags = flags | 1;
         }
-        if (self.check(TokenKind::String)) {
-            self.advance();
-        } else {
-            self.expect(TokenKind::Ident);
-            while (self.match(TokenKind::ColonColon))
-                self.expect(TokenKind::Ident);
-        }
-        if (self.match(TokenKind::LBrace))
+        Str path = 0;
+        if (self.check(TokenKind::String))
         {
-            if (!self.check(TokenKind::RBrace))
-            {
-                self.expect(TokenKind::Ident);
-                if (self.match(TokenKind::As))
-                    self.expect(TokenKind::Ident);
-                while (self.match(TokenKind::Comma))
-                {
-                    if (self.check(TokenKind::RBrace)) break;
-                    if (self.match(TokenKind::Star)) break;
-                    self.expect(TokenKind::Ident);
-                    if (self.match(TokenKind::As))
-                        self.expect(TokenKind::Ident);
-                }
-            }
-            self.expect(TokenKind::RBrace);
+            Token pathToken = self.advance();
+            path = self.ctx.intern(pathToken.data.ptr + 1, pathToken.data.len - 2);
+            self.addError();
         }
-        self.match(TokenKind::Semicolon);
-        return self.allocNode();
+        else path = self.parseNamespacePath();
+        ImportSymbol* symbols = null;
+        u32 symbolsLen = 0;
+        self.parseImportSymbols(&symbols, &symbolsLen);
+        self.expect(TokenKind::Semicolon);
+        return self.storeDecl(DeclKind::Import{ .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
 
-    NodeId parseModReexport()
+    NodeId parseModReexport(bool isPub)
     {
         self.expect(TokenKind::Mod);
-        self.expect(TokenKind::Ident);
+        Token aliasToken = self.expectName();
+        Str alias = self.ctx.intern(aliasToken.data.ptr, aliasToken.data.len);
         self.expect(TokenKind::Equal);
         self.expect(TokenKind::Import);
-        if (self.match(TokenKind::LParen)) {
+        u8 flags = 0;
+        if (self.match(TokenKind::LParen))
+        {
             self.expect(TokenKind::Ident);
             self.expect(TokenKind::RParen);
+            flags = flags | 1;
         }
-        if (self.check(TokenKind::String)){
-            self.advance();
-        } else {
-            self.expect(TokenKind::Ident);
-            while (self.match(TokenKind::ColonColon))
-            {
-                self.expect(TokenKind::Ident);
-            }
+        Str path = 0;
+        if (self.check(TokenKind::String))
+        {
+            Token pathToken = self.advance();
+            path = self.ctx.intern(pathToken.data.ptr + 1, pathToken.data.len - 2);
         }
-        self.match(TokenKind::Semicolon);
-        return self.allocNode();
+        else path = self.parseNamespacePath();
+        self.expect(TokenKind::Semicolon);
+        if (isPub) flags = flags | 2;
+        return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .flags = flags });
     }
 
     NodeId parseComptimeDecl()

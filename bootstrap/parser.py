@@ -809,7 +809,7 @@ class Parser:
         t = self.peek()
         if t.kind == TokenKind.Dec or t.kind == TokenKind.Hex or t.kind == TokenKind.Bin or t.kind == TokenKind.Oct:
             self.advance()
-            return IntLit(t.value, t.kind)
+            return IntLit(t.number, t.kind)
         if t.kind == TokenKind.Float:
             self.advance()
             return FloatLit(t.value)
