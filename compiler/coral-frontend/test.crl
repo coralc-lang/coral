@@ -4,10 +4,12 @@
  * itself, and stdlib files. Reports token and node counts.
  */
 
-import "../coral-common/token" { TokenKind };
+import "../coral-common/token" { Token, TokenKind, IdentifierInfo };
 import "../coral-lexer/lexer" { Lexer };
+import "../coral-lexer/ident" { isXidStart, isXidContinue };
 import "../coral-lexer/table" { IdentifierTable, IdentEntry };
 import "../coral-context/context" { AstContext };
+import "../coral-module/module" { ModuleMap, ModuleId };
 import "../coral-ast/decl" { File };
 import "../coral-parser/lib" { Parser };
 
@@ -117,141 +119,354 @@ TestResult runExpr(u8* src, usize len)
     return r;
 }
 
-void testExpr()
+bool testLexer()
+{
+    u8* src = "if x { return 1; }";
+    IdentEntry* entries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + sourceLen(src);
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+
+    u32 count = 0;
+    while (lexer.cur < lexer.bufEnd)
+    {
+        Token tok = lexer.nextToken();
+        if (tok.kind == TokenKind::Eof) break;
+        count = count + 1;
+    }
+    IdentifierInfo* switchInfo = idents.get("switch", 6);
+    printf("lexer test: tokens=%u switch_keyword=%u\n", count, switchInfo != null && switchInfo*.isKeyword ? 1 : 0);
+    free(entries);
+    return true;
+}
+
+bool testIdentifierRanges()
+{
+    bool ok = isXidStart(0x00C0) && isXidStart(0x06FF) && isXidStart(0x0700);
+    ok = ok && !isXidStart(0x07C0) && !isXidStart(0x1380);
+    ok = ok && isXidStart(0x13A0) && isXidStart(0x18AF) && !isXidStart(0x18B0);
+    ok = ok && isXidStart(0xA7FF) && isXidStart(0xA800) && isXidStart(0xD7FF);
+    ok = ok && !isXidStart(0xD800) && isXidStart(0x105BF) && !isXidStart(0x105C0);
+    ok = ok && isXidContinue('0') && isXidContinue(0x0300) && !isXidContinue('.');
+    printf("identifier ranges test: ok=%u\n", ok ? 1 : 0);
+    return ok;
+}
+
+bool testContext()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    Str first = ctx.intern("same", 4);
+    Str second = ctx.intern("same", 4);
+    printf("context test: interned=%u same=%u\n", ctx.internsLen, first == second ? 1 : 0);
+    ctx.deinit();
+    return true;
+}
+
+bool testModuleMap()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    ModuleMap map;
+    map.init(4);
+    Str path = ctx.intern("std/math", 8);
+    Str manifest = ctx.intern("std", 3);
+    ModuleId first = map.add(path, manifest, 2);
+    ModuleId second = map.resolvePath(path);
+    ModuleId missing = map.resolveLib(ctx.intern("other", 5));
+    printf("module map test: first=%u second=%u missing=%u\n", first.index, second.index, missing.index);
+    map.deinit();
+    ctx.deinit();
+    return true;
+}
+
+bool testExpr()
 {
     u8* src = "a + b * (c - d);";
     printf("expr test: ");
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testFunc()
+bool testCompositeExpressions()
+{
+    u8* src = "Point { .x = 1, .y = 2 }";
+    printf("composite expression test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testFunc()
 {
     u8* src = "pub i32 add(u32 a, u32 b) { return a + b; }";
     printf("func test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testVariant()
+bool testDeclarations()
+{
+    u8* src = "pub struct Point { u32 x; u32 y; } pub enum Color { Red, Green }";
+    printf("declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testGlobal()
+{
+    u8* src = "u32 global = 1;";
+    printf("global declaration test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testExternalDeclarations()
+{
+    u8* src = "extern(\"C\") void puts(u8* text); static u32 counter;";
+    printf("external declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testTypeDeclarations()
+{
+    u8* src = "const u32 LIMIT = 10; typedef Word = u32; distinct Meters = u32;";
+    printf("type declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testGenericSyntax()
+{
+    u8* src = "pub struct Box<T> { T value; }";
+    printf("generic syntax test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testVariant()
 {
     u8* src = "pub variant Option { Some { u32 value }, None }";
     printf("variant test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testSwitch()
+bool testSwitch()
 {
     u8* src = "switch (x) { A => { 1 }, else => { 0 } }";
     printf("switch test: ");
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testSwitchStmt()
+bool testSwitchStmt()
 {
     u8* src = "void f() { switch (x) { A => { a; }, else => { b; } } }";
     printf("switch stmt test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testFlag()
+bool testFlag()
 {
     u8* src = "flag(PLATFORM) { linux => { a; }, else => { b; } }";
     printf("flag test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testImport()
+bool testImport()
 {
     u8* src = "import \"path\" { foo, bar as baz };";
     printf("import path test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testImportRoot()
+bool testImportRoot()
 {
     u8* src = "import file::math::core { square };";
     printf("import root test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testImportLib()
+bool testImportAlias()
+{
+    u8* src = "import \"path\" { foo as bar, baz };";
+    printf("import alias test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testImportLib()
 {
     u8* src = "import(lib) std::math { pow };";
     printf("import lib test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testModReexport()
+bool testModReexport()
 {
     u8* src = "pub mod m = import \"path\";";
     printf("mod reexport test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testAttr()
+bool testModLibReexport()
+{
+    u8* src = "pub mod math = import(lib) std::math;";
+    printf("mod lib reexport test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testAttr()
 {
     u8* src = "[[packed]] pub struct Foo { u32 x; }";
     printf("attr test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testSwitchPatterns()
+bool testSwitchPatterns()
 {
     u8* src = "switch (x) { 0, 1 => { 1 }, Some { .value } => { 2 }, else => { 0 } }";
     printf("switch pattern test: ");
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testForIn()
+bool testForIn()
 {
     u8* src = "void f() { for (u32 value : values) { use(value); } }";
     printf("for-in test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testLocals()
+bool testLocals()
 {
     u8* src = "void f() { var x = 1; const u32 y = 2; x = y; }";
     printf("locals test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors == 0;
 }
 
-void testRecovery()
+bool testAssignmentPrecedence()
+{
+    u8* src = "void f() { a = b = c; }";
+    printf("assignment precedence test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testControlFlow()
+{
+    u8* src = "void f() { if (x) { y; } else { z; } while (x) { x = x - 1; } }";
+    printf("control flow test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testSpecialStatements()
+{
+    u8* src = "void f() { defer cleanup(); comptime { x; } asm { nop; } }";
+    printf("special statements test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testExpressionStatements()
+{
+    u8* src = "if (x) { 1 } else { 2 }";
+    printf("expression statement test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testRecovery()
 {
     u8* src = "u32";
     printf("recovery test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
+    return r.errors != 0;
 }
 
 pub i32 main()
 {
     printf("****coral parser self-test****\n");
-    testExpr();
-    testFunc();
-    testVariant();
-    testSwitch();
-    testSwitchStmt();
-    testFlag();
-    testImport();
-    testImportRoot();
-    testImportLib();
-    testModReexport();
-    testAttr();
-    testRecovery();
+    bool ok = true;
+    ok = testLexer() && ok;
+    ok = testIdentifierRanges() && ok;
+    ok = testContext() && ok;
+    ok = testModuleMap() && ok;
+    ok = testExpr() && ok;
+    ok = testCompositeExpressions() && ok;
+    ok = testFunc() && ok;
+    ok = testDeclarations() && ok;
+    ok = testGlobal() && ok;
+    ok = testExternalDeclarations() && ok;
+    ok = testTypeDeclarations() && ok;
+    ok = testGenericSyntax() && ok;
+    ok = testVariant() && ok;
+    ok = testSwitch() && ok;
+    ok = testSwitchStmt() && ok;
+    ok = testFlag() && ok;
+    ok = testImport() && ok;
+    ok = testImportRoot() && ok;
+    ok = testImportAlias() && ok;
+    ok = testImportLib() && ok;
+    ok = testModReexport() && ok;
+    ok = testModLibReexport() && ok;
+    ok = testAttr() && ok;
+    ok = testSwitchPatterns() && ok;
+    ok = testForIn() && ok;
+    ok = testLocals() && ok;
+    ok = testAssignmentPrecedence() && ok;
+    ok = testControlFlow() && ok;
+    ok = testSpecialStatements() && ok;
+    ok = testExpressionStatements() && ok;
+    ok = testRecovery() && ok;
     printf("****done****\n");
-    return 0;
+    return ok ? 0 : 1;
 }
