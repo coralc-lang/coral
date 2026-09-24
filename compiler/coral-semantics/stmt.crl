@@ -1,0 +1,149 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/decl" { Decl, DeclKind, Param, GenericParam };
+import "../coral-ast/stmt" { Stmt, StmtKind };
+import "scope" { Symbol };
+import "sema" { Sema };
+
+extend Sema
+{
+    bool checkStmt(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node*.kind.tag != NodeKind::Stmt) return true;
+        Stmt* stmt = &node*.kind.payload.Stmt.value;
+        switch (stmt*.kind.tag)
+        {
+            StmtKind::ExprStmt => { return self.checkExpr(stmt*.kind.payload.ExprStmt.expr); },
+            StmtKind::VarDecl => {
+                if (!self.checkExpr(stmt*.kind.payload.VarDecl.init)) return false;
+                Ty declaredType = stmt*.kind.payload.VarDecl.typeNode;
+                if (!self.checkType(declaredType)) return false;
+                Ty actualType = self.exprType(stmt*.kind.payload.VarDecl.init);
+                if (declaredType != 0 && !self.compatible(actualType, declaredType)) self.addError();
+                if (declaredType == 0) declaredType = actualType;
+                if (stmt*.kind.payload.VarDecl.name != 0)
+                    self.scopes.declare(stmt*.kind.payload.VarDecl.name, 1, declaredType, id, stmt*.kind.payload.VarDecl.flags);
+                return true;
+            },
+            StmtKind::Block => {
+                self.scopes.enter();
+                bool ok = true;
+                u32 i = 0;
+                while (i < stmt*.kind.payload.Block.stmtsLen)
+                {
+                    if (!self.checkStmt(stmt*.kind.payload.Block.stmts[i]))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    i = i + 1;
+                }
+                self.scopes.leave();
+                return ok;
+            },
+            StmtKind::Return => {
+                if (!self.checkExpr(stmt*.kind.payload.Return.value)) return false;
+                if (!self.compatible(self.exprType(stmt*.kind.payload.Return.value), self.currentReturnType)) self.addError();
+                return true;
+            },
+            StmtKind::If => {
+                if (!self.checkExpr(stmt*.kind.payload.If.cond)) return false;
+                if (!self.checkStmt(stmt*.kind.payload.If.thenBody)) return false;
+                return self.checkStmt(stmt*.kind.payload.If.elseBody);
+            },
+            StmtKind::While => {
+                if (!self.checkExpr(stmt*.kind.payload.While.cond)) return false;
+                return self.checkStmt(stmt*.kind.payload.While.body);
+            },
+            StmtKind::ForIn => {
+                if (!self.checkExpr(stmt*.kind.payload.ForIn.iterExpr)) return false;
+                self.scopes.enter();
+                self.scopes.declare(stmt*.kind.payload.ForIn.bindName, 1, stmt*.kind.payload.ForIn.bindType, id, 2);
+                bool ok = self.checkStmt(stmt*.kind.payload.ForIn.body);
+                self.scopes.leave();
+                return ok;
+            },
+            StmtKind::For => {
+                if (!self.checkStmt(stmt*.kind.payload.For.init)) return false;
+                if (!self.checkExpr(stmt*.kind.payload.For.cond)) return false;
+                if (!self.checkExpr(stmt*.kind.payload.For.post)) return false;
+                return self.checkStmt(stmt*.kind.payload.For.body);
+            },
+            StmtKind::Defer => { return self.checkStmt(stmt*.kind.payload.Defer.stmt); },
+            StmtKind::Comptime => {
+                u32 i = 0;
+                while (i < stmt*.kind.payload.Comptime.stmtsLen)
+                {
+                    if (!self.checkStmt(stmt*.kind.payload.Comptime.stmts[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            StmtKind::Asm => {
+                u32 i = 0;
+                while (i < stmt*.kind.payload.Asm.templateLen)
+                {
+                    if (!self.checkExpr(stmt*.kind.payload.Asm.template[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            else => {
+                self.addError();
+                return false;
+            }
+        }
+    }
+
+    bool checkFunction(Decl* decl)
+    {
+        self.scopes.enter();
+        bool ok = true;
+        u32 genericIndex = 0;
+        while (genericIndex < decl*.kind.payload.Func.genericParamsLen)
+        {
+            NodeId genericId = decl*.kind.payload.Func.genericParams[genericIndex];
+            Node* genericNode = self.ctx.nodes + genericId.index;
+            if (genericNode*.kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* generic = &genericNode*.kind.payload.GenericParam.value;
+                Ty typeNode = self.typeParamType(generic*.name, genericIndex);
+                if (!self.scopes.declare(generic*.name, 4, typeNode, genericId, 0)) ok = false;
+            }
+            genericIndex = genericIndex + 1;
+        }
+        u32 i = 0;
+        while (i < decl*.kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl*.kind.payload.Func.params[i];
+            Node* paramNode = self.ctx.nodes + paramId.index;
+            if (paramNode*.kind.tag == NodeKind::Param)
+            {
+                Param* param = &paramNode*.kind.payload.Param.value;
+                if (param*.name != 0)
+                {
+                    if ((param*.flags & 8) != 0)
+                    {
+                        Ty typeNode = self.typeParamType(param*.name, i);
+                        if (!self.scopes.declare(param*.name, 4, typeNode, paramId, 0)) ok = false;
+                    }
+                    else
+                    {
+                        if (!self.scopes.declare(param*.name, 1, param*.typeNode, paramId, 0)) ok = false;
+                    }
+                }
+                if (!self.checkType(param*.typeNode)) ok = false;
+            }
+            i = i + 1;
+        }
+        if (!self.checkType(decl*.kind.payload.Func.returnType)) ok = false;
+        self.currentReturnType = decl*.kind.payload.Func.returnType;
+        if (!self.checkStmt(decl*.kind.payload.Func.body)) ok = false;
+        self.currentReturnType = 0;
+        self.scopes.leave();
+        return ok;
+    }
+}

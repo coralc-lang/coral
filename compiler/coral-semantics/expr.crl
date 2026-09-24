@@ -1,0 +1,320 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/expr" { Expr, ExprKind };
+import "../coral-ast/decl" { Decl, DeclKind, Param };
+import "../coral-ast/stmt" { SwitchCase };
+import "scope" { Symbol };
+import "sema" { Sema };
+
+extend Sema
+{
+    bool checkIdent(Str name)
+    {
+        Symbol* symbol = self.scopes.lookup(name);
+        if (symbol == null)
+        {
+            self.addError();
+            return false;
+        }
+        return true;
+    }
+
+    bool assignExpr(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* node = self.ctx.nodes + id.index;
+        if (node*.kind.tag != NodeKind::Expr) return false;
+        Expr* expr = &node*.kind.payload.Expr.value;
+        if (expr*.kind.tag == ExprKind::Ident)
+        {
+            Symbol* symbol = self.scopes.lookup(expr*.kind.payload.Ident.name);
+            if (symbol == null) return false;
+            self.setExprType(id, symbol*.typeNode);
+            return self.scopes.assign(expr*.kind.payload.Ident.name, id);
+        }
+        if (expr*.kind.tag == ExprKind::Field)
+            return self.checkExpr(expr*.kind.payload.Field.obj);
+        if (expr*.kind.tag == ExprKind::Index)
+            return self.checkExpr(expr*.kind.payload.Index.obj);
+        if (expr*.kind.tag == ExprKind::Deref)
+            return self.checkExpr(expr*.kind.payload.Deref.expr);
+        return false;
+    }
+
+    bool checkCall(NodeId callId, Str name, NodeId* args, u32 argsLen)
+    {
+        Symbol* symbol = self.scopes.lookup(name);
+        if (symbol == null)
+        {
+            self.addError();
+            return false;
+        }
+        Node* declNode = self.ctx.nodes + symbol*.declaration.index;
+        if (declNode*.kind.tag != NodeKind::Decl) return true;
+        Decl* decl = &declNode*.kind.payload.Decl.value;
+        if (decl*.kind.tag != DeclKind::Func) return true;
+        if (decl*.kind.payload.Func.paramsLen != argsLen)
+        {
+            self.addError();
+            return false;
+        }
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            NodeId paramId = decl*.kind.payload.Func.params[i];
+            Node* paramNode = self.ctx.nodes + paramId.index;
+            if (paramNode*.kind.tag == NodeKind::Param)
+            {
+                Param* param = &paramNode*.kind.payload.Param.value;
+                if (!self.compatible(self.exprType(args[i]), param*.typeNode)) self.addError();
+            }
+            i = i + 1;
+        }
+        self.setExprType(callId, decl*.kind.payload.Func.returnType);
+        return true;
+    }
+
+    bool checkBinary(NodeId id, NodeId left, NodeId right)
+    {
+        if (!self.checkExpr(left)) return false;
+        if (!self.checkExpr(right)) return false;
+        Ty leftType = self.exprType(left);
+        Ty rightType = self.exprType(right);
+        if (leftType == 0) leftType = rightType;
+        if (rightType == 0) rightType = leftType;
+        if (!self.compatible(leftType, rightType)) self.addError();
+        self.setExprType(id, leftType);
+        return true;
+    }
+
+    bool checkExpr(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node*.kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node*.kind.payload.Expr.value;
+        switch (expr*.kind.tag)
+        {
+            ExprKind::IntLit => { self.setExprType(id, self.i32Type()); return true; },
+            ExprKind::FloatLit => { self.setExprType(id, self.f64Type()); return true; },
+            ExprKind::StringLit => { self.setExprType(id, self.strType()); return true; },
+            ExprKind::CharLit => { self.setExprType(id, self.charType()); return true; },
+            ExprKind::BoolLit => { self.setExprType(id, self.boolType()); return true; },
+            ExprKind::NullLit => { return true; },
+            ExprKind::Ident => {
+                if (!self.checkIdent(expr*.kind.payload.Ident.name)) return false;
+                Symbol* symbol = self.scopes.lookup(expr*.kind.payload.Ident.name);
+                if (symbol != null) self.setExprType(id, symbol*.typeNode);
+                return true;
+            },
+            ExprKind::TypeRef => {
+                if (!self.checkIdent(expr*.kind.payload.TypeRef.name)) return false;
+                if (!self.checkType(expr*.kind.payload.TypeRef.typeNode)) return false;
+                self.setExprType(id, expr*.kind.payload.TypeRef.typeNode);
+                return true;
+            },
+            ExprKind::Path => { return true; },
+            ExprKind::Call => {
+                if (!self.checkExpr(expr*.kind.payload.Call.callee)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.Call.argsLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.Call.args[i])) return false;
+                    i = i + 1;
+                }
+                Node* calleeNode = self.ctx.nodes + expr*.kind.payload.Call.callee.index;
+                if (calleeNode*.kind.tag == NodeKind::Expr)
+                {
+                    Expr* callee = &calleeNode*.kind.payload.Expr.value;
+                    if (callee*.kind.tag == ExprKind::Ident)
+                        return self.checkCall(id, callee*.kind.payload.Ident.name, expr*.kind.payload.Call.args, expr*.kind.payload.Call.argsLen);
+                }
+                return true;
+            },
+            ExprKind::MethodCall => {
+                if (!self.checkExpr(expr*.kind.payload.MethodCall.receiver)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.MethodCall.argsLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.MethodCall.args[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            ExprKind::Field => { return self.checkExpr(expr*.kind.payload.Field.obj); },
+            ExprKind::Index => {
+                if (!self.checkExpr(expr*.kind.payload.Index.obj)) return false;
+                return self.checkExpr(expr*.kind.payload.Index.index);
+            },
+            ExprKind::Cast => { return self.checkExpr(expr*.kind.payload.Cast.expr); },
+            ExprKind::Sizeof => { return true; },
+            ExprKind::Alignof => { return true; },
+            ExprKind::Typeof => { return self.checkExpr(expr*.kind.payload.Typeof.expr); },
+            ExprKind::AddressOf => { return self.checkExpr(expr*.kind.payload.AddressOf.expr); },
+            ExprKind::Deref => { return self.checkExpr(expr*.kind.payload.Deref.expr); },
+            ExprKind::Neg => { return self.checkExpr(expr*.kind.payload.Neg.expr); },
+            ExprKind::Not => { return self.checkExpr(expr*.kind.payload.Not.expr); },
+            ExprKind::Add => { return self.checkBinary(id, expr*.kind.payload.Add.left, expr*.kind.payload.Add.right); },
+            ExprKind::Sub => { return self.checkBinary(id, expr*.kind.payload.Sub.left, expr*.kind.payload.Sub.right); },
+            ExprKind::Mul => { return self.checkBinary(id, expr*.kind.payload.Mul.left, expr*.kind.payload.Mul.right); },
+            ExprKind::Div => { return self.checkBinary(id, expr*.kind.payload.Div.left, expr*.kind.payload.Div.right); },
+            ExprKind::Mod => { return self.checkBinary(id, expr*.kind.payload.Mod.left, expr*.kind.payload.Mod.right); },
+            ExprKind::Eq => { return self.checkBinary(id, expr*.kind.payload.Eq.left, expr*.kind.payload.Eq.right); },
+            ExprKind::Ne => { return self.checkBinary(id, expr*.kind.payload.Ne.left, expr*.kind.payload.Ne.right); },
+            ExprKind::Lt => { return self.checkBinary(id, expr*.kind.payload.Lt.left, expr*.kind.payload.Lt.right); },
+            ExprKind::Le => { return self.checkBinary(id, expr*.kind.payload.Le.left, expr*.kind.payload.Le.right); },
+            ExprKind::Gt => { return self.checkBinary(id, expr*.kind.payload.Gt.left, expr*.kind.payload.Gt.right); },
+            ExprKind::Ge => { return self.checkBinary(id, expr*.kind.payload.Ge.left, expr*.kind.payload.Ge.right); },
+            ExprKind::And => { return self.checkBinary(id, expr*.kind.payload.And.left, expr*.kind.payload.And.right); },
+            ExprKind::Or => { return self.checkBinary(id, expr*.kind.payload.Or.left, expr*.kind.payload.Or.right); },
+            ExprKind::BitAnd => { return self.checkBinary(id, expr*.kind.payload.BitAnd.left, expr*.kind.payload.BitAnd.right); },
+            ExprKind::BitOr => { return self.checkBinary(id, expr*.kind.payload.BitOr.left, expr*.kind.payload.BitOr.right); },
+            ExprKind::BitXor => { return self.checkBinary(id, expr*.kind.payload.BitXor.left, expr*.kind.payload.BitXor.right); },
+            ExprKind::Shl => { return self.checkBinary(id, expr*.kind.payload.Shl.left, expr*.kind.payload.Shl.right); },
+            ExprKind::Shr => { return self.checkBinary(id, expr*.kind.payload.Shr.left, expr*.kind.payload.Shr.right); },
+            ExprKind::Assign => {
+                if (!self.assignExpr(expr*.kind.payload.Assign.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.Assign.value)) return false;
+                if (!self.compatible(self.exprType(expr*.kind.payload.Assign.value), self.exprType(expr*.kind.payload.Assign.target))) self.addError();
+                return true;
+            },
+            ExprKind::AssignAdd => {
+                if (!self.assignExpr(expr*.kind.payload.AssignAdd.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignAdd.value)) return false;
+                if (!self.compatible(self.exprType(expr*.kind.payload.AssignAdd.value), self.exprType(expr*.kind.payload.AssignAdd.target))) self.addError();
+                return true;
+            },
+            ExprKind::AssignSub => {
+                if (!self.assignExpr(expr*.kind.payload.AssignSub.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignSub.value)) return false;
+                if (!self.compatible(self.exprType(expr*.kind.payload.AssignSub.value), self.exprType(expr*.kind.payload.AssignSub.target))) self.addError();
+                return true;
+            },
+            ExprKind::AssignMul => {
+                if (!self.assignExpr(expr*.kind.payload.AssignMul.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignMul.value)) return false;
+                return true;
+            },
+            ExprKind::AssignDiv => {
+                if (!self.assignExpr(expr*.kind.payload.AssignDiv.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignDiv.value)) return false;
+                return true;
+            },
+            ExprKind::AssignMod => {
+                if (!self.assignExpr(expr*.kind.payload.AssignMod.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignMod.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitAnd => {
+                if (!self.assignExpr(expr*.kind.payload.AssignBitAnd.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignBitAnd.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitOr => {
+                if (!self.assignExpr(expr*.kind.payload.AssignBitOr.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignBitOr.value)) return false;
+                return true;
+            },
+            ExprKind::AssignBitXor => {
+                if (!self.assignExpr(expr*.kind.payload.AssignBitXor.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignBitXor.value)) return false;
+                return true;
+            },
+            ExprKind::AssignShl => {
+                if (!self.assignExpr(expr*.kind.payload.AssignShl.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignShl.value)) return false;
+                return true;
+            },
+            ExprKind::AssignShr => {
+                if (!self.assignExpr(expr*.kind.payload.AssignShr.target)) return false;
+                if (!self.checkExpr(expr*.kind.payload.AssignShr.value)) return false;
+                return true;
+            },
+            ExprKind::TupleField => { return self.checkExpr(expr*.kind.payload.TupleField.obj); },
+            ExprKind::StructLiteral => {
+                if (!self.checkType(expr*.kind.payload.StructLiteral.typeNode)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.StructLiteral.fieldValuesLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.StructLiteral.fieldValues[i])) return false;
+                    i = i + 1;
+                }
+                self.setExprType(id, expr*.kind.payload.StructLiteral.typeNode);
+                return true;
+            },
+            ExprKind::ArrayLiteral => {
+                u32 i = 0;
+                while (i < expr*.kind.payload.ArrayLiteral.elemsLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.ArrayLiteral.elems[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            ExprKind::BuiltinCall => {
+                u32 i = 0;
+                while (i < expr*.kind.payload.BuiltinCall.argsLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.BuiltinCall.args[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            ExprKind::TupleExpr => {
+                u32 i = 0;
+                while (i < expr*.kind.payload.TupleExpr.elemsLen)
+                {
+                    if (!self.checkExpr(expr*.kind.payload.TupleExpr.elems[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            ExprKind::BlockExpr => {
+                u32 i = 0;
+                while (i < expr*.kind.payload.BlockExpr.stmtsLen)
+                {
+                    if (!self.checkStmt(expr*.kind.payload.BlockExpr.stmts[i])) return false;
+                    i = i + 1;
+                }
+                return self.checkExpr(expr*.kind.payload.BlockExpr.result);
+            },
+            ExprKind::Ternary => {
+                if (!self.checkExpr(expr*.kind.payload.Ternary.cond)) return false;
+                if (!self.checkExpr(expr*.kind.payload.Ternary.thenExpr)) return false;
+                return self.checkExpr(expr*.kind.payload.Ternary.elseExpr);
+            },
+            ExprKind::PostInc => { return self.assignExpr(expr*.kind.payload.PostInc.expr); },
+            ExprKind::PostDec => { return self.assignExpr(expr*.kind.payload.PostDec.expr); },
+            ExprKind::PreInc => { return self.assignExpr(expr*.kind.payload.PreInc.expr); },
+            ExprKind::PreDec => { return self.assignExpr(expr*.kind.payload.PreDec.expr); },
+            ExprKind::IfExpr => {
+                if (!self.checkExpr(expr*.kind.payload.IfExpr.cond)) return false;
+                if (!self.checkExpr(expr*.kind.payload.IfExpr.thenBody)) return false;
+                return self.checkExpr(expr*.kind.payload.IfExpr.elseBody);
+            },
+            ExprKind::SwitchExpr => {
+                if (!self.checkExpr(expr*.kind.payload.SwitchExpr.expr)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.SwitchExpr.casesLen)
+                {
+                    SwitchCase* switchCase = expr*.kind.payload.SwitchExpr.cases + i;
+                    u32 p = 0;
+                    while (p < switchCase*.patternsLen)
+                    {
+                        self.checkExpr(switchCase*.patterns[p]);
+                        p = p + 1;
+                    }
+                    self.checkExpr(switchCase*.guard);
+                    self.checkExpr(switchCase*.body);
+                    i = i + 1;
+                }
+                return true;
+            },
+            else => {
+                self.addError();
+                return false;
+            }
+        }
+    }
+}

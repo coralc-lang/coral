@@ -7,16 +7,23 @@ import "../coral-ast/types" { Ty, TypeKind, TypeEntry };
 import "../coral-ast/id" { Str };
 import "../coral-context/context" { AstContext, TyListBuilder };
 
+extern("C") void free(rawptr ptr);
+
 extend Parser
 {
     Ty parseType()
     {
-        if (self.match(TokenKind::Const))
-        {
-            Ty inner = self.parseType();
-            return self.makeConst(inner);
-        }
-        Ty base = self.parseBaseType();
+         if (self.match(TokenKind::Const))
+         {
+             Ty inner = self.parseType();
+             return self.makeConst(inner);
+         }
+         if (self.match(TokenKind::Comptime))
+         {
+             Ty inner = self.parseType();
+             return self.makeComptime(inner);
+         }
+         Ty base = self.parseBaseType();
         while (self.match(TokenKind::Star))
         {
             base = self.makePointer(base);
@@ -41,29 +48,79 @@ extend Parser
     Ty makeVoid()
     {
         TypeKind k;
-        k.tag = TypeKind_Void;
+        k.tag = TypeKind::Void;
         return self.allocTypeKind(k);
     }
     
-    Ty makeNamed(Str name)
-    {
-        TypeKind k;
-        k = TypeKind::Named { .name = name, .genericArgs = null, .genericArgsLen = 0 };
-        return self.allocTypeKind(k);
-    }
+     Ty makeNamed(Str name)
+     {
+         return self.makeNamedArgs(name, null, 0);
+     }
+
+     Ty makeNamedArgs(Str name, Ty* args, u32 argsLen)
+     {
+         TypeKind k;
+         k = TypeKind::Named { .name = name, .genericArgs = args, .genericArgsLen = argsLen };
+         return self.allocTypeKind(k);
+     }
+
+     bool parseGenericArguments(rawptr* outArgs, u32* outLen)
+     {
+         *outArgs = null;
+         *outLen = 0;
+         if (!self.check(TokenKind::Less)) return false;
+         ParserMark mark = self.save();
+         self.advance();
+         TyListBuilder args;
+         self.ctx.tyListInit(&args);
+         bool ok = true;
+         if (self.check(TokenKind::Greater) || self.check(TokenKind::Shr))
+         {
+             ok = self.consumeGreater();
+         }
+         else
+         {
+             while (true)
+             {
+                 Ty arg = self.parseType();
+                 if (self.panicMode || !self.ctx.tyListAppend(&args, arg))
+                 {
+                     ok = false;
+                     break;
+                 }
+                 if (!self.match(TokenKind::Comma)) break;
+             }
+             if (ok) ok = self.consumeGreater();
+         }
+         if (!ok)
+         {
+             if (args.data != null) free((rawptr)args.data);
+             self.restore(mark);
+             return false;
+         }
+         *outLen = args.len;
+         *outArgs = (rawptr)self.ctx.tyListFinish(&args);
+         return true;
+     }
     Ty makePointer(Ty base)
     {
         TypeKind k;
         k = TypeKind::Pointer { .base = base };
         return self.allocTypeKind(k);
     }
-    Ty makeConst(Ty base)
-    {
-        TypeKind k;
-        k = TypeKind::Const { .base = base };
-        return self.allocTypeKind(k);
-    }
-    Ty makeSlice(Ty base)
+     Ty makeConst(Ty base)
+     {
+         TypeKind k;
+         k = TypeKind::Const { .base = base };
+         return self.allocTypeKind(k);
+     }
+     Ty makeComptime(Ty base)
+     {
+         TypeKind k;
+         k = TypeKind::Comptime { .base = base };
+         return self.allocTypeKind(k);
+     }
+     Ty makeSlice(Ty base)
     {
         TypeKind k;
         k = TypeKind::Slice { .base = base };
@@ -105,24 +162,24 @@ extend Parser
     Ty parseBaseType()
     {
         if (self.match(TokenKind::Void)) return self.makeVoid();
-        if (self.match(TokenKind::Bool)) { TypeKind k; k.tag = TypeKind_Bool; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::Char)) { TypeKind k; k.tag = TypeKind_Char; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::U8)) { TypeKind k; k.tag = TypeKind_U8; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::I8)) { TypeKind k; k.tag = TypeKind_I8; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::U16)) { TypeKind k; k.tag = TypeKind_U16; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::I16)) { TypeKind k; k.tag = TypeKind_I16; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::U32)) { TypeKind k; k.tag = TypeKind_U32; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::I32)) { TypeKind k; k.tag = TypeKind_I32; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::U64)) { TypeKind k; k.tag = TypeKind_U64; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::I64)) { TypeKind k; k.tag = TypeKind_I64; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::U128)) { TypeKind k; k.tag = TypeKind_U128; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::I128)) { TypeKind k; k.tag = TypeKind_I128; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::F32)) { TypeKind k; k.tag = TypeKind_F32; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::F64)) { TypeKind k; k.tag = TypeKind_F64; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::Usize)) { TypeKind k; k.tag = TypeKind_Usize; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::Isize)) { TypeKind k; k.tag = TypeKind_Isize; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::Rawptr)) { TypeKind k; k.tag = TypeKind_Rawptr; return self.allocTypeKind(k); }
-        if (self.match(TokenKind::Str)) { TypeKind k; k.tag = TypeKind_Str; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Bool)) { TypeKind k; k.tag = TypeKind::Bool; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Char)) { TypeKind k; k.tag = TypeKind::Char; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::U8)) { TypeKind k; k.tag = TypeKind::U8; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::I8)) { TypeKind k; k.tag = TypeKind::I8; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::U16)) { TypeKind k; k.tag = TypeKind::U16; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::I16)) { TypeKind k; k.tag = TypeKind::I16; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::U32)) { TypeKind k; k.tag = TypeKind::U32; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::I32)) { TypeKind k; k.tag = TypeKind::I32; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::U64)) { TypeKind k; k.tag = TypeKind::U64; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::I64)) { TypeKind k; k.tag = TypeKind::I64; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::U128)) { TypeKind k; k.tag = TypeKind::U128; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::I128)) { TypeKind k; k.tag = TypeKind::I128; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::F32)) { TypeKind k; k.tag = TypeKind::F32; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::F64)) { TypeKind k; k.tag = TypeKind::F64; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Usize)) { TypeKind k; k.tag = TypeKind::Usize; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Isize)) { TypeKind k; k.tag = TypeKind::Isize; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Rawptr)) { TypeKind k; k.tag = TypeKind::Rawptr; return self.allocTypeKind(k); }
+        if (self.match(TokenKind::Str)) { TypeKind k; k.tag = TypeKind::Str; return self.allocTypeKind(k); }
 
          if (self.check(TokenKind::Ident))
          {
@@ -132,34 +189,9 @@ extend Parser
              {
                  self.expectName();
              }
-             if (self.check(TokenKind::Less))
-             {
-                 ParserMark m = self.save();
-                 self.advance();
-                 bool ok = true;
-                 if (self.check(TokenKind::Greater) || self.check(TokenKind::Shr))
-                 {
-                     ok = self.consumeGreater();
-                 }
-                 else
-                 {
-                     self.parseType();
-                     if (self.panicMode) ok = false;
-                     else
-                     {
-                         while (self.match(TokenKind::Comma))
-                         {
-                             self.parseType();
-                             if (self.panicMode) { ok = false; break; }
-                         }
-                         if (ok) ok = self.consumeGreater();
-                     }
-                 }
-                 if (!ok)
-                 {
-                     self.restore(m);
-                 }
-             }
+              Ty* genericArgs = null;
+              u32 genericArgsLen = 0;
+              self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
              if (self.check(TokenKind::LParen))
              {
                  self.advance();
@@ -180,7 +212,7 @@ extend Parser
                  Ty* values = self.ctx.tyListFinish(&params);
                  return self.makeFunctionPointer(name, 0, values, count);
              }
-             return self.makeNamed(name);
+              return self.makeNamedArgs(name, genericArgs, genericArgsLen);
          }
 
          if (self.check(TokenKind::LParen))

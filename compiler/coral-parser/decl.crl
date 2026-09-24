@@ -2,12 +2,12 @@
 
 import "base" { Parser, ParserMark };
 import "parser" { Parser };
-import "../coral-context/context" { AstContext, NodeListBuilder };
+import "../coral-context/context" { AstContext, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
 import "../coral-common/token" { Token, TokenKind };
 import "../coral-ast/id" { NodeId, Str };
-import "../coral-ast/decl" { Decl, DeclKind, Param, Field };
+import "../coral-ast/decl" { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant };
 import "../coral-ast/node" { Node, NodeKind };
-import "../coral-ast/types" { Ty };
+import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
 
 extend Parser
 {
@@ -80,18 +80,18 @@ extend Parser
         }
         bool isStatic = self.match(TokenKind::Static);
 
-        if (self.check(TokenKind::Struct))
-            return self.parseStructDecl();
-        if (self.check(TokenKind::Enum))
-            return self.parseEnumDecl();
-        if (self.check(TokenKind::Variant))
-            return self.parseVariantDecl();
-        if (self.check(TokenKind::Union))
-            return self.parseUnionDecl();
-        if (self.check(TokenKind::Trait))
-            return self.parseTraitDecl();
-        if (self.check(TokenKind::Extend))
-            return self.parseExtendDecl();
+         if (self.check(TokenKind::Struct))
+             return self.parseStructDecl(isPub);
+         if (self.check(TokenKind::Enum))
+             return self.parseEnumDecl(isPub);
+         if (self.check(TokenKind::Variant))
+             return self.parseVariantDecl(isPub);
+         if (self.check(TokenKind::Union))
+             return self.parseUnionDecl(isPub);
+         if (self.check(TokenKind::Trait))
+             return self.parseTraitDecl(isPub);
+         if (self.check(TokenKind::Extend))
+             return self.parseExtendDecl(isPub);
          if (self.check(TokenKind::Const))
              return self.parseConstDecl();
          if (self.check(TokenKind::Typedef))
@@ -151,8 +151,12 @@ extend Parser
          Ty retType = self.parseType();
          Token nameTok = self.expectName();
          Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         NodeListBuilder genericParams;
+         self.ctx.nodeListInit(&genericParams);
          if (self.check(TokenKind::Less))
-             self.parseGenericParams();
+             self.parseGenericParams(&genericParams);
+         u32 genericCount = genericParams.len;
+         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
          u8 flags = 0;
          if (isPub) flags = flags | 1;
          if (isExtern) flags = flags | 2;
@@ -181,7 +185,7 @@ extend Parser
                  body = self.parseBlock();
                  flags = flags | 8;
              }
-             return self.storeDecl(DeclKind::Func { .name = name, .genericParams = null, .genericParamsLen = 0, .params = paramValues, .paramsLen = paramCount, .returnType = retType, .body = body, .flags = flags });
+              return self.storeDecl(DeclKind::Func { .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .params = paramValues, .paramsLen = paramCount, .returnType = retType, .body = body, .flags = flags });
          }
          NodeId value = self.noneNode();
          if (self.match(TokenKind::Equal))
@@ -196,30 +200,28 @@ extend Parser
          return self.storeDecl(DeclKind::Constant { .name = name, .typeNode = retType, .value = value, .flags = flags });
      }
 
-    NodeId parseGenericParams()
-    {
-        self.expect(TokenKind::Less);
-        self.expect(TokenKind::Ident);
-        if (self.match(TokenKind::Colon))
-        {
-            self.expect(TokenKind::Ident);
-            while (self.match(TokenKind::Comma))
-                self.expect(TokenKind::Ident);
-        }
-        while (self.match(TokenKind::Comma))
-        {
-            self.expect(TokenKind::Ident);
-            if (self.match(TokenKind::Colon))
-                self.expect(TokenKind::Ident);
-        }
-        if (self.check(TokenKind::Shr))
-        {
-            self.advance();
-            return self.allocNode();
-        }
-        self.expect(TokenKind::Greater);
-        return self.allocNode();
-    }
+     NodeId parseGenericParam()
+     {
+         Token nameTok = self.expectName();
+         GenericParam param;
+         param.name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         param.bounds = null;
+         param.boundsLen = 0;
+         return self.storeNode(NodeKind::GenericParam { .value = param });
+     }
+
+     void parseGenericParams(NodeListBuilder* params)
+     {
+         self.expect(TokenKind::Less);
+         if (self.consumeGreater()) return;
+         while (true)
+         {
+             NodeId param = self.parseGenericParam();
+             if (!self.ctx.nodeListAppend(params, param)) self.panicMode = 1;
+             if (!self.match(TokenKind::Comma)) break;
+         }
+         if (!self.consumeGreater()) self.panicMode = 1;
+     }
 
      NodeId parseFuncDecl()
      {
@@ -240,164 +242,316 @@ extend Parser
              return self.storeParam(param);
          }
          param.typeNode = self.parseType();
+         if (self.check(TokenKind::Comma) || self.check(TokenKind::RParen))
+         {
+             param.name = 0;
+             param.flags = 8;
+             if (param.typeNode != 0)
+             {
+                 TypeEntry* typeEntry = self.ctx.types + param.typeNode;
+                 if (typeEntry*.kind.tag == TypeKind_Comptime)
+                 {
+                     TypeEntry* baseEntry = self.ctx.types + typeEntry*.kind.payload.Comptime.base;
+                     if (baseEntry*.kind.tag == TypeKind_Named)
+                         param.name = baseEntry*.kind.payload.Named.name;
+                 }
+             }
+             return self.storeParam(param);
+         }
          Token name = self.expectName();
          param.name = self.ctx.intern(name.data.ptr, name.data.len);
          return self.storeParam(param);
      }
 
-    NodeId parseStructDecl()
-    {
-        self.expect(TokenKind::Struct);
-        self.expect(TokenKind::Ident);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-        {
-            self.match(TokenKind::Pub);
-            if (self.check(TokenKind::Extern) || self.check(TokenKind::Static))
-            {
-                self.parseFuncDecl();
-                continue;
-            }
+     NodeId parseStructDecl(bool isPub)
+     {
+         self.expect(TokenKind::Struct);
+         Token nameTok = self.expect(TokenKind::Ident);
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         NodeListBuilder genericParams;
+         self.ctx.nodeListInit(&genericParams);
+         if (self.check(TokenKind::Less))
+             self.parseGenericParams(&genericParams);
+         u32 genericCount = genericParams.len;
+         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+         NodeListBuilder fields;
+         NodeListBuilder methods;
+         self.ctx.nodeListInit(&fields);
+         self.ctx.nodeListInit(&methods);
+         self.expect(TokenKind::LBrace);
+         while (!self.check(TokenKind::RBrace) && !self.atEnd())
+         {
+             u8 fieldFlags = 0;
+             if (self.match(TokenKind::Pub)) fieldFlags = 1;
+             if (self.check(TokenKind::Extern) || self.check(TokenKind::Static))
+             {
+                 NodeId method = self.parseFuncDecl();
+                 if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+                 continue;
+             }
 
-            ParserMark mark = self.save();
-            self.parseType();
-            self.expect(TokenKind::Ident);
-            bool isMethod = self.check(TokenKind::LParen);
-            self.restore(mark);
+             ParserMark mark = self.save();
+             self.parseType();
+             self.expect(TokenKind::Ident);
+             bool isMethod = self.check(TokenKind::LParen);
+             self.restore(mark);
 
-            if (isMethod)
-            {
-                self.parseFuncDecl();
-                continue;
-            }
+             if (isMethod)
+             {
+                 NodeId method = self.parseFuncDecl();
+                 if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+                 continue;
+             }
 
-            self.parseType();
-            self.expect(TokenKind::Ident);
-            if (self.match(TokenKind::Equal))
-                self.parseExpr();
-            self.match(TokenKind::Comma);
-            self.match(TokenKind::Semicolon);
-        }
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+             Ty fieldType = self.parseType();
+             Token fieldNameTok = self.expect(TokenKind::Ident);
+             Field field;
+             field.name = self.ctx.intern(fieldNameTok.data.ptr, fieldNameTok.data.len);
+             field.typeNode = fieldType;
+             field.defaultValue = self.noneNode();
+             field.loc.data = 0;
+             field.flags = fieldFlags;
+             if (self.match(TokenKind::Equal))
+             {
+                 field.defaultValue = self.parseExpr();
+                 field.flags = field.flags | 2;
+             }
+             NodeId fieldNode = self.storeField(field);
+             if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.panicMode = 1;
+             self.match(TokenKind::Comma);
+             self.match(TokenKind::Semicolon);
+         }
+         self.expect(TokenKind::RBrace);
+         u32 fieldCount = fields.len;
+         NodeId* fieldValues = self.ctx.nodeListFinish(&fields);
+         u32 methodCount = methods.len;
+         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+         u8 flags = 0;
+         if (isPub) flags = 1;
+         return self.storeDecl(DeclKind::Struct { .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .fields = fieldValues, .fieldsLen = fieldCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+     }
 
-    NodeId parseEnumDecl()
-    {
-        self.expect(TokenKind::Enum);
-        self.expect(TokenKind::Ident);
-        if (self.match(TokenKind::Colon))
-            self.parseType();
-        self.expect(TokenKind::LBrace);
-        if (!self.check(TokenKind::RBrace))
-        {
-            self.expect(TokenKind::Ident);
-            if (self.match(TokenKind::Equal))
-                self.parseExpr();
-            while (self.match(TokenKind::Comma))
-            {
-                if (self.check(TokenKind::RBrace)) break;
-                self.expect(TokenKind::Ident);
-                if (self.match(TokenKind::Equal))
-                    self.parseExpr();
-            }
-        }
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseEnumDecl(bool isPub)
+     {
+         self.expect(TokenKind::Enum);
+         Token nameTok = self.expect(TokenKind::Ident);
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         Ty backingType = 0;
+         u8 flags = 0;
+         if (self.match(TokenKind::Colon))
+         {
+             backingType = self.parseType();
+             flags = 1;
+         }
+         if (isPub) flags = flags | 2;
+         NodeListBuilder variants;
+         self.ctx.nodeListInit(&variants);
+         self.expect(TokenKind::LBrace);
+         if (!self.check(TokenKind::RBrace))
+         {
+             while (true)
+             {
+                  EnumVariant enumValue;
+                  Token variantTok = self.expect(TokenKind::Ident);
+                  enumValue.name = self.ctx.intern(variantTok.data.ptr, variantTok.data.len);
+                  enumValue.value = self.noneNode();
+                  enumValue.loc.data = 0;
+                  enumValue.flags = 0;
+                  if (self.match(TokenKind::Equal))
+                  {
+                      enumValue.value = self.parseExpr();
+                      enumValue.flags = 1;
+                  }
+                  NodeId variantNode = self.storeNode(NodeKind::EnumVariant { .value = enumValue });
+                 if (!self.ctx.nodeListAppend(&variants, variantNode)) self.panicMode = 1;
+                 if (!self.match(TokenKind::Comma)) break;
+                 if (self.check(TokenKind::RBrace)) break;
+             }
+         }
+         self.expect(TokenKind::RBrace);
+         u32 variantCount = variants.len;
+         NodeId* variantValues = self.ctx.nodeListFinish(&variants);
+         return self.storeDecl(DeclKind::Enum { .name = name, .backingType = backingType, .variants = variantValues, .variantsLen = variantCount, .flags = flags });
+     }
 
-    NodeId parseVariantDecl()
-    {
-        self.expect(TokenKind::Variant);
-        self.expect(TokenKind::Ident);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-        {
-            if (self.check(TokenKind::Pub))
-            {
-                self.advance();
-                self.parseFuncDecl();
-                continue;
-            }
-            self.expect(TokenKind::Ident);
-            if (!self.check(TokenKind::LBrace))
-            {
-                self.match(TokenKind::Comma);
-                continue;
-            }
-            self.expect(TokenKind::LBrace);
-            while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            {
-                self.parseType();
-                self.expect(TokenKind::Ident);
-                if (!self.match(TokenKind::Comma)) break;
-            }
-            self.expect(TokenKind::RBrace);
-            self.match(TokenKind::Comma);
-        }
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseVariantDecl(bool isPub)
+     {
+         self.expect(TokenKind::Variant);
+         Token nameTok = self.expect(TokenKind::Ident);
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         NodeListBuilder genericParams;
+         self.ctx.nodeListInit(&genericParams);
+         if (self.check(TokenKind::Less))
+             self.parseGenericParams(&genericParams);
+         u32 genericCount = genericParams.len;
+         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+         VariantListBuilder variants;
+         NodeListBuilder methods;
+         self.ctx.variantListInit(&variants);
+         self.ctx.nodeListInit(&methods);
+         self.expect(TokenKind::LBrace);
+         while (!self.check(TokenKind::RBrace) && !self.atEnd())
+         {
+             if (self.check(TokenKind::Pub))
+             {
+                 self.advance();
+                 NodeId method = self.parseFuncDecl();
+                 if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+                 continue;
+             }
+             Token variantTok = self.expect(TokenKind::Ident);
+              VariantVariant variantValue;
+              variantValue.name = self.ctx.intern(variantTok.data.ptr, variantTok.data.len);
+              variantValue.fieldNames = null;
+              variantValue.fieldTypes = null;
+              variantValue.fieldsLen = 0;
+              variantValue.loc.data = 0;
+             if (self.check(TokenKind::LBrace))
+             {
+                 self.advance();
+                 StrListBuilder fieldNames;
+                 TyListBuilder fieldTypes;
+                 self.ctx.strListInit(&fieldNames);
+                 self.ctx.tyListInit(&fieldTypes);
+                 while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                 {
+                     Ty fieldType = self.parseType();
+                     Token fieldTok = self.expect(TokenKind::Ident);
+                     Str fieldName = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
+                     if (!self.ctx.tyListAppend(&fieldTypes, fieldType)) self.panicMode = 1;
+                     if (!self.ctx.strListAppend(&fieldNames, fieldName)) self.panicMode = 1;
+                     if (!self.match(TokenKind::Comma) && !self.match(TokenKind::Semicolon)) break;
+                 }
+                 self.expect(TokenKind::RBrace);
+                  variantValue.fieldsLen = fieldNames.len;
+                  variantValue.fieldNames = self.ctx.strListFinish(&fieldNames);
+                  variantValue.fieldTypes = self.ctx.tyListFinish(&fieldTypes);
+             }
+             if (!self.ctx.variantListAppend(&variants, variantValue)) self.panicMode = 1;
+             self.match(TokenKind::Comma);
+         }
+         self.expect(TokenKind::RBrace);
+         u32 variantCount = variants.len;
+         VariantVariant* variantValues = self.ctx.variantListFinish(&variants);
+         u32 methodCount = methods.len;
+         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+         u8 flags = 0;
+         if (isPub) flags = 1;
+         return self.storeDecl(DeclKind::Variant { .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .variants = variantValues, .variantsLen = variantCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+     }
 
-    NodeId parseUnionDecl()
-    {
-        self.expect(TokenKind::Union);
-        self.expect(TokenKind::Ident);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-        {
-            if (self.check(TokenKind::Pub))
-            {
-                self.advance();
-                self.parseFuncDecl();
-                continue;
-            }
-            if (self.isTypeStart())
-            {
-                self.parseFuncDecl();
-                continue;
-            }
-            self.match(TokenKind::Pub);
-            self.parseType();
-            self.expect(TokenKind::Ident);
-            self.match(TokenKind::Comma);
-            self.match(TokenKind::Semicolon);
-        }
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseUnionDecl(bool isPub)
+     {
+         self.expect(TokenKind::Union);
+         Token nameTok = self.expect(TokenKind::Ident);
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         NodeListBuilder genericParams;
+         self.ctx.nodeListInit(&genericParams);
+         if (self.check(TokenKind::Less))
+             self.parseGenericParams(&genericParams);
+         u32 genericCount = genericParams.len;
+         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+         NodeListBuilder fields;
+         NodeListBuilder methods;
+         self.ctx.nodeListInit(&fields);
+         self.ctx.nodeListInit(&methods);
+         self.expect(TokenKind::LBrace);
+         while (!self.check(TokenKind::RBrace) && !self.atEnd())
+         {
+             u8 fieldFlags = 0;
+             if (self.match(TokenKind::Pub)) fieldFlags = 1;
+             if (self.check(TokenKind::Extern) || self.check(TokenKind::Static))
+             {
+                 NodeId method = self.parseFuncDecl();
+                 if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+                 continue;
+             }
+             ParserMark mark = self.save();
+             self.parseType();
+             self.expect(TokenKind::Ident);
+             bool isMethod = self.check(TokenKind::LParen);
+             self.restore(mark);
+             if (isMethod)
+             {
+                 NodeId method = self.parseFuncDecl();
+                 if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+                 continue;
+             }
+             Ty fieldType = self.parseType();
+             Token fieldTok = self.expect(TokenKind::Ident);
+             Field field;
+             field.name = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
+             field.typeNode = fieldType;
+             field.defaultValue = self.noneNode();
+             field.loc.data = 0;
+             field.flags = fieldFlags;
+             NodeId fieldNode = self.storeField(field);
+             if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.panicMode = 1;
+             self.match(TokenKind::Comma);
+             self.match(TokenKind::Semicolon);
+         }
+         self.expect(TokenKind::RBrace);
+         u32 fieldCount = fields.len;
+         NodeId* fieldValues = self.ctx.nodeListFinish(&fields);
+         u32 methodCount = methods.len;
+         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+         u8 flags = 0;
+         if (isPub) flags = 1;
+         return self.storeDecl(DeclKind::Union { .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .fields = fieldValues, .fieldsLen = fieldCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+     }
 
-    NodeId parseTraitDecl()
-    {
-        self.expect(TokenKind::Trait);
-        self.expect(TokenKind::Ident);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            self.parseFuncDecl();
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseTraitDecl(bool isPub)
+     {
+         self.expect(TokenKind::Trait);
+         Token nameTok = self.expect(TokenKind::Ident);
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         NodeListBuilder genericParams;
+         self.ctx.nodeListInit(&genericParams);
+         if (self.check(TokenKind::Less))
+             self.parseGenericParams(&genericParams);
+         u32 genericCount = genericParams.len;
+         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+         NodeListBuilder methods;
+         self.ctx.nodeListInit(&methods);
+         self.expect(TokenKind::LBrace);
+         while (!self.check(TokenKind::RBrace) && !self.atEnd())
+         {
+             NodeId method = self.parseFuncDecl();
+             if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+         }
+         self.expect(TokenKind::RBrace);
+         u32 methodCount = methods.len;
+         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+         u8 flags = 0;
+         if (isPub) flags = 1;
+         return self.storeDecl(DeclKind::Trait { .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+     }
 
-    NodeId parseExtendDecl()
-    {
-        self.expect(TokenKind::Extend);
-        self.parseType();
-        if (self.match(TokenKind::Colon))
-            self.expect(TokenKind::Ident);
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            self.parseFuncDecl();
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseExtendDecl(bool isPub)
+     {
+         self.expect(TokenKind::Extend);
+         Ty selfType = self.parseType();
+         Str traitName = 0;
+         if (self.match(TokenKind::Colon))
+         {
+             Token traitTok = self.expect(TokenKind::Ident);
+             traitName = self.ctx.intern(traitTok.data.ptr, traitTok.data.len);
+         }
+         NodeListBuilder methods;
+         self.ctx.nodeListInit(&methods);
+         self.expect(TokenKind::LBrace);
+         while (!self.check(TokenKind::RBrace) && !self.atEnd())
+         {
+             NodeId method = self.parseFuncDecl();
+             if (!self.ctx.nodeListAppend(&methods, method)) self.panicMode = 1;
+         }
+         self.expect(TokenKind::RBrace);
+         u32 methodCount = methods.len;
+         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
+         if (traitName != 0)
+             return self.storeDecl(DeclKind::ExtendTrait { .selfType = selfType, .traitName = traitName, .methods = methodValues, .methodsLen = methodCount });
+         return self.storeDecl(DeclKind::Extend { .selfType = selfType, .methods = methodValues, .methodsLen = methodCount });
+     }
 
     NodeId parseConstDecl()
     {

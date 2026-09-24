@@ -1,0 +1,96 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/decl" { File, Decl, DeclKind };
+import "scope" { Symbol, ScopeStack };
+import "sema" { Sema };
+
+extend Sema
+{
+    bool checkDecl(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node*.kind.tag != NodeKind::Decl) return true;
+        Decl* decl = &node*.kind.payload.Decl.value;
+        u8 kind = 0;
+        Str name = 0;
+        Ty typeNode = 0;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Func => {
+                kind = 2;
+                name = decl*.kind.payload.Func.name;
+                typeNode = decl*.kind.payload.Func.returnType;
+            },
+            DeclKind::Struct => {
+                kind = 3;
+                name = decl*.kind.payload.Struct.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Variant => {
+                kind = 3;
+                name = decl*.kind.payload.Variant.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Enum => {
+                kind = 3;
+                name = decl*.kind.payload.Enum.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Union => {
+                kind = 3;
+                name = decl*.kind.payload.Union.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::Trait => {
+                kind = 3;
+                name = decl*.kind.payload.Trait.name;
+                typeNode = self.namedType(name);
+            },
+            DeclKind::TypeAlias => {
+                kind = 3;
+                name = decl*.kind.payload.TypeAlias.name;
+                typeNode = decl*.kind.payload.TypeAlias.target;
+            },
+            DeclKind::Distinct => {
+                kind = 3;
+                name = decl*.kind.payload.Distinct.name;
+                typeNode = decl*.kind.payload.Distinct.baseType;
+            },
+            DeclKind::Constant => {
+                kind = 1;
+                name = decl*.kind.payload.Constant.name;
+                typeNode = decl*.kind.payload.Constant.typeNode;
+            },
+            else => {}
+        }
+        if (name != 0) self.scopes.declare(name, kind, typeNode, id, 0);
+        if (decl*.kind.tag == DeclKind::Func)
+            return self.checkFunction(decl);
+        return true;
+    }
+
+    bool checkFile(File* file)
+    {
+        if (file == null)
+        {
+            self.addError();
+            return false;
+        }
+        if (!self.scopes.enter())
+        {
+            self.addError();
+            return false;
+        }
+        u32 i = 0;
+        while (i < file*.declsLen)
+        {
+            self.checkDecl(file*.decls[i]);
+            i = i + 1;
+        }
+        self.scopes.leave();
+        self.errors = self.scopes.errors;
+        return self.errors == 0;
+    }
+}

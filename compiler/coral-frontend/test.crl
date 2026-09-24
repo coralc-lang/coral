@@ -9,7 +9,14 @@ import "../coral-lexer/lexer" { Lexer };
 import "../coral-lexer/ident" { isXidStart, isXidContinue };
 import "../coral-lexer/table" { IdentifierTable, IdentEntry };
 import "../coral-context/context" { AstContext };
+import "../coral-ast/id" { NodeId };
 import "../coral-module/module" { ModuleMap, ModuleId };
+import "../coral-semantics/scope" { ScopeStack, Symbol };
+import "../coral-semantics/sema" { Sema };
+import "../coral-semantics/decl";
+import "../coral-semantics/expr";
+import "../coral-semantics/stmt";
+import "../coral-semantics/typecheck";
 import "../coral-ast/decl" { File };
 import "../coral-parser/lib" { Parser };
 
@@ -108,6 +115,7 @@ TestResult runExpr(u8* src, usize len)
     p.pendingGreater = false;
     p.current = lexer.nextToken();
     p.previous = p.current;
+
     p.parseExpr();
 
     TestResult r;
@@ -117,6 +125,43 @@ TestResult runExpr(u8* src, usize len)
     ctx.deinit();
     free(identEntries);
     return r;
+}
+
+bool runSema(u8* src, usize len)
+{
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
+    IdentEntry* identEntries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(identEntries, 256);
+    idents.addKeywords();
+
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + len;
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+
+    Parser p;
+    p.lexer = &lexer;
+    p.ctx = &ctx;
+    p.panicMode = 0;
+    p.pendingGreater = false;
+    p.current = lexer.nextToken();
+    p.previous = p.current;
+    File* file = p.parseFile(ctx.intern("sema-test", 9));
+
+    Sema sema;
+    sema.init(&ctx);
+    bool ok = p.panicMode == 0 && sema.checkFile(file) && sema.errors == 0;
+    printf("sema check: ok=%u parse_errors=%u semantic_errors=%u\n", ok ? 1 : 0, p.panicMode, sema.errors);
+    sema.deinit();
+    ctx.deinit();
+    free(identEntries);
+    return ok;
 }
 
 bool testLexer()
@@ -147,6 +192,31 @@ bool testLexer()
     printf("lexer test: tokens=%u switch_keyword=%u\n", count, switchInfo != null && switchInfo*.isKeyword ? 1 : 0);
     free(entries);
     return true;
+}
+
+bool testNumberTokens()
+{
+    u8* src = "0xFF 0b1010 0o77";
+    IdentEntry* entries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + sourceLen(src);
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+    Token hex = lexer.nextToken();
+    Token binary = lexer.nextToken();
+    Token octal = lexer.nextToken();
+    bool ok = hex.kind == TokenKind::Hex && hex.data.len == 2 && hex.data.ptr[0] == 'F';
+    ok = ok && binary.kind == TokenKind::Bin && binary.data.len == 4 && binary.data.ptr[0] == '1';
+    ok = ok && octal.kind == TokenKind::Oct && octal.data.len == 2 && octal.data.ptr[0] == '7';
+    printf("number token test: ok=%u\n", ok ? 1 : 0);
+    free(entries);
+    return ok;
 }
 
 bool testIdentifierRanges()
@@ -189,10 +259,80 @@ bool testModuleMap()
     return true;
 }
 
+bool testScopes()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    Str x = ctx.intern("x", 1);
+    Str y = ctx.intern("y", 1);
+    Str missing = ctx.intern("missing", 7);
+    NodeId none;
+    none.index = 0;
+
+    ScopeStack scopes;
+    scopes.init(4);
+    bool ok = scopes.enter();
+    ok = ok && scopes.declare(x, 1, 0, none, 2);
+    ok = ok && !scopes.declare(x, 1, 0, none, 2);
+    ok = ok && scopes.assign(x, none);
+    ok = ok && scopes.enter();
+    ok = ok && scopes.declare(x, 1, 0, none, 2);
+    Symbol* shadow = scopes.lookup(x);
+    ok = ok && shadow != null;
+    ok = ok && scopes.leave();
+    ok = ok && scopes.lookup(x) != null;
+    ok = ok && scopes.declare(y, 1, 0, none, 1);
+    ok = ok && !scopes.assign(y, none);
+    ok = ok && !scopes.assign(missing, none);
+    ok = ok && scopes.errorCount() == 3;
+    printf("scope test: ok=%u errors=%u\n", ok ? 1 : 0, scopes.errorCount());
+    scopes.leave();
+    scopes.deinit();
+    ctx.deinit();
+    return ok;
+}
+
+bool testSema()
+{
+    u8* valid = "u32 f(u32 value) { return value; }";
+    u8* callValid = "u32 add(u32 a, u32 b) { return a + b; } u32 f() { return add(1, 2); }";
+    u8* duplicate = "u32 value; u32 value;";
+    u8* unknown = "u32 f() { return missing; }";
+    u8* constAssign = "u32 f() { const u32 value = 1; value = 2; return value; }";
+    u8* typeMismatch = "u32 f() { u32 value = 1; value = \"text\"; return value; }";
+    u8* arityMismatch = "u32 add(u32 a, u32 b) { return a + b; } u32 f() { return add(1); }";
+    u8* genericValid = "pub struct Box<T> { T value; } Box<u32> make() { return Box<u32>{ .value = 1 }; }";
+    u8* genericArity = "pub struct Box<T> { T value; } Box<u32, i32> make() { return null; }";
+    u8* comptimeValid = "void println(comptime T) { }";
+    u8* enumValid = "pub enum Color { Red, Green }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool callValidOk = runSema(callValid, sourceLen(callValid));
+    bool duplicateRejected = !runSema(duplicate, sourceLen(duplicate));
+    bool unknownRejected = !runSema(unknown, sourceLen(unknown));
+    bool constRejected = !runSema(constAssign, sourceLen(constAssign));
+    bool typeMismatchRejected = !runSema(typeMismatch, sourceLen(typeMismatch));
+    bool arityRejected = !runSema(arityMismatch, sourceLen(arityMismatch));
+    bool genericValidOk = runSema(genericValid, sourceLen(genericValid));
+    bool genericArityRejected = !runSema(genericArity, sourceLen(genericArity));
+    bool comptimeOk = runSema(comptimeValid, sourceLen(comptimeValid));
+    bool enumOk = runSema(enumValid, sourceLen(enumValid));
+    printf("semantic declaration test: valid=%u call_valid=%u duplicate=%u unknown=%u const_assign=%u type_mismatch=%u arity=%u generic_valid=%u generic_arity=%u comptime=%u enum=%u\n", validOk ? 1 : 0, callValidOk ? 1 : 0, duplicateRejected ? 1 : 0, unknownRejected ? 1 : 0, constRejected ? 1 : 0, typeMismatchRejected ? 1 : 0, arityRejected ? 1 : 0, genericValidOk ? 1 : 0, genericArityRejected ? 1 : 0, comptimeOk ? 1 : 0, enumOk ? 1 : 0);
+    return validOk && callValidOk && duplicateRejected && unknownRejected && constRejected && typeMismatchRejected && arityRejected && genericValidOk && genericArityRejected && comptimeOk && enumOk;
+}
+
 bool testExpr()
 {
     u8* src = "a + b * (c - d);";
     printf("expr test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testNumbers()
+{
+    u8* src = "0xFF + 0b1010 + 0o77 + 1_000";
+    printf("number test: ");
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
     return r.errors == 0;
@@ -222,7 +362,7 @@ bool testDeclarations()
     printf("declarations test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
-    return r.errors == 0;
+    return r.errors == 0 && r.nodes >= 7;
 }
 
 bool testGlobal()
@@ -252,10 +392,56 @@ bool testTypeDeclarations()
     return r.errors == 0;
 }
 
+bool testFunctionPointer()
+{
+    u8* src = "void f() { T(T) callback; }";
+    printf("function pointer test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
 bool testGenericSyntax()
 {
-    u8* src = "pub struct Box<T> { T value; }";
+    u8* src = "pub struct Pair<T, U> { T first; U second; }";
     printf("generic syntax test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0 && r.nodes >= 4;
+}
+
+bool testGenericExpressions()
+{
+    u8* path = "Option<f64>::None";
+    TestResult pathResult = runExpr(path, sourceLen(path));
+    u8* literal = "Box<u32> { .value = 1 }";
+    TestResult literalResult = runExpr(literal, sourceLen(literal));
+    printf("generic expression test: path=%u literal=%u\n", pathResult.errors, literalResult.errors);
+    return pathResult.errors == 0 && literalResult.errors == 0;
+}
+
+bool testGenericTypeForms()
+{
+    u8* src = "pub struct Vec<T> { T* data; } Vec<u32> make() { return Vec<u32>{ .data = null }; }";
+    printf("generic type form test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testGenericExtension()
+{
+    u8* src = "pub extend Option<T> { bool isSome() { return true; } }";
+    printf("generic extension test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testComptimeType()
+{
+    u8* src = "void println(comptime T) { }";
+    printf("comptime type test: ");
     TestResult r = runParser(src, sourceLen(src));
     r.print();
     return r.errors == 0;
@@ -366,7 +552,9 @@ bool testSwitchPatterns()
     printf("switch pattern test: ");
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
-    return r.errors == 0;
+    u8* underscore = "switch (x) { _ => { 0 }, else => { 1 } }";
+    TestResult underscoreResult = runExpr(underscore, sourceLen(underscore));
+    return r.errors == 0 && underscoreResult.errors == 0;
 }
 
 bool testForIn()
@@ -437,17 +625,26 @@ pub i32 main()
     printf("****coral parser self-test****\n");
     bool ok = true;
     ok = testLexer() && ok;
+    ok = testNumberTokens() && ok;
     ok = testIdentifierRanges() && ok;
     ok = testContext() && ok;
     ok = testModuleMap() && ok;
+    ok = testScopes() && ok;
+    ok = testSema() && ok;
     ok = testExpr() && ok;
+    ok = testNumbers() && ok;
     ok = testCompositeExpressions() && ok;
     ok = testFunc() && ok;
     ok = testDeclarations() && ok;
     ok = testGlobal() && ok;
     ok = testExternalDeclarations() && ok;
     ok = testTypeDeclarations() && ok;
+    ok = testFunctionPointer() && ok;
     ok = testGenericSyntax() && ok;
+    ok = testGenericExpressions() && ok;
+    ok = testGenericTypeForms() && ok;
+    ok = testGenericExtension() && ok;
+    ok = testComptimeType() && ok;
     ok = testVariant() && ok;
     ok = testSwitch() && ok;
     ok = testSwitchStmt() && ok;

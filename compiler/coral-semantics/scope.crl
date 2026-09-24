@@ -1,0 +1,186 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty };
+
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+pub struct Symbol
+{
+    Str name;
+    u8 kind;
+    Ty typeNode;
+    NodeId declaration;
+    u8 flags;
+}
+
+pub struct Scope
+{
+    Symbol* symbols;
+    u32 symbolsLen;
+    u32 symbolsCap;
+    Scope* parent;
+}
+
+pub struct ScopeStack
+{
+    rawptr* scopes;
+    u32 len;
+    u32 cap;
+    u32 errors;
+}
+
+extend ScopeStack
+{
+    void init(u32 cap)
+    {
+        self.scopes = null;
+        self.len = 0;
+        self.cap = 0;
+        self.errors = 0;
+        if (cap == 0) return;
+        self.scopes = (rawptr*)calloc((usize)cap, sizeof(rawptr));
+        if (self.scopes != null) self.cap = cap;
+    }
+
+    void deinit()
+    {
+        while (self.len > 0)
+        {
+            self.len = self.len - 1;
+            Scope* scope = (Scope*)self.scopes[self.len];
+            if (scope*.symbols != null) free((rawptr)scope*.symbols);
+            free((rawptr)scope);
+        }
+        if (self.scopes != null) free((rawptr)self.scopes);
+        self.scopes = null;
+        self.len = 0;
+        self.cap = 0;
+        self.errors = 0;
+    }
+
+    Scope* current()
+    {
+        if (self.scopes == null || self.len == 0) return null;
+        return (Scope*)self.scopes[self.len - 1];
+    }
+
+    bool enter()
+    {
+        if (self.scopes == null) return false;
+        if (self.len >= self.cap)
+        {
+            u32 newCap = self.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc((rawptr)self.scopes, (usize)newCap * sizeof(rawptr));
+            if (raw == null)
+            {
+                self.errors = self.errors + 1;
+                return false;
+            }
+            self.scopes = (rawptr*)raw;
+            self.cap = newCap;
+        }
+        Scope* scope = (Scope*)calloc(1, sizeof(Scope));
+        if (scope == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        scope*.parent = self.current();
+        self.scopes[self.len] = (rawptr)scope;
+        self.len = self.len + 1;
+        return true;
+    }
+
+    bool leave()
+    {
+        if (self.len == 0)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        self.len = self.len - 1;
+        Scope* scope = (Scope*)self.scopes[self.len];
+        if (scope*.symbols != null) free((rawptr)scope*.symbols);
+        free((rawptr)scope);
+        self.scopes[self.len] = null;
+        return true;
+    }
+
+    bool declare(Str name, u8 kind, Ty typeNode, NodeId declaration, u8 flags)
+    {
+        Scope* scope = self.current();
+        if (scope == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        u32 i = 0;
+        while (i < scope*.symbolsLen)
+        {
+            if (scope*.symbols[i].name == name)
+            {
+                self.errors = self.errors + 1;
+                return false;
+            }
+            i = i + 1;
+        }
+        if (scope*.symbolsLen >= scope*.symbolsCap)
+        {
+            u32 newCap = scope*.symbolsCap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc((rawptr)scope*.symbols, (usize)newCap * sizeof(Symbol));
+            if (raw == null)
+            {
+                self.errors = self.errors + 1;
+                return false;
+            }
+            scope*.symbols = (Symbol*)raw;
+            scope*.symbolsCap = newCap;
+        }
+        Symbol* symbol = scope*.symbols + scope*.symbolsLen;
+        symbol*.name = name;
+        symbol*.kind = kind;
+        symbol*.typeNode = typeNode;
+        symbol*.declaration = declaration;
+        symbol*.flags = flags;
+        scope*.symbolsLen = scope*.symbolsLen + 1;
+        return true;
+    }
+
+    Symbol* lookup(Str name)
+    {
+        Scope* scope = self.current();
+        while (scope != null)
+        {
+            u32 i = 0;
+            while (i < scope*.symbolsLen)
+            {
+                if (scope*.symbols[i].name == name) return scope*.symbols + i;
+                i = i + 1;
+            }
+            scope = scope*.parent;
+        }
+        return null;
+    }
+
+    bool assign(Str name, NodeId target)
+    {
+        Symbol* symbol = self.lookup(name);
+        if (symbol == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        if (symbol*.kind != 1 || (symbol*.flags & 1) != 0)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        symbol*.flags = symbol*.flags | 2;
+        return true;
+    }
+
+    u32 errorCount() { return self.errors; }
+}
