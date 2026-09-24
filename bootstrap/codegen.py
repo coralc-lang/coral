@@ -131,7 +131,7 @@ class CodeGen:
                 outer_field = self.gen_expr(node.func.obj.field)
                 method_name = self.gen_expr(node.func.field)
                 st = self.current_self_type or "Lexer"
-                type_name = self.field_type_names.get((st, outer_field), outer_field.capitalize())
+                type_name = self.field_type_names.get((st, outer_field), outer_field.capitalize()).rstrip('*').strip()
                 inner_arg = f"self->{outer_field}"
                 all_args = inner_arg + (", " + args if args else "")
                 return f"{type_name}_{method_name}({all_args})"
@@ -143,7 +143,7 @@ class CodeGen:
                     a_raw = self.local_types[a_name]
                     a_is_ptr = a_raw.strip().endswith('*')
                     a_type = a_raw.rstrip('*').strip()
-                    field_type = self.field_type_names.get((a_type, b_field), b_field.capitalize())
+                    field_type = self.field_type_names.get((a_type, b_field), b_field.capitalize()).rstrip('*').strip()
                     is_a_ptr = a_is_ptr
                     obj_inner = f"{a_name}->{b_field}" if is_a_ptr else f"{a_name}.{b_field}"
                     # b_field is Lexer* if Parser.lexer, so obj_inner already is Lexer*
@@ -838,11 +838,7 @@ class CodeGen:
                     for s in target_branch.stmts:
                         self.gen_stmt(s)
 
-        if not self.suppress_main:
-            has_main = any(isinstance(d, FuncDecl) and d.name == "main" for d in ast.decls)
-            if not has_main:
-                self.emit("int main(int argc, char** argv) {\n")
-                self.emit("    return 0;\n")
-                self.emit("}\n")
+        # No hardcoded main — test must provide its own main
+        pass
 
         return "".join(self.out)

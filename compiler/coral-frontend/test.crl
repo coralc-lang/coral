@@ -4,16 +4,10 @@
  * itself, and stdlib files. Reports token and node counts.
  */
 
-import "../coral-common/slice" { Slice };
-import "../coral-common/token" { Token, TokenKind };
+import "../coral-common/token" { TokenKind };
 import "../coral-lexer/lexer" { Lexer };
-import "../coral-lexer/table" { IdentifierTable };
 import "../coral-context/context" { AstContext };
 import "../coral-parser/parser" { Parser };
-import "../coral-parser/decl";
-import "../coral-parser/expr";
-import "../coral-parser/stmt";
-import "../coral-parser/type";
 
 extern("C") i32 printf(u8* fmt, ...);
 
@@ -44,6 +38,7 @@ TestResult runParser(u8* src, usize len)
     lexer.line = 1;
     lexer.lineStart = src;
     lexer.diag = null;
+    lexer.idents = null;
 
     Parser p;
     p.lexer = &lexer;
@@ -54,24 +49,19 @@ TestResult runParser(u8* src, usize len)
     p.current = lexer.token;
     p.previous = lexer.token;
 
-    u32 declCount = 0;
+    u32 decls = 0;
     while (!p.atEnd())
     {
-        TokenKind k = p.current.kind;
-        if (k == TokenKind::Eof) break;
-        if (k == TokenKind::Unknown)
-        {
-            p.advance();
-            continue;
-        }
+        if (p.current.kind == TokenKind::Eof) break;
+        if (p.current.kind == TokenKind::Unknown) { p.advance(); continue; }
         p.parseDecl();
-        declCount = declCount + 1;
-        if (declCount > 1000) break;
+        decls = decls + 1;
+        if (decls > 100) break;
         if (p.panicMode == 1) break;
     }
 
     TestResult r;
-    r.tokens = declCount;
+    r.tokens = decls;
     r.nodes = ctx.nodeCount();
     r.errors = p.panicMode;
     ctx.deinit();
@@ -82,8 +72,27 @@ void testExpr()
 {
     u8* src = "a + b * (c - d);";
     printf("expr test: ");
-    TestResult r = runParser(src, 18);
-    r.print();
+    AstContext ctx;
+    ctx.init(256, 256, 256);
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + 18;
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = null;
+    Parser p;
+    p.lexer = &lexer;
+    p.ctx = &ctx;
+    p.panicMode = 0;
+    p.pendingGreater = false;
+    Lexer_nextToken(&lexer);
+    p.current = lexer.token;
+    p.previous = lexer.token;
+    p.parseExpr();
+    printf("nodes=%u panic=%u\n", ctx.nodeCount(), p.panicMode);
+    ctx.deinit();
 }
 
 void testFunc()
@@ -158,9 +167,9 @@ void testAttr()
     r.print();
 }
 
-pub i32 runTests()
+pub i32 main()
 {
-    printf("=== coral parser self-test ===\n");
+    printf("****coral parser self-test****\n");
     testExpr();
     testFunc();
     testVariant();
@@ -171,6 +180,6 @@ pub i32 runTests()
     testImportLib();
     testModReexport();
     testAttr();
-    printf("=== done ===\n");
+    printf("****done****\n");
     return 0;
 }
