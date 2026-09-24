@@ -83,6 +83,28 @@ class CodeGen:
             return self.get_tuple_type(node.types)
         return "void*"
 
+    def _get_expr_type(self, node):
+        if isinstance(node, Ident):
+            return self.local_types.get(node.name, "")
+        if isinstance(node, DotExpr):
+            if isinstance(node.obj, Ident) and node.obj.name == "self":
+                outer_field = node.field.name if hasattr(node.field, 'name') else self.gen_expr(node.field)
+                st = self.current_self_type or "Lexer"
+                return self.field_type_names.get((st, outer_field), "")
+            if isinstance(node.obj, Ident) and node.obj.name in self.local_types:
+                a_name = node.obj.name
+                a_raw = self.local_types[a_name]
+                a_type = a_raw.rstrip('*').strip()
+                field_name = node.field.name if hasattr(node.field, 'name') else self.gen_expr(node.field)
+                return self.field_type_names.get((a_type, field_name), "")
+            if isinstance(node.obj, DotExpr):
+                inner_type = self._get_expr_type(node.obj)
+                if inner_type:
+                    base = inner_type.rstrip('*').strip()
+                    field_name = node.field.name if hasattr(node.field, 'name') else self.gen_expr(node.field)
+                    return self.field_type_names.get((base, field_name), "")
+        return ""
+
     def gen_expr(self, node):
         if isinstance(node, IntLit):
             return node.value
@@ -167,10 +189,20 @@ class CodeGen:
                     return f"{obj_str}->{field_str}"
                 else:
                     return f"{obj_str}.{field_str}"
+            if isinstance(node.obj, DotExpr) and isinstance(node.obj.obj, Ident) and node.obj.obj.name in self.local_types:
+                outer_field = self.gen_expr(node.obj.field)
+                a_name = node.obj.obj.name
+                a_raw = self.local_types[a_name]
+                a_type = a_raw.rstrip('*').strip()
+                field_type = self.field_type_names.get((a_type, outer_field), "")
+                if field_type.strip().endswith('*'):
+                    return f"{obj_str}->{field_str}"
+                else:
+                    return f"{obj_str}.{field_str}"
+            obj_type = self._get_expr_type(node.obj)
+            if obj_type and obj_type.strip().endswith('*'):
+                return f"{obj_str}->{field_str}"
             # Fallback: value field access uses .
-            return f"{obj_str}.{field_str}"
-            if isinstance(node.field, IntLit):
-                return f"{obj_str}._{field_str}"
             return f"{obj_str}.{field_str}"
         if isinstance(node, ColonColonExpr):
             left = self.gen_expr(node.left)
@@ -421,7 +453,7 @@ class CodeGen:
                 tp = self.gen_type(p.type_node)
                 params.append(f"{tp} {p.name}")
                 if p.name != "self":
-                    self.local_types[p.name] = tp.rstrip('*').strip()
+                    self.local_types[p.name] = tp
 
         param_str = ", ".join(params)
 
@@ -461,6 +493,11 @@ class CodeGen:
             saved_return = self.current_return_type
             ret = self.gen_type(method.return_type)
             self.current_return_type = ret
+            saved_locals = self.local_types
+            self.local_types = {}
+            for pp in method.params:
+                if pp.name != "self":
+                    self.local_types[pp.name] = self.gen_type(pp.type_node)
             has_self = any(p.name == "self" for p in method.params)
             if has_self:
                 params = [f"{st}* self"] + [
@@ -485,6 +522,7 @@ class CodeGen:
                 self.emit("\n")
             self.current_self_type = saved
             self.current_return_type = saved_return
+            self.local_types = saved_locals
 
     def gen_enum(self, node):
         self.emit(f"enum {node.name} {{\n")
@@ -765,6 +803,11 @@ class CodeGen:
                     saved = self.current_self_type
                     self.current_self_type = st
                     ret = self.gen_type(method.return_type)
+                    saved_locals = self.local_types
+                    self.local_types = {}
+                    for pp in method.params:
+                        if pp.name != "self":
+                            self.local_types[pp.name] = self.gen_type(pp.type_node)
                     has_self = any(p.name == "self" for p in method.params)
                     if has_self:
                         params = [f"{st}* self"] + [
@@ -788,6 +831,7 @@ class CodeGen:
                         self.gen_block(method.body)
                         self.emit("\n")
                     self.current_self_type = saved
+                    self.local_types = saved_locals
             elif isinstance(decl, ExtendTraitBlock):
                 for method in decl.methods:
                     st = self.gen_type(decl.type_node)
@@ -796,6 +840,11 @@ class CodeGen:
                     saved = self.current_self_type
                     self.current_self_type = st
                     ret = self.gen_type(method.return_type)
+                    saved_locals = self.local_types
+                    self.local_types = {}
+                    for pp in method.params:
+                        if pp.name != "self":
+                            self.local_types[pp.name] = self.gen_type(pp.type_node)
                     has_self = any(p.name == "self" for p in method.params)
                     if has_self:
                         params = [f"{st}* self"] + [
@@ -819,6 +868,7 @@ class CodeGen:
                         self.gen_block(method.body)
                         self.emit("\n")
                     self.current_self_type = saved
+                    self.local_types = saved_locals
             elif isinstance(decl, FlagDecl):
                 target_branch = None
                 flag_val = self.flags.get(decl.flag_name)
