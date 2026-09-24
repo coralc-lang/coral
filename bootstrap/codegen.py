@@ -43,6 +43,8 @@ class CodeGen:
         self.pointer_fields = {}
         self.field_type_names = {}
         self.flags = {}
+        self.global_methods = []
+        self.global_protos_emitted = False
 
     def set_current_file(self, path):
         self.current_file = path
@@ -60,6 +62,61 @@ class CodeGen:
         if name not in self.tuple_types:
             self.tuple_types[name] = types
         return name
+
+    def collect_global_methods(self, asts):
+        self.global_methods = []
+        for ast in asts:
+            for decl in ast.decls:
+                if isinstance(decl, StructDecl):
+                    owner = TypeIdent(decl.name)
+                    self.struct_names.add(decl.name)
+                    for method in decl.methods:
+                        self.global_methods.append((owner, method))
+                elif isinstance(decl, VariantDecl):
+                    owner = TypeIdent(decl.name)
+                    self.struct_names.add(decl.name)
+                    for method in getattr(decl, "methods", []):
+                        self.global_methods.append((owner, method))
+                elif isinstance(decl, (ExtendBlock, ExtendTraitBlock)):
+                    owner = decl.type_node
+                    self.struct_names.add(self.gen_type(owner))
+                    for method in decl.methods:
+                        self.global_methods.append((owner, method))
+                elif isinstance(decl, FuncDecl) and decl.self_type is not None:
+                    self.global_methods.append((decl.self_type, decl))
+        for owner, _ in self.global_methods:
+            self.struct_names.add(self.gen_type(owner))
+
+    def method_signature(self, owner, method):
+        owner_name = self.gen_type(owner)
+        ret = self.gen_type(method.return_type)
+        has_self = any(p.name == "self" for p in method.params)
+        if has_self:
+            params = [f"{owner_name}* self"] + [
+                f"{self.gen_type(p.type_node)} {p.name}"
+                for p in method.params if p.name != "self"
+            ]
+        elif getattr(method, "is_static", False):
+            params = [
+                f"{self.gen_type(p.type_node)} {p.name}"
+                for p in method.params
+            ]
+        else:
+            params = [f"{owner_name}* self"] + [
+                f"{self.gen_type(p.type_node)} {p.name}"
+                for p in method.params
+            ]
+        return f"{ret} {owner_name}_{method.name}({', '.join(params)})"
+
+    def emit_global_method_protos(self):
+        if self.global_protos_emitted:
+            return
+        self.emit("typedef uint32_t Str;\n")
+        self.emit("typedef uint32_t Ty;\n")
+        for owner, method in self.global_methods:
+            self.emit(self.method_signature(owner, method) + ";\n")
+        self.emit("\n")
+        self.global_protos_emitted = True
 
     def gen_type(self, node):
         if node is None:
@@ -133,7 +190,15 @@ class CodeGen:
             return f"({node.op} {self.gen_expr(node.expr)})"
         if isinstance(node, CallExpr):
             func_name = self.gen_expr(node.func)
-            args = ", ".join(self.gen_expr(a) for a in node.args)
+            arg_values = []
+            for arg in node.args:
+                value = self.gen_expr(arg)
+                if (isinstance(arg, ColonColonExpr) and
+                        isinstance(arg.left, Ident) and
+                        arg.left.name in ("ExprKind", "StmtKind")):
+                    value = f"({arg.left.name}){{ .tag = {value} }}"
+                arg_values.append(value)
+            args = ", ".join(arg_values)
             if isinstance(node.func, DotExpr) and isinstance(node.func.obj, Ident) and node.func.obj.name == "self":
                 obj_type = self.current_self_type or "Lexer"
                 method_name = self.gen_expr(node.func.field)
@@ -320,7 +385,7 @@ class CodeGen:
             if node.post:
                 if isinstance(node.post, ExprStmt):
                     self.emit(self.gen_expr(node.post.expr))
-                elif isinstance(node.post, Assign):
+                elif isinstance(node.post, (Assign, UnaryExpr)):
                     self.emit(self.gen_expr(node.post))
             self.emit(") ")
             self.gen_block(node.body)
@@ -670,6 +735,8 @@ class CodeGen:
             self.emit(f"typedef enum {name} {name};\n")
         if self.struct_names or self.enum_names:
             self.emit("\n")
+
+        self.emit_global_method_protos()
 
         for decl in ast.decls:
             if isinstance(decl, FuncDecl) and decl.is_extern:

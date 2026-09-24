@@ -98,7 +98,7 @@ def main():
                 k, v = val.split("=", 1)
                 flags[k] = v
 
-    from parser import StructDecl, EnumDecl, ExtendBlock
+    from parser import StructDecl, EnumDecl, ExtendBlock, VariantDecl, UnionDecl
     from codegen import CodeGen
 
     parsed = {}
@@ -110,6 +110,7 @@ def main():
 
     gen = CodeGen()
     gen.flags = flags
+    gen.collect_global_methods(all_asts.values())
     for path in ordered:
         ast = all_asts[path]
         for d in ast.decls:
@@ -120,6 +121,10 @@ def main():
             elif isinstance(d, ExtendBlock):
                 tn = gen.gen_type(d.type_node)
                 gen.struct_names.add(tn)
+            elif isinstance(d, VariantDecl):
+                gen.struct_names.add(d.name)
+            elif isinstance(d, UnionDecl):
+                gen.struct_names.add(d.name)
 
     all_c = []
     first = True
