@@ -31,6 +31,8 @@ pub struct DiagnosticEngine
     usize errors;
     usize warnings;
     usize errorLimit;
+    usize lexerErrors;
+    usize parserErrors;
     u8* bufStart;
     u8* bufEnd;
     SourceMap* sourceMap;
@@ -44,11 +46,18 @@ extend DiagnosticEngine
         e.errors = 0;
         e.warnings = 0;
         e.errorLimit = 20;
+        e.lexerErrors = 0;
+        e.parserErrors = 0;
         e.bufStart = bufStart;
         e.bufEnd = bufEnd;
         e.sourceMap = null;
         return e;
     }
+
+    usize errorCount() { return self.errors; }
+    usize warningCount() { return self.warnings; }
+    usize lexerErrorCount() { return self.lexerErrors; }
+    usize parserErrorCount() { return self.parserErrors; }
 
     bool hasErrors()
     {
@@ -57,44 +66,86 @@ extend DiagnosticEngine
 
     bool tooManyErrors()
     {
-        return self.errors >= self.errorLimit;
+        return self.errorLimit == 0 || self.errors >= self.errorLimit;
+    }
+
+    void setBuffer(u8* bufStart, u8* bufEnd)
+    {
+        if (bufStart != null) self.bufStart = bufStart;
+        if (bufEnd != null) self.bufEnd = bufEnd;
+    }
+
+    void emitErrorAt(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
+    {
+        bool shouldRender = !self.tooManyErrors();
+        self.errors = self.errors + 1;
+        self.setBuffer(bufStart, bufEnd);
+        if (errPtr == null) errPtr = self.bufStart;
+        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
+    }
+
+    void emitLexerError(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
+    {
+        bool shouldRender = !self.tooManyErrors();
+        self.errors = self.errors + 1;
+        self.lexerErrors = self.lexerErrors + 1;
+        self.setBuffer(bufStart, bufEnd);
+        if (errPtr == null) errPtr = self.bufStart;
+        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
+    }
+
+    void emitParserError(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
+    {
+        bool shouldRender = !self.tooManyErrors();
+        self.errors = self.errors + 1;
+        self.parserErrors = self.parserErrors + 1;
+        self.setBuffer(bufStart, bufEnd);
+        if (errPtr == null) errPtr = self.bufStart;
+        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
     }
 
     void reportError(u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
     {
-        if (self.tooManyErrors()) return;
-        self.errors = self.errors + 1;
-        self.bufStart = bufStart;
-        self.bufEnd = bufEnd;
-        self.renderSimple(ErrorCode::LexInvalidChar, errPtr, msg, "error");
+        self.emitLexerError(ErrorCode::LexInvalidChar, bufStart, bufEnd, errPtr, msg);
     }
 
     void emitError(ErrorCode code, u8* errPtr, u8* msg)
     {
-        if (self.tooManyErrors()) return;
-        self.errors = self.errors + 1;
-        self.renderSimple(code, errPtr, msg, "error");
+        self.emitErrorAt(code, self.bufStart, self.bufEnd, errPtr, msg);
     }
 
     void emitWarning(ErrorCode code, u8* errPtr, u8* msg)
     {
         self.warnings = self.warnings + 1;
+        if (errPtr == null) errPtr = self.bufStart;
         self.renderSimple(code, errPtr, msg, "warning");
     }
 
     void emitNote(ErrorCode code, u8* errPtr, u8* msg)
     {
+        if (errPtr == null) errPtr = self.bufStart;
         self.renderSimple(code, errPtr, msg, "note");
     }
 
     void emitFatal(ErrorCode code, u8* errPtr, u8* msg)
     {
         self.errors = self.errors + 1;
+        if (errPtr == null) errPtr = self.bufStart;
         self.renderSimple(code, errPtr, msg, "fatal error");
     }
 
     void renderSimple(ErrorCode code, u8* errPtr, u8* msg, u8* level)
     {
+        if (self.bufStart == null || self.bufEnd == null)
+        {
+            u8* safeLevel = level != null ? level : "error";
+            u8* safeMsg = msg != null ? msg : "diagnostic";
+            printf("%s: %s\n", safeLevel, safeMsg);
+            return;
+        }
+        if (errPtr == null || errPtr < self.bufStart) errPtr = self.bufStart;
+        if (errPtr > self.bufEnd) errPtr = self.bufEnd;
+
         u8* lineStart = errPtr;
         while (lineStart > self.bufStart)
         {
@@ -120,8 +171,10 @@ extend DiagnosticEngine
         }
 
         usize colNum = (usize)(errPtr - lineStart) + 1;
+        u8* safeLevel = level != null ? level : "error";
+        u8* safeMsg = msg != null ? msg : "diagnostic";
 
-        printf("%llu:%llu: %s: %s\n", lineNum, colNum, level, msg);
+        printf("%llu:%llu: %s: %s\n", lineNum, colNum, safeLevel, safeMsg);
 
         usize lineLen = (usize)(lineEnd - lineStart);
         write(1, lineStart, lineLen);
@@ -138,30 +191,38 @@ extend DiagnosticEngine
 
     void renderDiagnostic(Diagnostic* diag)
     {
+        if (diag == null) return;
         u8* sevStr = "error";
         if (diag.severity == 2) sevStr = "warning";
         if (diag.severity == 1) sevStr = "note";
         if (diag.severity == 4) sevStr = "fatal error";
 
-        printf("%s: %s\n", sevStr, diag.message);
-        printf("  %s\n", diag.detail);
+        printf("%s: %s\n", sevStr, diag.message != null ? diag.message : "diagnostic");
+        if (diag.detail != null) printf("  %s\n", diag.detail);
 
         u32 i = 0;
         while (i < diag.labelsLen)
         {
             Label* lbl = diag.labels + i;
-            self.renderLabel(lbl);
+            if (lbl != null) self.renderLabel(lbl);
             i = i + 1;
         }
 
-        printf("  why    %s\n", diag.why);
-        printf("  fix    %s\n", diag.fix);
-        printf("  learn  %s\n", diag.learn);
+        if (diag.why != null) printf("  why    %s\n", diag.why);
+        if (diag.fix != null) printf("  fix    %s\n", diag.fix);
+        if (diag.learn != null) printf("  learn  %s\n", diag.learn);
     }
 
     void renderLabel(Label* lbl)
     {
-        u8* errPtr = self.bufStart + lbl.span.start;
+        if (lbl == null || self.bufStart == null || self.bufEnd == null) return;
+        u32 start = lbl.span.start;
+        u32 end = lbl.span.end;
+        if (start > (usize)(self.bufEnd - self.bufStart)) start = (usize)(self.bufEnd - self.bufStart);
+        if (end < start) end = start;
+        if (end > (usize)(self.bufEnd - self.bufStart)) end = (usize)(self.bufEnd - self.bufStart);
+
+        u8* errPtr = self.bufStart + start;
         u8* lineStart = errPtr;
         while (lineStart > self.bufStart)
         {
@@ -187,8 +248,7 @@ extend DiagnosticEngine
         }
 
         usize startCol = (usize)(errPtr - lineStart);
-        u32 spanLen = lbl.span.end - lbl.span.start;
-
+        u32 spanLen = end - start;
         usize lineLen = (usize)(lineEnd - lineStart);
         printf("  %llu | ", lineNum);
         write(1, lineStart, lineLen);
@@ -212,14 +272,8 @@ extend DiagnosticEngine
             u32 mid = spanLen / 2;
             while (k < spanLen)
             {
-                if (k == mid)
-                {
-                    write(1, "+", 1);
-                }
-                else
-                {
-                    write(1, "-", 1);
-                }
+                if (k == mid) write(1, "+", 1);
+                else write(1, "-", 1);
                 k = k + 1;
             }
         }
@@ -244,6 +298,6 @@ extend DiagnosticEngine
                 j = j + 1;
             }
         }
-        printf("`- %s\n", lbl.text);
+        printf("`- %s\n", lbl.text != null ? lbl.text : "label");
     }
 }

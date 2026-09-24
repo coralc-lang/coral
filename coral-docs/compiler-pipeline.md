@@ -43,4 +43,10 @@ The self-host semantic layer is split by responsibility:
 - `member.crl`: field/method lookup and member type resolution.
 - `sema.crl`: semantic context ownership and diagnostics state.
 
-The frontend `analyze.crl` seam runs lexer → parser → Sema and returns parse errors, semantic errors, and AST node count. The frontend test harness exercises these modules through `compiler/coral-frontend/test.crl`; it is not enough to compile the semantic files without running their tests.
+## Current implementation boundary
+
+The self-host frontend currently has a tested lexer → parser → Sema path through `compiler/coral-frontend/analyze.crl`. Sema covers nested scopes, duplicate declarations, name lookup, assignment/mutability, basic type compatibility, call arity, generic declaration/reference arity, comptime type parameters, and field/method lookup.
+
+`coral-mono` is still a design boundary rather than an implemented stage. No concrete substitution, instance collector, or post-instantiation Sema pass exists yet. The frontend tests therefore validate generic syntax and Sema handling; they do not prove monomorphization.
+
+The current harness uses focused in-memory source snippets. Its `items` and node counts are parser-shape counters, not lexer token counts. The normal and ASan/UBSan runs validate this focused workload only; they do not establish full-compiler correctness, diagnostics quality, stage-1/stage-2 self-hosting, or backend safety.

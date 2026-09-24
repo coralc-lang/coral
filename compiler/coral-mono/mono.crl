@@ -1,0 +1,395 @@
+import "../coral-ast/id" { Str, NodeId, SourceLoc };
+import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/decl" { File, Decl, DeclKind, GenericParam, Param, Field, Attribute, VariantVariant };
+import "../coral-ast/expr" { Expr, ExprKind };
+import "../coral-ast/stmt" { Stmt, StmtKind, SwitchCase };
+import "../coral-ast/pat" { Pat, PatKind };
+import "../coral-context/context" { AstContext };
+import "../coral-semantics/sema" { Sema };
+import "../coral-semantics/typecheck";
+
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+pub enum MonoDeclKind
+{
+    TypeDecl,
+    FunctionDecl
+}
+
+pub enum MonoInstanceKind
+{
+    TypeInstance,
+    FunctionInstance
+}
+
+pub struct MonoDecl
+{
+    MonoDeclKind kind;
+    Str name;
+    NodeId declaration;
+}
+
+pub struct MonoSubstitution
+{
+    Str parameter;
+    u32 index;
+    NodeId declaration;
+    Ty typeNode;
+}
+
+pub struct MonoInstance
+{
+    MonoInstanceKind kind;
+    Str name;
+    NodeId declaration;
+    Ty typeNode;
+    Ty returnType;
+    Ty* paramTypes;
+    u32 paramTypesLen;
+    Ty* arguments;
+    u32 argumentsLen;
+    MonoSubstitution* substitutions;
+    u32 substitutionsLen;
+    NodeId body;
+    Attribute* attributes;
+    u32 attributesLen;
+    u8 validationAttempted;
+    u8 validated;
+}
+
+pub struct MonoWorkItem
+{
+    MonoDeclKind kind;
+    NodeId declaration;
+    Ty* arguments;
+    u32 argumentsLen;
+    MonoSubstitution* inherited;
+    u32 inheritedLen;
+}
+
+pub struct MonoContext
+{
+    AstContext* ast;
+    Sema* sema;
+    File* file;
+    MonoDecl* declarations;
+    u32 declarationsLen;
+    u32 declarationsCap;
+    MonoWorkItem* work;
+    u32 workLen;
+    u32 workCap;
+    MonoInstance* instances;
+    u32 instancesLen;
+    u32 instancesCap;
+    u32 errors;
+}
+
+extend MonoContext
+{
+    void init(AstContext* ast, Sema* sema)
+    {
+        self.ast = ast;
+        self.sema = sema;
+        self.file = null;
+        self.declarations = null;
+        self.declarationsLen = 0;
+        self.declarationsCap = 0;
+        self.work = null;
+        self.workLen = 0;
+        self.workCap = 0;
+        self.instances = null;
+        self.instancesLen = 0;
+        self.instancesCap = 0;
+        self.errors = 0;
+        if (ast == null) self.errors = 1;
+    }
+
+    void clear()
+    {
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            if (self.work[i].arguments != null) free((rawptr)self.work[i].arguments);
+            if (self.work[i].inherited != null) free((rawptr)self.work[i].inherited);
+            i = i + 1;
+        }
+        if (self.work != null) free((rawptr)self.work);
+        i = 0;
+        while (i < self.instancesLen)
+        {
+            if (self.instances[i].arguments != null) free((rawptr)self.instances[i].arguments);
+            if (self.instances[i].substitutions != null) free((rawptr)self.instances[i].substitutions);
+            i = i + 1;
+        }
+        if (self.instances != null) free((rawptr)self.instances);
+        if (self.declarations != null) free((rawptr)self.declarations);
+        self.file = null;
+        self.work = null;
+        self.workLen = 0;
+        self.workCap = 0;
+        self.instances = null;
+        self.instancesLen = 0;
+        self.instancesCap = 0;
+        self.declarations = null;
+        self.declarationsLen = 0;
+        self.declarationsCap = 0;
+        self.errors = 0;
+    }
+
+    void deinit()
+    {
+        self.clear();
+        self.ast = null;
+        self.sema = null;
+    }
+
+    bool reserveDeclarations()
+    {
+        if (self.declarationsLen < self.declarationsCap) return true;
+        u32 newCap = self.declarationsCap * 2;
+        if (newCap == 0) newCap = 16;
+        rawptr raw = realloc((rawptr)self.declarations, (usize)newCap * sizeof(MonoDecl));
+        if (raw == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        self.declarations = (MonoDecl*)raw;
+        self.declarationsCap = newCap;
+        return true;
+    }
+
+    bool reserveWork()
+    {
+        if (self.workLen < self.workCap) return true;
+        u32 newCap = self.workCap * 2;
+        if (newCap == 0) newCap = 16;
+        rawptr raw = realloc((rawptr)self.work, (usize)newCap * sizeof(MonoWorkItem));
+        if (raw == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        self.work = (MonoWorkItem*)raw;
+        self.workCap = newCap;
+        return true;
+    }
+
+    bool reserveInstances()
+    {
+        if (self.instancesLen < self.instancesCap) return true;
+        u32 newCap = self.instancesCap * 2;
+        if (newCap == 0) newCap = 16;
+        rawptr raw = realloc((rawptr)self.instances, (usize)newCap * sizeof(MonoInstance));
+        if (raw == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        self.instances = (MonoInstance*)raw;
+        self.instancesCap = newCap;
+        return true;
+    }
+
+    Ty* copyTypes(Ty* values, u32 len)
+    {
+        if (len == 0) return null;
+        Ty* result = (Ty*)malloc((usize)len * sizeof(Ty));
+        if (result == null)
+        {
+            self.errors = self.errors + 1;
+            return null;
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            result[i] = values[i];
+            i = i + 1;
+        }
+        return result;
+    }
+
+    MonoSubstitution* copySubstitutions(MonoSubstitution* values, u32 len)
+    {
+        if (len == 0) return null;
+        MonoSubstitution* result = (MonoSubstitution*)malloc((usize)len * sizeof(MonoSubstitution));
+        if (result == null)
+        {
+            self.errors = self.errors + 1;
+            return null;
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            result[i] = values[i];
+            i = i + 1;
+        }
+        return result;
+    }
+
+    Node* nodeAt(NodeId id)
+    {
+        if (self.ast == null || id.index == 0 || id.index >= self.ast.nodesLen) return null;
+        return self.ast.nodes + id.index;
+    }
+
+    Decl* declAt(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node*.kind.tag != NodeKind::Decl) return null;
+        return &node*.kind.payload.Decl.value;
+    }
+
+    TypeEntry* typeEntryAt(Ty typeNode)
+    {
+        if (self.ast == null || typeNode == 0 || typeNode >= self.ast.typesLen) return null;
+        return self.ast.types + typeNode;
+    }
+
+    u32 nodeCount()
+    {
+        if (self.ast == null) return 0;
+        return self.ast.nodesLen;
+    }
+
+    u8 declarationKind(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Struct => { return 1; },
+            DeclKind::Enum => { return 1; },
+            DeclKind::Variant => { return 1; },
+            DeclKind::Union => { return 1; },
+            DeclKind::Trait => { return 1; },
+            DeclKind::Func => { return 2; },
+            else => { return 0; },
+        }
+    }
+
+    Str declarationName(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Struct => { return decl*.kind.payload.Struct.name; },
+            DeclKind::Enum => { return decl*.kind.payload.Enum.name; },
+            DeclKind::Variant => { return decl*.kind.payload.Variant.name; },
+            DeclKind::Union => { return decl*.kind.payload.Union.name; },
+            DeclKind::Trait => { return decl*.kind.payload.Trait.name; },
+            DeclKind::Func => { return decl*.kind.payload.Func.name; },
+            default => { return 0; },
+        }
+    }
+
+    Str parameterName(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node*.kind.tag != NodeKind::Param) return 0;
+        Param* param = &node*.kind.payload.Param.value;
+        if (param*.name != 0) return param*.name;
+        TypeEntry* entry = self.typeEntryAt(param*.typeNode);
+        if (entry != null && entry*.kind.tag == TypeKind::Comptime)
+        {
+            TypeEntry* base = self.typeEntryAt(entry*.kind.payload.Comptime.base);
+            if (base != null && base*.kind.tag == TypeKind::Named)
+                return base*.kind.payload.Named.name;
+        }
+        return 0;
+    }
+
+    bool isComptimeParameter(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null || node*.kind.tag != NodeKind::Param) return false;
+        Param* param = &node*.kind.payload.Param.value;
+        TypeEntry* entry = self.typeEntryAt(param*.typeNode);
+        return entry != null && entry*.kind.tag == TypeKind::Comptime;
+    }
+
+    u32 explicitGenericCount(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return 0;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Struct => { return decl*.kind.payload.Struct.genericParamsLen; },
+            DeclKind::Variant => { return decl*.kind.payload.Variant.genericParamsLen; },
+            DeclKind::Union => { return decl*.kind.payload.Union.genericParamsLen; },
+            DeclKind::Trait => { return decl*.kind.payload.Trait.genericParamsLen; },
+            DeclKind::Func => { return decl*.kind.payload.Func.genericParamsLen; },
+            default => { return 0; },
+        }
+    }
+
+    bool nameInGenericParams(NodeId id, Str name)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return false;
+        NodeId* params = null;
+        u32 len = 0;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Struct => {
+                params = decl*.kind.payload.Struct.genericParams;
+                len = decl*.kind.payload.Struct.genericParamsLen;
+            },
+            DeclKind::Variant => {
+                params = decl*.kind.payload.Variant.genericParams;
+                len = decl*.kind.payload.Variant.genericParamsLen;
+            },
+            DeclKind::Union => {
+                params = decl*.kind.payload.Union.genericParams;
+                len = decl*.kind.payload.Union.genericParamsLen;
+            },
+            DeclKind::Trait => {
+                params = decl*.kind.payload.Trait.genericParams;
+                len = decl*.kind.payload.Trait.genericParamsLen;
+            },
+            DeclKind::Func => {
+                params = decl*.kind.payload.Func.genericParams;
+                len = decl*.kind.payload.Func.genericParamsLen;
+            },
+            default => { return false; },
+        }
+        u32 i = 0;
+        while (i < len)
+        {
+            Node* node = self.nodeAt(params[i]);
+            if (node != null && node*.kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* param = &node*.kind.payload.GenericParam.value;
+                if (param*.name == name) return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    u32 genericCount(NodeId id)
+    {
+        u32 count = self.explicitGenericCount(id);
+        Decl* decl = self.declAt(id);
+        if (decl == null || decl*.kind.tag != DeclKind::Func) return count;
+        u32 i = 0;
+        while (i < decl*.kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl*.kind.payload.Func.params[i];
+            if (self.isComptimeParameter(paramId))
+            {
+                Str name = self.parameterName(paramId);
+                if (!self.nameInGenericParams(id, name)) count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    bool isGenericDeclaration(NodeId id) { return self.genericCount(id) != 0; }
+}

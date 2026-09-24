@@ -1,4 +1,5 @@
 import "../coral-common/token" { Token, TokenKind };
+import "../coral-diagnostics/code" { ErrorCode };
 import "ident" { decodeUtf8, isXidStart };
 import "escape" { EscapeResult, decodeEscapeSequence };
 import "base" { Lexer };
@@ -11,6 +12,7 @@ extend Lexer
 {
     Token nextToken()
     {
+        if (self.isAtEnd()) return self.makeToken(TokenKind::Eof, self.cur);
         self.skipWsCmts();
         u8* start = self.cur;
         if (self.isAtEnd()) return self.makeToken(TokenKind::Eof, start);
@@ -46,31 +48,39 @@ extend Lexer
         if (c == '"') return self.lexString(start);
         if (c == '\'')
         {
-            while (!self.isAtEnd() && self.cur[0] != '\'')
+            bool terminated = false;
+            while (!self.isAtEnd())
             {
+                if (self.cur[0] == '\'')
+                {
+                    self.cur++;
+                    terminated = true;
+                    break;
+                }
+                if (self.cur[0] == '\n') break;
                 if (self.cur[0] == '\\')
                 {
                     EscapeResult esc = EscapeResult::decodeEscapeSequence(self.cur, self.bufEnd);
                     if (!esc.isValid)
-                        self.reportError(self.bufStart, self.bufEnd, self.cur, "unknown escape sequence");
-                    self.cur += esc.bytesConsumed;
+                        self.reportErrorCode(ErrorCode::LexInvalidEscape, self.bufStart, self.bufEnd, self.cur, "invalid escape sequence");
+                    if (esc.bytesConsumed == 0) self.cur++;
+                    else self.cur += esc.bytesConsumed;
                 } else {
                     usize len;
-                    u32 cp = decodeUtf8(self.cur, self.bufEnd, &len);
-                    if (len > 0) {
-                        self.cur += len;
-                    } else {
-                        self.cur++;
-                    }
+                    decodeUtf8(self.cur, self.bufEnd, &len);
+                    if (len > 0) self.cur += len;
+                    else self.cur++;
                 }
             }
-            if (!self.isAtEnd()) self.cur++;
+            if (!terminated)
+                self.reportErrorCode(ErrorCode::LexUnterminatedChar, self.bufStart, self.bufEnd, start, "unterminated character literal");
             return self.makeToken(TokenKind::Char, start);
         }
 
         Token op = self.lexOperator(c, start);
         if (op.kind != TokenKind::Eof) return op;
 
-        return self.makeToken(TokenKind::Eof, start);
+        self.reportErrorCode(ErrorCode::LexUnknownChar, self.bufStart, self.bufEnd, start, "unknown character");
+        return self.makeToken(TokenKind::Unknown, start);
     }
 }
