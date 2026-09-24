@@ -17,6 +17,8 @@ import "../coral-semantics/decl";
 import "../coral-semantics/expr";
 import "../coral-semantics/stmt";
 import "../coral-semantics/typecheck";
+import "../coral-semantics/member" { MemberInfo };
+import "analyze" { AnalyzeResult, analyze };
 import "../coral-ast/decl" { File };
 import "../coral-parser/lib" { Parser };
 
@@ -129,38 +131,9 @@ TestResult runExpr(u8* src, usize len)
 
 bool runSema(u8* src, usize len)
 {
-    AstContext ctx;
-    ctx.init(4096, 4096, 4096);
-    IdentEntry* identEntries = malloc(256 * 64);
-    IdentifierTable idents;
-    idents.init(identEntries, 256);
-    idents.addKeywords();
-
-    Lexer lexer;
-    lexer.bufStart = src;
-    lexer.cur = src;
-    lexer.bufEnd = src + len;
-    lexer.line = 1;
-    lexer.lineStart = src;
-    lexer.diag = null;
-    lexer.idents = &idents;
-
-    Parser p;
-    p.lexer = &lexer;
-    p.ctx = &ctx;
-    p.panicMode = 0;
-    p.pendingGreater = false;
-    p.current = lexer.nextToken();
-    p.previous = p.current;
-    File* file = p.parseFile(ctx.intern("sema-test", 9));
-
-    Sema sema;
-    sema.init(&ctx);
-    bool ok = p.panicMode == 0 && sema.checkFile(file) && sema.errors == 0;
-    printf("sema check: ok=%u parse_errors=%u semantic_errors=%u\n", ok ? 1 : 0, p.panicMode, sema.errors);
-    sema.deinit();
-    ctx.deinit();
-    free(identEntries);
+    AnalyzeResult result = analyze(src, len);
+    bool ok = result.parseErrors == 0 && result.semanticErrors == 0;
+    printf("sema check: ok=%u parse_errors=%u semantic_errors=%u\n", ok ? 1 : 0, result.parseErrors, result.semanticErrors);
     return ok;
 }
 
@@ -301,7 +274,7 @@ bool testSema()
     u8* constAssign = "u32 f() { const u32 value = 1; value = 2; return value; }";
     u8* typeMismatch = "u32 f() { u32 value = 1; value = \"text\"; return value; }";
     u8* arityMismatch = "u32 add(u32 a, u32 b) { return a + b; } u32 f() { return add(1); }";
-    u8* genericValid = "pub struct Box<T> { T value; } Box<u32> make() { return Box<u32>{ .value = 1 }; }";
+    u8* genericValid = "pub struct Box<T> { T value; } Box<T> make(comptime T) { return Box<T>{ .value = 1 }; }";
     u8* genericArity = "pub struct Box<T> { T value; } Box<u32, i32> make() { return null; }";
     u8* comptimeValid = "void println(comptime T) { }";
     u8* enumValid = "pub enum Color { Red, Green }";
@@ -327,6 +300,18 @@ bool testExpr()
     TestResult r = runExpr(src, sourceLen(src));
     r.print();
     return r.errors == 0;
+}
+
+bool testMemberSemantics()
+{
+    u8* valid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.x; }";
+    u8* invalid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.z; }";
+    u8* method = "pub struct Counter { u32 value; u32 get() { return 1; } } u32 read() { Counter c = Counter { .value = 1 }; return c.get(); }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool invalidRejected = !runSema(invalid, sourceLen(invalid));
+    bool methodOk = runSema(method, sourceLen(method));
+    printf("member semantic test: valid=%u invalid=%u method=%u\n", validOk ? 1 : 0, invalidRejected ? 1 : 0, methodOk ? 1 : 0);
+    return validOk && invalidRejected && methodOk;
 }
 
 bool testNumbers()
@@ -631,6 +616,7 @@ pub i32 main()
     ok = testModuleMap() && ok;
     ok = testScopes() && ok;
     ok = testSema() && ok;
+    ok = testMemberSemantics() && ok;
     ok = testExpr() && ok;
     ok = testNumbers() && ok;
     ok = testCompositeExpressions() && ok;

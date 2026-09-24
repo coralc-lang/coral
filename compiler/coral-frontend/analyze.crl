@@ -1,0 +1,67 @@
+import "../coral-common/token" { TokenKind };
+import "../coral-lexer/lexer" { Lexer };
+import "../coral-lexer/table" { IdentifierTable, IdentEntry };
+import "../coral-context/context" { AstContext };
+import "../coral-ast/decl" { File };
+import "../coral-parser/lib" { Parser };
+import "../coral-semantics/sema" { Sema };
+import "../coral-semantics/decl";
+import "../coral-semantics/expr";
+import "../coral-semantics/stmt";
+import "../coral-semantics/typecheck";
+import "../coral-semantics/member";
+
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr ptr);
+
+pub struct AnalyzeResult
+{
+    u32 parseErrors;
+    u32 semanticErrors;
+    u32 nodes;
+}
+
+AnalyzeResult analyze(u8* src, usize len)
+{
+    AnalyzeResult result;
+    result.parseErrors = 0;
+    result.semanticErrors = 0;
+    result.nodes = 0;
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
+    IdentEntry* entries = (IdentEntry*)malloc(256 * sizeof(IdentEntry));
+    if (entries == null)
+    {
+        ctx.deinit();
+        return result;
+    }
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + len;
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+    Parser parser;
+    parser.lexer = &lexer;
+    parser.ctx = &ctx;
+    parser.panicMode = 0;
+    parser.pendingGreater = false;
+    parser.current = lexer.nextToken();
+    parser.previous = parser.current;
+    File* file = parser.parseFile(ctx.intern("frontend", 8));
+    Sema sema;
+    sema.init(&ctx);
+    sema.checkFile(file);
+    result.parseErrors = parser.panicMode;
+    result.semanticErrors = sema.errors;
+    result.nodes = ctx.nodeCount();
+    sema.deinit();
+    ctx.deinit();
+    free(entries);
+    return result;
+}

@@ -1,10 +1,11 @@
 import "../coral-ast/id" { Str, NodeId };
-import "../coral-ast/types" { Ty };
+import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
 import "../coral-ast/node" { Node, NodeKind };
 import "../coral-ast/expr" { Expr, ExprKind };
 import "../coral-ast/decl" { Decl, DeclKind, Param };
 import "../coral-ast/stmt" { SwitchCase };
 import "scope" { Symbol };
+import "member" { MemberInfo };
 import "sema" { Sema };
 
 extend Sema
@@ -34,11 +35,35 @@ extend Sema
             return self.scopes.assign(expr*.kind.payload.Ident.name, id);
         }
         if (expr*.kind.tag == ExprKind::Field)
-            return self.checkExpr(expr*.kind.payload.Field.obj);
+        {
+            if (!self.checkExpr(expr*.kind.payload.Field.obj)) return false;
+            MemberInfo member = self.findMember(self.exprType(expr*.kind.payload.Field.obj), expr*.kind.payload.Field.field);
+            if (member.typeNode == 0) return false;
+            self.setExprType(id, member.typeNode);
+            return true;
+        }
         if (expr*.kind.tag == ExprKind::Index)
-            return self.checkExpr(expr*.kind.payload.Index.obj);
+        {
+            if (!self.checkExpr(expr*.kind.payload.Index.obj)) return false;
+            Ty objectType = self.exprType(expr*.kind.payload.Index.obj);
+            if (objectType == 0) return false;
+            TypeEntry* objectEntry = self.ctx.types + objectType;
+            if (objectEntry*.kind.tag == TypeKind_Array) self.setExprType(id, objectEntry*.kind.payload.Array.base);
+            else if (objectEntry*.kind.tag == TypeKind_Slice) self.setExprType(id, objectEntry*.kind.payload.Slice.base);
+            else if (objectEntry*.kind.tag == TypeKind_Pointer) self.setExprType(id, objectEntry*.kind.payload.Pointer.base);
+            else return false;
+            return self.checkExpr(expr*.kind.payload.Index.index);
+        }
         if (expr*.kind.tag == ExprKind::Deref)
-            return self.checkExpr(expr*.kind.payload.Deref.expr);
+        {
+            if (!self.checkExpr(expr*.kind.payload.Deref.expr)) return false;
+            Ty pointerType = self.exprType(expr*.kind.payload.Deref.expr);
+            if (pointerType == 0) return false;
+            TypeEntry* pointerEntry = self.ctx.types + pointerType;
+            if (pointerEntry*.kind.tag != TypeKind_Pointer) return false;
+            self.setExprType(id, pointerEntry*.kind.payload.Pointer.base);
+            return true;
+        }
         return false;
     }
 
@@ -134,17 +159,70 @@ extend Sema
             },
             ExprKind::MethodCall => {
                 if (!self.checkExpr(expr*.kind.payload.MethodCall.receiver)) return false;
+                MemberInfo methodInfo = self.findMethod(self.exprType(expr*.kind.payload.MethodCall.receiver), expr*.kind.payload.MethodCall.method);
+                if (methodInfo.declaration.index == 0)
+                {
+                    self.addError();
+                    return false;
+                }
+                Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
+                Decl* methodDecl = &methodNode*.kind.payload.Decl.value;
+                if (methodDecl*.kind.payload.Func.paramsLen != expr*.kind.payload.MethodCall.argsLen)
+                {
+                    self.addError();
+                    return false;
+                }
                 u32 i = 0;
                 while (i < expr*.kind.payload.MethodCall.argsLen)
                 {
                     if (!self.checkExpr(expr*.kind.payload.MethodCall.args[i])) return false;
+                    NodeId paramId = methodDecl*.kind.payload.Func.params[i];
+                    Node* paramNode = self.ctx.nodes + paramId.index;
+                    if (paramNode*.kind.tag == NodeKind::Param)
+                    {
+                        Param* param = &paramNode*.kind.payload.Param.value;
+                        if (!self.compatible(self.exprType(expr*.kind.payload.MethodCall.args[i]), param*.typeNode)) self.addError();
+                    }
                     i = i + 1;
                 }
+                self.setExprType(id, methodDecl*.kind.payload.Func.returnType);
                 return true;
             },
-            ExprKind::Field => { return self.checkExpr(expr*.kind.payload.Field.obj); },
+            ExprKind::Field => {
+                if (!self.checkExpr(expr*.kind.payload.Field.obj)) return false;
+                MemberInfo member = self.findMember(self.exprType(expr*.kind.payload.Field.obj), expr*.kind.payload.Field.field);
+                if (member.typeNode == 0)
+                {
+                    self.addError();
+                    return false;
+                }
+                self.setExprType(id, member.typeNode);
+                return true;
+            },
+            ExprKind::DerefField => {
+                if (!self.checkExpr(expr*.kind.payload.DerefField.obj)) return false;
+                MemberInfo member = self.findMember(self.exprType(expr*.kind.payload.DerefField.obj), expr*.kind.payload.DerefField.field);
+                if (member.typeNode == 0)
+                {
+                    self.addError();
+                    return false;
+                }
+                self.setExprType(id, member.typeNode);
+                return true;
+            },
             ExprKind::Index => {
                 if (!self.checkExpr(expr*.kind.payload.Index.obj)) return false;
+                Ty objectType = self.exprType(expr*.kind.payload.Index.obj);
+                if (objectType == 0) return false;
+                TypeEntry* objectEntry = self.ctx.types + objectType;
+                if (objectEntry*.kind.tag == TypeKind_Array) self.setExprType(id, objectEntry*.kind.payload.Array.base);
+                else if (objectEntry*.kind.tag == TypeKind_Slice) self.setExprType(id, objectEntry*.kind.payload.Slice.base);
+                else if (objectEntry*.kind.tag == TypeKind_Pointer) self.setExprType(id, objectEntry*.kind.payload.Pointer.base);
+                else
+                {
+                    self.addError();
+                    return false;
+                }
                 return self.checkExpr(expr*.kind.payload.Index.index);
             },
             ExprKind::Cast => { return self.checkExpr(expr*.kind.payload.Cast.expr); },
@@ -237,7 +315,14 @@ extend Sema
                 u32 i = 0;
                 while (i < expr*.kind.payload.StructLiteral.fieldValuesLen)
                 {
+                    MemberInfo member = self.findMember(expr*.kind.payload.StructLiteral.typeNode, expr*.kind.payload.StructLiteral.fieldNames[i]);
+                    if (member.typeNode == 0)
+                    {
+                        self.addError();
+                        return false;
+                    }
                     if (!self.checkExpr(expr*.kind.payload.StructLiteral.fieldValues[i])) return false;
+                    if (!self.compatible(self.exprType(expr*.kind.payload.StructLiteral.fieldValues[i]), member.typeNode)) self.addError();
                     i = i + 1;
                 }
                 self.setExprType(id, expr*.kind.payload.StructLiteral.typeNode);
