@@ -1,0 +1,323 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/decl" { File, Decl, DeclKind };
+import "../coral-ast/expr" { Expr, ExprKind };
+import "../coral-ast/stmt" { Stmt, StmtKind };
+import "mono" { MonoContext, MonoDeclKind, MonoWorkItem };
+
+extend MonoContext
+{
+    NodeId findDeclaration(Str name)
+    {
+        if (self.file == null)
+        {
+            NodeId none;
+            none.index = 0;
+            return none;
+        }
+        u32 i = 0;
+        while (i < self.file*.declsLen)
+        {
+            if (self.declarationName(self.file*.decls[i]) == name) return self.file*.decls[i];
+            i = i + 1;
+        }
+        NodeId none;
+        none.index = 0;
+        return none;
+    }
+
+    bool isConcreteType(Ty typeNode)
+    {
+        if (typeNode == 0) return false;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return false;
+        if (entry*.kind.tag == TypeKind_TypeParam) return false;
+        if (entry*.kind.tag == TypeKind_Named)
+        {
+            NodeId declId = self.findDeclaration(entry*.kind.payload.Named.name);
+            if (declId.index == 0) return false;
+            u32 i = 0;
+            while (i < entry*.kind.payload.Named.genericArgsLen)
+            {
+                if (!self.isConcreteType(entry*.kind.payload.Named.genericArgs[i])) return false;
+                i = i + 1;
+            }
+        }
+        return true;
+    }
+
+    bool areConcreteTypes(Ty* types, u32 len)
+    {
+        u32 i = 0;
+        while (i < len)
+        {
+            if (!self.isConcreteType(types[i])) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    bool enqueue(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen)
+    {
+        if (self.genericCount(declaration) != argumentsLen)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        if (!self.areConcreteTypes(arguments, argumentsLen)) return true;
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            if (self.work[i].kind == kind && self.work[i].declaration.index == declaration.index)
+            {
+                u32 j = 0;
+                while (j < argumentsLen)
+                {
+                    if (!self.sema.sameType(self.work[i].arguments[j], arguments[j])) break;
+                    j = j + 1;
+                }
+                if (j == argumentsLen) return true;
+            }
+            i = i + 1;
+        }
+        if (!self.reserveWork()) return false;
+        MonoWorkItem* item = self.work + self.workLen;
+        item.kind = kind;
+        item.declaration = declaration;
+        item.arguments = self.copyTypes(arguments, argumentsLen);
+        item.argumentsLen = argumentsLen;
+        item.inherited = null;
+        item.inheritedLen = 0;
+        self.workLen = self.workLen + 1;
+        return item.arguments != null || argumentsLen == 0;
+    }
+
+    bool collectType(Ty typeNode)
+    {
+        if (typeNode == 0) return true;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return false;
+        if (entry*.kind.tag == TypeKind_Named)
+        {
+            NodeId declId = self.findDeclaration(entry*.kind.payload.Named.name);
+            if (declId.index == 0) return true;
+            if (entry*.kind.payload.Named.genericArgsLen > 0)
+            {
+                if (!self.enqueue(MonoDeclKind::TypeDecl, declId, entry*.kind.payload.Named.genericArgs, entry*.kind.payload.Named.genericArgsLen)) return false;
+            }
+            u32 i = 0;
+            while (i < entry*.kind.payload.Named.genericArgsLen)
+            {
+                if (!self.collectType(entry*.kind.payload.Named.genericArgs[i])) return false;
+                i = i + 1;
+            }
+            return true;
+        }
+        if (entry*.kind.tag == TypeKind_Pointer) return self.collectType(entry*.kind.payload.Pointer.base);
+        if (entry*.kind.tag == TypeKind_Const) return self.collectType(entry*.kind.payload.Const.base);
+        if (entry*.kind.tag == TypeKind_Comptime) return self.collectType(entry*.kind.payload.Comptime.base);
+        if (entry*.kind.tag == TypeKind_Slice) return self.collectType(entry*.kind.payload.Slice.base);
+        if (entry*.kind.tag == TypeKind_Array) return self.collectType(entry*.kind.payload.Array.base);
+        if (entry*.kind.tag == TypeKind_FnPtr)
+        {
+            if (!self.collectType(entry*.kind.payload.FnPtr.returnType)) return false;
+            u32 i = 0;
+            while (i < entry*.kind.payload.FnPtr.paramsLen)
+            {
+                if (!self.collectType(entry*.kind.payload.FnPtr.params[i])) return false;
+                i = i + 1;
+            }
+        }
+        if (entry*.kind.tag == TypeKind_Tuple)
+        {
+            u32 i = 0;
+            while (i < entry*.kind.payload.Tuple.elemsLen)
+            {
+                if (!self.collectType(entry*.kind.payload.Tuple.elems[i])) return false;
+                i = i + 1;
+            }
+        }
+        return true;
+    }
+
+    bool collectCall(NodeId callId)
+    {
+        Node* callNode = self.nodeAt(callId);
+        if (callNode == null || callNode*.kind.tag != NodeKind::Expr) return true;
+        Expr* call = &callNode*.kind.payload.Expr.value;
+        if (call*.kind.tag != ExprKind::Call) return true;
+        Node* calleeNode = self.nodeAt(call*.kind.payload.Call.callee);
+        if (calleeNode == null || calleeNode*.kind.tag != NodeKind::Expr) return true;
+        Expr* callee = &calleeNode*.kind.payload.Expr.value;
+        if (callee*.kind.tag != ExprKind::Ident) return true;
+        NodeId declaration = self.findDeclaration(callee*.kind.payload.Ident.name);
+        if (declaration.index == 0 || self.genericCount(declaration) == 0) return true;
+        Ty* arguments = (Ty*)calloc((usize)call*.kind.payload.Call.argsLen, sizeof(Ty));
+        if (arguments == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        u32 i = 0;
+        while (i < call*.kind.payload.Call.argsLen)
+        {
+            arguments[i] = self.sema.exprType(call*.kind.payload.Call.args[i]);
+            i = i + 1;
+        }
+        bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, call*.kind.payload.Call.argsLen);
+        free((rawptr)arguments);
+        return ok;
+    }
+
+    bool collectExpr(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null) return true;
+        if (node*.kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node*.kind.payload.Expr.value;
+        switch (expr*.kind.tag)
+        {
+            ExprKind::TypeRef => { return self.collectType(expr*.kind.payload.TypeRef.typeNode); },
+            ExprKind::StructLiteral => {
+                if (!self.collectType(expr*.kind.payload.StructLiteral.typeNode)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.StructLiteral.fieldValuesLen)
+                {
+                    if (!self.collectExpr(expr*.kind.payload.StructLiteral.fieldValues[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            ExprKind::Call => {
+                if (!self.collectExpr(expr*.kind.payload.Call.callee)) return false;
+                u32 i = 0;
+                while (i < expr*.kind.payload.Call.argsLen)
+                {
+                    if (!self.collectExpr(expr*.kind.payload.Call.args[i])) return false;
+                    i = i + 1;
+                }
+                return self.collectCall(id);
+            },
+            ExprKind::Field => { return self.collectExpr(expr*.kind.payload.Field.obj); },
+            ExprKind::Index => {
+                if (!self.collectExpr(expr*.kind.payload.Index.obj)) return false;
+                return self.collectExpr(expr*.kind.payload.Index.index);
+            },
+            ExprKind::Cast => { return self.collectExpr(expr*.kind.payload.Cast.expr); },
+            ExprKind::Add => {
+                if (!self.collectExpr(expr*.kind.payload.Add.left)) return false;
+                return self.collectExpr(expr*.kind.payload.Add.right);
+            },
+            ExprKind::Assign => {
+                if (!self.collectExpr(expr*.kind.payload.Assign.target)) return false;
+                return self.collectExpr(expr*.kind.payload.Assign.value);
+            },
+            else => { return true; }
+        }
+    }
+
+    bool collectStmt(NodeId id)
+    {
+        Node* node = self.nodeAt(id);
+        if (node == null) return true;
+        if (node*.kind.tag != NodeKind::Stmt) return true;
+        Stmt* stmt = &node*.kind.payload.Stmt.value;
+        switch (stmt*.kind.tag)
+        {
+            StmtKind::ExprStmt => { return self.collectExpr(stmt*.kind.payload.ExprStmt.expr); },
+            StmtKind::VarDecl => { return self.collectExpr(stmt*.kind.payload.VarDecl.init); },
+            StmtKind::Block => {
+                u32 i = 0;
+                while (i < stmt*.kind.payload.Block.stmtsLen)
+                {
+                    if (!self.collectStmt(stmt*.kind.payload.Block.stmts[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            StmtKind::Return => { return self.collectExpr(stmt*.kind.payload.Return.value); },
+            StmtKind::If => {
+                if (!self.collectExpr(stmt*.kind.payload.If.cond)) return false;
+                if (!self.collectStmt(stmt*.kind.payload.If.thenBody)) return false;
+                return self.collectStmt(stmt*.kind.payload.If.elseBody);
+            },
+            StmtKind::While => {
+                if (!self.collectExpr(stmt*.kind.payload.While.cond)) return false;
+                return self.collectStmt(stmt*.kind.payload.While.body);
+            },
+            else => { return true; }
+        }
+    }
+
+    bool collectDecl(NodeId id)
+    {
+        Decl* decl = self.declAt(id);
+        if (decl == null) return true;
+        switch (decl*.kind.tag)
+        {
+            DeclKind::Struct => {
+                u32 i = 0;
+                while (i < decl*.kind.payload.Struct.fieldsLen)
+                {
+                    Node* field = self.nodeAt(decl*.kind.payload.Struct.fields[i]);
+                    if (field != null && field*.kind.tag == NodeKind::Field && !self.collectType(field*.kind.payload.Field.value.typeNode)) return false;
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < decl*.kind.payload.Struct.methodsLen)
+                {
+                    if (!self.collectDecl(decl*.kind.payload.Struct.methods[i])) return false;
+                    i = i + 1;
+                }
+                return true;
+            },
+            DeclKind::Variant => {
+                u32 i = 0;
+                while (i < decl*.kind.payload.Variant.variantsLen)
+                {
+                    u32 j = 0;
+                    while (j < decl*.kind.payload.Variant.variants[i].fieldsLen)
+                    {
+                        if (!self.collectType(decl*.kind.payload.Variant.variants[i].fieldTypes[j])) return false;
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+                return true;
+            },
+            DeclKind::Func => {
+                if (!self.collectType(decl*.kind.payload.Func.returnType)) return false;
+                u32 i = 0;
+                while (i < decl*.kind.payload.Func.paramsLen)
+                {
+                    Node* param = self.nodeAt(decl*.kind.payload.Func.params[i]);
+                    if (param != null && param*.kind.tag == NodeKind::Param && !self.collectType(param*.kind.payload.Param.value.typeNode)) return false;
+                    i = i + 1;
+                }
+                return self.collectStmt(decl*.kind.payload.Func.body);
+            },
+            DeclKind::Constant => { return self.collectExpr(decl*.kind.payload.Constant.value); },
+            DeclKind::TypeAlias => { return self.collectType(decl*.kind.payload.TypeAlias.target); },
+            DeclKind::Distinct => { return self.collectType(decl*.kind.payload.Distinct.baseType); },
+            else => { return true; }
+        }
+    }
+
+    bool collectFile(File* file)
+    {
+        self.file = file;
+        if (file == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        u32 i = 0;
+        while (i < file*.declsLen)
+        {
+            if (!self.collectDecl(file*.decls[i])) return false;
+            i = i + 1;
+        }
+        return self.errors == 0;
+    }
+}

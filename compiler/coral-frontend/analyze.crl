@@ -10,6 +10,9 @@ import "../coral-semantics/expr";
 import "../coral-semantics/stmt";
 import "../coral-semantics/typecheck";
 import "../coral-semantics/member";
+import "../coral-mono/mono" { MonoContext };
+import "../coral-mono/collect";
+import "../coral-mono/instantiate";
 
 extern("C") rawptr malloc(usize size);
 extern("C") void free(rawptr ptr);
@@ -18,6 +21,8 @@ pub struct AnalyzeResult
 {
     u32 parseErrors;
     u32 semanticErrors;
+    u32 monoErrors;
+    u32 instances;
     u32 nodes;
 }
 
@@ -26,6 +31,8 @@ AnalyzeResult analyze(u8* src, usize len)
     AnalyzeResult result;
     result.parseErrors = 0;
     result.semanticErrors = 0;
+    result.monoErrors = 0;
+    result.instances = 0;
     result.nodes = 0;
     AstContext ctx;
     ctx.init(4096, 4096, 4096);
@@ -55,13 +62,20 @@ AnalyzeResult analyze(u8* src, usize len)
     parser.current = lexer.nextToken();
     parser.previous = parser.current;
     File* file = parser.parseFile(ctx.intern("frontend", 8));
-    Sema sema;
-    sema.init(&ctx);
-    sema.checkFile(file);
-    result.parseErrors = parser.panicMode;
-    result.semanticErrors = sema.errors;
-    result.nodes = ctx.nodeCount();
-    sema.deinit();
+     Sema sema;
+     sema.init(&ctx);
+     sema.checkFile(file);
+     MonoContext mono;
+     mono.init(&ctx, &sema);
+     mono.collectFile(file);
+     mono.run();
+     result.parseErrors = parser.errorCount();
+     result.semanticErrors = sema.errors;
+     result.monoErrors = mono.errors;
+     result.instances = mono.instancesLen;
+     result.nodes = ctx.nodeCount();
+     mono.deinit();
+     sema.deinit();
     ctx.deinit();
     free(entries);
     return result;

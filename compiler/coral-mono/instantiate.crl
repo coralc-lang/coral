@@ -1,0 +1,277 @@
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/types" { Ty, TypeEntry, TypeKind };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/decl" { Decl, DeclKind, GenericParam };
+import "../coral-semantics/sema" { Sema };
+import "mono" { MonoContext, MonoDeclKind, MonoInstance, MonoInstanceKind, MonoSubstitution };
+
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+extend MonoContext
+{
+    Ty findSubstitution(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
+    {
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null || entry*.kind.tag != TypeKind_TypeParam) return 0;
+        u32 i = 0;
+        while (i < substitutionsLen)
+        {
+            if (substitutions[i].index == entry*.kind.payload.TypeParam.index ||
+                substitutions[i].parameter == entry*.kind.payload.TypeParam.name)
+                return substitutions[i].typeNode;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    Ty substituteType(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
+    {
+        if (typeNode == 0) return 0;
+        TypeEntry* entry = self.typeEntryAt(typeNode);
+        if (entry == null) return 0;
+        if (entry*.kind.tag == TypeKind_TypeParam)
+            return self.findSubstitution(typeNode, substitutions, substitutionsLen);
+        if (entry*.kind.tag == TypeKind_Named)
+        {
+            Ty* args = self.copyTypes(entry*.kind.payload.Named.genericArgs, entry*.kind.payload.Named.genericArgsLen);
+            u32 i = 0;
+            while (i < entry*.kind.payload.Named.genericArgsLen)
+            {
+                args[i] = self.substituteType(args[i], substitutions, substitutionsLen);
+                i = i + 1;
+            }
+            TypeKind kind = TypeKind::Named{ .name = entry*.kind.payload.Named.name, .genericArgs = args, .genericArgsLen = entry*.kind.payload.Named.genericArgsLen };
+            return self.sema.allocType(kind);
+        }
+        if (entry*.kind.tag == TypeKind_Pointer)
+        {
+            TypeKind kind = TypeKind::Pointer{ .base = self.substituteType(entry*.kind.payload.Pointer.base, substitutions, substitutionsLen) };
+            return self.sema.allocType(kind);
+        }
+        if (entry*.kind.tag == TypeKind_Const)
+        {
+            TypeKind kind = TypeKind::Const{ .base = self.substituteType(entry*.kind.payload.Const.base, substitutions, substitutionsLen) };
+            return self.sema.allocType(kind);
+        }
+        if (entry*.kind.tag == TypeKind_Comptime)
+        {
+            TypeKind kind = TypeKind::Comptime{ .base = self.substituteType(entry*.kind.payload.Comptime.base, substitutions, substitutionsLen) };
+            return self.sema.allocType(kind);
+        }
+        if (entry*.kind.tag == TypeKind_Slice)
+        {
+            TypeKind kind = TypeKind::Slice{ .base = self.substituteType(entry*.kind.payload.Slice.base, substitutions, substitutionsLen) };
+            return self.sema.allocType(kind);
+        }
+        if (entry*.kind.tag == TypeKind_Array)
+        {
+            TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry*.kind.payload.Array.base, substitutions, substitutionsLen), .len = entry*.kind.payload.Array.len };
+            return self.sema.allocType(kind);
+        }
+        return typeNode;
+    }
+
+    MonoSubstitution* buildSubstitutions(NodeId declaration, Ty* arguments, u32 argumentsLen)
+    {
+        u32 count = self.genericCount(declaration);
+        if (count == 0) return null;
+        MonoSubstitution* result = (MonoSubstitution*)calloc((usize)count, sizeof(MonoSubstitution));
+        if (result == null)
+        {
+            self.errors = self.errors + 1;
+            return null;
+        }
+        u32 next = 0;
+        Decl* decl = self.declAt(declaration);
+        if (decl == null) return result;
+        NodeId* params = null;
+        u32 paramCount = 0;
+        if (decl*.kind.tag == DeclKind::Struct)
+        {
+            params = decl*.kind.payload.Struct.genericParams;
+            paramCount = decl*.kind.payload.Struct.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Variant)
+        {
+            params = decl*.kind.payload.Variant.genericParams;
+            paramCount = decl*.kind.payload.Variant.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Union)
+        {
+            params = decl*.kind.payload.Union.genericParams;
+            paramCount = decl*.kind.payload.Union.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Trait)
+        {
+            params = decl*.kind.payload.Trait.genericParams;
+            paramCount = decl*.kind.payload.Trait.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Func)
+        {
+            params = decl*.kind.payload.Func.genericParams;
+            paramCount = decl*.kind.payload.Func.genericParamsLen;
+        }
+        u32 i = 0;
+        while (i < paramCount && next < argumentsLen)
+        {
+            Node* node = self.nodeAt(params[i]);
+            if (node != null && node*.kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* param = &node*.kind.payload.GenericParam.value;
+                result[next].parameter = param*.name;
+                result[next].index = next;
+                result[next].declaration = params[i];
+                result[next].typeNode = arguments[next];
+                next = next + 1;
+            }
+            i = i + 1;
+        }
+        if (decl*.kind.tag == DeclKind::Func)
+        {
+            i = 0;
+            while (i < decl*.kind.payload.Func.paramsLen && next < argumentsLen)
+            {
+                NodeId paramId = decl*.kind.payload.Func.params[i];
+                if (self.isComptimeParameter(paramId))
+                {
+                    Str name = self.parameterName(paramId);
+                    if (!self.nameInGenericParams(declaration, name))
+                    {
+                        result[next].parameter = name;
+                        result[next].index = next;
+                        result[next].declaration = paramId;
+                        result[next].typeNode = arguments[next];
+                        next = next + 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return result;
+    }
+
+    bool sameArguments(Ty* left, Ty* right, u32 len)
+    {
+        u32 i = 0;
+        while (i < len)
+        {
+            if (!self.sema.sameType(left[i], right[i])) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    bool hasInstance(MonoDeclKind kind, Str name, Ty* arguments, u32 argumentsLen)
+    {
+        u32 i = 0;
+        while (i < self.instancesLen)
+        {
+            if (self.instances[i].kind == (u8)kind && self.instances[i].name == name &&
+                self.instances[i].argumentsLen == argumentsLen &&
+                self.sameArguments(self.instances[i].arguments, arguments, argumentsLen))
+                return true;
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool addInstance(NodeId declaration, Ty* arguments, u32 argumentsLen)
+    {
+        Decl* decl = self.declAt(declaration);
+        if (decl == null) return false;
+        Str name = self.declarationName(declaration);
+        MonoDeclKind kind;
+        if (decl*.kind.tag == DeclKind::Func) kind = MonoDeclKind::FunctionDecl;
+        else kind = MonoDeclKind::TypeDecl;
+        if (self.hasInstance(kind, name, arguments, argumentsLen)) return true;
+        if (!self.reserveInstances()) return false;
+        MonoInstance* instance = self.instances + self.instancesLen;
+        if (decl*.kind.tag == DeclKind::Func) instance.kind = MonoInstanceKind::FunctionInstance;
+        else instance.kind = MonoInstanceKind::TypeInstance;
+        instance.name = name;
+        instance.declaration = declaration;
+        instance.typeNode = 0;
+        instance.returnType = 0;
+        instance.paramTypes = null;
+        instance.paramTypesLen = 0;
+        instance.arguments = self.copyTypes(arguments, argumentsLen);
+        instance.argumentsLen = argumentsLen;
+        instance.substitutions = self.buildSubstitutions(declaration, arguments, argumentsLen);
+        instance.substitutionsLen = self.genericCount(declaration);
+        if (decl*.kind.tag == DeclKind::Func) instance.body = decl*.kind.payload.Func.body;
+        else
+        {
+            NodeId none;
+            none.index = 0;
+            instance.body = none;
+        }
+        instance.attributes = decl*.attrs;
+        instance.attributesLen = decl*.attrsLen;
+        instance.validationAttempted = 0;
+        instance.validated = 0;
+        if (decl*.kind.tag == DeclKind::Func)
+        {
+            instance.returnType = self.substituteType(decl*.kind.payload.Func.returnType, instance.substitutions, instance.substitutionsLen);
+            instance.paramTypesLen = decl*.kind.payload.Func.paramsLen;
+            if (instance.paramTypesLen > 0)
+            {
+                instance.paramTypes = (Ty*)calloc((usize)instance.paramTypesLen, sizeof(Ty));
+                if (instance.paramTypes == null)
+                {
+                    self.errors = self.errors + 1;
+                    return false;
+                }
+                u32 i = 0;
+                while (i < instance.paramTypesLen)
+                {
+                    Node* param = self.nodeAt(decl*.kind.payload.Func.params[i]);
+                    if (param != null && param*.kind.tag == NodeKind::Param)
+                        instance.paramTypes[i] = self.substituteType(param*.kind.payload.Param.value.typeNode, instance.substitutions, instance.substitutionsLen);
+                    i = i + 1;
+                }
+            }
+        }
+        else
+        {
+            TypeKind kind = TypeKind::Named{ .name = name, .genericArgs = instance.arguments, .genericArgsLen = argumentsLen };
+            instance.typeNode = self.sema.allocType(kind);
+        }
+        self.instancesLen = self.instancesLen + 1;
+        return true;
+    }
+
+    bool validateInstance(MonoInstance* instance)
+    {
+        instance.validationAttempted = 1;
+        u32 errorsBefore = self.sema.errors;
+        if (instance.kind == MonoInstanceKind::FunctionInstance)
+        {
+            if (!self.sema.checkType(instance.returnType)) return false;
+            u32 i = 0;
+            while (i < instance.paramTypesLen)
+            {
+                if (!self.sema.checkType(instance.paramTypes[i])) return false;
+                i = i + 1;
+            }
+        }
+        else if (!self.sema.checkType(instance.typeNode)) return false;
+        if (self.sema.errors == errorsBefore) instance.validated = 1;
+        else instance.validated = 0;
+        return instance.validated != 0;
+    }
+
+    bool run()
+    {
+        u32 i = 0;
+        while (i < self.workLen)
+        {
+            if (!self.addInstance(self.work[i].declaration, self.work[i].arguments, self.work[i].argumentsLen)) return false;
+            MonoInstance* instance = self.instances + self.instancesLen - 1;
+            if (!self.validateInstance(instance)) self.errors = self.errors + 1;
+            i = i + 1;
+        }
+        return self.errors == 0;
+    }
+}
