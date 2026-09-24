@@ -1,4 +1,7 @@
-from lexer import TokenKind
+from lexer import TokenKind, KEYWORDS
+
+NAME_TOKEN_KINDS = {TokenKind.Ident}
+NAME_TOKEN_KINDS.update(KEYWORDS.values())
 
 
 class Node:
@@ -414,6 +417,12 @@ class Parser:
             raise SyntaxError(f"{self.filename}:{t.line}:{t.col}: expected {kind}, got {t.kind} ({t.value!r})")
         return self.advance()
 
+    def expect_name(self):
+        t = self.peek()
+        if t.kind in NAME_TOKEN_KINDS:
+            return self.advance()
+        return self.expect(TokenKind.Ident)
+
     def match(self, kind):
         if self.peek().kind == kind:
             return self.advance()
@@ -704,7 +713,7 @@ class Parser:
                     left = StarDotExpr(left, Ident(field.value))
             elif self.peek().kind == TokenKind.ColonColon:
                 self.advance()
-                right_name = self.expect(TokenKind.Ident)
+                right_name = self.expect_name()
                 left = ColonColonExpr(left, Ident(right_name.value))
             elif self.peek().kind == TokenKind.LBracket:
                 self.advance()
@@ -726,7 +735,7 @@ class Parser:
                 field_values = []
                 if self.peek().kind != TokenKind.RBrace:
                     self.expect(TokenKind.Dot)
-                    fname = self.expect(TokenKind.Ident).value
+                    fname = self.expect_name().value
                     self.expect(TokenKind.Equal)
                     fval = self.parse_expr()
                     field_names.append(fname)
@@ -735,7 +744,7 @@ class Parser:
                         if self.peek().kind == TokenKind.RBrace:
                             break
                         self.expect(TokenKind.Dot)
-                        fname = self.expect(TokenKind.Ident).value
+                        fname = self.expect_name().value
                         self.expect(TokenKind.Equal)
                         fval = self.parse_expr()
                         field_names.append(fname)
@@ -780,7 +789,8 @@ class Parser:
                                     TokenKind.U32, TokenKind.I32, TokenKind.U64, TokenKind.I64,
                                     TokenKind.U128, TokenKind.I128, TokenKind.F32, TokenKind.F64,
                                     TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str,
-                                    TokenKind.Struct):
+                                    TokenKind.Struct) or (self.peek().kind == TokenKind.Ident and
+                                                          self.peek2().kind == TokenKind.Star):
                 tp = self.parse_type()
                 self.expect(TokenKind.Rparen)
                 inner = self.parse_unary()
@@ -1043,7 +1053,7 @@ class Parser:
             self.advance()
             fields = []
             while self.peek().kind != TokenKind.RBrace:
-                fname = self.expect(TokenKind.Ident).value
+                fname = self.expect_name().value
                 fields.append(fname)
                 self.match(TokenKind.Comma)
             self.expect(TokenKind.RBrace)

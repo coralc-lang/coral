@@ -8,8 +8,11 @@
 import "../coral-ast/id" { Str, SourceLoc, NodeId };
 import "../coral-ast/types" { Ty, TypeEntry };
 import "../coral-ast/node" { Node };
+import "../coral-ast/stmt" { SwitchCase };
 
 extern("C") rawptr malloc(usize size);
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
 extern("C") void free(rawptr ptr);
 
 pub struct InternEntry
@@ -17,6 +20,34 @@ pub struct InternEntry
     u8* ptr;
     usize len;
     u32 id;
+}
+
+pub struct NodeListBuilder
+{
+    NodeId* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct StrListBuilder
+{
+    Str* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct TyListBuilder
+{
+    Ty* data;
+    u32 len;
+    u32 cap;
+}
+
+pub struct SwitchListBuilder
+{
+    SwitchCase* data;
+    u32 len;
+    u32 cap;
 }
 
 pub struct AstContext
@@ -30,30 +61,87 @@ pub struct AstContext
     Node* nodes;
     u32 nodesLen;
     u32 nodesCap;
+    rawptr* owned;
+    u32 ownedLen;
+    u32 ownedCap;
 
     void init(u32 internCap, u32 typeCap, u32 nodeCap)
     {
-        self.interns = malloc(internCap * 24);
-        self.internsLen = 1;
-        self.internsCap = internCap;
-        self.types = malloc(typeCap * 64);
-        self.typesLen = 1;
-        self.typesCap = typeCap;
-        self.nodes = malloc(nodeCap * 192);
-        self.nodesLen = 1;
-        self.nodesCap = nodeCap;
+        self.interns = null;
+        self.internsLen = 0;
+        self.internsCap = 0;
+        self.types = null;
+        self.typesLen = 0;
+        self.typesCap = 0;
+        self.nodes = null;
+        self.nodesLen = 0;
+        self.nodesCap = 0;
+        self.owned = null;
+        self.ownedLen = 0;
+        self.ownedCap = 0;
+
+        if (internCap > 0)
+        {
+            self.interns = calloc((usize)internCap, 24);
+            if (self.interns != null)
+            {
+                self.internsCap = internCap;
+                self.internsLen = 1;
+            }
+        }
+        if (typeCap > 0)
+        {
+            self.types = calloc((usize)typeCap, 64);
+            if (self.types != null)
+            {
+                self.typesCap = typeCap;
+                self.typesLen = 1;
+            }
+        }
+        if (nodeCap > 0)
+        {
+            self.nodes = calloc((usize)nodeCap, 192);
+            if (self.nodes != null)
+            {
+                self.nodesCap = nodeCap;
+                self.nodesLen = 1;
+            }
+            self.owned = calloc((usize)nodeCap, 8);
+            if (self.owned != null) self.ownedCap = nodeCap;
+        }
     }
 
     void deinit()
     {
-        free(self.interns);
-        free(self.types);
-        free(self.nodes);
+        u32 i = 0;
+        while (i < self.ownedLen)
+        {
+            if (self.owned[i] != null) free(self.owned[i]);
+            i = i + 1;
+        }
+        if (self.owned != null) free(self.owned);
+        if (self.interns != null) free(self.interns);
+        if (self.types != null) free(self.types);
+        if (self.nodes != null) free(self.nodes);
+        self.interns = null;
+        self.internsLen = 0;
+        self.internsCap = 0;
+        self.types = null;
+        self.typesLen = 0;
+        self.typesCap = 0;
+        self.nodes = null;
+        self.nodesLen = 0;
+        self.nodesCap = 0;
+        self.owned = null;
+        self.ownedLen = 0;
+        self.ownedCap = 0;
     }
 
     bool streq(u8* a, usize aLen, u8* b, usize bLen)
     {
         if (aLen != bLen) return false;
+        if (aLen == 0) return true;
+        if (a == null || b == null) return false;
         usize i = 0;
         while (i < aLen)
         {
@@ -67,8 +155,11 @@ pub struct AstContext
 
     u32 intern(u8* ptr, usize len)
     {
-        u32 i = 0;
-        while (i < self.internsLen)
+        if (self.interns == null || self.internsLen == 0) return 0;
+        if (len == 0 || ptr == null) return 0;
+
+        u32 i = 1;
+        while (i < self.internsLen && i < self.internsCap)
         {
             InternEntry* e = self.interns + i;
             if (self.streq(e.ptr, e.len, ptr, len))
@@ -86,9 +177,203 @@ pub struct AstContext
         return e.id;
     }
 
+    bool track(rawptr ptr)
+    {
+        if (ptr == null) return true;
+        if (self.owned == null || self.ownedLen >= self.ownedCap) return false;
+        self.owned[self.ownedLen] = ptr;
+        self.ownedLen = self.ownedLen + 1;
+        return true;
+    }
+
+    void nodeListInit(NodeListBuilder* b)
+    {
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+    }
+
+    bool nodeListAppend(NodeListBuilder* b, NodeId value)
+    {
+        if (b*.len >= b*.cap)
+        {
+            u32 newCap = b*.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc(b*.data, (usize)newCap * 4);
+            if (raw == null) return false;
+            b*.data = (NodeId*)raw;
+            b*.cap = newCap;
+        }
+        b*.data[b*.len] = value;
+        b*.len = b*.len + 1;
+        return true;
+    }
+
+    NodeId* nodeListFinish(NodeListBuilder* b)
+    {
+        NodeId* result = b*.data;
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            free((rawptr)result);
+            return null;
+        }
+        return result;
+    }
+
+    void strListInit(StrListBuilder* b)
+    {
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+    }
+
+    bool strListAppend(StrListBuilder* b, Str value)
+    {
+        if (b*.len >= b*.cap)
+        {
+            u32 newCap = b*.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc(b*.data, (usize)newCap * 4);
+            if (raw == null) return false;
+            b*.data = (Str*)raw;
+            b*.cap = newCap;
+        }
+        b*.data[b*.len] = value;
+        b*.len = b*.len + 1;
+        return true;
+    }
+
+    Str* strListFinish(StrListBuilder* b)
+    {
+        Str* result = b*.data;
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            free((rawptr)result);
+            return null;
+        }
+        return result;
+    }
+
+    void tyListInit(TyListBuilder* b)
+    {
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+    }
+
+    bool tyListAppend(TyListBuilder* b, Ty value)
+    {
+        if (b*.len >= b*.cap)
+        {
+            u32 newCap = b*.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc(b*.data, (usize)newCap * 4);
+            if (raw == null) return false;
+            b*.data = (Ty*)raw;
+            b*.cap = newCap;
+        }
+        b*.data[b*.len] = value;
+        b*.len = b*.len + 1;
+        return true;
+    }
+
+    Ty* tyListFinish(TyListBuilder* b)
+    {
+        Ty* result = b*.data;
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            free((rawptr)result);
+            return null;
+        }
+        return result;
+    }
+
+    void switchListInit(SwitchListBuilder* b)
+    {
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+    }
+
+    bool switchListAppend(SwitchListBuilder* b, SwitchCase value)
+    {
+        if (b*.len >= b*.cap)
+        {
+            u32 newCap = b*.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc(b*.data, (usize)newCap * 64);
+            if (raw == null) return false;
+            b*.data = (SwitchCase*)raw;
+            b*.cap = newCap;
+        }
+        b*.data[b*.len] = value;
+        b*.len = b*.len + 1;
+        return true;
+    }
+
+    SwitchCase* switchListFinish(SwitchListBuilder* b)
+    {
+        SwitchCase* result = b*.data;
+        b*.data = null;
+        b*.len = 0;
+        b*.cap = 0;
+        if (result != null && !self.track((rawptr)result))
+        {
+            free((rawptr)result);
+            return null;
+        }
+        return result;
+    }
+
+    rawptr allocBytes(usize size)
+    {
+        if (size == 0) return null;
+        rawptr ptr = malloc(size);
+        if (ptr == null) return null;
+        if (!self.track(ptr))
+        {
+            free(ptr);
+            return null;
+        }
+        return ptr;
+    }
+
+    NodeId* allocNodeList(u32 len)
+    {
+        if (len == 0) return null;
+        return (NodeId*)self.allocBytes((usize)len * 4);
+    }
+
+    Str* allocStrList(u32 len)
+    {
+        if (len == 0) return null;
+        return (Str*)self.allocBytes((usize)len * 4);
+    }
+
+    Ty* allocTyList(u32 len)
+    {
+        if (len == 0) return null;
+        return (Ty*)self.allocBytes((usize)len * 4);
+    }
+
+    SwitchCase* allocSwitchCaseList(u32 len)
+    {
+        if (len == 0) return null;
+        return (SwitchCase*)self.allocBytes((usize)len * 64);
+    }
+
     Ty allocTypeSlot()
     {
-        if (self.typesLen >= self.typesCap) return 0;
+        if (self.types == null || self.typesLen == 0 || self.typesLen >= self.typesCap) return 0;
         Ty id = self.typesLen;
         self.typesLen = self.typesLen + 1;
         return id;
@@ -96,7 +381,7 @@ pub struct AstContext
 
     NodeId allocNodeSlot()
     {
-        if (self.nodesLen >= self.nodesCap)
+        if (self.nodes == null || self.nodesLen == 0 || self.nodesLen >= self.nodesCap)
         {
             NodeId n;
             n.index = 0;

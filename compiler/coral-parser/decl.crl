@@ -1,9 +1,10 @@
 /* parser/decl.crl — declaration parsing */
 
 import "base" { Parser, ParserMark };
+import "../coral-context/context" { AstContext, NodeListBuilder };
 import "../coral-common/token" { Token, TokenKind };
 import "../coral-ast/id" { NodeId, Str };
-import "../coral-ast/decl" { Decl, DeclKind };
+import "../coral-ast/decl" { Decl, DeclKind, Param, Field };
 import "../coral-ast/node" { Node, NodeKind };
 import "../coral-ast/types" { Ty };
 
@@ -11,13 +12,24 @@ extend Parser
 {
     NodeId storeDecl(DeclKind kind)
     {
-        NodeId id = self.ctx.allocNodeSlot();
-        if (id.index == 0) return id;
         Decl d;
         d.kind = kind;
-        Node n;
-        n.kind = NodeKind::Decl { .value = d };
-        return id;
+        d.loc.data = 0;
+        d.attrs = null;
+        d.attrsLen = 0;
+        return self.storeNode(NodeKind::Decl { .value = d });
+    }
+
+    NodeId storeParam(Param value)
+    {
+        value.loc.data = 0;
+        return self.storeNode(NodeKind::Param { .value = value });
+    }
+
+    NodeId storeField(Field value)
+    {
+        value.loc.data = 0;
+        return self.storeNode(NodeKind::Field { .value = value });
     }
 
     NodeId parseDecl()
@@ -79,8 +91,10 @@ extend Parser
             return self.parseTraitDecl();
         if (self.check(TokenKind::Extend))
             return self.parseExtendDecl();
-        if (self.check(TokenKind::Typedef))
-            return self.parseTypedefDecl();
+         if (self.check(TokenKind::Const))
+             return self.parseConstDecl();
+         if (self.check(TokenKind::Typedef))
+             return self.parseTypedefDecl();
         if (self.check(TokenKind::Distinct))
             return self.parseDistinctDecl();
         if (self.check(TokenKind::Flag))
@@ -96,6 +110,7 @@ extend Parser
             return self.parseFuncOrVarDecl(isPub, isExtern, isStatic);
 
         self.panicMode = 1;
+        if (!self.atEnd()) self.advance();
         return self.noneNode();
     }
 
@@ -130,36 +145,48 @@ extend Parser
         }
     }
 
-    NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
-    {
-        Ty retType = self.parseType();
-        Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        if (self.check(TokenKind::LParen))
-        {
-            self.expect(TokenKind::LParen);
-            if (!self.check(TokenKind::RParen))
-            {
-                self.parseParam();
-                while (self.match(TokenKind::Comma))
-                    self.parseParam();
-            }
-            self.expect(TokenKind::RParen);
-            if (self.match(TokenKind::Semicolon))
-                return self.allocNode();
-            self.expect(TokenKind::LBrace);
-            while (!self.check(TokenKind::RBrace) && !self.atEnd())
-                self.parseStmt();
-            self.expect(TokenKind::RBrace);
-            return self.allocNode();
-        }
-        self.expect(TokenKind::Equal);
-        self.parseExpr();
-        self.expect(TokenKind::Semicolon);
-        return self.allocNode();
-    }
+     NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
+     {
+         Ty retType = self.parseType();
+         Token nameTok = self.expectName();
+         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+         if (self.check(TokenKind::Less))
+             self.parseGenericParams();
+         u8 flags = 0;
+         if (isPub) flags = flags | 1;
+         if (isExtern) flags = flags | 2;
+         if (isStatic) flags = flags | 4;
+         if (self.check(TokenKind::LParen))
+         {
+             self.advance();
+             NodeListBuilder params;
+             self.ctx.nodeListInit(&params);
+             if (!self.check(TokenKind::RParen))
+             {
+                 NodeId param = self.parseParam();
+                 if (!self.ctx.nodeListAppend(&params, param)) self.panicMode = 1;
+                 while (self.match(TokenKind::Comma))
+                 {
+                     param = self.parseParam();
+                     if (!self.ctx.nodeListAppend(&params, param)) self.panicMode = 1;
+                 }
+             }
+             self.expect(TokenKind::RParen);
+             u32 paramCount = params.len;
+             NodeId* paramValues = self.ctx.nodeListFinish(&params);
+             NodeId body = self.noneNode();
+             if (!self.match(TokenKind::Semicolon))
+             {
+                 body = self.parseBlock();
+                 flags = flags | 8;
+             }
+             return self.storeDecl(DeclKind::Func { .name = name, .genericParams = null, .genericParamsLen = 0, .params = paramValues, .paramsLen = paramCount, .returnType = retType, .body = body, .flags = flags });
+         }
+         self.expect(TokenKind::Equal);
+         NodeId value = self.parseExpr();
+         self.expect(TokenKind::Semicolon);
+         return self.storeDecl(DeclKind::Constant { .name = name, .typeNode = retType, .value = value, .flags = flags });
+     }
 
     NodeId parseGenericParams()
     {
@@ -186,40 +213,29 @@ extend Parser
         return self.allocNode();
     }
 
-    NodeId parseFuncDecl()
-    {
-        Ty retType = self.parseType();
-        self.expect(TokenKind::Ident);
-        if (self.check(TokenKind::Less))
-            self.parseGenericParams();
-        self.expect(TokenKind::LParen);
-        if (!self.check(TokenKind::RParen))
-        {
-            self.parseParam();
-            while (self.match(TokenKind::Comma))
-                self.parseParam();
-        }
-        self.expect(TokenKind::RParen);
-        if (self.match(TokenKind::Semicolon))
-            return self.allocNode();
-        self.expect(TokenKind::LBrace);
-        while (!self.check(TokenKind::RBrace) && !self.atEnd())
-            self.parseStmt();
-        self.expect(TokenKind::RBrace);
-        return self.allocNode();
-    }
+     NodeId parseFuncDecl()
+     {
+         return self.parseFuncOrVarDecl(false, false, false);
+     }
 
-    NodeId parseParam()
-    {
-        if (self.check(TokenKind::Self))
-        {
-            self.advance();
-            return self.allocNode();
-        }
-        self.parseType();
-        self.expect(TokenKind::Ident);
-        return self.allocNode();
-    }
+     NodeId parseParam()
+     {
+         Param param;
+         param.loc.data = 0;
+         param.flags = 0;
+         if (self.check(TokenKind::Self))
+         {
+             self.advance();
+             param.name = self.ctx.intern("self", 4);
+             param.typeNode = 0;
+             param.flags = 1;
+             return self.storeParam(param);
+         }
+         param.typeNode = self.parseType();
+         Token name = self.expectName();
+         param.name = self.ctx.intern(name.data.ptr, name.data.len);
+         return self.storeParam(param);
+     }
 
     NodeId parseStructDecl()
     {

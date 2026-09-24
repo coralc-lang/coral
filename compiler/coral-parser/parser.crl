@@ -3,7 +3,9 @@
 import "../coral-common/token" { Token, TokenKind }
 import "../coral-lexer/lexer" { Lexer }
 import "../coral-context/context" { AstContext }
-import "../coral-ast/id" { NodeId }
+import "../coral-ast/id" { NodeId, SourceLoc };
+import "../coral-ast/node" { Node, NodeKind };
+import "../coral-ast/pat" { Pat, PatKind };
 import "base" { Parser, ParserMark };
 import "../coral-parser/type";
 import "../coral-parser/expr";
@@ -50,12 +52,170 @@ extend Parser
             return self.advance();
         }
         self.panicMode = 1;
-        return self.current;
+        Token bad = self.current;
+        if (!self.atEnd()) self.advance();
+        return bad;
+    }
+
+    NodeId parseSwitchPattern()
+    {
+        TokenKind k = self.current.kind;
+        if (k == TokenKind::Pipe)
+        {
+            NodeListBuilder alternatives;
+            self.ctx.nodeListInit(&alternatives);
+            while (self.match(TokenKind::Pipe))
+            {
+                NodeId pat = self.parseSwitchPattern();
+                if (!self.ctx.nodeListAppend(&alternatives, pat)) self.panicMode = 1;
+            }
+            u32 count = alternatives.len;
+            NodeId* values = self.ctx.nodeListFinish(&alternatives);
+            return self.storePat(PatKind::Or { .alternatives = values, .alternativesLen = count });
+        }
+        if (k == TokenKind::Ident)
+        {
+            Token first = self.advance();
+            Str firstName = self.ctx.intern(first.data.ptr, first.data.len);
+            if (first.data.len == 1 && first.data.ptr[0] == '_')
+                return self.storePat(PatKind::Wildcard);
+            if (self.match(TokenKind::ColonColon))
+            {
+                Token second = self.expect(TokenKind::Ident);
+                Str secondName = self.ctx.intern(second.data.ptr, second.data.len);
+                if (self.check(TokenKind::LBrace))
+                {
+                    self.advance();
+                    StrListBuilder fields;
+                    self.ctx.strListInit(&fields);
+                    while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                    {
+                        self.match(TokenKind::Dot);
+                        Token field = self.expect(TokenKind::Ident);
+                        Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                        if (!self.ctx.strListAppend(&fields, fieldName)) self.panicMode = 1;
+                        if (!self.match(TokenKind::Comma)) break;
+                    }
+                    self.expect(TokenKind::RBrace);
+                    u32 count = fields.len;
+                    Str* names = self.ctx.strListFinish(&fields);
+                    return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = names, .fieldNamesLen = count });
+                }
+                return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = null, .fieldNamesLen = 0 });
+            }
+            if (self.check(TokenKind::LBrace))
+            {
+                self.advance();
+                StrListBuilder fields;
+                self.ctx.strListInit(&fields);
+                while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                {
+                    self.match(TokenKind::Dot);
+                    Token field = self.expect(TokenKind::Ident);
+                    Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                    if (!self.ctx.strListAppend(&fields, fieldName)) self.panicMode = 1;
+                    if (!self.match(TokenKind::Comma)) break;
+                }
+                self.expect(TokenKind::RBrace);
+                u32 count = fields.len;
+                Str* names = self.ctx.strListFinish(&fields);
+                if (first.data.ptr[0] >= 'A' && first.data.ptr[0] <= 'Z')
+                    return self.storePat(PatKind::Variant { .typeName = 0, .variant = firstName, .fieldNames = names, .fieldNamesLen = count });
+                return self.storePat(PatKind::Struct { .name = firstName, .fieldNames = names, .fieldNamesLen = count });
+            }
+            return self.storePat(PatKind::Ident { .name = firstName });
+        }
+        if (k == TokenKind::LParen)
+        {
+            self.advance();
+            NodeListBuilder elems;
+            self.ctx.nodeListInit(&elems);
+            while (!self.check(TokenKind::RParen) && !self.atEnd())
+            {
+                NodeId pat = self.parseSwitchPattern();
+                if (!self.ctx.nodeListAppend(&elems, pat)) self.panicMode = 1;
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.expect(TokenKind::RParen);
+            NodeId* values = self.ctx.nodeListFinish(&elems);
+            return self.storePat(PatKind::Tuple { .elems = values, .elemsLen = elems.len });
+        }
+        if (k == TokenKind::Dec || k == TokenKind::Hex || k == TokenKind::Bin ||
+            k == TokenKind::Oct || k == TokenKind::Float || k == TokenKind::String ||
+            k == TokenKind::Char || k == TokenKind::True || k == TokenKind::False ||
+            k == TokenKind::Null)
+        {
+            NodeId expr = self.parseExpr();
+            return self.storePat(PatKind::Lit { .expr = expr });
+        }
+        self.panicMode = 1;
+        if (!self.atEnd()) self.advance();
+        return self.noneNode();
+    }
+
+    Token expectName()
+    {
+        if (self.current.kind == TokenKind::Ident ||
+            self.current.kind == TokenKind::Struct ||
+            self.current.kind == TokenKind::Variant ||
+            self.current.kind == TokenKind::Enum ||
+            self.current.kind == TokenKind::Union ||
+            self.current.kind == TokenKind::Trait ||
+            self.current.kind == TokenKind::Extend ||
+            self.current.kind == TokenKind::Import ||
+            self.current.kind == TokenKind::Return ||
+            self.current.kind == TokenKind::If ||
+            self.current.kind == TokenKind::Else ||
+            self.current.kind == TokenKind::Switch ||
+            self.current.kind == TokenKind::Flag ||
+            self.current.kind == TokenKind::Self ||
+            self.current.kind == TokenKind::Const ||
+            self.current.kind == TokenKind::Var)
+        {
+            return self.advance();
+        }
+        return self.expect(TokenKind::Ident);
+    }
+
+    void synchronize()
+    {
+        while (!self.atEnd())
+        {
+            if (self.current.kind == TokenKind::RBrace ||
+                self.current.kind == TokenKind::Semicolon ||
+                self.current.kind == TokenKind::RParen)
+            {
+                return;
+            }
+            self.advance();
+        }
     }
 
     bool atEnd() { return self.current.kind == TokenKind::Eof; }
     NodeId noneNode() { return self.ctx.noneNode(); }
-    NodeId allocNode() { return self.ctx.allocNodeSlot(); }
+
+    NodeId storeNode(NodeKind kind)
+    {
+        NodeId id = self.ctx.allocNodeSlot();
+        if (id.index == 0) return id;
+        Node* node = self.ctx.nodes + id.index;
+        node.kind = kind;
+        node.loc.data = 0;
+        return id;
+    }
+
+    NodeId storePat(PatKind kind)
+    {
+        Pat p;
+        p.kind = kind;
+        p.loc.data = 0;
+        return self.storeNode(NodeKind::Pat { .value = p });
+    }
+
+    NodeId allocNode()
+    {
+        return self.storeNode(NodeKind::Invalid { .flags = 0 });
+    }
 
     ParserMark save()
     {

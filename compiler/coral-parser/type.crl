@@ -4,6 +4,7 @@ import "base" { Parser, ParserMark };
 import "../coral-common/token" { Token, TokenKind };
 import "../coral-ast/types" { Ty, TypeKind, TypeEntry };
 import "../coral-ast/id" { Str };
+import "../coral-context/context" { AstContext, TyListBuilder };
 
 extend Parser
 {
@@ -73,9 +74,28 @@ extend Parser
         k = TypeKind::Array { .base = base, .len = len };
         return self.allocTypeKind(k);
     }
+    Ty makeTuple(Ty* elems, u32 len)
+    {
+        TypeKind k;
+        k = TypeKind::Tuple { .elems = elems, .elemsLen = len };
+        return self.allocTypeKind(k);
+    }
+
+    Ty makeFunctionPointer(Str name, Ty returnType, Ty* params, u32 paramsLen)
+    {
+        TypeKind k;
+        k = TypeKind::FnPtr { .returnType = returnType, .params = params, .paramsLen = paramsLen, .name = name };
+        return self.allocTypeKind(k);
+    }
+
     Ty allocTypeKind(TypeKind kind)
     {
         Ty id = self.ctx.allocTypeSlot();
+        if (id == 0 || self.ctx.types == null)
+        {
+            self.panicMode = 1;
+            return 0;
+        }
         TypeEntry* e = self.ctx.types + id;
         e.kind = kind;
         return id;
@@ -103,81 +123,107 @@ extend Parser
         if (self.match(TokenKind::Rawptr)) { TypeKind k; k.tag = TypeKind_Rawptr; return self.allocTypeKind(k); }
         if (self.match(TokenKind::Str)) { TypeKind k; k.tag = TypeKind_Str; return self.allocTypeKind(k); }
 
-        if (self.check(TokenKind::Ident))
-        {
-            self.advance();
-            while (self.match(TokenKind::ColonColon))
-            {
-                self.expect(TokenKind::Ident);
-            }
-            if (self.check(TokenKind::Less))
-            {
-                ParserMark m = self.save();
-                self.advance();
-                bool ok = true;
-                if (self.check(TokenKind::Greater) || self.check(TokenKind::Shr))
-                {
-                    ok = self.consumeGreater();
-                }
-                else
-                {
-                    self.parseType();
-                    if (self.panicMode) ok = false;
-                    else
-                    {
-                        while (self.match(TokenKind::Comma))
-                        {
-                            self.parseType();
-                            if (self.panicMode) { ok = false; break; }
-                        }
-                        if (ok) ok = self.consumeGreater();
-                    }
-                }
-                if (!ok)
-                {
-                    self.restore(m);
-                }
-            }
-            if (self.check(TokenKind::LParen))
-            {
-                self.advance();
-                if (!self.check(TokenKind::RParen))
-                {
-                    self.parseType();
-                    while (self.match(TokenKind::Comma))
-                    {
-                        self.parseType();
-                    }
-                }
-                self.expect(TokenKind::RParen);
-            }
-            return self.allocType();
-        }
+         if (self.check(TokenKind::Ident))
+         {
+             Token nameTok = self.advance();
+             Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+             while (self.match(TokenKind::ColonColon))
+             {
+                 self.expect(TokenKind::Ident);
+             }
+             if (self.check(TokenKind::Less))
+             {
+                 ParserMark m = self.save();
+                 self.advance();
+                 bool ok = true;
+                 if (self.check(TokenKind::Greater) || self.check(TokenKind::Shr))
+                 {
+                     ok = self.consumeGreater();
+                 }
+                 else
+                 {
+                     self.parseType();
+                     if (self.panicMode) ok = false;
+                     else
+                     {
+                         while (self.match(TokenKind::Comma))
+                         {
+                             self.parseType();
+                             if (self.panicMode) { ok = false; break; }
+                         }
+                         if (ok) ok = self.consumeGreater();
+                     }
+                 }
+                 if (!ok)
+                 {
+                     self.restore(m);
+                 }
+             }
+             if (self.check(TokenKind::LParen))
+             {
+                 self.advance();
+                 TyListBuilder params;
+                 self.ctx.tyListInit(&params);
+                 if (!self.check(TokenKind::RParen))
+                 {
+                     Ty param = self.parseType();
+                     if (!self.ctx.tyListAppend(&params, param)) self.panicMode = 1;
+                     while (self.match(TokenKind::Comma))
+                     {
+                         param = self.parseType();
+                         if (!self.ctx.tyListAppend(&params, param)) self.panicMode = 1;
+                     }
+                 }
+                 self.expect(TokenKind::RParen);
+                 u32 count = params.len;
+                 Ty* values = self.ctx.tyListFinish(&params);
+                 return self.makeFunctionPointer(name, 0, values, count);
+             }
+             return self.makeNamed(name);
+         }
 
-        if (self.check(TokenKind::LParen))
-        {
-            self.advance();
-            self.parseType();
-            while (self.match(TokenKind::Comma))
-            {
-                self.parseType();
-            }
-            self.expect(TokenKind::RParen);
-            return self.allocType();
-        }
+         if (self.check(TokenKind::LParen))
+         {
+             self.advance();
+             TyListBuilder elems;
+             self.ctx.tyListInit(&elems);
+             if (!self.check(TokenKind::RParen))
+             {
+                 Ty elem = self.parseType();
+                 if (!self.ctx.tyListAppend(&elems, elem)) self.panicMode = 1;
+                 while (self.match(TokenKind::Comma))
+                 {
+                     elem = self.parseType();
+                     if (!self.ctx.tyListAppend(&elems, elem)) self.panicMode = 1;
+                 }
+             }
+             self.expect(TokenKind::RParen);
+             u32 count = elems.len;
+             Ty* values = self.ctx.tyListFinish(&elems);
+             return self.makeTuple(values, count);
+         }
 
-        if (self.check(TokenKind::Struct))
-        {
-            self.advance();
-            self.expect(TokenKind::LParen);
-            self.parseType();
-            while (self.match(TokenKind::Comma))
-            {
-                self.parseType();
-            }
-            self.expect(TokenKind::RParen);
-            return self.allocType();
-        }
+         if (self.check(TokenKind::Struct))
+         {
+             self.advance();
+             self.expect(TokenKind::LParen);
+             TyListBuilder elems;
+             self.ctx.tyListInit(&elems);
+             if (!self.check(TokenKind::RParen))
+             {
+                 Ty elem = self.parseType();
+                 if (!self.ctx.tyListAppend(&elems, elem)) self.panicMode = 1;
+                 while (self.match(TokenKind::Comma))
+                 {
+                     elem = self.parseType();
+                     if (!self.ctx.tyListAppend(&elems, elem)) self.panicMode = 1;
+                 }
+             }
+             self.expect(TokenKind::RParen);
+             u32 count = elems.len;
+             Ty* values = self.ctx.tyListFinish(&elems);
+             return self.makeTuple(values, count);
+         }
 
         self.panicMode = 1;
         return 0;
@@ -185,6 +231,7 @@ extend Parser
 
     Ty allocType()
     {
-        return self.ctx.allocTypeSlot();
+        self.panicMode = 1;
+        return 0;
     }
 }

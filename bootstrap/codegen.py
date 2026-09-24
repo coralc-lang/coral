@@ -195,7 +195,7 @@ class CodeGen:
                 value = self.gen_expr(arg)
                 if (isinstance(arg, ColonColonExpr) and
                         isinstance(arg.left, Ident) and
-                        arg.left.name in ("ExprKind", "StmtKind")):
+                        arg.left.name in ("ExprKind", "StmtKind", "PatKind")):
                     value = f"({arg.left.name}){{ .tag = {value} }}"
                 arg_values.append(value)
             args = ", ".join(arg_values)
@@ -452,30 +452,38 @@ class CodeGen:
             self.emit(f"switch ({self.gen_expr(node.expr)}) {{\n")
             self.indent += 1
             for pattern, body in node.cases:
-                self.emit_indent()
                 if isinstance(pattern, DestructPattern):
-                    self.emit(f"case {pattern.name}:\n")
+                    labels = [pattern.name]
                 elif isinstance(pattern, OrPattern):
-                    for i, p in enumerate(pattern.patterns):
-                        self.emit_indent()
-                        self.emit(f"case {self.gen_expr(p)}:\n")
+                    labels = [self.gen_expr(p) for p in pattern.patterns]
                 else:
-                    self.emit(f"case {self.gen_expr(pattern)}:\n")
-                self.indent += 1
-                for s in body.stmts:
-                    self.gen_stmt(s)
-                self.emit_indent()
-                self.emit("break;\n")
-                self.indent -= 1
+                    labels = [self.gen_expr(pattern)]
+                for label in labels:
+                    self.emit_indent()
+                    self.emit(f"case {label}:\n")
+                    self.emit_indent()
+                    self.emit("{\n")
+                    self.indent += 1
+                    for s in body.stmts:
+                        self.gen_stmt(s)
+                    self.emit_indent()
+                    self.emit("break;\n")
+                    self.indent -= 1
+                    self.emit_indent()
+                    self.emit("}\n")
             if node.else_body:
                 self.emit_indent()
                 self.emit("default:\n")
+                self.emit_indent()
+                self.emit("{\n")
                 self.indent += 1
                 for s in node.else_body.stmts:
                     self.gen_stmt(s)
                 self.emit_indent()
                 self.emit("break;\n")
                 self.indent -= 1
+                self.emit_indent()
+                self.emit("}\n")
             self.indent -= 1
             self.emit_indent()
             self.emit("}\n")
