@@ -1,14 +1,10 @@
-/* parser/parser.crl — parser state and token stream */
-
 import "../coral-common/token" { Token, TokenKind }
-import "../coral-diagnostics/code" { ErrorCode }
 import "../coral-lexer/lexer" { Lexer }
-import "../coral-context/context" { AstContext, NodeListBuilder };
-import "../coral-ast/decl" { File }
-import "../coral-ast/id" { NodeId, SourceLoc };
-import "../coral-ast/node" { Node, NodeKind };
-import "../coral-ast/pat" { Pat, PatKind };
-import "base" { Parser, ParserMark };
+import "../coral-context/context" { AstContext }
+import "../coral-ast/id" { NodeId, SourceLoc }
+import "../coral-ast/node" { Node, NodeKind }
+import "../coral-ast/pat" { Pat, PatKind }
+import "base" { Parser, ParserMark }
 
 extend Parser
 {
@@ -22,69 +18,6 @@ extend Parser
         p.current = lexer.nextToken();
         p.previous = p.current;
         return p;
-    }
-
-    u32 errorCount() { return self.panicMode & 0x3fffffff; }
-    bool hasParseErrors() { return self.errorCount() != 0; }
-    bool isRecovering() { return (self.panicMode & 0x40000000) != 0; }
-    bool isSpeculating() { return (self.panicMode & 0x80000000) != 0; }
-    void beginSpeculation() { self.panicMode = self.panicMode | 0x80000000; }
-    void endSpeculation() { self.panicMode = self.panicMode & 0x7fffffff; }
-    void beginRecovery() { self.panicMode = self.panicMode | 0x40000000; }
-    void endRecovery() { self.panicMode = self.panicMode & 0xbfffffff; }
-    void reportCurrentError(ErrorCode code, u8* msg) { self.reportError(code, self.current, msg); }
-    
-    void addError()
-    {
-        u32 count = self.errorCount();
-        if (count < 0x3fffffff)
-            self.panicMode = (self.panicMode & 0xc0000000) | (count + 1);
-    }
-
-    void reportError(ErrorCode code, Token token, u8* msg)
-    {
-        self.addError();
-        if (self.isSpeculating() || self.lexer == null || self.lexer.diag == null) return;
-        u8* errPtr = token.data.ptr;
-        if (errPtr == null) errPtr = self.lexer.getCur();
-        self.lexer.diag.emitParserError(code, self.lexer.bufStart, self.lexer.bufEnd, errPtr, msg);
-    }
-
-    u8* expectedTokenText(TokenKind kind)
-    {
-        switch (kind)
-        {
-            TokenKind::LParen => { return "expected '('"; },
-            TokenKind::RParen => { return "expected ')'"; },
-            TokenKind::LBrace => { return "expected '{'"; },
-            TokenKind::RBrace => { return "expected '}'"; },
-            TokenKind::LBracket => { return "expected '['"; },
-            TokenKind::RBracket => { return "expected ']'"; },
-            TokenKind::Ident => { return "expected identifier"; },
-            TokenKind::Equal => { return "expected '='"; },
-            TokenKind::Semicolon => { return "expected ';'"; },
-            TokenKind::Comma => { return "expected ','"; },
-            TokenKind::Colon => { return "expected ':'"; },
-            TokenKind::FatArrow => { return "expected '=>'"; },
-            TokenKind::Less => { return "expected '<'"; },
-            TokenKind::Greater => { return "expected '>'"; },
-            else => { return "expected token"; },
-        }
-    }
-
-    void reportExpected(TokenKind kind)
-    {
-        if (self.current.kind == TokenKind::Eof)
-            self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
-        else
-            self.reportError(ErrorCode::ParseExpectedToken, self.current, self.expectedTokenText(kind));
-    }
-
-    bool isRecoveryBoundary(TokenKind kind)
-    {
-        return kind == TokenKind::Eof || kind == TokenKind::Semicolon ||
-               kind == TokenKind::RBrace || kind == TokenKind::RParen ||
-               kind == TokenKind::RBracket || kind == TokenKind::LBrace;
     }
 
     Token advance()
@@ -122,288 +55,8 @@ extend Parser
         return self.advance();
     }
 
-    NodeId parseSwitchPattern()
-    {
-        TokenKind k = self.current.kind;
-        if (k == TokenKind::Pipe)
-        {
-            NodeListBuilder alternatives;
-            self.ctx.nodeListInit(&alternatives);
-            while (self.match(TokenKind::Pipe))
-            {
-                NodeId pat = self.parseSwitchPattern();
-                if (!self.ctx.nodeListAppend(&alternatives, pat)) self.addError();
-            }
-            u32 count = alternatives.len;
-            NodeId* values = self.ctx.nodeListFinish(&alternatives);
-            return self.storePat(PatKind::Or { .alternatives = values, .alternativesLen = count });
-        }
-        if (k == TokenKind::Ident)
-        {
-            Token first = self.advance();
-            Str firstName = self.ctx.intern(first.data.ptr, first.data.len);
-            if (self.match(TokenKind::ColonColon))
-            {
-                Token second = self.expect(TokenKind::Ident);
-                Str secondName = self.ctx.intern(second.data.ptr, second.data.len);
-                if (self.check(TokenKind::LBrace))
-                {
-                    self.advance();
-                    StrListBuilder fields;
-                    self.ctx.strListInit(&fields);
-                    while (!self.check(TokenKind::RBrace) && !self.atEnd())
-                    {
-                        self.match(TokenKind::Dot);
-                        Token field = self.expect(TokenKind::Ident);
-                        Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
-                        if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
-                        if (!self.match(TokenKind::Comma)) break;
-                    }
-                    self.expect(TokenKind::RBrace);
-                    u32 count = fields.len;
-                    Str* names = self.ctx.strListFinish(&fields);
-                    return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = names, .fieldNamesLen = count });
-                }
-                return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = null, .fieldNamesLen = 0 });
-            }
-            if (self.check(TokenKind::LBrace))
-            {
-                self.advance();
-                StrListBuilder fields;
-                self.ctx.strListInit(&fields);
-                while (!self.check(TokenKind::RBrace) && !self.atEnd())
-                {
-                    self.match(TokenKind::Dot);
-                    Token field = self.expect(TokenKind::Ident);
-                    Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
-                    if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
-                    if (!self.match(TokenKind::Comma)) break;
-                }
-                self.expect(TokenKind::RBrace);
-                u32 count = fields.len;
-                Str* names = self.ctx.strListFinish(&fields);
-                if (first.data.ptr[0] >= 'A' && first.data.ptr[0] <= 'Z')
-                    return self.storePat(PatKind::Variant { .typeName = 0, .variant = firstName, .fieldNames = names, .fieldNamesLen = count });
-                return self.storePat(PatKind::Struct { .name = firstName, .fieldNames = names, .fieldNamesLen = count });
-            }
-            return self.storePat(PatKind::Ident { .name = firstName });
-        }
-        if (k == TokenKind::LParen)
-        {
-            self.advance();
-            NodeListBuilder elems;
-            self.ctx.nodeListInit(&elems);
-            while (!self.check(TokenKind::RParen) && !self.atEnd())
-            {
-                NodeId pat = self.parseSwitchPattern();
-                if (!self.ctx.nodeListAppend(&elems, pat)) self.addError();
-                if (!self.match(TokenKind::Comma)) break;
-            }
-            self.expect(TokenKind::RParen);
-            NodeId* values = self.ctx.nodeListFinish(&elems);
-            return self.storePat(PatKind::Tuple { .elems = values, .elemsLen = elems.len });
-        }
-        if (k == TokenKind::Dec || k == TokenKind::Hex || k == TokenKind::Bin ||
-            k == TokenKind::Oct || k == TokenKind::Float || k == TokenKind::String ||
-            k == TokenKind::Char || k == TokenKind::True || k == TokenKind::False ||
-            k == TokenKind::Null)
-        {
-            NodeId expr = self.parseExpr();
-            return self.storePat(PatKind::Lit { .expr = expr });
-        }
-        if (self.isRecoveryBoundary(self.current.kind))
-        {
-            self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
-            return self.noneNode();
-        }
-        self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
-        self.advance();
-        return self.noneNode();
-    }
-
-    Token expectName()
-    {
-        if (self.current.kind == TokenKind::Ident ||
-            self.current.kind == TokenKind::Struct ||
-            self.current.kind == TokenKind::Variant ||
-            self.current.kind == TokenKind::Enum ||
-            self.current.kind == TokenKind::Union ||
-            self.current.kind == TokenKind::Trait ||
-            self.current.kind == TokenKind::Extend ||
-            self.current.kind == TokenKind::Import ||
-            self.current.kind == TokenKind::Return ||
-            self.current.kind == TokenKind::If ||
-            self.current.kind == TokenKind::Else ||
-            self.current.kind == TokenKind::Switch ||
-            self.current.kind == TokenKind::Flag ||
-            self.current.kind == TokenKind::Self ||
-            self.current.kind == TokenKind::Const ||
-            self.current.kind == TokenKind::Var)
-        {
-            return self.advance();
-        }
-        return self.expect(TokenKind::Ident);
-    }
-
-    bool isDeclarationStart()
-    {
-        TokenKind kind = self.current.kind;
-        switch (kind)
-        {
-            TokenKind::Pub, TokenKind::Extern, TokenKind::Static, TokenKind::Struct,
-            TokenKind::Enum, TokenKind::Variant, TokenKind::Union, TokenKind::Trait,
-            TokenKind::Extend, TokenKind::Const, TokenKind::Typedef, TokenKind::Distinct,
-            TokenKind::Flag, TokenKind::Import, TokenKind::Mod, TokenKind::Comptime,
-            TokenKind::Void, TokenKind::Bool, TokenKind::Char, TokenKind::U8,
-            TokenKind::I8, TokenKind::U16, TokenKind::I16, TokenKind::U32,
-            TokenKind::I32, TokenKind::U64, TokenKind::I64, TokenKind::U128,
-            TokenKind::I128, TokenKind::F32, TokenKind::F64, TokenKind::Usize,
-            TokenKind::Isize, TokenKind::Rawptr, TokenKind::Str, TokenKind::Ident,
-            TokenKind::LParen => { return true; },
-            else => { return false; },
-        }
-    }
-
-    void synchronize()
-    {
-        self.beginRecovery();
-        u32 braceDepth = 0;
-        u32 parenDepth = 0;
-        u32 bracketDepth = 0;
-        u32 startLine = self.current.line;
-        while (!self.atEnd())
-        {
-            TokenKind kind = self.current.kind;
-            if (braceDepth == 0 && parenDepth == 0 && bracketDepth == 0)
-            {
-                if (kind == TokenKind::Semicolon)
-                {
-                    self.advance();
-                    break;
-                }
-                if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
-                    kind == TokenKind::RBracket)
-                    break;
-                if (self.current.line > startLine && self.isDeclarationStart()) break;
-            }
-            if (kind == TokenKind::LBrace) braceDepth = braceDepth + 1;
-            else if (kind == TokenKind::RBrace)
-            {
-                if (braceDepth > 0) braceDepth = braceDepth - 1;
-            }
-            else if (kind == TokenKind::LParen) parenDepth = parenDepth + 1;
-            else if (kind == TokenKind::RParen)
-            {
-                if (parenDepth > 0) parenDepth = parenDepth - 1;
-            }
-            else if (kind == TokenKind::LBracket) bracketDepth = bracketDepth + 1;
-            else if (kind == TokenKind::RBracket)
-            {
-                if (bracketDepth > 0) bracketDepth = bracketDepth - 1;
-            }
-            self.advance();
-        }
-        self.endRecovery();
-    }
-
-    void synchronizeStatement()
-    {
-        self.beginRecovery();
-        while (!self.atEnd())
-        {
-            TokenKind kind = self.current.kind;
-            if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
-                kind == TokenKind::RBracket)
-                break;
-            if (kind == TokenKind::Semicolon)
-            {
-                self.advance();
-                break;
-            }
-            self.advance();
-        }
-        self.endRecovery();
-    }
-
-    void synchronizeExpression()
-    {
-        self.beginRecovery();
-        while (!self.atEnd())
-        {
-            TokenKind kind = self.current.kind;
-            if (kind == TokenKind::Comma || kind == TokenKind::Semicolon ||
-                kind == TokenKind::RParen || kind == TokenKind::RBrace ||
-                kind == TokenKind::RBracket)
-                break;
-            self.advance();
-        }
-        self.endRecovery();
-    }
-
-    void synchronizeCase()
-    {
-        self.beginRecovery();
-        while (!self.atEnd())
-        {
-            TokenKind kind = self.current.kind;
-            if (kind == TokenKind::Comma || kind == TokenKind::FatArrow ||
-                kind == TokenKind::RBrace)
-                break;
-            self.advance();
-        }
-        self.endRecovery();
-    }
-
     bool atEnd() { return self.current.kind == TokenKind::Eof; }
     NodeId noneNode() { return self.ctx.noneNode(); }
-
-    File* parseFile(Str path)
-    {
-        NodeListBuilder decls;
-        self.ctx.nodeListInit(&decls);
-        while (!self.atEnd())
-        {
-            if (self.check(TokenKind::Unknown))
-            {
-                self.advance();
-                continue;
-            }
-            if (self.check(TokenKind::RBrace) || self.check(TokenKind::RParen) ||
-                self.check(TokenKind::RBracket))
-            {
-                self.reportCurrentError(ErrorCode::ParseExpectedDecl, "unexpected closing token");
-                self.advance();
-                continue;
-            }
-
-            u32 errorsBefore = self.errorCount();
-            u8* cursorBefore = self.lexer.getCur();
-            Token tokenBefore = self.current;
-            NodeId decl = self.parseDecl();
-            if (!self.ctx.nodeListAppend(&decls, decl)) self.addError();
-
-            bool progressed = self.lexer.getCur() != cursorBefore ||
-                              self.current.kind != tokenBefore.kind ||
-                              self.current.data.ptr != tokenBefore.data.ptr;
-            if (!progressed)
-            {
-                if (self.check(TokenKind::Unknown) || !self.atEnd()) self.advance();
-            }
-            if (self.errorCount() > errorsBefore) self.synchronize();
-        }
-        u32 count = decls.len;
-        NodeId* values = self.ctx.nodeListFinish(&decls);
-        File* file = self.ctx.allocFile();
-        if (file == null)
-        {
-            self.addError();
-            return null;
-        }
-        file*.path = path;
-        file*.decls = values;
-        file*.declsLen = count;
-        return file;
-    }
 
     SourceLoc tokenLoc(Token token)
     {
@@ -416,11 +69,12 @@ extend Parser
 
     NodeId storeNode(NodeKind kind)
     {
-         NodeId id = self.ctx.allocNodeSlot();
-         if (id.index == 0) {
-             self.addError();
-             return id;
-         }
+        NodeId id = self.ctx.allocNodeSlot();
+        if (id.index == 0)
+        {
+            self.addError();
+            return id;
+        }
         Node* node = self.ctx.nodes + id.index;
         node.kind = kind;
         node.loc = self.tokenLoc(self.previous);
@@ -450,6 +104,7 @@ extend Parser
         m.previous = self.previous;
         m.panicMode = self.panicMode;
         m.pendingGreater = self.pendingGreater;
+        self.beginSpeculation();
         return m;
     }
 

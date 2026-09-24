@@ -1,0 +1,152 @@
+import "../coral-common/token" { Token, TokenKind };
+import "../coral-diagnostics/code" { ErrorCode };
+import "../coral-context/context" { AstContext, NodeListBuilder, StrListBuilder };
+import "../coral-ast/id" { NodeId, Str };
+import "../coral-ast/pat" { Pat, PatKind };
+import "../coral-ast/node" { Node, NodeKind };
+import "base" { Parser };
+
+extend Parser
+{
+    NodeId parseSwitchPattern()
+    {
+        TokenKind k = self.current.kind;
+        if (k == TokenKind::Pipe)
+        {
+            NodeListBuilder alternatives;
+            self.ctx.nodeListInit(&alternatives);
+            while (self.match(TokenKind::Pipe))
+            {
+                NodeId pat = self.parseSwitchPattern();
+                if (!self.ctx.nodeListAppend(&alternatives, pat)) self.addError();
+            }
+            u32 count = alternatives.len;
+            NodeId* values = self.ctx.nodeListFinish(&alternatives);
+            return self.storePat(PatKind::Or { .alternatives = values, .alternativesLen = count });
+        }
+        if (k == TokenKind::Ident)
+        {
+            Token first = self.advance();
+            Str firstName = self.ctx.intern(first.data.ptr, first.data.len);
+            if (self.match(TokenKind::ColonColon))
+            {
+                Token second = self.expect(TokenKind::Ident);
+                Str secondName = self.ctx.intern(second.data.ptr, second.data.len);
+                if (self.check(TokenKind::LBrace))
+                {
+                    self.advance();
+                    StrListBuilder fields;
+                    self.ctx.strListInit(&fields);
+                    while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                    {
+                        self.match(TokenKind::Dot);
+                        Token field = self.expect(TokenKind::Ident);
+                        Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                        if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
+                        if (!self.match(TokenKind::Comma)) break;
+                    }
+                    self.expect(TokenKind::RBrace);
+                    u32 count = fields.len;
+                    Str* names = self.ctx.strListFinish(&fields);
+                    return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = names, .fieldNamesLen = count });
+                }
+                return self.storePat(PatKind::Variant { .typeName = firstName, .variant = secondName, .fieldNames = null, .fieldNamesLen = 0 });
+            }
+            if (self.check(TokenKind::LBrace))
+            {
+                self.advance();
+                StrListBuilder fields;
+                self.ctx.strListInit(&fields);
+                while (!self.check(TokenKind::RBrace) && !self.atEnd())
+                {
+                    self.match(TokenKind::Dot);
+                    Token field = self.expect(TokenKind::Ident);
+                    Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                    if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
+                    if (!self.match(TokenKind::Comma)) break;
+                }
+                self.expect(TokenKind::RBrace);
+                u32 count = fields.len;
+                Str* names = self.ctx.strListFinish(&fields);
+                if (first.data.ptr[0] >= 'A' && first.data.ptr[0] <= 'Z')
+                    return self.storePat(PatKind::Variant { .typeName = 0, .variant = firstName, .fieldNames = names, .fieldNamesLen = count });
+                return self.storePat(PatKind::Struct { .name = firstName, .fieldNames = names, .fieldNamesLen = count });
+            }
+            return self.storePat(PatKind::Ident { .name = firstName });
+        }
+        if (k == TokenKind::LParen)
+        {
+            self.advance();
+            NodeListBuilder elems;
+            self.ctx.nodeListInit(&elems);
+            while (!self.check(TokenKind::RParen) && !self.atEnd())
+            {
+                NodeId pat = self.parseSwitchPattern();
+                if (!self.ctx.nodeListAppend(&elems, pat)) self.addError();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+            self.expect(TokenKind::RParen);
+            NodeId* values = self.ctx.nodeListFinish(&elems);
+            return self.storePat(PatKind::Tuple { .elems = values, .elemsLen = elems.len });
+        }
+        if (k == TokenKind::Dec || k == TokenKind::Hex || k == TokenKind::Bin ||
+            k == TokenKind::Oct || k == TokenKind::Float || k == TokenKind::String ||
+            k == TokenKind::CharLit || k == TokenKind::True || k == TokenKind::False ||
+            k == TokenKind::Null)
+        {
+            NodeId expr = self.parseExpr();
+            return self.storePat(PatKind::Lit { .expr = expr });
+        }
+        if (self.isRecoveryBoundary(self.current.kind))
+        {
+            self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
+            return self.noneNode();
+        }
+        self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
+        self.advance();
+        return self.noneNode();
+    }
+
+    Token expectName()
+    {
+        if (self.current.kind == TokenKind::Ident ||
+            self.current.kind == TokenKind::Struct ||
+            self.current.kind == TokenKind::Variant ||
+            self.current.kind == TokenKind::Enum ||
+            self.current.kind == TokenKind::Union ||
+            self.current.kind == TokenKind::Trait ||
+            self.current.kind == TokenKind::Extend ||
+            self.current.kind == TokenKind::Import ||
+            self.current.kind == TokenKind::Return ||
+            self.current.kind == TokenKind::If ||
+            self.current.kind == TokenKind::Else ||
+            self.current.kind == TokenKind::Switch ||
+            self.current.kind == TokenKind::Flag ||
+            self.current.kind == TokenKind::Self ||
+            self.current.kind == TokenKind::Const ||
+            self.current.kind == TokenKind::Var)
+        {
+            return self.advance();
+        }
+        return self.expect(TokenKind::Ident);
+    }
+
+    bool isDeclarationStart()
+    {
+        TokenKind kind = self.current.kind;
+        switch (kind)
+        {
+            TokenKind::Pub, TokenKind::Extern, TokenKind::Static, TokenKind::Struct,
+            TokenKind::Enum, TokenKind::Variant, TokenKind::Union, TokenKind::Trait,
+            TokenKind::Extend, TokenKind::Const, TokenKind::Typedef, TokenKind::Distinct,
+            TokenKind::Flag, TokenKind::Import, TokenKind::Mod, TokenKind::Comptime,
+            TokenKind::Void, TokenKind::Bool, TokenKind::Char, TokenKind::U8,
+            TokenKind::I8, TokenKind::U16, TokenKind::I16, TokenKind::U32,
+            TokenKind::I32, TokenKind::U64, TokenKind::I64, TokenKind::U128,
+            TokenKind::I128, TokenKind::F32, TokenKind::F64, TokenKind::Usize,
+            TokenKind::Isize, TokenKind::Rawptr, TokenKind::Str, TokenKind::Ident,
+            TokenKind::LParen => { return true; },
+            else => { return false; },
+        }
+    }
+}

@@ -1,0 +1,163 @@
+import "../coral-common/token" { Token, TokenKind };
+import "../coral-diagnostics/code" { ErrorCode };
+import "../coral-diagnostics/engine" { DiagnosticEngine };
+import "base" { Parser };
+
+extend Parser
+{
+    u32 errorCount() { return self.panicMode & 0x3fffffff; }
+    bool hasParseErrors() { return self.errorCount() != 0; }
+    bool isRecovering() { return (self.panicMode & 0x40000000) != 0; }
+    bool isSpeculating() { return (self.panicMode & 0x80000000) != 0; }
+    void beginSpeculation() { self.panicMode = self.panicMode | 0x80000000; }
+    void endSpeculation() { self.panicMode = self.panicMode & 0x7fffffff; }
+    void beginRecovery() { self.panicMode = self.panicMode | 0x40000000; }
+    void endRecovery() { self.panicMode = self.panicMode & 0xbfffffff; }
+    void reportCurrentError(ErrorCode code, u8* msg) { self.reportError(code, self.current, msg); }
+
+    void addError()
+    {
+        u32 count = self.errorCount();
+        if (count < 0x3fffffff)
+            self.panicMode = (self.panicMode & 0xc0000000) | (count + 1);
+    }
+
+    void reportError(ErrorCode code, Token token, u8* msg)
+    {
+        if (self.isSpeculating()) return;
+        self.addError();
+        if (self.lexer == null) return;
+        DiagnosticEngine* diag = self.lexer.diag;
+        if (diag == null) return;
+        u8* errPtr = token.data.ptr;
+        if (errPtr == null) errPtr = self.lexer.getCur();
+        diag.emitParserError(code, self.lexer.bufStart, self.lexer.bufEnd, errPtr, msg);
+    }
+
+    u8* expectedTokenText(TokenKind kind)
+    {
+        switch (kind)
+        {
+            TokenKind::LParen => { return "expected '('"; },
+            TokenKind::RParen => { return "expected ')'"; },
+            TokenKind::LBrace => { return "expected '{'"; },
+            TokenKind::RBrace => { return "expected '}'"; },
+            TokenKind::LBracket => { return "expected '['"; },
+            TokenKind::RBracket => { return "expected ']'"; },
+            TokenKind::Ident => { return "expected identifier"; },
+            TokenKind::Equal => { return "expected '='"; },
+            TokenKind::Semicolon => { return "expected ';'"; },
+            TokenKind::Comma => { return "expected ','"; },
+            TokenKind::Colon => { return "expected ':'"; },
+            TokenKind::FatArrow => { return "expected '=>'"; },
+            TokenKind::Less => { return "expected '<'"; },
+            TokenKind::Greater => { return "expected '>'"; },
+            else => { return "expected token"; },
+        }
+    }
+
+    void reportExpected(TokenKind kind)
+    {
+        if (self.current.kind == TokenKind::Eof)
+            self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
+        else
+            self.reportError(ErrorCode::ParseExpectedToken, self.current, self.expectedTokenText(kind));
+    }
+
+    bool isRecoveryBoundary(TokenKind kind)
+    {
+        return kind == TokenKind::Eof || kind == TokenKind::Semicolon ||
+               kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+               kind == TokenKind::RBracket || kind == TokenKind::LBrace;
+    }
+
+    void synchronize()
+    {
+        self.beginRecovery();
+        u32 braceDepth = 0;
+        u32 parenDepth = 0;
+        u32 bracketDepth = 0;
+        u32 startLine = self.current.line;
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (braceDepth == 0 && parenDepth == 0 && bracketDepth == 0)
+            {
+                if (kind == TokenKind::Semicolon)
+                {
+                    self.advance();
+                    break;
+                }
+                if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+                    kind == TokenKind::RBracket)
+                    break;
+                if (self.current.line > startLine && self.isDeclarationStart()) break;
+            }
+            if (kind == TokenKind::LBrace) braceDepth = braceDepth + 1;
+            else if (kind == TokenKind::RBrace)
+            {
+                if (braceDepth > 0) braceDepth = braceDepth - 1;
+            }
+            else if (kind == TokenKind::LParen) parenDepth = parenDepth + 1;
+            else if (kind == TokenKind::RParen)
+            {
+                if (parenDepth > 0) parenDepth = parenDepth - 1;
+            }
+            else if (kind == TokenKind::LBracket) bracketDepth = bracketDepth + 1;
+            else if (kind == TokenKind::RBracket)
+            {
+                if (bracketDepth > 0) bracketDepth = bracketDepth - 1;
+            }
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    void synchronizeStatement()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::RBrace || kind == TokenKind::RParen ||
+                kind == TokenKind::RBracket)
+                break;
+            if (kind == TokenKind::Semicolon)
+            {
+                self.advance();
+                break;
+            }
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    void synchronizeExpression()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::Comma || kind == TokenKind::Semicolon ||
+                kind == TokenKind::RParen || kind == TokenKind::RBrace ||
+                kind == TokenKind::RBracket)
+                break;
+            self.advance();
+        }
+        self.endRecovery();
+    }
+
+    void synchronizeCase()
+    {
+        self.beginRecovery();
+        while (!self.atEnd())
+        {
+            TokenKind kind = self.current.kind;
+            if (kind == TokenKind::Comma || kind == TokenKind::FatArrow ||
+                kind == TokenKind::RBrace)
+                break;
+            self.advance();
+        }
+        self.endRecovery();
+    }
+}

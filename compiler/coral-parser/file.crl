@@ -1,0 +1,55 @@
+import "../coral-common/token" { TokenKind };
+import "../coral-diagnostics/code" { ErrorCode };
+import "../coral-context/context" { AstContext, NodeListBuilder };
+import "../coral-ast/decl" { File };
+import "../coral-ast/id" { Str, NodeId };
+import "../coral-ast/node" { Node, NodeKind };
+import "base" { Parser };
+
+extend Parser
+{
+    File* parseFile(Str path)
+    {
+        NodeListBuilder decls;
+        self.ctx.nodeListInit(&decls);
+        while (!self.atEnd())
+        {
+            if (self.check(TokenKind::Unknown))
+            {
+                self.advance();
+                continue;
+            }
+            if (self.check(TokenKind::RBrace) || self.check(TokenKind::RParen) ||
+                self.check(TokenKind::RBracket))
+            {
+                self.reportCurrentError(ErrorCode::ParseExpectedDecl, "unexpected closing token");
+                self.advance();
+                continue;
+            }
+
+            u32 errorsBefore = self.errorCount();
+            u8* cursorBefore = self.lexer.getCur();
+            Token tokenBefore = self.current;
+            NodeId decl = self.parseDecl();
+            if (!self.ctx.nodeListAppend(&decls, decl)) self.addError();
+
+            bool progressed = self.lexer.getCur() != cursorBefore ||
+                              self.current.kind != tokenBefore.kind ||
+                              self.current.data.ptr != tokenBefore.data.ptr;
+            if (!progressed && !self.atEnd()) self.advance();
+            if (self.errorCount() > errorsBefore) self.synchronize();
+        }
+        u32 count = decls.len;
+        NodeId* values = self.ctx.nodeListFinish(&decls);
+        File* file = self.ctx.allocFile();
+        if (file == null)
+        {
+            self.addError();
+            return null;
+        }
+        file*.path = path;
+        file*.decls = values;
+        file*.declsLen = count;
+        return file;
+    }
+}
