@@ -49,7 +49,7 @@ extend Sema
             if (!self.checkExpr(expr*.kind.payload.Field.obj)) return false;
             MemberInfo member = self.findMember(self.exprType(expr*.kind.payload.Field.obj), expr*.kind.payload.Field.field);
             if (member.typeNode == 0) return false;
-            self.setExprType(id, member.typeNode);
+            self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr*.kind.payload.Field.obj)));
             return true;
         }
         if (expr*.kind.tag == ExprKind::Index)
@@ -113,6 +113,49 @@ extend Sema
         return true;
     }
 
+    bool checkPath(NodeId id)
+    {
+        if (id.index == 0) return true;
+        Node* node = self.ctx.nodes + id.index;
+        if (node*.kind.tag != NodeKind::Expr) return true;
+        Expr* expr = &node*.kind.payload.Expr.value;
+        if (expr*.kind.tag != ExprKind::Path) return true;
+        NodeId* segments = expr*.kind.payload.Path.segments;
+        u32 segmentsLen = expr*.kind.payload.Path.segmentsLen;
+        if (segmentsLen < 2) return true;
+        Node* leftNode = self.ctx.nodes + segments[0].index;
+        if (leftNode*.kind.tag != NodeKind::Expr) return true;
+        Expr* leftExpr = &leftNode*.kind.payload.Expr.value;
+        if (leftExpr*.kind.tag == ExprKind::Path) return self.checkPath(segments[0]);
+        if (leftExpr*.kind.tag != ExprKind::Ident) return true;
+        Node* rightNode = self.ctx.nodes + segments[1].index;
+        if (rightNode*.kind.tag != NodeKind::Expr) return true;
+        Expr* rightExpr = &rightNode*.kind.payload.Expr.value;
+        if (rightExpr*.kind.tag != ExprKind::Ident) return true;
+        Str root = leftExpr*.kind.payload.Ident.name;
+        Str member = rightExpr*.kind.payload.Ident.name;
+        Symbol* symbol = self.scopes.lookup(root);
+        if (symbol == null)
+        {
+            self.addError();
+            return false;
+        }
+        if (symbol*.kind == 5 && symbol*.declaration.index != 0)
+        {
+            Node* declNode = self.ctx.nodes + symbol*.declaration.index;
+            if (declNode*.kind.tag == NodeKind::Decl)
+            {
+                Decl* decl = &declNode*.kind.payload.Decl.value;
+                if (!self.moduleExportsContain(decl, member))
+                {
+                    self.addError();
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     bool checkBinary(NodeId id, NodeId left, NodeId right)
     {
         if (!self.checkExpr(left)) return false;
@@ -152,7 +195,7 @@ extend Sema
                 self.setExprType(id, expr*.kind.payload.TypeRef.typeNode);
                 return true;
             },
-            ExprKind::Path => { return true; },
+            ExprKind::Path => { return self.checkPath(id); },
             ExprKind::Call => {
                 if (!self.checkExpr(expr*.kind.payload.Call.callee)) return false;
                 u32 i = 0;
@@ -209,7 +252,7 @@ extend Sema
                     self.addError();
                     return false;
                 }
-                self.setExprType(id, member.typeNode);
+                self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr*.kind.payload.Field.obj)));
                 return true;
             },
             ExprKind::DerefField => {
@@ -220,7 +263,7 @@ extend Sema
                     self.addError();
                     return false;
                 }
-                self.setExprType(id, member.typeNode);
+                self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr*.kind.payload.DerefField.obj)));
                 return true;
             },
             ExprKind::Index => {
@@ -335,7 +378,8 @@ extend Sema
                         return false;
                     }
                     if (!self.checkExpr(expr*.kind.payload.StructLiteral.fieldValues[i])) return false;
-                    if (!self.compatible(self.exprType(expr*.kind.payload.StructLiteral.fieldValues[i]), member.typeNode)) self.addError();
+                    Ty expected = self.substituteFieldTy(member.typeNode, expr*.kind.payload.StructLiteral.typeNode);
+                    if (!self.compatible(self.exprType(expr*.kind.payload.StructLiteral.fieldValues[i]), expected)) self.addError();
                     i = i + 1;
                 }
                 self.setExprType(id, expr*.kind.payload.StructLiteral.typeNode);

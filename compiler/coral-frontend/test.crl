@@ -323,6 +323,8 @@ bool testSema()
     u8* genericArity = "pub struct Box<T> { T value; } Box<u32, i32> make() { return null; }";
     u8* comptimeValid = "void println(comptime T) { }";
     u8* enumValid = "pub enum Color { Red, Green }";
+    u8* nonGenericBox = "pub struct Box<T> { T value; } Box<i32> fill() { return Box<i32>{ .value = 1 }; }";
+    u8* nonGenericBoxBad = "pub struct Box<T> { T value; } Box<i32> bad() { return Box<i32>{ .value = \"text\" }; }";
     bool validOk = runSema(valid, sourceLen(valid));
     bool callValidOk = runSema(callValid, sourceLen(callValid));
     bool duplicateRejected = !runSema(duplicate, sourceLen(duplicate));
@@ -334,8 +336,10 @@ bool testSema()
     bool genericArityRejected = !runSema(genericArity, sourceLen(genericArity));
     bool comptimeOk = runSema(comptimeValid, sourceLen(comptimeValid));
     bool enumOk = runSema(enumValid, sourceLen(enumValid));
-    printf("semantic declaration test: valid=%u call_valid=%u duplicate=%u unknown=%u const_assign=%u type_mismatch=%u arity=%u generic_valid=%u generic_arity=%u comptime=%u enum=%u\n", validOk ? 1 : 0, callValidOk ? 1 : 0, duplicateRejected ? 1 : 0, unknownRejected ? 1 : 0, constRejected ? 1 : 0, typeMismatchRejected ? 1 : 0, arityRejected ? 1 : 0, genericValidOk ? 1 : 0, genericArityRejected ? 1 : 0, comptimeOk ? 1 : 0, enumOk ? 1 : 0);
-    return validOk && callValidOk && duplicateRejected && unknownRejected && constRejected && typeMismatchRejected && arityRejected && genericValidOk && genericArityRejected && comptimeOk && enumOk;
+    bool nonGenericOk = runSema(nonGenericBox, sourceLen(nonGenericBox));
+    bool nonGenericBadRejected = !runSema(nonGenericBoxBad, sourceLen(nonGenericBoxBad));
+    printf("semantic declaration test: valid=%u call_valid=%u duplicate=%u unknown=%u const_assign=%u type_mismatch=%u arity=%u generic_valid=%u generic_arity=%u comptime=%u enum=%u nongeneric=%u nongeneric_bad=%u\n", validOk ? 1 : 0, callValidOk ? 1 : 0, duplicateRejected ? 1 : 0, unknownRejected ? 1 : 0, constRejected ? 1 : 0, typeMismatchRejected ? 1 : 0, arityRejected ? 1 : 0, genericValidOk ? 1 : 0, genericArityRejected ? 1 : 0, comptimeOk ? 1 : 0, enumOk ? 1 : 0, nonGenericOk ? 1 : 0, nonGenericBadRejected ? 1 : 0);
+    return validOk && callValidOk && duplicateRejected && unknownRejected && constRejected && typeMismatchRejected && arityRejected && genericValidOk && genericArityRejected && comptimeOk && enumOk && nonGenericOk && nonGenericBadRejected;
 }
 
 bool testMono()
@@ -361,11 +365,13 @@ bool testMemberSemantics()
     u8* valid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.x; }";
     u8* invalid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.z; }";
     u8* method = "pub struct Counter { u32 value; u32 get() { return 1; } } u32 read() { Counter c = Counter { .value = 1 }; return c.get(); }";
+    u8* genericField = "pub struct Box<T> { T value; } i32 get() { Box<i32> b = Box<i32>{ .value = 1 }; return b.value; }";
     bool validOk = runSema(valid, sourceLen(valid));
     bool invalidRejected = !runSema(invalid, sourceLen(invalid));
     bool methodOk = runSema(method, sourceLen(method));
-    printf("member semantic test: valid=%u invalid=%u method=%u\n", validOk ? 1 : 0, invalidRejected ? 1 : 0, methodOk ? 1 : 0);
-    return validOk && invalidRejected && methodOk;
+    bool genericFieldOk = runSema(genericField, sourceLen(genericField));
+    printf("member semantic test: valid=%u invalid=%u method=%u generic_field=%u\n", validOk ? 1 : 0, invalidRejected ? 1 : 0, methodOk ? 1 : 0, genericFieldOk ? 1 : 0);
+    return validOk && invalidRejected && methodOk && genericFieldOk;
 }
 
 bool testNumbers()
@@ -668,6 +674,30 @@ bool testRecovery()
     return r.errors != 0;
 }
 
+bool testImportBindings()
+{
+    u8* valid = "pub mod m = import \"path\" { add as plus }; import m { add }; u32 f() { return m::add(1, 2); }";
+    u8* wildcard = "pub mod m = import \"path\" { * }; import m { whatever };";
+    u8* opaque = "pub mod m = import \"path\"; u32 f() { return m::anything(1); }";
+    u8* rootPath = "import file::math::core { square };";
+    u8* libPath = "import(lib) std::math { pow };";
+    u8* unknownNs = "u32 f() { return zzz::add(1, 2); }";
+    u8* unknownMod = "import missing { x };";
+    u8* unknownMember = "pub mod m = import \"path\" { add as plus }; u32 f() { return m::nope(1); }";
+    u8* unknownSymbol = "pub mod m = import \"path\" { add as plus }; import m { missing };";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool wildcardOk = runSema(wildcard, sourceLen(wildcard));
+    bool opaqueOk = runSema(opaque, sourceLen(opaque));
+    bool rootOk = runSema(rootPath, sourceLen(rootPath));
+    bool libOk = runSema(libPath, sourceLen(libPath));
+    bool unknownNsRejected = !runSema(unknownNs, sourceLen(unknownNs));
+    bool unknownModRejected = !runSema(unknownMod, sourceLen(unknownMod));
+    bool unknownMemberRejected = !runSema(unknownMember, sourceLen(unknownMember));
+    bool unknownSymbolRejected = !runSema(unknownSymbol, sourceLen(unknownSymbol));
+    printf("import binding test: valid=%u wildcard=%u opaque=%u root=%u lib=%u unknown_ns=%u unknown_mod=%u unknown_member=%u unknown_symbol=%u\n", validOk ? 1 : 0, wildcardOk ? 1 : 0, opaqueOk ? 1 : 0, rootOk ? 1 : 0, libOk ? 1 : 0, unknownNsRejected ? 1 : 0, unknownModRejected ? 1 : 0, unknownMemberRejected ? 1 : 0, unknownSymbolRejected ? 1 : 0);
+    return validOk && wildcardOk && opaqueOk && rootOk && libOk && unknownNsRejected && unknownModRejected && unknownMemberRejected && unknownSymbolRejected;
+}
+
 pub i32 main()
 {
     printf("****coral parser self-test****\n");
@@ -708,6 +738,7 @@ pub i32 main()
     ok = testImportLib() && ok;
     ok = testModReexport() && ok;
     ok = testModLibReexport() && ok;
+    ok = testImportBindings() && ok;
     ok = testAttr() && ok;
     ok = testSwitchPatterns() && ok;
     ok = testForIn() && ok;

@@ -49,11 +49,13 @@ class CodeGen:
         self.flags = {}
         self.global_methods = []
         self.global_protos_emitted = False
+        self.namespaces = set()
 
     def set_current_file(self, path):
         self.current_file = path
         self.out = []
         self.indent = 0
+        self.namespaces = set()
 
     def emit(self, s):
         self.out.append(s)
@@ -131,6 +133,13 @@ class CodeGen:
                 return BUILTIN_TYPES[name]
             if node.generic_args:
                 return f"void*"
+            if "::" in name:
+                head = name.split("::")[0]
+                if head in self.namespaces or head in ("file", "lib"):
+                    return name.split("::")[-1]
+                raise SyntaxError(
+                    f"{self.current_file}: undefined namespace '{head}' in qualified type '{name}'"
+                )
             return name
         if isinstance(node, PointerType):
             return self.gen_type(node.base) + "*"
@@ -338,6 +347,15 @@ class CodeGen:
         if isinstance(node, ColonColonExpr):
             left = self.gen_expr(node.left)
             right = self.gen_expr(node.right)
+            if isinstance(node.left, Ident):
+                name = node.left.name
+                if name in self.struct_names or name in self.enum_names:
+                    return f"{left}_{right}"
+                if name in self.namespaces:
+                    return right
+                raise SyntaxError(
+                    f"{self.current_file}: undefined namespace '{name}' in qualified name '{name}::{right}'"
+                )
             return f"{left}_{right}"
         if isinstance(node, StructLiteral):
             te = node.type_expr
@@ -801,6 +819,20 @@ class CodeGen:
         self.emit("#include <assert.h>\n\n")
 
         self.emit("typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n\n")
+
+        self.namespaces = set()
+        for decl in ast.decls:
+            if isinstance(decl, ModReexport):
+                if getattr(decl, "alias", None):
+                    self.namespaces.add(decl.alias)
+            elif isinstance(decl, ImportDecl):
+                for sym in (getattr(decl, "symbols", None) or []):
+                    if isinstance(sym, tuple):
+                        local = sym[1] or sym[0]
+                    else:
+                        local = sym
+                    if local and local != "*":
+                        self.namespaces.add(local)
 
         self.collect_ast_tuple_types(ast)
 

@@ -2,13 +2,15 @@ mod id = import "../coral-ast/id";
 mod types = import "../coral-ast/types";
 mod node = import "../coral-ast/node";
 mod decl_ast = import "../coral-ast/decl";
+mod context = import "../coral-context/context";
 mod scope = import "scope";
 mod sema = import "sema";
 
 import id { Str, NodeId };
 import types { Ty };
 import node { Node, NodeKind };
-import decl_ast { File, Decl, DeclKind };
+import decl_ast { File, Decl, DeclKind, ImportSymbol };
+import context { InternEntry };
 import scope { Symbol, ScopeStack };
 import sema { Sema };
 
@@ -70,11 +72,130 @@ extend Sema
                 name = decl*.kind.payload.Constant.name;
                 typeNode = decl*.kind.payload.Constant.typeNode;
             },
+            DeclKind::ModReexport => {
+                kind = 5;
+                name = decl*.kind.payload.ModReexport.alias;
+            },
+            DeclKind::Import => {
+                if (!self.checkImportDecl(id, decl)) return false;
+            },
             else => {}
         }
         if (name != 0) self.scopes.declare(name, kind, typeNode, id, 0);
         if (decl*.kind.tag == DeclKind::Func)
             return self.checkFunction(decl);
+        return true;
+    }
+
+    bool moduleExportsContain(Decl* modDecl, Str member)
+    {
+        if (modDecl == null) return true;
+        if (modDecl*.kind.tag != DeclKind::ModReexport) return true;
+        if (modDecl*.kind.payload.ModReexport.symbolsLen == 0) return true;
+        ImportSymbol* symbols = modDecl*.kind.payload.ModReexport.symbols;
+        u32 i = 0;
+        while (i < modDecl*.kind.payload.ModReexport.symbolsLen)
+        {
+            if ((symbols[i].flags & 2) != 0) return true;
+            if (symbols[i].name == member) return true;
+            if (symbols[i].alias != 0 && symbols[i].alias == member) return true;
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool isRootSegment(u8* ptr, u32 len)
+    {
+        if (len == 4 && ptr[0] == 102 && ptr[1] == 105 && ptr[2] == 108 && ptr[3] == 101) return true;
+        if (len == 3 && ptr[0] == 108 && ptr[1] == 105 && ptr[2] == 98) return true;
+        return false;
+    }
+
+    bool checkImportDecl(NodeId id, Decl* decl)
+    {
+        Str path = decl*.kind.payload.Import.path;
+        if (path == 0)
+        {
+            self.addError();
+            return false;
+        }
+        Decl* modDecl = null;
+        if ((decl*.kind.payload.Import.flags & 1) == 0)
+        {
+            InternEntry* entry = self.ctx.interns + path;
+            u32 firstLen = 0;
+            while (firstLen < entry*.len && entry*.ptr[firstLen] != 58) firstLen = firstLen + 1;
+            if (firstLen == 0)
+            {
+                self.addError();
+                return false;
+            }
+            if (!self.isRootSegment(entry*.ptr, firstLen))
+            {
+                Str first = self.ctx.intern(entry*.ptr, (usize)firstLen);
+                Symbol* symbol = self.scopes.lookup(first);
+                if (symbol == null)
+                {
+                    self.addError();
+                    return false;
+                }
+                if (symbol*.kind == 5 && symbol*.declaration.index != 0)
+                {
+                    Node* modNode = self.ctx.nodes + symbol*.declaration.index;
+                    if (modNode*.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* resolved = &modNode*.kind.payload.Decl.value;
+                        if (firstLen < entry*.len)
+                        {
+                            u32 memberStart = firstLen + 2;
+                            u32 memberLen = memberStart;
+                            while (memberLen < entry*.len && entry*.ptr[memberLen] != 58) memberLen = memberLen + 1;
+                            if (memberLen <= memberStart)
+                            {
+                                self.addError();
+                                return false;
+                            }
+                            Str member = self.ctx.intern(entry*.ptr + memberStart, (usize)(memberLen - memberStart));
+                            if (!self.moduleExportsContain(resolved, member))
+                            {
+                                self.addError();
+                                return false;
+                            }
+                        }
+                        else modDecl = resolved;
+                    }
+                }
+            }
+        }
+        if (modDecl != null)
+        {
+            u32 i = 0;
+            while (i < decl*.kind.payload.Import.symbolsLen)
+            {
+                ImportSymbol* symbol = decl*.kind.payload.Import.symbols + i;
+                if ((symbol*.flags & 2) == 0 && symbol*.name != 0)
+                {
+                    if (!self.moduleExportsContain(modDecl, symbol*.name))
+                    {
+                        self.addError();
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        u32 i = 0;
+        while (i < decl*.kind.payload.Import.symbolsLen)
+        {
+            ImportSymbol* symbol = decl*.kind.payload.Import.symbols + i;
+            if ((symbol*.flags & 2) == 0)
+            {
+                Str local = symbol*.name;
+                if (symbol*.alias != 0) local = symbol*.alias;
+                if (local != 0) self.scopes.declare(local, 2, 0, id, 0);
+            }
+            i = i + 1;
+        }
         return true;
     }
 

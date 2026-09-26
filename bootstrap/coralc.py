@@ -500,41 +500,44 @@ def main(argv=None):
     except OSError as exc:
         _abort(str(exc))
 
-    gen = CodeGen()
-    gen.flags = flags
-    gen.collect_global_methods(all_asts.values())
-    for path in ordered:
-        ast = all_asts[path]
-        for d in ast.decls:
-            if isinstance(d, StructDecl):
-                gen.struct_names.add(d.name)
-            elif isinstance(d, EnumDecl):
-                gen.enum_names.add(d.name)
-            elif isinstance(d, ExtendBlock):
-                tn = gen.gen_type(d.type_node)
-                gen.struct_names.add(tn)
-            elif isinstance(d, VariantDecl):
-                gen.struct_names.add(d.name)
-            elif isinstance(d, UnionDecl):
-                gen.struct_names.add(d.name)
+    try:
+        gen = CodeGen()
+        gen.flags = flags
+        gen.collect_global_methods(all_asts.values())
+        for path in ordered:
+            ast = all_asts[path]
+            for d in ast.decls:
+                if isinstance(d, StructDecl):
+                    gen.struct_names.add(d.name)
+                elif isinstance(d, EnumDecl):
+                    gen.enum_names.add(d.name)
+                elif isinstance(d, ExtendBlock):
+                    tn = gen.gen_type(d.type_node)
+                    gen.struct_names.add(tn)
+                elif isinstance(d, VariantDecl):
+                    gen.struct_names.add(d.name)
+                elif isinstance(d, UnionDecl):
+                    gen.struct_names.add(d.name)
 
-    all_c = []
-    first = True
-    for path in ordered:
-        ast = all_asts[path]
-        gen.set_current_file(path)
-        gen.suppress_main = not first
-        c_code = gen.generate(ast)
-        if first:
-            all_c.append(c_code)
-            first = False
-        else:
-            for line in c_code.split("\n"):
-                if line.startswith("#include"):
-                    continue
-                if line.startswith("typedef struct _coral_str"):
-                    continue
-                all_c.append(line)
+        all_c = []
+        first = True
+        for path in ordered:
+            ast = all_asts[path]
+            gen.set_current_file(path)
+            gen.suppress_main = not first
+            c_code = gen.generate(ast)
+            if first:
+                all_c.append(c_code)
+                first = False
+            else:
+                for line in c_code.split("\n"):
+                    if line.startswith("#include"):
+                        continue
+                    if line.startswith("typedef struct _coral_str"):
+                        continue
+                    all_c.append(line)
+    except SyntaxError as exc:
+        _abort(str(exc))
 
     c_path = output_path + ".c"
     try:

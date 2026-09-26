@@ -14,6 +14,9 @@ import decl_ast { Decl, DeclKind, GenericParam, Param };
 import scope { Symbol };
 import sema { Sema };
 
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr ptr);
+
 extend Sema
 {
     Ty allocType(TypeKind kind)
@@ -322,6 +325,143 @@ extend Sema
             i = i + 1;
         }
         return false;
+    }
+
+    Str structParamName(Ty objectType, u32 index)
+    {
+        if (objectType == 0) return 0;
+        TypeEntry* obj = self.ctx.types + objectType;
+        if (obj*.kind.tag != TypeKind::Named) return 0;
+        Symbol* symbol = self.scopes.lookup(obj*.kind.payload.Named.name);
+        if (symbol == null) return 0;
+        Node* declNode = self.ctx.nodes + symbol*.declaration.index;
+        if (declNode*.kind.tag != NodeKind::Decl) return 0;
+        Decl* decl = &declNode*.kind.payload.Decl.value;
+        NodeId* generics = null;
+        u32 count = 0;
+        if (decl*.kind.tag == DeclKind::Struct)
+        {
+            generics = decl*.kind.payload.Struct.genericParams;
+            count = decl*.kind.payload.Struct.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Variant)
+        {
+            generics = decl*.kind.payload.Variant.genericParams;
+            count = decl*.kind.payload.Variant.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Union)
+        {
+            generics = decl*.kind.payload.Union.genericParams;
+            count = decl*.kind.payload.Union.genericParamsLen;
+        }
+        else if (decl*.kind.tag == DeclKind::Trait)
+        {
+            generics = decl*.kind.payload.Trait.genericParams;
+            count = decl*.kind.payload.Trait.genericParamsLen;
+        }
+        if (generics == null || index >= count) return 0;
+        Node* genericNode = self.ctx.nodes + generics[index].index;
+        if (genericNode*.kind.tag != NodeKind::GenericParam) return 0;
+        return genericNode*.kind.payload.GenericParam.value.name;
+    }
+
+    Ty substituteFieldTy(Ty fieldType, Ty objectType)
+    {
+        if (fieldType == 0 || objectType == 0) return fieldType;
+        TypeEntry* obj = self.ctx.types + objectType;
+        while (obj != null)
+        {
+            if (obj*.kind.tag == TypeKind::Pointer) objectType = obj*.kind.payload.Pointer.base;
+            else if (obj*.kind.tag == TypeKind::Const) objectType = obj*.kind.payload.Const.base;
+            else if (obj*.kind.tag == TypeKind::Comptime) objectType = obj*.kind.payload.Comptime.base;
+            else break;
+            if (objectType == 0) return fieldType;
+            obj = self.ctx.types + objectType;
+        }
+        if (obj == null || obj*.kind.tag != TypeKind::Named) return fieldType;
+        u32 objArgsLen = obj*.kind.payload.Named.genericArgsLen;
+        Ty* objArgs = obj*.kind.payload.Named.genericArgs;
+        if (objArgsLen == 0) return fieldType;
+        TypeEntry* entry = self.ctx.types + fieldType;
+        switch (entry*.kind.tag)
+        {
+            TypeKind::TypeParam => {
+                u32 i = 0;
+                while (i < objArgsLen)
+                {
+                    if (self.structParamName(objectType, i) == entry*.kind.payload.TypeParam.name) return objArgs[i];
+                    i = i + 1;
+                }
+                return fieldType;
+            },
+            TypeKind::Named => {
+                if (entry*.kind.payload.Named.genericArgsLen == 0)
+                {
+                    Str name = entry*.kind.payload.Named.name;
+                    u32 i = 0;
+                    while (i < objArgsLen)
+                    {
+                        if (self.structParamName(objectType, i) == name) return objArgs[i];
+                        i = i + 1;
+                    }
+                    return fieldType;
+                }
+                u32 len = entry*.kind.payload.Named.genericArgsLen;
+                Ty* args = (Ty*)malloc((usize)len * sizeof(Ty));
+                if (args == null) return fieldType;
+                bool changed = false;
+                u32 i = 0;
+                while (i < len)
+                {
+                    args[i] = self.substituteFieldTy(entry*.kind.payload.Named.genericArgs[i], objectType);
+                    if (args[i] != entry*.kind.payload.Named.genericArgs[i]) changed = true;
+                    i = i + 1;
+                }
+                if (!changed)
+                {
+                    free((rawptr)args);
+                    return fieldType;
+                }
+                if (!self.ctx.track((rawptr)args))
+                {
+                    free((rawptr)args);
+                    return fieldType;
+                }
+                TypeKind kind = TypeKind::Named{ .name = entry*.kind.payload.Named.name, .genericArgs = args, .genericArgsLen = len };
+                return self.allocType(kind);
+            },
+            TypeKind::Pointer => {
+                Ty base = self.substituteFieldTy(entry*.kind.payload.Pointer.base, objectType);
+                if (base == entry*.kind.payload.Pointer.base) return fieldType;
+                TypeKind kind = TypeKind::Pointer{ .base = base };
+                return self.allocType(kind);
+            },
+            TypeKind::Const => {
+                Ty base = self.substituteFieldTy(entry*.kind.payload.Const.base, objectType);
+                if (base == entry*.kind.payload.Const.base) return fieldType;
+                TypeKind kind = TypeKind::Const{ .base = base };
+                return self.allocType(kind);
+            },
+            TypeKind::Comptime => {
+                Ty base = self.substituteFieldTy(entry*.kind.payload.Comptime.base, objectType);
+                if (base == entry*.kind.payload.Comptime.base) return fieldType;
+                TypeKind kind = TypeKind::Comptime{ .base = base };
+                return self.allocType(kind);
+            },
+            TypeKind::Slice => {
+                Ty base = self.substituteFieldTy(entry*.kind.payload.Slice.base, objectType);
+                if (base == entry*.kind.payload.Slice.base) return fieldType;
+                TypeKind kind = TypeKind::Slice{ .base = base };
+                return self.allocType(kind);
+            },
+            TypeKind::Array => {
+                Ty base = self.substituteFieldTy(entry*.kind.payload.Array.base, objectType);
+                if (base == entry*.kind.payload.Array.base) return fieldType;
+                TypeKind kind = TypeKind::Array{ .base = base, .len = entry*.kind.payload.Array.len };
+                return self.allocType(kind);
+            },
+            else => { return fieldType; }
+        }
     }
 
     bool compatible(Ty from, Ty to)
