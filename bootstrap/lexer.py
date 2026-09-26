@@ -105,7 +105,6 @@ class TokenKind:
     Shl = "Shl"
     Shr = "Shr"
     Arrow = "Arrow"
-    StarDot = "StarDot"
     Ellipsis = "Ellipsis"
     LParen = "LParen"
     RParen = "RParen"
@@ -486,9 +485,6 @@ class Lexer:
             if c == ":" and nxt == ":":
                 self.advance()
                 return self.make_token(TokenKind.ColonColon, start)
-            if c == "*" and nxt == ".":
-                self.advance()
-                return self.make_token(TokenKind.StarDot, start)
             if c == "[" and nxt == "[":
                 self.advance()
                 return self.make_token(TokenKind.AttrOpen, start)

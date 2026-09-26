@@ -188,7 +188,7 @@ class ColonColonExpr(Node):
         self.right = right
 
 
-class StarDotExpr(Node):
+class ArrowExpr(Node):
     def __init__(self, obj, field):
         self.obj = obj
         self.field = field
@@ -757,14 +757,14 @@ class Parser:
                     left = DotExpr(left, Ident(field.value))
                 else:
                     raise SyntaxError(f"expected field name or index after '.', got {self.peek().kind}")
-            elif self.peek().kind == TokenKind.StarDot:
+            elif self.peek().kind == TokenKind.Arrow:
                 self.advance()
                 if self.peek().kind == TokenKind.Dec:
                     field_tok = self.advance()
-                    left = StarDotExpr(left, IntLit(field_tok.value, "dec"))
+                    left = ArrowExpr(left, IntLit(field_tok.value, "dec"))
                 else:
                     field = self.expect(TokenKind.Ident)
-                    left = StarDotExpr(left, Ident(field.value))
+                    left = ArrowExpr(left, Ident(field.value))
             elif self.peek().kind == TokenKind.ColonColon:
                 self.advance()
                 right_name = self.expect_name()

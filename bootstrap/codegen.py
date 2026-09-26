@@ -373,7 +373,7 @@ class CodeGen:
                 for fn, fv in zip(node.field_names, node.field_values)
             )
             return f"({tname}){{{fields}}}"
-        if isinstance(node, StarDotExpr):
+        if isinstance(node, ArrowExpr):
             return f"{self.gen_expr(node.obj)}->{self.gen_expr(node.field)}"
         if isinstance(node, IndexExpr):
             return f"{self.gen_expr(node.obj)}[{self.gen_expr(node.index)}]"
