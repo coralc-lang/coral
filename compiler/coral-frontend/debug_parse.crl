@@ -1,67 +1,29 @@
-mod token = import "../coral-common/token";
-import token { TokenKind };
-mod lexer_mod = import "../coral-lexer/lexer";
-import lexer_mod { Lexer };
-mod table = import "../coral-lexer/table";
-import table { IdentifierTable, IdentEntry };
-mod context = import "../coral-context/context";
-import context { AstContext };
-mod diagnostics = import "../coral-diagnostics/engine";
-import diagnostics { DiagnosticEngine };
-mod parser_lib = import "../coral-parser/lib";
-import parser_lib { Parser };
+/* coral-frontend/debug_parse.crl — temporary parse/analyze harness (delete when done) */
 
-extern("C") rawptr malloc(usize size);
-extern("C") void free(rawptr ptr);
+mod analyze_module = import "analyze";
+import analyze_module { AnalyzeResult, analyze };
+
 extern("C") i32 printf(u8* fmt, ...);
 
-usize sourceLen(u8* s)
+usize sourceLen(u8* src)
 {
-    usize len = 0;
-    while (s[len] != 0) len = len + 1;
-    return len;
+    usize n = 0;
+    while (src[n] != 0) n = n + 1;
+    return n;
 }
 
-u32 tryParse(u8* label, u8* src)
+void tryAnalyze(u8* label, u8* src)
 {
-    usize len = sourceLen(src);
-    AstContext ctx;
-    ctx.init(4096, 4096, 4096);
-    IdentEntry* entries = (IdentEntry*)malloc(256 * sizeof(IdentEntry));
-    IdentifierTable idents;
-    idents.init(entries, 256);
-    idents.addKeywords();
-    DiagnosticEngine diag;
-    diag.init(src, src + len);
-    Lexer lexer;
-    lexer.bufStart = src;
-    lexer.cur = src;
-    lexer.bufEnd = src + len;
-    lexer.line = 1;
-    lexer.lineStart = src;
-    lexer.diag = &diag;
-    lexer.idents = &idents;
-    Parser p;
-    p.lexer = &lexer;
-    p.ctx = &ctx;
-    p.panicMode = 0;
-    p.pendingGreater = false;
-    p.current = lexer.nextToken();
-    p.previous = p.current;
-    p.parseFile(ctx.intern("debug", 5));
-    u32 errors = p.errorCount();
-    printf("[%s] errors=%u nodes=%u\n", label, errors, ctx.nodeCount());
-    ctx.deinit();
-    free(entries);
-    return errors;
+    AnalyzeResult r = analyze(src, sourceLen(src));
+    printf("[%s] parse=%d semantic=%d mono=%d\n", label, r.parseErrors, r.semanticErrors, r.monoErrors);
 }
 
 pub i32 main()
 {
-    tryParse("empty", ";");
-    tryParse("const", "const u32 x = 1;");
-    tryParse("func-noparams", "u32 f() { return 1; }");
-    tryParse("func-param", "u32 f(u32 value) { return value; }");
-    tryParse("block", "u32 f() { u32 x = 1; return x; }");
+    tryAnalyze("extend-scope", "pub struct Box<T> { T value; } pub extend Box<T> { Box<T> make(T a) { return Box<T>{ .value = a }; } }");
+    tryAnalyze("toplevel-undeclared-T", "pub struct Box<T> { T value; } Box<T> make(T a) { return Box<T>{ .value = a }; }");
+    tryAnalyze("explicit-generic", "pub struct Box<T> { T value; } Box<T> make<T>(T a) { return Box<T>{ .value = a }; }");
+    tryAnalyze("nongeneric-alias-T", "pub struct Box<T> { T value; } typedef T = i32; Box<T> make(T a) { return Box<T>{ .value = a }; }");
+    tryAnalyze("nongeneric-i32", "pub struct Box<T> { T value; } Box<i32> fill() { return Box<i32>{ .value = 1 }; }");
     return 0;
 }

@@ -583,7 +583,7 @@ class Parser:
                                  TokenKind.PipeEqual, TokenKind.CaretEqual,
                                  TokenKind.AmpEqual, TokenKind.NegEqual):
             op = self.advance()
-            right = self.parse_or()
+            right = self.parse_expr()
             op_map = {
                 TokenKind.Equal: "=", TokenKind.PlusEqual: "+=",
                 TokenKind.MinusEqual: "-=", TokenKind.StarEqual: "*=",

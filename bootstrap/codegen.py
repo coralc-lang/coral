@@ -229,7 +229,10 @@ class CodeGen:
 
     def gen_expr(self, node):
         if isinstance(node, IntLit):
-            return str(node.value)
+            value = int(node.value)
+            if value > 9223372036854775807:
+                return f"{value}ULL"
+            return str(value)
         if isinstance(node, FloatLit):
             return node.value
         if isinstance(node, StringLit):
@@ -305,8 +308,6 @@ class CodeGen:
         if isinstance(node, DotExpr):
             obj_str = self.gen_expr(node.obj)
             field_str = self.gen_expr(node.field)
-            if obj_str in ("diag", "lbl"):
-                return f"{obj_str}->{field_str}"
             if isinstance(node.obj, Ident) and node.obj.name == "self":
                 return f"self->{field_str}"
             if isinstance(node.obj, Ident) and node.obj.name in self.local_types and self.local_types[node.obj.name].strip().endswith('*'):
