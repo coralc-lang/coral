@@ -1,5 +1,5 @@
 mod Arena = import "arena" { Arena };
-mod Token = import "token" { Token };
+mod Token = import "token" { Token, TokenKind };
 mod Slice = import "../coral-common/slice" { Slice };
 // IDENT      = /[A-Za-z_][A-Za-z0-9_-]*/
 // STRING     = '"' { [^"\\] | "\\" . } '"'
@@ -21,7 +21,7 @@ pub struct Lexer
     Arena* arena;
     bool hadError;
 
-    void lexer_init(Slice s, Arena* arena) {
+    void init(Slice s, Arena* arena) {
         self.src = s.ptr;
         self.len = s.len;
         self.pos = 0;
@@ -50,29 +50,29 @@ pub struct Lexer
         }
     }
 
-    bool is_ident_start(u8 c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
-    static bool isIdentCont(u8 c) { return is_ident_start(c) || (c >= '0' && c <= '9') || c == '-'; }
-    static bool is_digit(u8 c) { return c >= '0' && c <= '9'; }
+    bool isIdentStart(u8 c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
+    bool isIdentCont(u8 c) { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-'; }
+    bool isDigit(u8 c) { return c >= '0' && c <= '9'; }
     
-    Token lexer_next()
+    Token next()
     {
         self.skipWsAndComments();
     
         Token t;
-        t.kind = EOF;
+        t.kind = TokenKind::EOF;
         t.text.ptr = 0; t.text.len = 0;
         t.line = self.line; t.col = self.col;
         t.numValue = 0; t.boolValue = false;
     
         if (self.pos >= self.len) { t.kind = EOF; return t; }
         u8 c = self.peekc();
-        if (c == '{') { self.advc(); t.kind = LBRACE; return t; }
-        if (c == '}') { self.advc(); t.kind = RBRACE; return t; }
-        if (c == '[') { self.advc(); t.kind = LBRACKET; return t; }
-        if (c == ']') { self.advc(); t.kind = RBRACKET; return t; }
-        if (c == '=') { self.advc(); t.kind = EQUALS; return t; }
-        if (c == ';') { self.advc(); t.kind = SEMI; return t; }
-        if (c == ',') { self.advc(); t.kind = COMMA; return t; }
+        if (c == '{') { self.advc(); t.kind = TokenKind::LBRACE; return t; }
+        if (c == '}') { self.advc(); t.kind = TokenKind::RBRACE; return t; }
+        if (c == '[') { self.advc(); t.kind = TokenKind::LBRACKET; return t; }
+        if (c == ']') { self.advc(); t.kind = TokenKind::RBRACKET; return t; }
+        if (c == '=') { self.advc(); t.kind = TokenKind::EQUALS; return t; }
+        if (c == ';') { self.advc(); t.kind = TokenKind::SEMI; return t; }
+        if (c == ',') { self.advc(); t.kind = TokenKind::COMMA; return t; }
     
         if (c == '"')
         {
@@ -82,12 +82,12 @@ pub struct Lexer
             usize outLen = 0;
             loop {
                 u8 cc = self.peekc();
-                if (cc == 0) { self.hadError = true; t.kind = ERROR; return t; }
+                if (cc == 0) { self.hadError = true; t.kind = TokenKind::ERROR; return t; }
                 if (cc == '"') { self.advc(); break; }
                 if (cc == '\\') {
                     self.advc();
                     u8 esc = self.peekc();
-                    if (esc == 0) { self.hadError = true; t.kind = ERROR; return t; }
+                    if (esc == 0) { self.hadError = true; t.kind = TokenKind::ERROR; return t; }
                     self.advc();
                     switch (esc) {
                         'n' => { buf[outLen] = '\n'; },
@@ -101,21 +101,21 @@ pub struct Lexer
                     continue;
                 }
                 buf[outLen] = cc;
-                outLen = outLen + 1;
+   TokenKind::             outLen = outLen + 1;
                 selfadvc();
             }
             buf[outLen] = 0;
-            t.kind = STRING;
-            t.text = str_make(buf, outLen);
+            t.kind = TokenKind::STRING;
+            t.text = Slice::from(buf, outLen);
             return t;
         }
     
-        if (is_digit(c))
+        if (isDigit(c))
         {
             usize start = self.pos;
-            while (is_digit(self.peekc())) self.advc();
+            while (isDigit(self.peekc())) self.advc();
             usize l = self.pos - start;
-            t.kind = NUMBER;
+            t.kind = TokenKind::NUMBER;
             t.text = Slice::from(self.src + start, l);
             usize v = 0;
             for (usize i = 0; i < l; i = i + 1) v = v * 10 + (self.src[start + i] - '0');
@@ -123,13 +123,13 @@ pub struct Lexer
             return t;
         }
     
-        if (is_ident_start(c))
+        if (isIdentStart(c))
         {
             usize start = self.pos;
             while (isIdentCont(self.peekc())) self.advc();
             usize l = self.pos - start;
             Slice txt = Slice::from(self.src + start, l);
-            if (txt.eq("true"))  { t.kind = BOOL; t.boolValue = true;  t.text = txt; return t; }
+            if (txt.eq("true"))  { t.kind = TokenKind::BOOL; t.boolValue = true;  t.text = txt; return t; }
             if (txt.eq("false")) { t.kind = BOOL; t.boolValue = false; t.text = txt; return t; }
             t.kind = IDENT;
             t.text = txt;
@@ -139,8 +139,8 @@ pub struct Lexer
         // Unknown u8acter.
         self.advc();
         self.hadError = true;
-        t.kind = ERROR;
-        t.text = str_make(self.src + (self.pos - 1), 1);
+        t.kind = TokenKind::ERROR;
+        t.text = Slice::from(self.src + (self.pos - 1), 1);
         return t;
     }
 }
