@@ -1,12 +1,18 @@
 mod id = import "../coral-ast/id";
 mod types = import "../coral-ast/types";
+mod node_ast = import "../coral-ast/node";
 mod context = import "../coral-context/context";
 mod scope = import "scope";
+mod diag_engine = import "../coral-diagnostics/engine";
+mod diag_code = import "../coral-diagnostics/code";
 
-import id { Str, NodeId };
+import id { Str, NodeId, SourceLoc };
 import types { Ty };
+import node_ast { Node, NodeKind };
 import context { AstContext };
 import scope { ScopeStack };
+import diag_engine { DiagnosticEngine };
+import diag_code { ErrorCode };
 
 extern("C") rawptr calloc(usize count, usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
@@ -21,11 +27,12 @@ pub struct Sema
     NodeId* extends;
     u32 extendsLen;
     u32 extendsCap;
+    DiagnosticEngine* diag;
 }
 
 extend Sema
 {
-    void init(AstContext* ctx)
+    void init(AstContext* ctx, DiagnosticEngine* diag)
     {
         self.ctx = ctx;
         self.scopes = (ScopeStack*)calloc(1, sizeof(ScopeStack));
@@ -35,6 +42,7 @@ extend Sema
         self.extends = null;
         self.extendsLen = 0;
         self.extendsCap = 0;
+        self.diag = diag;
     }
 
     void deinit()
@@ -52,6 +60,7 @@ extend Sema
         self.extends = null;
         self.extendsLen = 0;
         self.extendsCap = 0;
+        self.diag = null;
     }
 
     void addExtend(NodeId id)
@@ -73,5 +82,50 @@ extend Sema
     {
         if (self.scopes != null) self.scopes.errors = self.scopes.errors + 1;
         self.errors = self.errors + 1;
+    }
+
+    u8* locPtr(SourceLoc loc)
+    {
+        if (self.diag == null) return null;
+        u8* buf = self.diag.bufStart;
+        u8* end = self.diag.bufEnd;
+        if (buf == null) return null;
+        u32 line = loc.data >> 16;
+        u32 col = loc.data & 0xffff;
+        if (line == 0) return buf;
+        u32 curLine = 1;
+        u8* p = buf;
+        while (p < end && curLine < line)
+        {
+            if (p[0] == 10) curLine = curLine + 1;
+            p = p + 1;
+        }
+        if (col == 0) col = 1;
+        u32 c = 1;
+        while (p < end && c < col && p[0] != 10 && p[0] != 13)
+        {
+            p = p + 1;
+            c = c + 1;
+        }
+        return p;
+    }
+
+    void semaError(ErrorCode code, SourceLoc loc, u8* msg)
+    {
+        self.addError();
+        if (self.diag == null) return;
+        self.diag.emitError(code, self.locPtr(loc), msg);
+    }
+
+    void semaErrorNode(ErrorCode code, NodeId id, u8* msg)
+    {
+        SourceLoc loc;
+        loc.data = 0;
+        if (id.index != 0)
+        {
+            Node* node = self.ctx.nodes + id.index;
+            loc = node->loc;
+        }
+        self.semaError(code, loc, msg);
     }
 }

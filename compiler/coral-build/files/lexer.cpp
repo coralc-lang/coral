@@ -1,132 +1,140 @@
 #include "lexer.h"
 
-static char peekc(Lexer* lx) {
-    if (lx->pos >= lx->len) return 0;
-    return lx->src[lx->pos];
+static bool isIdentStart(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+static bool isIdentCont(char c) {
+    return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-';
+}
+static bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+void Lexer::init(char* src, i64 len) {
+    self->src = src;
+    self->len = len;
+    self->pos = 0;
+    self->line = 1;
+    self->col = 1;
+    self->hadError = false;
 }
 
-static char advc(Lexer* lx) {
-    char c = lx->src[lx->pos];
-    lx->pos = lx->pos + 1;
-    if (c == '\n') { lx->line = lx->line + 1; lx->col = 1; }
-    else { lx->col = lx->col + 1; }
+char Lexer::peek() const {
+    if (self->pos >= self->len) return 0;
+    return self->src[self->pos];
+}
+
+char Lexer::advance() {
+    char c = self->src[self->pos];
+    self->pos = self->pos + 1;
+    if (c == '\n') { self->line = self->line + 1; self->col = 1; }
+    else { self->col = self->col + 1; }
     return c;
 }
 
-static void skip_ws_and_comments(Lexer* lx) {
+void Lexer::skipWsAndComments() {
     for (;;) {
-        char c = peekc(lx);
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { advc(lx); continue; }
+        char c = self->peek();
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { self->advance(); continue; }
         if (c == '#') {
-            while (peekc(lx) != 0 && peekc(lx) != '\n') advc(lx);
+            while (self->peek() != 0 && self->peek() != '\n') self->advance();
             continue;
         }
         break;
     }
 }
 
-static bool is_ident_start(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
-}
-static bool is_ident_cont(char c) {
-    return is_ident_start(c) || (c >= '0' && c <= '9') || c == '-';
-}
-static bool is_digit(char c) { return c >= '0' && c <= '9'; }
-
-void lexer_init(Lexer* lx, const char* src, long len, Arena* arena) {
-    lx->src = src;
-    lx->len = len;
-    lx->pos = 0;
-    lx->line = 1;
-    lx->col = 1;
-    lx->arena = arena;
-    lx->hadError = false;
-}
-
-Token lexer_next(Lexer* lx) {
-    skip_ws_and_comments(lx);
+Token Lexer::next() {
+    self->skipWsAndComments();
 
     Token t;
     t.kind = TK_EOF;
     t.text.ptr = 0; t.text.len = 0;
-    t.line = lx->line; t.col = lx->col;
+    t.line = self->line; t.col = self->col;
     t.numValue = 0; t.boolValue = false;
 
-    if (lx->pos >= lx->len) { t.kind = TK_EOF; return t; }
+    if (self->pos >= self->len) { t.kind = TK_EOF; return t; }
 
-    char c = peekc(lx);
+    char c = self->peek();
 
-    if (c == '{') { advc(lx); t.kind = TK_LBRACE; return t; }
-    if (c == '}') { advc(lx); t.kind = TK_RBRACE; return t; }
-    if (c == '[') { advc(lx); t.kind = TK_LBRACKET; return t; }
-    if (c == ']') { advc(lx); t.kind = TK_RBRACKET; return t; }
-    if (c == '=') { advc(lx); t.kind = TK_EQUALS; return t; }
-    if (c == ';') { advc(lx); t.kind = TK_SEMI; return t; }
-    if (c == ',') { advc(lx); t.kind = TK_COMMA; return t; }
+    if (c == '{') { self->advance(); t.kind = TK_LBRACE;   return t; }
+    if (c == '}') { self->advance(); t.kind = TK_RBRACE;   return t; }
+    if (c == '[') { self->advance(); t.kind = TK_LBRACKET; return t; }
+    if (c == ']') { self->advance(); t.kind = TK_RBRACKET; return t; }
+    if (c == '=') { self->advance(); t.kind = TK_EQUALS;   return t; }
+    if (c == ';') { self->advance(); t.kind = TK_SEMI;     return t; }
+    if (c == ',') { self->advance(); t.kind = TK_COMMA;    return t; }
 
     if (c == '"') {
-        advc(lx); // consume opening quote
-        long remaining = lx->len - lx->pos;
-        char* buf = (char*)arena_alloc(lx->arena, remaining + 1, 1);
-        long outLen = 0;
+        self->advance(); // opening quote
+        i64 start = self->pos;
+        i64 writePos = start; // trails `pos` only once an escape is seen
+
         for (;;) {
-            char cc = peekc(lx);
-            if (cc == 0) { lx->hadError = true; t.kind = TK_ERROR; return t; }
-            if (cc == '"') { advc(lx); break; }
+            char cc = self->peek();
+            if (cc == 0) { self->hadError = true; t.kind = TK_ERROR; return t; }
+            if (cc == '"') { self->advance(); break; }
+
             if (cc == '\\') {
-                advc(lx);
-                char esc = peekc(lx);
-                if (esc == 0) { lx->hadError = true; t.kind = TK_ERROR; return t; }
-                advc(lx);
+                self->advance(); // the backslash
+                char esc = self->peek();
+                if (esc == 0) { self->hadError = true; t.kind = TK_ERROR; return t; }
+                self->advance(); // the escaped character
+
+                char decoded;
                 switch (esc) {
-                    case 'n': buf[outLen] = '\n'; break;
-                    case 't': buf[outLen] = '\t'; break;
-                    case 'r': buf[outLen] = '\r'; break;
-                    case '"': buf[outLen] = '"'; break;
-                    case '\\': buf[outLen] = '\\'; break;
-                    default: buf[outLen] = esc; break;
+                    case 'n':  decoded = '\n'; break;
+                    case 't':  decoded = '\t'; break;
+                    case 'r':  decoded = '\r'; break;
+                    case '"':  decoded = '"';  break;
+                    case '\\': decoded = '\\'; break;
+                    default:   decoded = esc;  break;
                 }
-                outLen = outLen + 1;
+                self->src[writePos] = decoded;
+                writePos = writePos + 1;
                 continue;
             }
-            buf[outLen] = cc;
-            outLen = outLen + 1;
-            advc(lx);
+
+            // Ordinary character. While writePos == pos (no escape seen
+            // yet) this is a self-assignment of one byte -- effectively
+            // free, and definitely not a heap allocation.
+            self->src[writePos] = cc;
+            writePos = writePos + 1;
+            self->advance();
         }
-        buf[outLen] = 0;
+
+        i64 outLen = writePos - start;
         t.kind = TK_STRING;
-        t.text = str_make(buf, outLen);
+        t.text = Str::make(self->src + start, outLen);
         return t;
     }
 
-    if (is_digit(c)) {
-        long start = lx->pos;
-        while (is_digit(peekc(lx))) advc(lx);
-        long l = lx->pos - start;
+    if (isDigit(c)) {
+        i64 start = self->pos;
+        while (isDigit(self->peek())) self->advance();
+        i64 l = self->pos - start;
         t.kind = TK_NUMBER;
-        t.text = str_make(lx->src + start, l);
-        long long v = 0;
-        for (long i = 0; i < l; i = i + 1) v = v * 10 + (lx->src[start + i] - '0');
+        t.text = Str::make(self->src + start, l);
+        i64 v = 0;
+        for (i64 i = 0; i < l; i = i + 1) v = v * 10 + (self->src[start + i] - '0');
         t.numValue = v;
         return t;
     }
 
-    if (is_ident_start(c)) {
-        long start = lx->pos;
-        while (is_ident_cont(peekc(lx))) advc(lx);
-        long l = lx->pos - start;
-        Str txt = str_make(lx->src + start, l);
-        if (str_eq_cstr(txt, "true"))  { t.kind = TK_BOOL; t.boolValue = true;  t.text = txt; return t; }
-        if (str_eq_cstr(txt, "false")) { t.kind = TK_BOOL; t.boolValue = false; t.text = txt; return t; }
+    if (isIdentStart(c)) {
+        i64 start = self->pos;
+        while (isIdentCont(self->peek())) self->advance();
+        i64 l = self->pos - start;
+        Str txt = Str::make(self->src + start, l);
+        if (txt.equalsCstr("true"))  { t.kind = TK_BOOL; t.boolValue = true;  t.text = txt; return t; }
+        if (txt.equalsCstr("false")) { t.kind = TK_BOOL; t.boolValue = false; t.text = txt; return t; }
         t.kind = TK_IDENT;
         t.text = txt;
         return t;
     }
 
     // Unknown character.
-    advc(lx);
-    lx->hadError = true;
+    self->advance();
+    self->hadError = true;
     t.kind = TK_ERROR;
-    t.text = str_make(lx->src + (lx->pos - 1), 1);
+    t.text = Str::make(self->src + (self->pos - 1), 1);
     return t;
 }

@@ -3,103 +3,111 @@
 #include <cstdlib>
 #include <cstring>
 
-static void print_indent(int n) {
-    for (int i = 0; i < n; i = i + 1) fputs("  ", stdout);
+struct AstDumper {
+    void indent(i32 depth);
+    void dumpValue(Value v);
+    void dumpNode(Node* n, i32 depth);
+};
+
+void AstDumper::indent(i32 depth) {
+    for (i32 i = 0; i < depth; i = i + 1) fputs("  ", stdout);
 }
 
-static void print_value(Value v) {
+void AstDumper::dumpValue(Value v) {
     switch (v.kind) {
         case VK_STRING:
-            putchar('"'); str_print(v.str); putchar('"');
+            putchar('"'); v.str.print(); putchar('"');
             break;
         case VK_NUMBER:
-            printf("%lld", v.num);
+            printf("%lld", (long long)v.num);
             break;
         case VK_BOOL:
             fputs(v.boolean ? "true" : "false", stdout);
             break;
         case VK_LIST:
             putchar('[');
-            for (long i = 0; i < v.list->items.count; i = i + 1) {
+            for (i64 i = 0; i < v.list->count; i = i + 1) {
                 if (i != 0) fputs(", ", stdout);
-                print_value(v.list->items.data[i]);
+                self->dumpValue(v.list->at(i));
             }
             putchar(']');
             break;
     }
 }
 
-static void dump_node(Node* n, int depth) {
-    print_indent(depth);
-    fputs(node_kind_name(n->kind), stdout);
+void AstDumper::dumpNode(Node* n, i32 depth) {
+    self->indent(depth);
+    fputs(nodeKindName(n->kind), stdout);
     if (n->hasLabel) {
-        // alias's label is an IDENT (e.g. `alias lexer = ...`), everything
+        // alias's label is an IDENT (e.g. `alias lexer = ...`); everything
         // else that has a label (build, override, task, target, ...) got
-        // it from a quoted STRING -- print each the way it was written.
-        if (n->kind == NK_ALIAS) { putchar(' '); str_print(n->label); }
-        else { fputs(" \"", stdout); str_print(n->label); fputs("\"", stdout); }
+        // it from a quoted STRING. Print each the way it was written.
+        if (n->kind == NK_ALIAS) { putchar(' '); n->label.print(); }
+        else { fputs(" \"", stdout); n->label.print(); fputs("\"", stdout); }
     }
-    if (n->hasExtends) { fputs(" extends \"", stdout); str_print(n->extendsTarget); fputs("\"", stdout); }
-    if (n->hasPayload) { fputs(" = \"", stdout); str_print(n->payload); fputs("\"", stdout); }
+    if (n->hasExtends) { fputs(" extends \"", stdout); n->extendsTarget.print(); fputs("\"", stdout); }
+    if (n->hasPayload)  { fputs(" = \"", stdout); n->payload.print(); fputs("\"", stdout); }
     putchar('\n');
 
-    for (long i = 0; i < n->fields.count; i = i + 1) {
-        print_indent(depth + 1);
-        str_print(n->fields.data[i].name);
+    for (i64 i = 0; i < n->fields.count; i = i + 1) {
+        self->indent(depth + 1);
+        n->fields.at(i).name.print();
         fputs(" = ", stdout);
-        print_value(n->fields.data[i].value);
+        self->dumpValue(n->fields.at(i).value);
         putchar('\n');
     }
-    for (long i = 0; i < n->children.count; i = i + 1) {
-        dump_node(n->children.data[i], depth + 1);
+    for (i64 i = 0; i < n->children.count; i = i + 1) {
+        self->dumpNode(n->children.at(i), depth + 1);
     }
 }
 
 int main(int argc, char** argv) {
-    const char* buf;
-    long len;
     char* fileBuf = 0;
+    char* buf;
+    i64 len;
 
     if (argc > 1) {
         FILE* f = fopen(argv[1], "rb");
         if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
         fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
+        i64 sz = ftell(f);
         fseek(f, 0, SEEK_SET);
-        fileBuf = (char*)malloc((unsigned long)sz + 1);
-        long rd = (long)fread(fileBuf, 1, (unsigned long)sz, f);
+        fileBuf = (char*)malloc((u64)sz + 1);
+        i64 rd = (i64)fread(fileBuf, 1, (u64)sz, f);
         fileBuf[rd] = 0;
         fclose(f);
         buf = fileBuf;
         len = rd;
     } else {
-        static const char* embedded =
+        static char embedded[] =
             "schema = 1;\n"
             "build \"demo\" {\n"
             "    root = \"src/\";\n"
             "    modules = [\"a\", \"b\"];\n"
             "}\n";
         buf = embedded;
-        len = (long)strlen(embedded);
+        len = (i64)strlen(embedded);
     }
 
     Arena arena;
-    arena_init(&arena, 1 << 16);
+    arena.init(1 << 16);
 
     Parser p;
-    parser_init(&p, buf, len, &arena);
-    Node* root = parse_file(&p);
+    p.init(buf, len, &arena);
+    Node* root = p.parseFile();
 
     int rc = 0;
     if (p.hadError) {
-        fprintf(stderr, "parse error at line %ld, col %ld: %s\n", p.errLine, p.errCol, p.errMsg);
+        fprintf(stderr, "parse error at line %lld, col %lld: %s\n",
+                (long long)p.errLine, (long long)p.errCol, p.errMsg);
         rc = 1;
     } else {
-        printf("parsed ok: %ld top-level declaration(s)\n\n", root->children.count);
-        dump_node(root, 0);
+        printf("parsed ok: %lld top-level declaration(s)\n\n", (long long)root->children.count);
+        AstDumper dumper;
+        dumper.dumpNode(root, 0);
     }
 
     if (fileBuf) free(fileBuf);
-    arena_free_all(&arena);
+    arena.freeAll();
     return rc;
 }

@@ -1,92 +1,102 @@
 #pragma once
+#include "types.h"
 #include "str.h"
 #include "dynarray.h"
 
-// value = STRING | NUMBER | BOOL | list ;  list = "[" [value {"," value} [","]] "]" ;
 enum ValueKind { VK_STRING, VK_NUMBER, VK_BOOL, VK_LIST };
 
-struct Value;
+struct ValueArray; // defined below, after Value -- forward-declared here so
+                    // Value's union can hold a pointer to one.
 
-struct ValueList {
-    DynArray<Value> items;
-};
-
-// A tagged union of the four value shapes the grammar allows. We keep this
-// as plain fields (a "poor man's union") rather than a real C++ union
-// because Value contains a DynArray<Value>* which is fine in a union too,
-// but keeping everything as plain fields makes the AST dump code simpler
-// and costs only a few bytes.
+// value = STRING | NUMBER | BOOL | list ;
+// A real union this time: Str, i64 and bool are all trivial, and
+// ValueArray* is just a pointer, so the union is itself trivially
+// copyable -- no special-member-function gymnastics needed.
 struct Value {
     ValueKind kind;
-    Str str;          // VK_STRING
-    long long num;     // VK_NUMBER
-    bool boolean;      // VK_BOOL
-    ValueList* list;   // VK_LIST
+    union {
+        Str str;
+        i64 num;
+        bool boolean;
+        ValueArray* list;
+    };
+
+    static Value ofString(Str s);
+    static Value ofNumber(i64 n);
+    static Value ofBool(bool b);
+    static Value ofList(ValueArray* l);
 };
 
+DEFINE_ARRAY(ValueArray, Value);
+
 // field = IDENT "=" value ";"
-// Every "IDENT = value ;" construct in the grammar (plain fields, modules/
-// skip lists, provides/requires/exclude/include/features lists, feature_decl
+// Every "IDENT = value ;" shape in the grammar (plain fields, modules/skip
+// lists, provides/requires/exclude/include/features lists, feature_decl
 // entries, env pairs, doc fields, dep_field entries, ...) is represented
-// uniformly as a Field. This is deliberate: the spec itself says the parser
-// accepts more than is semantically valid and leaves validation to "the
-// builder" (see e.g. the notes on `phase` requiring `on`/`run`, and on
-// `deps`/`remote` being "parsed but not evaluated"). A generic Field covers
-// all of these without needing ~60 distinct struct types.
+// uniformly as a Field -- they're all structurally identical, and the
+// spec's own notes say the parser is meant to accept more than is
+// semantically valid and leave validation to "the builder".
 struct Field {
     Str name;
     Value value;
 };
 
-// One kind per distinct decl/block shape in the v2 grammar.
+DEFINE_ARRAY(FieldArray, Field);
+
 enum NodeKind {
-    NK_ROOT,       // the whole file
-    NK_SCHEMA,     // schema = NUMBER ;
-    NK_STRICT,     // strict = BOOL ;
-    NK_BUILD,      // build STRING [extends STRING] { ... }
-    NK_WORKSPACE,  // workspace STRING { ... }
-    NK_PROFILE,    // profile STRING [extends STRING] { ... }
-    NK_ALIAS,      // alias IDENT = STRING ;
-    NK_TASK,       // task STRING { ... }
-    NK_TEST,       // test STRING { ... }
-    NK_BENCH,      // bench STRING { ... }
-    NK_HOOK,       // hook STRING { ... }
-    NK_PHASE,      // phase STRING { ... }
-    NK_TARGET,     // target STRING { ... }           (nested in build)
-    NK_LINK,       // link [STRING] { ... }            (nested)
-    NK_ARTIFACT,   // artifact [STRING] { ... }        (nested)
-    NK_FEATURES,   // features { IDENT = list ; ... }  (nested)
-    NK_ENV,        // env = { IDENT = STRING ; ... } ; (nested)
-    NK_LOG,        // log { ... }                      (nested)
-    NK_METRICS,    // metrics { ... }                  (nested)
-    NK_LINT,       // lint { ... }
-    NK_FORMAT,     // format { ... }
-    NK_LSP,        // lsp { ... }
-    NK_CI,         // ci { ... }
-    NK_REMOTE,     // remote { ... }
-    NK_DEPS,       // deps { dep_entry* }
-    NK_DEP_ENTRY,  // STRING = { dep_field* } ;        (child of deps)
-    NK_OVERRIDE,   // override STRING { ... }          (nested in build)
-    NK_INCLUDE     // include STRING ;
+    NK_ROOT,
+    NK_SCHEMA,
+    NK_STRICT,
+    NK_BUILD,
+    NK_WORKSPACE,
+    NK_PROFILE,
+    NK_ALIAS,
+    NK_TASK,
+    NK_TEST,
+    NK_BENCH,
+    NK_HOOK,
+    NK_PHASE,
+    NK_TARGET,
+    NK_LINK,
+    NK_ARTIFACT,
+    NK_FEATURES,
+    NK_ENV,
+    NK_LOG,
+    NK_METRICS,
+    NK_LINT,
+    NK_FORMAT,
+    NK_LSP,
+    NK_CI,
+    NK_REMOTE,
+    NK_DEPS,
+    NK_DEP_ENTRY,
+    NK_OVERRIDE,
+    NK_INCLUDE
 };
+
+const char* nodeKindName(NodeKind k);
+
+struct Node; // forward-declared so ChildArray can hold Node*
+DEFINE_ARRAY(ChildArray, Node*);
 
 struct Node {
     NodeKind kind;
 
-    Str label;          // build/override/task/target/... string label, or
-                         // alias's IDENT name
+    Str label;          // build/override/task/target/... label, or
+                        // alias's IDENT name
     bool hasLabel;
 
     Str extendsTarget;   // build/profile "extends" target
     bool hasExtends;
 
-    Str payload;         // alias's STRING target, include's path
+    Str payload;         // alias's STRING target, or include's path
     bool hasPayload;
 
-    DynArray<Field> fields;    // plain "name = value ;" entries
-    DynArray<Node*> children;  // nested blocks (override, env, target,
-                               // link, artifact, features, log, metrics,
-                               // dep_entry)
-};
+    FieldArray fields;    // plain "name = value ;" entries
+    ChildArray children;  // nested blocks (override, env, target, link,
+                          // artifact, features, log, metrics, dep_entry)
 
-const char* node_kind_name(NodeKind k);
+    void init(NodeKind kind, Arena* arena);
+    void addField(Str name, Value v);
+    void addChild(Node* child);
+};

@@ -1,26 +1,37 @@
 #pragma once
+#include "types.h"
 #include "token.h"
-#include "arena.h"
 
-// IDENT      = /[A-Za-z_][A-Za-z0-9_-]*/
-// STRING     = '"' { [^"\\] | "\\" . } '"'
-// NUMBER     = /[0-9]+/
-// BOOL       = "true" | "false"     (lexed as identifiers, reclassified)
-// comment    = "#" { [^\n] }
+// A build tool's lexer is on the hot path (it re-runs on every invocation,
+// on every file in the project), so it does no allocation at all:
 //
-// Keywords (build, workspace, task, extends, ...) are NOT special-cased by
-// the lexer -- they come back as plain TK_IDENT tokens, exactly like the
-// EBNF's quoted-terminal convention implies (they match the IDENT pattern).
-// The parser is what knows which identifier text means what.
+//   - identifiers, numbers, and punctuation are always zero-copy slices
+//     directly into the source buffer.
+//   - a quoted string with no escapes is also a zero-copy slice.
+//   - a quoted string WITH escapes is decoded in place: since resolving an
+//     escape (\n, \", \\, ...) only ever shortens the text, we can write
+//     the decoded bytes backwards over the same span we're reading from,
+//     with a read cursor always at or ahead of the write cursor. No heap
+//     buffer, no arena, nothing -- this is why `src` below is a mutable
+//     char*, not `const char*`.
+//
+// (The earlier version of this lexer allocated a fresh arena buffer sized
+// to the entire *remaining length of the file* for every single string
+// token, even ones with no escapes. That's not just wasted allocation,
+// it's O(remaining-file-size) work per string literal. This version does
+// none of that.)
 struct Lexer {
-    const char* src;
-    long len;
-    long pos;
-    long line;
-    long col;
-    Arena* arena;
+    char* src;
+    i64 len;
+    i64 pos;
+    i64 line;
+    i64 col;
     bool hadError;
-};
 
-void lexer_init(Lexer* lx, const char* src, long len, Arena* arena);
-Token lexer_next(Lexer* lx);
+    void init(char* src, i64 len);
+    Token next();
+
+    char peek() const;
+    char advance();
+    void skipWsAndComments();
+};

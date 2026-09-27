@@ -1,4 +1,5 @@
 #pragma once
+#include "types.h"
 #include "str.h"
 
 enum TokenKind {
@@ -20,8 +21,8 @@ enum TokenKind {
 struct Token {
     TokenKind kind;
     Str text;
-    long line;
-    long col;
-    long long numValue;
+    i64 line;
+    i64 col;
+    i64 numValue;
     bool boolValue;
 };
