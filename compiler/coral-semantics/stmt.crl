@@ -10,7 +10,7 @@ import id { Str, NodeId };
 import types { Ty };
 import node { Node, NodeKind };
 import decl_ast { Decl, DeclKind, Param, GenericParam };
-import stmt_ast { Stmt, StmtKind };
+import stmt_ast { Stmt, StmtKind, SwitchCase };
 import scope { Symbol };
 import sema { Sema };
 
@@ -42,11 +42,7 @@ extend Sema
                 u32 i = 0;
                 while (i < stmt->kind.payload.Block.stmtsLen)
                 {
-                    if (!self.checkStmt(stmt->kind.payload.Block.stmts[i]))
-                    {
-                        ok = false;
-                        break;
-                    }
+                    if (!self.checkStmt(stmt->kind.payload.Block.stmts[i])) ok = false;
                     i = i + 1;
                 }
                 self.scopes.leave();
@@ -99,6 +95,42 @@ extend Sema
                 }
                 return true;
             },
+            StmtKind::Break => { return true; },
+            StmtKind::Continue => { return true; },
+            StmtKind::Loop => { return self.checkStmt(stmt->kind.payload.Loop.body); },
+            StmtKind::Switch => {
+                if (!self.checkExpr(stmt->kind.payload.Switch.expr)) return false;
+                bool ok = true;
+                u32 i = 0;
+                while (i < stmt->kind.payload.Switch.casesLen)
+                {
+                    SwitchCase* switchCase = stmt->kind.payload.Switch.cases + i;
+                    u32 p = 0;
+                    while (p < switchCase->patternsLen)
+                    {
+                        if (!self.checkExpr(switchCase->patterns[p])) ok = false;
+                        p = p + 1;
+                    }
+                    if (switchCase->guard.index != 0)
+                    {
+                        if (!self.checkExpr(switchCase->guard)) ok = false;
+                    }
+                    if (switchCase->body.index != 0)
+                    {
+                        Node* bodyNode = self.ctx.nodes + switchCase->body.index;
+                        if (bodyNode->kind.tag == NodeKind::Expr)
+                        {
+                            if (!self.checkExpr(switchCase->body)) ok = false;
+                        }
+                        else
+                        {
+                            if (!self.checkStmt(switchCase->body)) ok = false;
+                        }
+                    }
+                    i = i + 1;
+                }
+                return ok;
+            },
             else => {
                 self.addError();
                 return false;
@@ -106,7 +138,7 @@ extend Sema
         }
     }
 
-    bool checkFunction(Decl* decl)
+    bool checkFunction(Decl* decl, Ty selfType)
     {
         self.scopes.enter();
         bool ok = true;
@@ -124,6 +156,7 @@ extend Sema
             genericIndex = genericIndex + 1;
         }
         u32 i = 0;
+        bool hasSelfParam = false;
         while (i < decl->kind.payload.Func.paramsLen)
         {
             NodeId paramId = decl->kind.payload.Func.params[i];
@@ -131,6 +164,7 @@ extend Sema
             if (paramNode->kind.tag == NodeKind::Param)
             {
                 Param* param = &paramNode->kind.payload.Param.value;
+                if ((param->flags & 1) != 0) hasSelfParam = true;
                 if (param->name != 0)
                 {
                     if ((param->flags & 8) != 0)
@@ -138,14 +172,23 @@ extend Sema
                         Ty typeNode = self.typeParamType(param->name, i);
                         if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0)) ok = false;
                     }
+                    else if ((param->flags & 1) != 0 && selfType != 0)
+                    {
+                        if (!self.scopes.declare(param->name, 1, selfType, paramId, 0)) ok = false;
+                    }
                     else
                     {
                         if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0)) ok = false;
                     }
                 }
-                if (!self.checkType(param->typeNode)) ok = false;
+                if ((param->flags & 1) == 0 && !self.checkType(param->typeNode)) ok = false;
             }
             i = i + 1;
+        }
+        if (selfType != 0 && !hasSelfParam)
+        {
+            Str selfStr = self.ctx.intern("self", 4);
+            self.scopes.declare(selfStr, 1, selfType, decl->kind.payload.Func.body, 0);
         }
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
         self.currentReturnType = decl->kind.payload.Func.returnType;

@@ -149,6 +149,62 @@ pub extend Parser
         }
     }
 
+    void rebindTypeParams(Ty ty, NodeId* genericValues, u32 genericCount)
+    {
+        if (ty == 0 || genericCount == 0) return;
+        TypeEntry* entry = self.ctx.types + ty;
+        if (entry->kind.tag == TypeKind::Named)
+        {
+            Str nm = entry->kind.payload.Named.name;
+            u32 g = 0;
+            while (g < genericCount)
+            {
+                Node* gn = self.ctx.nodes + genericValues[g].index;
+                if (gn->kind.tag == NodeKind::GenericParam)
+                {
+                    if (gn->kind.payload.GenericParam.value.name == nm)
+                    {
+                        entry->kind = TypeKind::TypeParam { .name = nm, .index = g };
+                        return;
+                    }
+                }
+                g = g + 1;
+            }
+            u32 i = 0;
+            while (i < entry->kind.payload.Named.genericArgsLen)
+            {
+                self.rebindTypeParams(entry->kind.payload.Named.genericArgs[i], genericValues, genericCount);
+                i = i + 1;
+            }
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Pointer)
+        {
+            self.rebindTypeParams(entry->kind.payload.Pointer.base, genericValues, genericCount);
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Const)
+        {
+            self.rebindTypeParams(entry->kind.payload.Const.base, genericValues, genericCount);
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Comptime)
+        {
+            self.rebindTypeParams(entry->kind.payload.Comptime.base, genericValues, genericCount);
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Slice)
+        {
+            self.rebindTypeParams(entry->kind.payload.Slice.base, genericValues, genericCount);
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Array)
+        {
+            self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
+            return;
+        }
+    }
+
     NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
     {
         Ty retType = self.parseType();
@@ -160,6 +216,7 @@ pub extend Parser
             self.parseGenericParams(&genericParams);
         u32 genericCount = genericParams.len;
         NodeId* genericValues = self.ctx.nodeListFinish(&genericParams);
+        self.rebindTypeParams(retType, genericValues, genericCount);
         u8 flags = 0;
         if (isPub) flags = flags | 1;
         if (isExtern) flags = flags | 2;
@@ -182,6 +239,14 @@ pub extend Parser
             self.expect(TokenKind::RParen);
             u32 paramCount = params.len;
             NodeId* paramValues = self.ctx.nodeListFinish(&params);
+            u32 pi = 0;
+            while (pi < paramCount)
+            {
+                Node* pn = self.ctx.nodes + paramValues[pi].index;
+                if (pn->kind.tag == NodeKind::Param)
+                    self.rebindTypeParams(pn->kind.payload.Param.value.typeNode, genericValues, genericCount);
+                pi = pi + 1;
+            }
             NodeId body = self.noneNode();
             if (!self.match(TokenKind::Semicolon))
             {

@@ -169,6 +169,13 @@ extend Sema
         return true;
     }
 
+    bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
+    {
+        if (!self.checkBinary(id, left, right)) return false;
+        self.setExprType(id, self.boolType());
+        return true;
+    }
+
     bool checkExpr(NodeId id)
     {
         if (id.index == 0) return true;
@@ -223,7 +230,19 @@ extend Sema
                 }
                 Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
                 Decl* methodDecl = &methodNode->kind.payload.Decl.value;
-                if (methodDecl->kind.payload.Func.paramsLen != expr->kind.payload.MethodCall.argsLen)
+                u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
+                u32 selfOffset = 0;
+                if (paramsLen > 0)
+                {
+                    NodeId firstParamId = methodDecl->kind.payload.Func.params[0];
+                    Node* firstParamNode = self.ctx.nodes + firstParamId.index;
+                    if (firstParamNode->kind.tag == NodeKind::Param)
+                    {
+                        Param* firstParam = &firstParamNode->kind.payload.Param.value;
+                        if ((firstParam->flags & 1) != 0) selfOffset = 1;
+                    }
+                }
+                if (paramsLen - selfOffset != expr->kind.payload.MethodCall.argsLen)
                 {
                     self.addError();
                     return false;
@@ -232,7 +251,7 @@ extend Sema
                 while (i < expr->kind.payload.MethodCall.argsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.MethodCall.args[i])) return false;
-                    NodeId paramId = methodDecl->kind.payload.Func.params[i];
+                    NodeId paramId = methodDecl->kind.payload.Func.params[i + selfOffset];
                     Node* paramNode = self.ctx.nodes + paramId.index;
                     if (paramNode->kind.tag == NodeKind::Param)
                     {
@@ -294,14 +313,14 @@ extend Sema
             ExprKind::Mul => { return self.checkBinary(id, expr->kind.payload.Mul.left, expr->kind.payload.Mul.right); },
             ExprKind::Div => { return self.checkBinary(id, expr->kind.payload.Div.left, expr->kind.payload.Div.right); },
             ExprKind::Mod => { return self.checkBinary(id, expr->kind.payload.Mod.left, expr->kind.payload.Mod.right); },
-            ExprKind::Eq => { return self.checkBinary(id, expr->kind.payload.Eq.left, expr->kind.payload.Eq.right); },
-            ExprKind::Ne => { return self.checkBinary(id, expr->kind.payload.Ne.left, expr->kind.payload.Ne.right); },
-            ExprKind::Lt => { return self.checkBinary(id, expr->kind.payload.Lt.left, expr->kind.payload.Lt.right); },
-            ExprKind::Le => { return self.checkBinary(id, expr->kind.payload.Le.left, expr->kind.payload.Le.right); },
-            ExprKind::Gt => { return self.checkBinary(id, expr->kind.payload.Gt.left, expr->kind.payload.Gt.right); },
-            ExprKind::Ge => { return self.checkBinary(id, expr->kind.payload.Ge.left, expr->kind.payload.Ge.right); },
-            ExprKind::And => { return self.checkBinary(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
-            ExprKind::Or => { return self.checkBinary(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
+            ExprKind::Eq => { return self.checkBinaryBool(id, expr->kind.payload.Eq.left, expr->kind.payload.Eq.right); },
+            ExprKind::Ne => { return self.checkBinaryBool(id, expr->kind.payload.Ne.left, expr->kind.payload.Ne.right); },
+            ExprKind::Lt => { return self.checkBinaryBool(id, expr->kind.payload.Lt.left, expr->kind.payload.Lt.right); },
+            ExprKind::Le => { return self.checkBinaryBool(id, expr->kind.payload.Le.left, expr->kind.payload.Le.right); },
+            ExprKind::Gt => { return self.checkBinaryBool(id, expr->kind.payload.Gt.left, expr->kind.payload.Gt.right); },
+            ExprKind::Ge => { return self.checkBinaryBool(id, expr->kind.payload.Ge.left, expr->kind.payload.Ge.right); },
+            ExprKind::And => { return self.checkBinaryBool(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
+            ExprKind::Or => { return self.checkBinaryBool(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
             ExprKind::BitAnd => { return self.checkBinary(id, expr->kind.payload.BitAnd.left, expr->kind.payload.BitAnd.right); },
             ExprKind::BitOr => { return self.checkBinary(id, expr->kind.payload.BitOr.left, expr->kind.payload.BitOr.right); },
             ExprKind::BitXor => { return self.checkBinary(id, expr->kind.payload.BitXor.left, expr->kind.payload.BitXor.right); },
@@ -437,6 +456,8 @@ extend Sema
             },
             ExprKind::SwitchExpr => {
                 if (!self.checkExpr(expr->kind.payload.SwitchExpr.expr)) return false;
+                Ty resultTy = 0;
+                bool ok = true;
                 u32 i = 0;
                 while (i < expr->kind.payload.SwitchExpr.casesLen)
                 {
@@ -444,14 +465,24 @@ extend Sema
                     u32 p = 0;
                     while (p < switchCase->patternsLen)
                     {
-                        self.checkExpr(switchCase->patterns[p]);
+                        if (!self.checkExpr(switchCase->patterns[p])) ok = false;
                         p = p + 1;
                     }
-                    self.checkExpr(switchCase->guard);
-                    self.checkExpr(switchCase->body);
+                    if (switchCase->guard.index != 0)
+                    {
+                        if (!self.checkExpr(switchCase->guard)) ok = false;
+                    }
+                    if (!self.checkExpr(switchCase->body)) ok = false;
+                    Ty bodyTy = self.exprType(switchCase->body);
+                    if (bodyTy != 0)
+                    {
+                        if (resultTy == 0) resultTy = bodyTy;
+                        else if (!self.compatible(bodyTy, resultTy)) self.addError();
+                    }
                     i = i + 1;
                 }
-                return true;
+                self.setExprType(id, resultTy);
+                return ok;
             },
             else => {
                 self.addError();
