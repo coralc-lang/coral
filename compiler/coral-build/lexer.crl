@@ -1,16 +1,37 @@
 mod Arena = import "arena" { Arena };
-mod Token = import "token" { Token, TokenKind };
-mod Slice = import "../coral-common/slice" { Slice };
-// IDENT      = /[A-Za-z_][A-Za-z0-9_-]*/
-// STRING     = '"' { [^"\\] | "\\" . } '"'
-// NUMBER     = /[0-9]+/
-// BOOL       = "true" | "false"     (lexed as identifiers, reclassified)
-// comment    = "#" { [^\n] }
+mod Tok = import "token" { Token, TokenKind };
+mod SliceMod = import "../coral-common/slice" { Slice };
+
+// IDENT   = /[A-Za-z_][A-Za-z0-9_-]*/
+// STRING  = '"' { [^"\\] | "\\" . } '"'
+// NUMBER  = /[0-9]+/
+// BOOL    = "true" | "false"   (lexed as ident, reclassified)
+// comment = "#" { [^\n] }
 //
-// Keywords (build, workspace, task, extends, ...) are NOT special-cased by
-// the lexer -- they come back as plain IDENT tokens, exactly like the
-// EBNF's quoted-terminal convention implies (they match the IDENT pattern).
-// The parser is what knows which identifier text means what.
+// Keywords come back as plain IDENT tokens; the parser decides what
+// identifier text means what.
+
+pub bool isIdentStart(u8 c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
+
+pub bool isIdentCont(u8 c)
+{
+    if (isIdentStart(c)) return true;
+    return c >= '0' && c <= '9' || c == '-';
+}
+
+pub bool isDigit(u8 c)
+{
+    return c >= '0' && c <= '9';
+}
+
+pub Slice mkSlice(u8* p, usize n)
+{
+    Slice s;
+    s.ptr = p;
+    s.len = n;
+    return s;
+}
+
 pub struct Lexer
 {
     Slice src;
@@ -21,30 +42,31 @@ pub struct Lexer
 
     void init(Slice s)
     {
-        self.src.ptr = s.ptr;
-        self.src.len = s.len;
+        self.src = s;
         self.pos = 0;
         self.line = 1;
         self.col = 1;
         self.hadError = false;
     }
 
-    u8 peek() const
+    u8 peek()
     {
         if (self.pos >= self.src.len) return 0;
         return self.src.ptr[self.pos];
     }
 
-    static bool isIdentStart(u8 c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
-    static bool isIdentCont(u8 c) { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-'; }
-    static bool isDigit(u8 c) { return c >= '0' && c <= '9'; }
-
     void skipWsAndComments()
     {
-        loop {
+        while (true)
+        {
             u8 c = self.peek();
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { self.advance(); continue; }
-            if (c == '#') {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                self.advance();
+                continue;
+            }
+            if (c == '#')
+            {
                 while (self.peek() != 0 && self.peek() != '\n') self.advance();
                 continue;
             }
@@ -56,62 +78,78 @@ pub struct Lexer
     {
         u8 c = self.src.ptr[self.pos];
         self.pos = self.pos + 1;
-        if (c == '\n') { self.line = self.line + 1; self.col = 1; }
-        else { self.col = self.col + 1; }
+        if (c == '\n')
+        {
+            self.line = self.line + 1;
+            self.col = 1;
+        }
+        else
+        {
+            self.col = self.col + 1;
+        }
         return c;
     }
 
-    bool isIdentStart(u8 c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
-    bool isIdentCont(u8 c) { return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-'; }
-    bool isDigit(u8 c) { return c >= '0' && c <= '9'; }
-    
-    Token Lexer::next()
+    Token next()
     {
         self.skipWsAndComments();
-        
-        Token t = {
-            .kind = TokenKind::EOF,
-            .text.ptr = null,
-            .text.len = 0,
-            .line = self.line,
-            .col = self.col,
-            .numValue = 0,
-            .boolValue = false
-        };
 
-        if (self.pos >= self.src.len) { t.kind = TokenKind::EOF; return t; }
+        Token t;
+        t.kind = TokenKind::Eof;
+        t.text = mkSlice(null, 0);
+        t.line = self.line;
+        t.col = self.col;
+        t.numValue = 0;
+        t.boolValue = false;
+
+        if (self.pos >= self.src.len) return t;
         u8 c = self.peek();
-    
-        if (c == '{') { self.advance(); t.kind = TokenKind::LBRACE; return t; }
-        if (c == '}') { self.advance(); t.kind = TokenKind::RBRACE; return t; }
-        if (c == '[') { self.advance(); t.kind = TokenKind::LBRACKET; return t; }
-        if (c == ']') { self.advance(); t.kind = TokenKind::RBRACKET; return t; }
-        if (c == '=') { self.advance(); t.kind = TokenKind::EQUALS; return t; }
-        if (c == ';') { self.advance(); t.kind = TokenKind::SEMI; return t; }
-        if (c == ',') { self.advance(); t.kind = TokenKind::COMMA; return t; }
-    
-        if (c == '"') {
-            self.advance(); // opening quote
+
+        if (c == '{') { self.advance(); t.kind = TokenKind::LBrace; return t; }
+        if (c == '}') { self.advance(); t.kind = TokenKind::RBrace; return t; }
+        if (c == '[') { self.advance(); t.kind = TokenKind::LBracket; return t; }
+        if (c == ']') { self.advance(); t.kind = TokenKind::RBracket; return t; }
+        if (c == '=') { self.advance(); t.kind = TokenKind::Equals; return t; }
+        if (c == ';') { self.advance(); t.kind = TokenKind::Semi; return t; }
+        if (c == ',') { self.advance(); t.kind = TokenKind::Comma; return t; }
+
+        if (c == '"')
+        {
+            self.advance();
             usize start = self.pos;
-            usize writePos = start; // trails `pos` only once an escape is seen
-    
-            loop {
+            usize writePos = start;
+            while (true)
+            {
                 u8 cc = self.peek();
-                if (cc == 0) { self.hadError = true; t.kind = TokenKind::ERROR; return t; }
-                if (cc == '"') { self.advance(); break; }
-    
-                if (cc == '\\') {
-                    self.advance(); // the backslash
+                if (cc == 0)
+                {
+                    self.hadError = true;
+                    t.kind = TokenKind::Error;
+                    return t;
+                }
+                if (cc == '"')
+                {
+                    self.advance();
+                    break;
+                }
+                if (cc == '\\')
+                {
+                    self.advance();
                     u8 esc = self.peek();
-                    if (esc == 0) { self.hadError = true; t.kind = TokenKind::ERROR; return t; }
-                    self.advance(); // the escaped character
-    
+                    if (esc == 0)
+                    {
+                        self.hadError = true;
+                        t.kind = TokenKind::Error;
+                        return t;
+                    }
+                    self.advance();
                     u8 decoded;
-                    switch (esc) {
+                    switch (esc)
+                    {
                         'n' => { decoded = '\n'; },
                         't' => { decoded = '\t'; },
                         'r' => { decoded = '\r'; },
-                        '"' => { decoded = '"';  },
+                        '"' => { decoded = '"'; },
                         '\\' => { decoded = '\\'; },
                         else => { decoded = esc; }
                     }
@@ -119,50 +157,62 @@ pub struct Lexer
                     writePos = writePos + 1;
                     continue;
                 }
-    
-                // Ordinary character. While writePos == pos (no escape seen
-                // yet) this is a self-assignment of one byte -- effectively
-                // free, and definitely not a heap allocation.
                 self.src.ptr[writePos] = cc;
                 writePos = writePos + 1;
                 self.advance();
             }
-    
-            usize outLen = writePos - start;
-            t.kind = TokenKind::STRING;
-            t.text = Slice::from(self.src + start, outLen);
+            t.kind = TokenKind::String;
+            t.text = mkSlice(self.src.ptr + start, writePos - start);
             return t;
         }
-    
-        if (isDigit(c)) {
+
+        if (isDigit(c))
+        {
             usize start = self.pos;
             while (isDigit(self.peek())) self.advance();
             usize l = self.pos - start;
-            t.kind = TokenKind::NUMBER;
-            t.text = Slice::from(self.src + start, l);
-            usize v = 0;
-            for (usize i = 0; i < l; i = i + 1) v = v * 10 + (self.src.ptr[start + i] - '0');
+            t.kind = TokenKind::Number;
+            t.text = mkSlice(self.src.ptr + start, l);
+            i64 v = 0;
+            usize i = 0;
+            while (i < l)
+            {
+                v = v * 10 + (i64)(self.src.ptr[start + i] - '0');
+                i = i + 1;
+            }
             t.numValue = v;
             return t;
         }
-    
-        if (isIdentStart(c)) {
+
+        if (isIdentStart(c))
+        {
             usize start = self.pos;
             while (isIdentCont(self.peek())) self.advance();
             usize l = self.pos - start;
-            Slice txt = Slice::from(self.src + start, l);
-            if (txt.eq(Slice{ "true", 4 }))  { t.kind = TokenKind::BOOL; t.boolValue = true;  t.text = txt; return t; }
-            if (txt.eq(Slice{ "false", 5 })) { t.kind = TokenKind::BOOL; t.boolValue = false; t.text = txt; return t; }
-            t.kind = TokenKind::IDENT;
+            Slice txt = mkSlice(self.src.ptr + start, l);
+            if (txt.eq(mkSlice("true", 4)))
+            {
+                t.kind = TokenKind::Bool;
+                t.boolValue = true;
+                t.text = txt;
+                return t;
+            }
+            if (txt.eq(mkSlice("false", 5)))
+            {
+                t.kind = TokenKind::Bool;
+                t.boolValue = false;
+                t.text = txt;
+                return t;
+            }
+            t.kind = TokenKind::Ident;
             t.text = txt;
             return t;
         }
-    
-        // Unknown character.
+
         self.advance();
         self.hadError = true;
-        t.kind = TokenKind::ERROR;
-        t.text = Slice::from(self.src + (self.pos - 1), 1);
+        t.kind = TokenKind::Error;
+        t.text = mkSlice(self.src.ptr + (self.pos - 1), 1);
         return t;
     }
 }

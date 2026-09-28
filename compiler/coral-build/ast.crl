@@ -1,20 +1,20 @@
 mod slice = import "../coral-common/slice" { Slice };
 mod arena = import "arena" { Arena };
 
-pub Variant Value
+pub variant Value
 {
-    string { Slice; },
-    number { i64; },
-    boolean { bool boolean; },
-    list { ValueArrray* list; }
+    String { Slice value; },
+    Number { i64 value; },
+    Boolean { bool value; },
+    List { ValueArray* value; }
 }
 
-extend Value
+pub struct ValueArray
 {
-    // static Value ofString(Slice s)
-    // static Value ofNumber(i64 n)
-    // static Value ofBool(bool b)
-    // static Value ofList(ValueArray* l)
+    Value* data;
+    usize len;
+    usize cap;
+    Arena* arena;
 }
 
 pub struct Field
@@ -28,66 +28,182 @@ pub struct FieldArray
     Field* data;
     usize len;
     usize cap;
-    Arena arena;
+    Arena* arena;
 }
-
-pub enum NodeKind
-{
-    ROOT,
-    SCHEMA,
-    STRICT,
-    BUILD,
-    WORKSPACE,
-    PROFILE,
-    ALIAS,
-    TASK,
-    TEST,
-    BENCH,
-    HOOK,
-    PHASE,
-    TARGET,
-    LINK,
-    ARTIFACT,
-    FEATURES,
-    ENV,
-    LOG,
-    METRICS,
-    LINT,
-    FORMAT,
-    LSP,
-    CI,
-    REMOTE,
-    DEPS,
-    DEP_ENTRY,
-    OVERRIDE,
-    INCLUDE
-}
-
-pub u8* nodeKindName(NodeKind k) const
-
-struct Node {
-    NodeKind kind;
-    Slice label;          // build/override/task/target/... label, or
-                        // alias's IDENT name
-    bool hasLabel;
-    Slice extendsTarget;   // build/profile "extends" target
-    bool hasExtends;
-    Slice payload;         // alias's STRING target, or include's path
-    bool hasPayload;
-
-    FieldArray fields;    // plain "name = value ;" entries
-    ChildArray children;  // nested blocks (override, env, target, link,
-                          // artifact, features, log, metrics, dep_entry)
-
-    void init(NodeKind kind, Arena* arena)
-    void addField(Slice name, Value v)
-    void addChild(Node* child)
-};
 
 pub struct ChildArray
 {
     Node* data;
     usize len;
     usize cap;
-    Arena arena;
+    Arena* arena;
+}
+
+pub enum NodeKind
+{
+    Root,
+    Schema,
+    Strict,
+    Build,
+    Workspace,
+    Profile,
+    Alias,
+    Task,
+    Test,
+    Bench,
+    Hook,
+    Phase,
+    Target,
+    Link,
+    Artifact,
+    Features,
+    Env,
+    Log,
+    Metrics,
+    Lint,
+    Format,
+    Lsp,
+    Ci,
+    Remote,
+    Deps,
+    DepEntry,
+    Override,
+    Include
+}
+
+pub u8* nodeKindName(NodeKind k)
+{
+    switch (k)
+    {
+        NodeKind::Root => { return "root"; },
+        NodeKind::Schema => { return "schema"; },
+        NodeKind::Strict => { return "strict"; },
+        NodeKind::Build => { return "build"; },
+        NodeKind::Workspace => { return "workspace"; },
+        NodeKind::Profile => { return "profile"; },
+        NodeKind::Alias => { return "alias"; },
+        NodeKind::Task => { return "task"; },
+        NodeKind::Test => { return "test"; },
+        NodeKind::Bench => { return "bench"; },
+        NodeKind::Hook => { return "hook"; },
+        NodeKind::Phase => { return "phase"; },
+        NodeKind::Target => { return "target"; },
+        NodeKind::Link => { return "link"; },
+        NodeKind::Artifact => { return "artifact"; },
+        NodeKind::Features => { return "features"; },
+        NodeKind::Env => { return "env"; },
+        NodeKind::Log => { return "log"; },
+        NodeKind::Metrics => { return "metrics"; },
+        NodeKind::Lint => { return "lint"; },
+        NodeKind::Format => { return "format"; },
+        NodeKind::Lsp => { return "lsp"; },
+        NodeKind::Ci => { return "ci"; },
+        NodeKind::Remote => { return "remote"; },
+        NodeKind::Deps => { return "deps"; },
+        NodeKind::DepEntry => { return "dep_entry"; },
+        NodeKind::Override => { return "override"; },
+        NodeKind::Include => { return "include"; },
+        else => { return "node"; }
+    }
+}
+
+pub struct Node
+{
+    NodeKind kind;
+    Slice label;
+    bool hasLabel;
+    Slice extendsTarget;
+    bool hasExtends;
+    Slice payload;
+    bool hasPayload;
+    FieldArray fields;
+    ChildArray children;
+    Arena* arena;
+
+    void init(NodeKind k, Arena* a)
+    {
+        self.kind = k;
+        self.arena = a;
+        self.label.ptr = null;
+        self.label.len = 0;
+        self.hasLabel = false;
+        self.extendsTarget.ptr = null;
+        self.extendsTarget.len = 0;
+        self.hasExtends = false;
+        self.payload.ptr = null;
+        self.payload.len = 0;
+        self.hasPayload = false;
+        self.fields.data = null;
+        self.fields.len = 0;
+        self.fields.cap = 0;
+        self.fields.arena = a;
+        self.children.data = null;
+        self.children.len = 0;
+        self.children.cap = 0;
+        self.children.arena = a;
+    }
+
+    void addField(Slice name, Value v)
+    {
+        if (self.fields.len >= self.fields.cap)
+        {
+            usize newCap = 8;
+            if (self.fields.cap != 0) newCap = self.fields.cap * 2;
+            Field* fresh = (Field*)self.arena.alloc(newCap * sizeof(Field), 8);
+            if (fresh == null) return;
+            usize i = 0;
+            while (i < self.fields.len)
+            {
+                fresh[i] = self.fields.data[i];
+                i = i + 1;
+            }
+            self.fields.data = fresh;
+            self.fields.cap = newCap;
+        }
+        self.fields.data[self.fields.len].name = name;
+        self.fields.data[self.fields.len].value = v;
+        self.fields.len = self.fields.len + 1;
+    }
+
+    void addChild(Node* child)
+    {
+        if (self.children.len >= self.children.cap)
+        {
+            usize newCap = 8;
+            if (self.children.cap != 0) newCap = self.children.cap * 2;
+            Node* fresh = (Node*)self.arena.alloc(newCap * sizeof(Node), 8);
+            if (fresh == null) return;
+            usize i = 0;
+            while (i < self.children.len)
+            {
+                fresh[i] = self.children.data[i];
+                i = i + 1;
+            }
+            self.children.data = fresh;
+            self.children.cap = newCap;
+        }
+        self.children.data[self.children.len] = *child;
+        self.children.len = self.children.len + 1;
+    }
+}
+
+pub void valueArrayPush(ValueArray* arr, Value v)
+{
+    if (arr.len >= arr.cap)
+    {
+        usize newCap = 8;
+        if (arr.cap != 0) newCap = arr.cap * 2;
+        Value* fresh = (Value*)arr.arena.alloc(newCap * sizeof(Value), 8);
+        if (fresh == null) return;
+        usize i = 0;
+        while (i < arr.len)
+        {
+            fresh[i] = arr.data[i];
+            i = i + 1;
+        }
+        arr.data = fresh;
+        arr.cap = newCap;
+    }
+    arr.data[arr.len] = v;
+    arr.len = arr.len + 1;
 }
