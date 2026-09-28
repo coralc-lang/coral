@@ -1,0 +1,77 @@
+mod arena_mod = import "arena" { Arena };
+mod parser_mod = import "parser" { Parser };
+mod builder_mod = import "builder" { builderRun };
+mod slice_mod = import "../coral-common/slice" { Slice };
+mod ast_mod = import "ast" { Node };
+
+extern("C") i32 printf(u8* fmt, ...);
+extern("C") i32 open(u8* path, i32 flags, i32 mode);
+extern("C") i32 read(i32 fd, u8* buf, usize len);
+extern("C") i32 close(i32 fd);
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+Slice readFile(u8* cpath, usize* outLen)
+{
+    *outLen = 0;
+    i32 fd = open(cpath, 0, 0);
+    if (fd < 0)
+    {
+        Slice s;
+        s.ptr = null;
+        s.len = 0;
+        return s;
+    }
+    usize cap = 65536;
+    u8* buf = (u8*)malloc(cap);
+    usize len = 0;
+    while (true)
+    {
+        if (len >= cap)
+        {
+            u8* fresh = (u8*)realloc(buf, cap * 2);
+            if (fresh == null) break;
+            buf = fresh;
+            cap = cap * 2;
+        }
+        i32 got = read(fd, buf + len, cap - len);
+        if (got <= 0) break;
+        len = len + (usize)got;
+    }
+    close(fd);
+    Slice s;
+    s.ptr = buf;
+    s.len = len;
+    *outLen = len;
+    return s;
+}
+
+i32 main()
+{
+    Arena a;
+    a.init(1048576);
+
+    usize len = 0;
+    Slice src = readFile("example.crlb", &len);
+    if (src.ptr == null)
+    {
+        printf("cannot read example.crlb\n");
+        return 1;
+    }
+
+    Parser p;
+    p.init(&a, src);
+    Node* root = p.parseFile();
+    if (root == null || p.errors > 0)
+    {
+        printf("parse failed, errors=%d\n", (i32)p.errors);
+        return 2;
+    }
+    printf("parsed ok, children=%d\n", (i32)root.children.len);
+
+    i32 errs = builderRun(root, &a, false, false);
+    printf("builder errors=%d\n", errs);
+    if (errs == 0) return 0;
+    return 3;
+}
