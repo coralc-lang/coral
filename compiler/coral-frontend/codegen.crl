@@ -67,7 +67,7 @@ void stPut(Stream* s, u8* data, usize n)
     {
         usize nc = s.cap * 2;
         while (nc < s.len + n + 1) nc = nc * 2;
-        u8* np = (u8*)s.arena->alloc(nc, 1);
+        u8* np = (u8*)s.arena.alloc(nc, 1);
         if (np == null) return;
         memcpy(np, s.p, s.len);
         s.p = np;
@@ -282,7 +282,7 @@ Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
     while (i < argsLen)
     {
         stCh(&cg.tybuf, 95);
-        stPS(&cg.tybuf, cgMangleTy(cg, args[i]));
+        cgMangleTy(cg, args[i]);
         i = i + 1;
     }
     return stTail(&cg.tybuf, st);
@@ -296,10 +296,10 @@ bool cgIsStrTy(Codegen* cg, NodeId id)
     if (n.kind.tag != NodeKind::Expr) return false;
     Ty t = cgSubstTy(cg, n.kind.payload.Expr.value.resolvedType);
     if (t == 0) return false;
-    return (cg.ctx->types + t).kind.tag == TypeKind::Str;
+    return (cg.ctx->types + t)->kind.tag == TypeKind::Str;
 }
 
-NodeId cgFindDecl(Codegen* cg, Str name, DeclKind tag)
+NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
 {
     NodeId none;
     none.index = 0;
@@ -337,9 +337,10 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
 {
     *found = false;
     *outRet = 0;
-    NodeId declId = cgFindDecl(cg, name, DeclKind::Func);
+    NodeId declId = cgFindDecl(cg, name, (u32)DeclKind::Func);
     if (declId.index == 0) return Slice::from(null, 0);
-    Decl* dd = &cgNode(cg, declId).kind.payload.Decl.value;
+    Node* ddn = cgNode(cg, declId);
+    Decl* dd = &ddn.kind.payload.Decl.value;
     if (cg.mono == null || cg.mono.genericCount(declId) == 0) {
         *found = true;
         *outRet = dd.kind.payload.Func.returnType;
@@ -396,35 +397,43 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
 
 extern("C") Slice tyStr(Codegen* cg, Ty t);
 
+/* append text at [start, ...) — tyStr arms all write into tybuf so nested
+   composition never re-appends a slice of the same buffer */
+Slice tyStrPut(Codegen* cg, Slice text, usize start)
+{
+    stPS(&cg.tybuf, text);
+    return stTail(&cg.tybuf, start);
+}
+
 Slice tyStr(Codegen* cg, Ty t)
 {
-    if (t == 0) return (Slice)Slice::from((u8*)"rawptr", 6);
+    if (t == 0) return Slice::from((u8*)"rawptr", 6);
     TypeEntry* e = cg.ctx->types + t;
     TypeKind k = e.kind;
     usize start = cg.tybuf.len;
     switch (k.tag)
     {
-        TypeKind::Void => { return (Slice)Slice::from((u8*)"void", 4); },
-        TypeKind::Bool => { return (Slice)Slice::from((u8*)"_Bool", 5); },
-        TypeKind::Char => { return (Slice)Slice::from((u8*)"char", 4); },
-        TypeKind::I8 => { return (Slice)Slice::from((u8*)"int8_t", 6); },
-        TypeKind::U8 => { return (Slice)Slice::from((u8*)"uint8_t", 7); },
-        TypeKind::I16 => { return (Slice)Slice::from((u8*)"int16_t", 7); },
-        TypeKind::U16 => { return (Slice)Slice::from((u8*)"uint16_t", 8); },
-        TypeKind::I32 => { return (Slice)Slice::from((u8*)"int32_t", 7); },
-        TypeKind::U32 => { return (Slice)Slice::from((u8*)"uint32_t", 8); },
-        TypeKind::I64 => { return (Slice)Slice::from((u8*)"int64_t", 7); },
-        TypeKind::U64 => { return (Slice)Slice::from((u8*)"uint64_t", 8); },
-        TypeKind::I128 => { return (Slice)Slice::from((u8*)"__int128_t", 10); },
-        TypeKind::U128 => { return (Slice)Slice::from((u8*)"__uint128_t", 11); },
-        TypeKind::F32 => { return (Slice)Slice::from((u8*)"float", 5); },
-        TypeKind::F64 => { return (Slice)Slice::from((u8*)"double", 6); },
-        TypeKind::Isize => { return (Slice)Slice::from((u8*)"intptr_t", 8); },
-        TypeKind::Usize => { return (Slice)Slice::from((u8*)"size_t", 6); },
-        TypeKind::Rawptr => { return (Slice)Slice::from((u8*)"void*", 5); },
+        TypeKind::Void => { return tyStrPut(cg, Slice::from((u8*)"void", 4), start); },
+        TypeKind::Bool => { return tyStrPut(cg, Slice::from((u8*)"_Bool", 5), start); },
+        TypeKind::Char => { return tyStrPut(cg, Slice::from((u8*)"char", 4), start); },
+        TypeKind::I8 => { return tyStrPut(cg, Slice::from((u8*)"int8_t", 6), start); },
+        TypeKind::U8 => { return tyStrPut(cg, Slice::from((u8*)"uint8_t", 7), start); },
+        TypeKind::I16 => { return tyStrPut(cg, Slice::from((u8*)"int16_t", 7), start); },
+        TypeKind::U16 => { return tyStrPut(cg, Slice::from((u8*)"uint16_t", 8), start); },
+        TypeKind::I32 => { return tyStrPut(cg, Slice::from((u8*)"int32_t", 7), start); },
+        TypeKind::U32 => { return tyStrPut(cg, Slice::from((u8*)"uint32_t", 8), start); },
+        TypeKind::I64 => { return tyStrPut(cg, Slice::from((u8*)"int64_t", 7), start); },
+        TypeKind::U64 => { return tyStrPut(cg, Slice::from((u8*)"uint64_t", 8), start); },
+        TypeKind::I128 => { return tyStrPut(cg, Slice::from((u8*)"__int128_t", 10), start); },
+        TypeKind::U128 => { return tyStrPut(cg, Slice::from((u8*)"__uint128_t", 11), start); },
+        TypeKind::F32 => { return tyStrPut(cg, Slice::from((u8*)"float", 5), start); },
+        TypeKind::F64 => { return tyStrPut(cg, Slice::from((u8*)"double", 6), start); },
+        TypeKind::Isize => { return tyStrPut(cg, Slice::from((u8*)"intptr_t", 8), start); },
+        TypeKind::Usize => { return tyStrPut(cg, Slice::from((u8*)"size_t", 6), start); },
+        TypeKind::Rawptr => { return tyStrPut(cg, Slice::from((u8*)"void*", 5), start); },
         /* str = immutable slice view { ptr, len } (preamble typedef) */
-        TypeKind::Str => { return (Slice)Slice::from((u8*)"_coral_str", 10); },
-        TypeKind::Error => { return (Slice)Slice::from((u8*)"void", 4); },
+        TypeKind::Str => { return tyStrPut(cg, Slice::from((u8*)"_coral_str", 10), start); },
+        TypeKind::Error => { return tyStrPut(cg, Slice::from((u8*)"void", 4), start); },
         TypeKind::Named => {
             /* inside an instance: resolve a bare generic parameter name */
             Ty sub = cgSubstTy(cg, t);
@@ -452,11 +461,10 @@ Slice tyStr(Codegen* cg, Ty t)
                     i = i + 1;
                 }
             }
-            return cgIntern(cg, name);
+            return tyStrPut(cg, cgIntern(cg, name), start);
         },
         TypeKind::Pointer => {
-            Slice base = tyStr(cg, k.payload.Pointer.base);
-            stPS(&cg.tybuf, base);
+            tyStr(cg, k.payload.Pointer.base);
             stCh(&cg.tybuf, '*');
             return stTail(&cg.tybuf, start);
         },
@@ -464,13 +472,12 @@ Slice tyStr(Codegen* cg, Ty t)
             Ty base = k.payload.Const.base;
             TypeEntry* be = cg.ctx->types + base;
             if (be.kind.tag == TypeKind::Pointer) {
-                Slice b = tyStr(cg, base);
-                stPS(&cg.tybuf, b);
+                tyStr(cg, base);
                 stP(&cg.tybuf, " const");
                 return stTail(&cg.tybuf, start);
             }
             stP(&cg.tybuf, "const ");
-            stPS(&cg.tybuf, tyStr(cg, base));
+            tyStr(cg, base);
             return stTail(&cg.tybuf, start);
         },
         TypeKind::Comptime => { return tyStr(cg, k.payload.Comptime.base); },
@@ -478,20 +485,19 @@ Slice tyStr(Codegen* cg, Ty t)
             Ty sub = cgSubstTy(cg, t);
             if (sub != t) return tyStr(cg, sub);
             cg.errors = cg.errors + 1;
-            return (Slice)Slice::from((u8*)"void*", 5);
+            return tyStrPut(cg, Slice::from((u8*)"void*", 5), start);
         },
         TypeKind::Slice => { return cgRegName(cg, t); },
         TypeKind::FnPtr => { return cgRegName(cg, t); },
         TypeKind::Tuple => { return cgRegName(cg, t); },
         TypeKind::Array => {
-            Slice b = tyStr(cg, k.payload.Array.base);
-            stPS(&cg.tybuf, b);
+            tyStr(cg, k.payload.Array.base);
             stCh(&cg.tybuf, '[');
             stU64(&cg.tybuf, (u64)k.payload.Array.len);
             stCh(&cg.tybuf, ']');
             return stTail(&cg.tybuf, start);
         },
-        else => { return (Slice)Slice::from((u8*)"void*", 5); },
+        else => { return tyStrPut(cg, Slice::from((u8*)"void*", 5), start); },
     }
     return stTail(&cg.tybuf, start);
 }
@@ -535,7 +541,7 @@ Slice cgRegName(Codegen* cg, Ty t)
 
     if (k.tag == TypeKind::Slice) {
         stP(&cg.tybuf, "Slice_");
-        stPS(&cg.tybuf, tyStr(cg, k.payload.Slice.base));
+        tyStr(cg, k.payload.Slice.base);
     } else if (k.tag == TypeKind::FnPtr) {
         stP(&cg.tybuf, "FnP_");
         stU64(&cg.tybuf, (u64)t);
@@ -545,7 +551,7 @@ Slice cgRegName(Codegen* cg, Ty t)
         while (i < k.payload.Tuple.elemsLen)
         {
             if (i > 0) stCh(&cg.tybuf, '_');
-            stPS(&cg.tybuf, tyStr(cg, k.payload.Tuple.elems[i]));
+            tyStr(cg, k.payload.Tuple.elems[i]);
             i = i + 1;
         }
     }
@@ -634,9 +640,9 @@ Node* cgNode(Codegen* cg, NodeId id)
 /* C type text for a value expression node (0-safe). */
 Slice cgValExprTy(Codegen* cg, NodeId id)
 {
-    if (id.index == 0) return (Slice)Slice::from((u8*)"rawptr", 6);
+    if (id.index == 0) return Slice::from((u8*)"rawptr", 6);
     Node* n = cgNode(cg, id);
-    if (n.kind.tag != NodeKind::Expr) return (Slice)Slice::from((u8*)"rawptr", 6);
+    if (n.kind.tag != NodeKind::Expr) return Slice::from((u8*)"rawptr", 6);
     return cgResultTy(cg, id, &n.kind.payload.Expr.value);
 }
 
@@ -645,15 +651,16 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
     if (e.resolvedType != 0) return tyStr(cg, cgSubstTy(cg, e.resolvedType));
     switch (e.kind.tag)
     {
-        ExprKind::Not => { return (Slice)Slice::from((u8*)"_Bool", 5); },
+        ExprKind::Not => { return Slice::from((u8*)"_Bool", 5); },
         ExprKind::AddressOf => {
             NodeId c = e.kind.payload.AddressOf.expr;
             Node* cn = cgNode(cg, c);
-            Slice base = (Slice)Slice::from((u8*)"rawptr", 6);
+            Slice base = Slice::from((u8*)"rawptr", 6);
+            usize s = cg.tybuf.len;
             if (cn.kind.tag == NodeKind::Expr)
                 base = cgResultTy(cg, c, &cn.kind.payload.Expr.value);
-            usize s = cg.tybuf.len;
-            stPS(&cg.tybuf, base);
+            if (!(base.ptr + base.len == cg.tybuf.p + cg.tybuf.len))
+                stPS(&cg.tybuf, base);
             stCh(&cg.tybuf, '*');
             return stTail(&cg.tybuf, s);
         },
@@ -670,7 +677,7 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
         ExprKind::AssignShr => { return cgValExprTy(cg, e.kind.payload.AssignShr.value); },
         else => {},
     }
-    return (Slice)Slice::from((u8*)"rawptr", 6);
+    return Slice::from((u8*)"rawptr", 6);
 }
 
 void cgEmitStmt(Codegen* cg, u8* text)
@@ -857,28 +864,44 @@ Slice cgExpr(Codegen* cg, NodeId id)
             /* str literal: immutable slice; the compiler counts the length */
             Slice s = cgIntern(cg, e.kind.payload.StringLit.value);
             stP(&cg.ebuf, "(_coral_str){ (const uint8_t*)\"");
-            usize i = 0;
-            while (i < s.len)
+            usize begin = 0;
+            usize end = s.len;
+            if (s.len >= 2 && s.ptr[0] == '"') { begin = 1; end = s.len - 1; }
+            usize i = begin;
+            usize dlen = 0;
+            while (i < end)
             {
                 u8 c = s.ptr[i];
-                if (c == '"') stP(&cg.ebuf, "\\\"");
-                else if (c == '\\') stP(&cg.ebuf, "\\\\");
-                else if (c == '\n') stP(&cg.ebuf, "\\n");
-                else if (c == '\t') stP(&cg.ebuf, "\\t");
-                else if (c == '\r') stP(&cg.ebuf, "\\r");
-                else                 if (c < 32 || c > 126) {
+                if (c == '\\' && i + 1 < end) {
+                    u8 esc = s.ptr[i + 1];
+                    if (esc == 'n') stP(&cg.ebuf, "\\n");
+                    else if (esc == 't') stP(&cg.ebuf, "\\t");
+                    else if (esc == 'r') stP(&cg.ebuf, "\\r");
+                    else if (esc == '0') stP(&cg.ebuf, "\\0");
+                    else if (esc == '"' || esc == '\\' || esc == '\'') { stCh(&cg.ebuf, '\\'); stCh(&cg.ebuf, esc); }
+                    else { stCh(&cg.ebuf, esc); }
+                    dlen = dlen + 1;
+                    i = i + 2;
+                } else if (c == '"') {
+                    stP(&cg.ebuf, "\\\"");
+                    dlen = dlen + 1;
+                    i = i + 1;
+                } else if (c < 32 || c > 126) {
                     stP(&cg.ebuf, "\\");
                     u8 v = c;
                     stCh(&cg.ebuf, (u8)(48 + (v / 64)));
                     stCh(&cg.ebuf, (u8)(48 + ((v / 8) % 8)));
                     stCh(&cg.ebuf, (u8)(48 + (v % 8)));
+                    dlen = dlen + 1;
+                    i = i + 1;
                 } else {
                     stCh(&cg.ebuf, c);
+                    dlen = dlen + 1;
+                    i = i + 1;
                 }
-                i = i + 1;
             }
             stP(&cg.ebuf, "\", ");
-            stU64(&cg.ebuf, (u64)s.len);
+            stU64(&cg.ebuf, (u64)dlen);
             stP(&cg.ebuf, " }");
             return stTail(&cg.ebuf, es);
         },
@@ -920,7 +943,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Node* seg0 = cgNode(cg, e.kind.payload.Path.segments[0]);
                 if (seg0.kind.tag == NodeKind::Expr && seg0.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                     Str root = seg0.kind.payload.Expr.value.kind.payload.Ident.name;
-                    if (cgFindDecl(cg, root, DeclKind::Enum).index != 0) {
+                    if (cgFindDecl(cg, root, (u32)DeclKind::Enum).index != 0) {
                         Node* seg1 = cgNode(cg, e.kind.payload.Path.segments[1]);
                         if (seg1.kind.tag == NodeKind::Expr && seg1.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                             stPS(&cg.ebuf, cgIntern(cg, root));
@@ -949,40 +972,45 @@ Slice cgExpr(Codegen* cg, NodeId id)
         /* pure inline: children become temps first, result parenthesized */
         ExprKind::Neg => {
             Slice c = cgExpr(cg, e.kind.payload.Neg.expr);
-            stCh(&cg.ebuf, "(-(");
+            usize rs = cg.ebuf.len;
+            stP(&cg.ebuf, "(-(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::Not => {
             Slice c = cgExpr(cg, e.kind.payload.Not.expr);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "(!(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::AddressOf => {
             Slice c = cgLvalue(cg, e.kind.payload.AddressOf.expr);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "(&(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::Deref => {
             Slice c = cgExpr(cg, e.kind.payload.Deref.expr);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "(*(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::Cast => {
             Slice c = cgExpr(cg, e.kind.payload.Cast.expr);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
             stPS(&cg.ebuf, tyStr(cg, e.kind.payload.Cast.targetType));
             stP(&cg.ebuf, ")(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
 
         /* binary → three-address temp */
@@ -1020,7 +1048,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             if (cgIsStrTy(cg, left) &&
                 (e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne))
             {
-                u32 ts = cgNewTemp(cg, (Slice)Slice::from((u8*)"_Bool", 5), 0);
+                u32 ts = cgNewTemp(cg, Slice::from((u8*)"_Bool", 5), 0);
                 Slice sn = cgTempName(cg, ts);
                 stNL(&cg.body, cg.ind);
                 stPS(&cg.body, sn);
@@ -1042,8 +1070,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (e.kind.tag == ExprKind::Eq) stP(&cg.body, "== 0)");
                 else stP(&cg.body, "!= 0)");
                 stCh(&cg.body, ';');
-                stPS(&cg.ebuf, sn);
-                return stTail(&cg.ebuf, es);
+                return sn;
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
@@ -1054,15 +1081,14 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, op);
             stPS(&cg.body, r);
             stP(&cg.body, ");");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         /* short-circuit → labels */
         ExprKind::And => {
             Slice l = cgExpr(cg, e.kind.payload.And.left);
             Slice r = cgExpr(cg, e.kind.payload.And.right);
-            u32 t = cgNewTemp(cg, (Slice)Slice::from((u8*)"_Bool", 5), 0);
+            u32 t = cgNewTemp(cg, Slice::from((u8*)"_Bool", 5), 0);
             Slice tn = cgTempName(cg, t);
             u32 lf = cgLabel(cg);
             u32 le = cgLabel(cg);
@@ -1087,13 +1113,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.body, tn);
             stP(&cg.body, " = 0;");
             cgEmitLabel(cg, le);
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
         ExprKind::Or => {
             Slice l = cgExpr(cg, e.kind.payload.Or.left);
             Slice r = cgExpr(cg, e.kind.payload.Or.right);
-            u32 t = cgNewTemp(cg, (Slice)Slice::from((u8*)"_Bool", 5), 0);
+            u32 t = cgNewTemp(cg, Slice::from((u8*)"_Bool", 5), 0);
             Slice tn = cgTempName(cg, t);
             u32 lt = cgLabel(cg);
             u32 le = cgLabel(cg);
@@ -1118,8 +1143,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.body, tn);
             stP(&cg.body, " = 1;");
             cgEmitLabel(cg, le);
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::Call => {
@@ -1133,7 +1157,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             fdecl.index = 0;
             if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                 Str fname = cn.kind.payload.Expr.value.kind.payload.Ident.name;
-                fdecl = cgFindDecl(cg, fname, DeclKind::Func);
+                fdecl = cgFindDecl(cg, fname, (u32)DeclKind::Func);
                 calleeText = cgResolveCall(cg, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
                 if (resolved) {
                     retTy = tyStr(cg, cgSubstTy(cg, rty));
@@ -1150,7 +1174,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
-                Stream as = stNew(cg.arena, 64);
+                Stream abuf = stNew(cg.arena, 64);
                 bool first = true;
                 NodeId* args = e.kind.payload.Call.args;
                 u32 argsLen = e.kind.payload.Call.argsLen;
@@ -1158,7 +1182,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 while (i < argsLen && i < 16) {
                     bool skip = false;
                     if (fdecl.index != 0) {
-                        Decl* fd = &cgNode(cg, fdecl).kind.payload.Decl.value;
+                        Node* fdn = cgNode(cg, fdecl);
+                        Decl* fd = &fdn.kind.payload.Decl.value;
                         if (i < fd.kind.payload.Func.paramsLen) {
                             Node* pn = cgNode(cg, fd.kind.payload.Func.params[i]);
                             if (pn.kind.tag == NodeKind::Param && (pn.kind.payload.Param.value.flags & 8) != 0) skip = true;
@@ -1166,14 +1191,14 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                     if (!skip) {
                         if (first) first = false;
-                        else stP(&as, ", ");
-                        stPS(&as, cgExpr(cg, args[i]));
+                        else stP(&abuf, ", ");
+                        stPS(&abuf, cgExpr(cg, args[i]));
                         n = n + 1;
                     }
                     i = i + 1;
                 }
                 if (argsLen > 16) cg.errors = cg.errors + 1;
-                argTexts = stTail(&as, 0);
+                argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, retTy, 0);
             Slice tn = cgTempName(cg, t);
@@ -1184,8 +1209,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stCh(&cg.body, '(');
             stPS(&cg.body, argTexts);
             stP(&cg.body, ");");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::MethodCall => {
@@ -1199,13 +1223,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (re.kind.tag == TypeKind::Pointer) recvTy = re.kind.payload.Pointer.base;
                 owner = cgOwnerName(cg, recvTy);
             } else {
-                owner = (Slice)Slice::from((u8*)"Unknown", 7);
+                owner = Slice::from((u8*)"Unknown", 7);
             }
             Slice recvText = cgExpr(cg, recv);
             bool recvIsPtr = false;
             if (rn.kind.tag == NodeKind::Expr) {
                 Ty rt = rn.kind.payload.Expr.value.resolvedType;
-                if (rt != 0 && (cg.ctx->types + rt).kind.tag == TypeKind::Pointer) recvIsPtr = true;
+                if (rt != 0 && (cg.ctx->types + rt)->kind.tag == TypeKind::Pointer) recvIsPtr = true;
             }
             /* method name */
             usize cs = cg.ebuf.len;
@@ -1217,17 +1241,17 @@ Slice cgExpr(Codegen* cg, NodeId id)
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
-                Stream as = stNew(cg.arena, 64);
+                Stream abuf = stNew(cg.arena, 64);
                 bool first = true;
                 Ty rawRecvTy = 0;
                 if (rn.kind.tag == NodeKind::Expr) rawRecvTy = rn.kind.payload.Expr.value.resolvedType;
                 bool hasSelf = cgMethodHasSelf(cg, rawRecvTy, e.kind.payload.MethodCall.method);
                 if (hasSelf) {
-                    if (recvIsPtr) stPS(&as, recvText);
+                    if (recvIsPtr) stPS(&abuf, recvText);
                     else {
-                        stP(&as, "&(");
-                        stPS(&as, recvText);
-                        stCh(&as, ')');
+                        stP(&abuf, "&(");
+                        stPS(&abuf, recvText);
+                        stCh(&abuf, ')');
                     }
                     first = false;
                     n = n + 1;
@@ -1237,13 +1261,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 u32 i = 0;
                 while (i < argsLen && n < 16) {
                     if (first) first = false;
-                    else stP(&as, ", ");
-                    stPS(&as, cgExpr(cg, args[i]));
+                    else stP(&abuf, ", ");
+                    stPS(&abuf, cgExpr(cg, args[i]));
                     n = n + 1;
                     i = i + 1;
                 }
                 if (argsLen + (hasSelf ? 1 : 0) > 16) cg.errors = cg.errors + 1;
-                argTexts = stTail(&as, 0);
+                argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
@@ -1254,8 +1278,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stCh(&cg.body, '(');
             stPS(&cg.body, argTexts);
             stP(&cg.body, ");");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::StaticCall => {
@@ -1267,20 +1290,20 @@ Slice cgExpr(Codegen* cg, NodeId id)
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
-                Stream as = stNew(cg.arena, 64);
+                Stream abuf = stNew(cg.arena, 64);
                 bool first = true;
                 NodeId* args = e.kind.payload.StaticCall.args;
                 u32 argsLen = e.kind.payload.StaticCall.argsLen;
                 u32 i = 0;
                 while (i < argsLen && n < 16) {
                     if (first) first = false;
-                    else stP(&as, ", ");
-                    stPS(&as, cgExpr(cg, args[i]));
+                    else stP(&abuf, ", ");
+                    stPS(&abuf, cgExpr(cg, args[i]));
                     n = n + 1;
                     i = i + 1;
                 }
                 if (argsLen > 16) cg.errors = cg.errors + 1;
-                argTexts = stTail(&as, 0);
+                argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
@@ -1291,8 +1314,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stCh(&cg.body, '(');
             stPS(&cg.body, argTexts);
             stP(&cg.body, ");");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::Field, ExprKind::DerefField => {
@@ -1310,7 +1332,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
-                if (ot != 0 && (cg.ctx->types + ot).kind.tag == TypeKind::Pointer) isPtr = true;
+                if (ot != 0 && (cg.ctx->types + ot)->kind.tag == TypeKind::Pointer) isPtr = true;
             }
             usize cs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
@@ -1325,8 +1347,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, " = ");
             stPS(&cg.body, fieldText);
             stCh(&cg.body, ';');
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::Index => {
@@ -1347,8 +1368,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, " = ");
             stPS(&cg.body, idxText);
             stCh(&cg.body, ';');
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::TupleField => {
@@ -1366,8 +1386,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, " = ");
             stPS(&cg.body, ttext);
             stCh(&cg.body, ';');
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::StructLiteral => {
@@ -1395,8 +1414,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, "){");
             stPS(&cg.body, stTail(&vs, 0));
             stP(&cg.body, "};");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::ArrayLiteral => {
@@ -1421,8 +1439,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, "){");
             stPS(&cg.body, stTail(&vs, 0));
             stP(&cg.body, "};");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::TupleExpr => {
@@ -1447,8 +1464,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, "){");
             stPS(&cg.body, stTail(&vs, 0));
             stP(&cg.body, "};");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::Ternary => {
@@ -1478,8 +1494,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.body, ee);
             stP(&cg.body, ");");
             cgEmitLabel(cg, lend);
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::IfExpr => {
@@ -1509,8 +1524,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.body, elsec);
             stP(&cg.body, ");");
             cgEmitLabel(cg, lend);
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::BlockExpr => {
@@ -1522,8 +1536,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
             }
             if (e.kind.payload.BlockExpr.result.index != 0)
                 return cgExpr(cg, e.kind.payload.BlockExpr.result);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "0");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
 
         ExprKind::PostInc, ExprKind::PostDec, ExprKind::PreInc, ExprKind::PreDec => {
@@ -1554,8 +1569,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&cg.body, lv);
                 stCh(&cg.body, ';');
             }
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::Assign, ExprKind::AssignAdd, ExprKind::AssignSub,
@@ -1589,8 +1603,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, " ");
             stPS(&cg.body, rv);
             stP(&cg.body, ");");
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::BuiltinCall => {
@@ -1608,8 +1621,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stP(&cg.body, "assert(");
                 stPS(&cg.body, a);
                 stP(&cg.body, ");");
+                usize rs = cg.ebuf.len;
                 stP(&cg.ebuf, "0");
-                return stTail(&cg.ebuf, es);
+                return stTail(&cg.ebuf, rs);
             }
             cg.errors = cg.errors + 1;
             stP(&cg.ebuf, "0");
@@ -1621,8 +1635,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
             cgEmitSwitch(cg, scrut, e.kind.payload.SwitchExpr.cases, e.kind.payload.SwitchExpr.casesLen, tn);
-            stPS(&cg.ebuf, tn);
-            return stTail(&cg.ebuf, es);
+            return tn;
         },
 
         ExprKind::TypeRef => {
@@ -1667,10 +1680,11 @@ Slice cgLvalue(Codegen* cg, NodeId id)
         },
         ExprKind::Deref => {
             Slice c = cgExpr(cg, e.kind.payload.Deref.expr);
+            usize rs = cg.ebuf.len;
             stP(&cg.ebuf, "(*(");
             stPS(&cg.ebuf, c);
             stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::Field, ExprKind::DerefField => {
             NodeId obj;
@@ -1687,32 +1701,35 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
-                if (ot != 0 && (cg.ctx->types + ot).kind.tag == TypeKind::Pointer) isPtr = true;
+                if (ot != 0 && (cg.ctx->types + ot)->kind.tag == TypeKind::Pointer) isPtr = true;
             }
+            usize rs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
             if (isPtr) stP(&cg.ebuf, "->");
             else stCh(&cg.ebuf, '.');
             stPS(&cg.ebuf, cgIntern(cg, field));
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::Index => {
             Slice o = cgExpr(cg, e.kind.payload.Index.obj);
             Slice ix = cgExpr(cg, e.kind.payload.Index.index);
             bool isStr = cgIsStrTy(cg, e.kind.payload.Index.obj);
+            usize rs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
             if (isStr) stP(&cg.ebuf, ".ptr");
             stCh(&cg.ebuf, '[');
             stPS(&cg.ebuf, ix);
             stCh(&cg.ebuf, ']');
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         ExprKind::TupleField => {
             Slice o = cgLvalue(cg, e.kind.payload.TupleField.obj);
+            usize rs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
             stCh(&cg.ebuf, '.');
             stP(&cg.ebuf, "_");
             stU64(&cg.ebuf, (u64)e.kind.payload.TupleField.index);
-            return stTail(&cg.ebuf, es);
+            return stTail(&cg.ebuf, rs);
         },
         else => {
             /* not an lvalue — fall back to value path (error surfaces in C) */
@@ -1726,12 +1743,12 @@ Slice cgLvalue(Codegen* cg, NodeId id)
 
 Slice cgValBody(Codegen* cg, NodeId id)
 {
-    if (id.index == 0) return (Slice)Slice::from((u8*)"0", 1);
+    if (id.index == 0) return Slice::from((u8*)"0", 1);
     Node* n = cgNode(cg, id);
     if (n.kind.tag == NodeKind::Expr) return cgExpr(cg, id);
     if (n.kind.tag != NodeKind::Stmt) {
         cg.errors = cg.errors + 1;
-        return (Slice)Slice::from((u8*)"0", 1);
+        return Slice::from((u8*)"0", 1);
     }
     Stmt* s = &n.kind.payload.Stmt.value;
     if (s.kind.tag == StmtKind::ExprStmt) return cgExpr(cg, s.kind.payload.ExprStmt.expr);
@@ -1744,16 +1761,16 @@ Slice cgValBody(Codegen* cg, NodeId id)
             cgStmt(cg, s.kind.payload.Block.stmts[i]);
             i = i + 1;
         }
-        if (cnt == 0) return (Slice)Slice::from((u8*)"0", 1);
+        if (cnt == 0) return Slice::from((u8*)"0", 1);
         NodeId last = s.kind.payload.Block.stmts[cnt - 1];
         Node* ln = cgNode(cg, last);
         if (ln.kind.tag == NodeKind::Stmt && ln.kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
             return cgExpr(cg, ln.kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
         cgStmt(cg, last);
-        return (Slice)Slice::from((u8*)"0", 1);
+        return Slice::from((u8*)"0", 1);
     }
     cg.errors = cg.errors + 1;
-    return (Slice)Slice::from((u8*)"0", 1);
+    return Slice::from((u8*)"0", 1);
 }
 
 /* ── switch lowering: compare chains + labels ────────────────── */
@@ -1842,8 +1859,8 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard)
  * (resultTemp names the temp each branch assigns). */
 void cgEmitSwitch(Codegen* cg, Slice scrut, SwitchCase* cases, u32 casesLen, Slice resultTemp)
 {
-    u32* chkL = (u32*)cg.arena->alloc(64 * 4, 4);
-    u32* bodyL = (u32*)cg.arena->alloc(64 * 4, 4);
+    u32* chkL = (u32*)cg.arena.alloc(64 * 4, 4);
+    u32* bodyL = (u32*)cg.arena.alloc(64 * 4, 4);
     if (chkL == null || bodyL == null || casesLen > 64) {
         cg.errors = cg.errors + 1;
         return;
@@ -2049,20 +2066,20 @@ void cgStmt(Codegen* cg, NodeId id)
                 Node* inn = cgNode(cg, init);
                 if (inn.kind.tag == NodeKind::Expr)
                     tyText = cgResultTy(cg, init, &inn.kind.payload.Expr.value);
-                else tyText = (Slice)Slice::from((u8*)"rawptr", 6);
-            } else tyText = (Slice)Slice::from((u8*)"rawptr", 6);
+                else tyText = Slice::from((u8*)"rawptr", 6);
+            } else tyText = Slice::from((u8*)"rawptr", 6);
 
             /* array-typed local: declarator form, braced initializer */
             bool isArray = false;
-            if (ty != 0 && (cg.ctx->types + ty).kind.tag == TypeKind::Array) isArray = true;
+            if (ty != 0 && (cg.ctx->types + ty)->kind.tag == TypeKind::Array) isArray = true;
 
             Node* inn = (init.index != 0) ? cgNode(cg, init) : null;
             bool initIsArrayLit = false;
             if (inn != null && inn.kind.tag == NodeKind::Expr &&
                 inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral) initIsArrayLit = true;
 
-            stNL(&cg.body, cg.ind);
             if (isArray) {
+                stNL(&cg.body, cg.ind);
                 TypeEntry* te = cg.ctx->types + ty;
                 stPS(&cg.body, tyStr(cg, te.kind.payload.Array.base));
                 stCh(&cg.body, ' ');
@@ -2088,11 +2105,14 @@ void cgStmt(Codegen* cg, NodeId id)
                     stP(&cg.body, " = {0}");
                 }
             } else {
+                bool hasInit = init.index != 0;
+                Slice initText;
+                if (hasInit) initText = cgExpr(cg, init);
+                stNL(&cg.body, cg.ind);
                 stPS(&cg.body, tyText);
                 stCh(&cg.body, ' ');
                 stPS(&cg.body, cgIntern(cg, name));
-                if (init.index != 0) {
-                    Slice initText = cgExpr(cg, init);
+                if (hasInit) {
                     stP(&cg.body, " = ");
                     stPS(&cg.body, initText);
                 }
@@ -2253,7 +2273,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 return;
             }
             Slice elemTy = tyStr(cg, te.kind.payload.Slice.base);
-            u32 idx = cgNewTemp(cg, (Slice)Slice::from((u8*)"size_t", 6), 0);
+            u32 idx = cgNewTemp(cg, Slice::from((u8*)"size_t", 6), 0);
             Slice ix = cgTempName(cg, idx);
             u32 ltop = cgLabel(cg);
             u32 lbrk = cgLabel(cg);
@@ -2352,7 +2372,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 Node* tn = cgNode(cg, tnid);
                 if (tn.kind.tag == NodeKind::Expr && tn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit) {
                     Slice piece = cgIntern(cg, tn.kind.payload.Expr.value.kind.payload.StringLit.value);
-                    u8* nb = (u8*)cg.arena->alloc(blen + piece.len + 1, 1);
+                    u8* nb = (u8*)cg.arena.alloc(blen + piece.len + 1, 1);
                     if (nb != null) {
                         memcpy(nb, built, blen);
                         memcpy(nb + blen, piece.ptr, piece.len);
@@ -2439,7 +2459,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
             {
                 Ty pt = p.typeNode;
                 if (paramTys != null) pt = paramTys[i];
-                if (pt != 0 && (cg.ctx->types + pt).kind.tag == TypeKind::Array)
+                if (pt != 0 && (cg.ctx->types + pt)->kind.tag == TypeKind::Array)
                 {
                     TypeEntry* te = cg.ctx->types + pt;
                     stPS(s, tyStr(cg, te.kind.payload.Array.base));
@@ -2464,7 +2484,8 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
 
 void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner)
 {
-    Decl* dd = &cgNode(cg, declId).kind.payload.Decl.value;
+    Node* ddn = cgNode(cg, declId);
+    Decl* dd = &ddn.kind.payload.Decl.value;
     MonoSubstitution* oldSubs = cg.subs;
     u32 oldSubsLen = cg.subsLen;
     cg.subs = subs;
@@ -2484,7 +2505,8 @@ void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys
 
 void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner, u8 isStatic)
 {
-    Decl* dd = &cgNode(cg, declId).kind.payload.Decl.value;
+    Node* ddn = cgNode(cg, declId);
+    Decl* dd = &ddn.kind.payload.Decl.value;
 
     MonoSubstitution* oldSubs = cg.subs;
     u32 oldSubsLen = cg.subsLen;
@@ -2791,9 +2813,9 @@ void cgEmitTypeDefs(Codegen* cg)
                 bool atom = false;
                 if (vn.kind.tag == NodeKind::Expr)
                 {
-                    ExprKind k = vn.kind.payload.Expr.value.kind.tag;
-                    if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
-                        k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit) atom = true;
+                    u32 ktag = vn.kind.payload.Expr.value.kind.tag;
+                    if (ktag == ExprKind::IntLit || ktag == ExprKind::FloatLit || ktag == ExprKind::BoolLit ||
+                        ktag == ExprKind::StringLit || ktag == ExprKind::CharLit || ktag == ExprKind::NullLit) atom = true;
                 }
                 if (!atom) { cg.errors = cg.errors + 1; }
                 stP(&cg.defs, "static ");
@@ -3011,7 +3033,8 @@ void cgEmitBodies(Codegen* cg)
             MonoInstance* inst = cg.mono.instances + i;
             if (inst.kind == MonoInstanceKind::FunctionInstance)
             {
-                Decl* dd = &cgNode(cg, inst.declaration).kind.payload.Decl.value;
+                Node* idn = cgNode(cg, inst.declaration);
+                Decl* dd = &idn.kind.payload.Decl.value;
                 if ((dd.kind.payload.Func.flags & 8) != 0 && (dd.kind.payload.Func.flags & 2) == 0)
                 {
                     Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
