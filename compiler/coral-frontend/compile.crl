@@ -2,11 +2,50 @@
 
 mod slice_mod = import "../coral-common/slice" { Slice };
 mod args_mod = import "args" { Options };
-mod io_mod = import "io" { readFile, sliceCStr };
+mod io_mod = import "io";
+import io_mod { readFile, sliceCStr, writeFile };
 mod analyze_module = import "analyze";
 import analyze_module { CompileUnit, analyzeForCompile, freeUnit };
+mod arena_mod = import "../coral-build/arena";
+import arena_mod { Arena };
+mod codegen_mod = import "codegen";
+import codegen_mod { generateC, CodegenResult };
 
 extern("C") i32 printf(u8* fmt, ...);
+extern("C") i32 system(u8* cmd);
+extern("C") rawptr malloc(usize size);
+
+bool endsWithCrl(Slice s)
+{
+    if (s.len < 4) return false;
+    return s.ptr[s.len - 4] == 46 && s.ptr[s.len - 3] == 99 &&
+           s.ptr[s.len - 2] == 114 && s.ptr[s.len - 1] == 108;
+}
+
+/* default output: input with a trailing `.crl` stripped */
+Slice defaultOutput(Slice input)
+{
+    if (endsWithCrl(input)) return Slice::from(input.ptr, input.len - 4);
+    return input;
+}
+
+/* append a NUL-terminated string to a byte buffer */
+usize appendStr(u8* buf, usize cap, usize len, u8* s, usize slen)
+{
+    usize i = 0;
+    while (i < slen && len + 1 < cap) {
+        buf[len] = s[i];
+        len = len + 1;
+        i = i + 1;
+    }
+    buf[len] = 0;
+    return len;
+}
+
+usize appendSlice(u8* buf, usize cap, usize len, Slice s)
+{
+    return appendStr(buf, cap, len, s.ptr, s.len);
+}
 
 pub i32 compileFile(Options* opts)
 {
@@ -19,14 +58,68 @@ pub i32 compileFile(Options* opts)
         return 1;
     }
 
-    CompileUnit unit = analyzeForCompile(src.ptr, len);
+    CompileUnit unit = analyzeForCompile(src.ptr, len, inC);
     if (unit.ctx == null) {
         printf("coral: compile failed, errors=%d\n",
                (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors));
         return 2;
     }
 
-    printf("coral: analyzed ok (%s)\n", inC);
+    /* output binary path: -o or input minus `.crl` */
+    Slice out = opts.output;
+    if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
+    u8* outC = sliceCStr(out);
+    if (outC == null) { freeUnit(&unit); return 1; }
+
+    /* generated C sits next to the output: <out>.c */
+    u8* cPath = (u8*)malloc(out.len + 3);
+    if (cPath == null) { freeUnit(&unit); return 1; }
+    usize ci = 0;
+    while (ci < out.len) { cPath[ci] = out.ptr[ci]; ci = ci + 1; }
+    cPath[ci] = 46; cPath[ci + 1] = 99; cPath[ci + 2] = 0;
+
+    Arena a;
+    a.init(4194304);
+    CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
+    if (cg.errors > 0 || cg.cCode.ptr == null) {
+        printf("coral: codegen failed, errors=%d\n", (i32)cg.errors);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+
+    if (!writeFile(cPath, cg.cCode)) {
+        printf("coral: cannot write %s\n", cPath);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+    printf("coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
+
+    i32 rc = 0;
+    if (opts.dryRun) {
+        printf("coral: dry run, would link %s\n", outC);
+    } else {
+        u8* cmd = (u8*)malloc(out.len + 4096);
+        if (cmd == null) { rc = 3; }
+        else {
+            usize cl = 0;
+            cl = appendStr(cmd, out.len + 4096, cl, (u8*)"gcc -std=gnu11 ", 15);
+            cl = appendSlice(cmd, out.len + 4096, cl, Slice::from(cPath, out.len + 2));
+            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -o ", 4);
+            cl = appendSlice(cmd, out.len + 4096, cl, out);
+            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" 2>&1", 5);
+            i32 st = system(cmd);
+            if (st != 0) {
+                printf("coral: gcc failed (status %d)\n", (i32)st);
+                rc = 3;
+            } else {
+                printf("coral: compiled %s -> %s\n", inC, outC);
+            }
+        }
+    }
+
+    a.freeAll();
     freeUnit(&unit);
-    return 0;
+    return rc;
 }

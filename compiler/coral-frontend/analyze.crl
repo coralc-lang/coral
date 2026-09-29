@@ -44,11 +44,14 @@ pub struct AnalyzeResult
 }
 
 /* Like analyze(), but keeps the AST alive for a backend: the context is
- * heap-allocated and outlives this call. Free with freeUnit(). */
+ * heap-allocated and outlives this call. Free with freeUnit().
+ * sema/mono are kept too — the backend reads monomorphisation instances. */
 pub struct CompileUnit
 {
     AstContext* ctx;
     File* file;
+    Sema* sema;
+    MonoContext* mono;
     u32 parseErrors;
     u32 semanticErrors;
     u32 monoErrors;
@@ -56,6 +59,16 @@ pub struct CompileUnit
 
 pub void freeUnit(CompileUnit* unit)
 {
+    if (unit.mono != null) {
+        unit.mono.deinit();
+        free(unit.mono);
+        unit.mono = null;
+    }
+    if (unit.sema != null) {
+        unit.sema.deinit();
+        free(unit.sema);
+        unit.sema = null;
+    }
     if (unit.ctx != null) {
         unit.ctx.deinit();
         free(unit.ctx);
@@ -64,11 +77,13 @@ pub void freeUnit(CompileUnit* unit)
     }
 }
 
-CompileUnit analyzeForCompile(u8* src, usize len)
+CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
 {
     CompileUnit unit = CompileUnit {
         .ctx = null,
         .file = null,
+        .sema = null,
+        .mono = null,
         .parseErrors = 0,
         .semanticErrors = 0,
         .monoErrors = 0,
@@ -115,30 +130,43 @@ CompileUnit analyzeForCompile(u8* src, usize len)
     };
     parser.previous = parser.current;
 
-    File* file = parser.parseFile(ctx.intern("main", 4));
+    /* real file path so the backend can mangle module paths from it */
+    Str pathStr = ctx.intern((u8*)"main", 4);
+    if (path != null) {
+        usize plen = 0;
+        while (path[plen] != 0) plen = plen + 1;
+        if (plen > 0) pathStr = ctx.intern(path, plen);
+    }
+    File* file = parser.parseFile(pathStr);
     unit.parseErrors = parser.errorCount();
     if (file == null && unit.parseErrors == 0) unit.parseErrors = 1;
 
     if (file != null) {
-        Sema sema;
-        sema.init(ctx, &engine);
-        sema.checkFile(file);
+        Sema* sema = (Sema*)malloc(sizeof(Sema));
+        MonoContext* mono = (MonoContext*)malloc(sizeof(MonoContext));
+        if (sema == null || mono == null) {
+            unit.parseErrors = unit.parseErrors + 1;
+            if (sema != null) free(sema);
+            if (mono != null) free(mono);
+        } else {
+            sema.init(ctx, &engine);
+            sema.checkFile(file);
 
-        MonoContext mono;
-        mono.init(ctx, &sema);
-        mono.collectFile(file);
-        mono.run();
+            mono.init(ctx, sema);
+            mono.collectFile(file);
+            mono.run();
 
-        unit.semanticErrors = sema.errors;
-        unit.monoErrors = mono.errors;
-
-        mono.deinit();
-        sema.deinit();
+            unit.semanticErrors = sema.errors;
+            unit.monoErrors = mono.errors;
+            unit.sema = sema;
+            unit.mono = mono;
+        }
     }
 
     free(entries);
 
     if (unit.parseErrors > 0 || unit.semanticErrors > 0 || unit.monoErrors > 0) {
+        freeUnit(&unit);            /* sema + mono (unit.ctx not set yet) */
         ctx.deinit();
         free(ctx);
         return unit;
