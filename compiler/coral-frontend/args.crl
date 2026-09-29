@@ -5,13 +5,16 @@ mod io_mod = import "io" { readCmdline, sliceCStr };
 
 extern("C") i32 printf(u8* fmt, ...);
 
-pub enum Command { Build, Map, Init, Run }
-pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Other }
+pub enum Command { Build, Map, Init, Run, Compile }
+pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Out, Other }
 
 pub struct Options
 {
     Command cmd;
     Slice buildFile;
+    bool buildFileSet;
+    Slice input;
+    Slice output;
     bool help;
     bool force;
     bool dryRun;
@@ -50,6 +53,7 @@ Flag classifyFlag(Slice a)
         2 => {
             if (aEq(a, "-h", 2)) return Flag::Help;
             if (aEq(a, "-f", 2)) return Flag::File;
+            if (aEq(a, "-o", 2)) return Flag::Out;
         },
         6 => { if (aEq(a, "--help", 6)) return Flag::Help; },
         7 => { if (aEq(a, "--force", 7)) return Flag::Force; },
@@ -69,8 +73,10 @@ pub void usage()
     printf("  map     discover lib.crl folders, update the build file\n");
     printf("  init    scaffold a new build file\n");
     printf("  run     build, then run the output\n");
+    printf("  <file.crl>  compile a single file\n");
     printf("options:\n");
-    printf("  -f <file>     build file (default build.crlb)\n");
+    printf("  -f <file>     build file (default coral.crlb, fallback build.crlb)\n");
+    printf("  -o <file>     output file (single-file compile)\n");
     printf("  --force       rebuild everything\n");
     printf("  --map-only    write modules.map only\n");
     printf("  --dry-run     compile without producing output\n");
@@ -82,6 +88,9 @@ pub bool parseArgs(Options* opts)
 {
     opts->cmd = Command::Build;
     opts->buildFile = Slice::from("coral.crlb", 10);
+    opts->buildFileSet = false;
+    opts->input = Slice::from(null, 0);
+    opts->output = Slice::from(null, 0);
     opts->help = false;
     opts->force = false;
     opts->dryRun = false;
@@ -117,6 +126,18 @@ pub bool parseArgs(Options* opts)
                     return false;
                 }
                 opts->buildFile = val;
+                opts->buildFileSet = true;
+                continue;
+            },
+            Flag::Out => {
+                Slice val;
+                pos = nextArg(argv, pos, &val);
+                if (val.len == 0)
+                {
+                    printf("coral: -o needs a file path\n");
+                    return false;
+                }
+                opts->output = val;
                 continue;
             },
             
@@ -142,6 +163,14 @@ pub bool parseArgs(Options* opts)
             4 => { if (aEq(tok, "init", 4)) { opts->cmd = Command::Init; known = true; } },
             5 => { if (aEq(tok, "build", 5)) { opts->cmd = Command::Build; known = true; } },
             else => {},
+        }
+        if (!known) {
+            usize i = tok.len;
+            if (i >= 4 && tok.ptr[i - 4] == 46 && tok.ptr[i - 3] == 99 && tok.ptr[i - 2] == 114 && tok.ptr[i - 1] == 108) {
+                opts->cmd = Command::Compile;
+                opts->input = tok;
+                known = true;
+            }
         }
         if (!known) {
             printf("coral: unknown command: %s\n", sliceCStr(tok));

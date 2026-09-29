@@ -1,18 +1,18 @@
-mod lexer_mod = import "lexer" { Lexer, mkSlice };
-mod tok_mod = import "token" { Token, TokenKind };
-mod ast_mod = import "ast" { Node, NodeKind, Value, ValueArray, nodeKindName, valueArrayPush };
+mod lexer_mod = import "lexer" { CrlbLexer, mkSlice };
+mod tok_mod = import "token" { CrlbToken, CrlbTokenKind };
+mod ast_mod = import "ast" { CrlbNode, CrlbNodeKind, Value, ValueArray, nodeKindName, valueArrayPush };
 mod arena_mod = import "arena" { Arena };
 mod slice_mod = import "../coral-common/slice" { Slice };
 
 extern("C") i32 printf(u8* fmt, ...);
 
 // recursive-descent parser for the .crlb build-file grammar (build_sys.md)
-pub struct Parser
+pub struct CrlbParser
 {
-    Lexer* lx;
-    Token prev;
-    Token cur;
-    Token next;
+    CrlbLexer* lx;
+    CrlbToken prev;
+    CrlbToken cur;
+    CrlbToken next;
     Arena* arena;
     u32 errors;
 
@@ -20,7 +20,7 @@ pub struct Parser
     {
         self.arena = a;
         self.errors = 0;
-        self.lx = (Lexer*)self.arena.alloc(sizeof(Lexer), 8);
+        self.lx = (CrlbLexer*)self.arena.alloc(sizeof(CrlbLexer), 8);
         if (self.lx == null) return;
         self.lx.init(src);
         self.cur = self.lx.next();
@@ -35,23 +35,23 @@ pub struct Parser
         self.next = self.lx.next();
     }
 
-    bool check(TokenKind k) { return self.cur.kind == k; }
-    bool checkNext(TokenKind k) { return self.next.kind == k; }
+    bool check(CrlbTokenKind k) { return self.cur.kind == k; }
+    bool checkNext(CrlbTokenKind k) { return self.next.kind == k; }
 
-    bool match(TokenKind k)
+    bool match(CrlbTokenKind k)
     {
         if (self.cur.kind != k) return false;
         self.advance();
         return true;
     }
 
-    void errorAt(Token t, u8* msg)
+    void errorAt(CrlbToken t, u8* msg)
     {
         self.errors = self.errors + 1;
         printf("%llu:%llu: parse error: %s\n", t.line, t.col, msg);
     }
 
-    void expect(TokenKind k, u8* msg)
+    void expect(CrlbTokenKind k, u8* msg)
     {
         if (self.cur.kind != k)
         {
@@ -61,9 +61,9 @@ pub struct Parser
         self.advance();
     }
 
-    bool isWord(Token t, u8* cstr, usize len)
+    bool isWord(CrlbToken t, u8* cstr, usize len)
     {
-        if (t.kind != TokenKind::Ident) return false;
+        if (t.kind != CrlbTokenKind::Ident) return false;
         Slice s = t.text;
         return s.eq(mkSlice(cstr, len));
     }
@@ -79,22 +79,22 @@ pub struct Parser
     {
         switch (self.cur.kind)
         {
-            TokenKind::String => {
+            CrlbTokenKind::String => {
                 Value v = Value::String { .value = self.cur.text };
                 self.advance();
                 return v;
             },
-            TokenKind::Number => {
+            CrlbTokenKind::Number => {
                 Value v = Value::Number { .value = self.cur.numValue };
                 self.advance();
                 return v;
             },
-            TokenKind::Bool => {
+            CrlbTokenKind::Bool => {
                 Value v = Value::Boolean { .value = self.cur.boolValue };
                 self.advance();
                 return v;
             },
-            TokenKind::LBracket => {
+            CrlbTokenKind::LBracket => {
                 self.advance();
                 ValueArray* arr = (ValueArray*)self.arena.alloc(sizeof(ValueArray), 8);
                 if (arr != null)
@@ -104,13 +104,13 @@ pub struct Parser
                     arr.cap = 0;
                     arr.arena = self.arena;
                 }
-                while (!self.check(TokenKind::RBracket) && !self.check(TokenKind::Eof))
+                while (!self.check(CrlbTokenKind::RBracket) && !self.check(CrlbTokenKind::Eof))
                 {
                     Value item = self.parseValue();
                     if (arr != null) valueArrayPush(arr, item);
-                    if (!self.match(TokenKind::Comma)) break;
+                    if (!self.match(CrlbTokenKind::Comma)) break;
                 }
-                self.expect(TokenKind::RBracket, "expected ] to close list");
+                self.expect(CrlbTokenKind::RBracket, "expected ] to close list");
                 Value v = Value::List { .value = arr };
                 return v;
             },
@@ -125,95 +125,95 @@ pub struct Parser
 
     // children
 
-    bool childKind(Slice name, NodeKind* out)
+    bool childKind(Slice name, CrlbNodeKind* out)
     {
-        if (name.eq(mkSlice("override", 8))) { *out = NodeKind::Override; return true; }
-        if (name.eq(mkSlice("target", 6))) { *out = NodeKind::Target; return true; }
-        if (name.eq(mkSlice("link", 4))) { *out = NodeKind::Link; return true; }
-        if (name.eq(mkSlice("artifact", 8))) { *out = NodeKind::Artifact; return true; }
-        if (name.eq(mkSlice("features", 8))) { *out = NodeKind::Features; return true; }
-        if (name.eq(mkSlice("env", 3))) { *out = NodeKind::Env; return true; }
-        if (name.eq(mkSlice("log", 3))) { *out = NodeKind::Log; return true; }
-        if (name.eq(mkSlice("metrics", 7))) { *out = NodeKind::Metrics; return true; }
-        if (name.eq(mkSlice("test", 4))) { *out = NodeKind::Test; return true; }
-        if (name.eq(mkSlice("bench", 5))) { *out = NodeKind::Bench; return true; }
-        if (name.eq(mkSlice("hook", 4))) { *out = NodeKind::Hook; return true; }
-        if (name.eq(mkSlice("phase", 5))) { *out = NodeKind::Phase; return true; }
-        if (name.eq(mkSlice("task", 4))) { *out = NodeKind::Task; return true; }
-        if (name.eq(mkSlice("profile", 7))) { *out = NodeKind::Profile; return true; }
-        if (name.eq(mkSlice("workspace", 9))) { *out = NodeKind::Workspace; return true; }
-        if (name.eq(mkSlice("deps", 4))) { *out = NodeKind::Deps; return true; }
-        if (name.eq(mkSlice("remote", 6))) { *out = NodeKind::Remote; return true; }
-        if (name.eq(mkSlice("ci", 2))) { *out = NodeKind::Ci; return true; }
-        if (name.eq(mkSlice("lint", 4))) { *out = NodeKind::Lint; return true; }
-        if (name.eq(mkSlice("format", 6))) { *out = NodeKind::Format; return true; }
-        if (name.eq(mkSlice("lsp", 3))) { *out = NodeKind::Lsp; return true; }
-        if (name.eq(mkSlice("include", 7))) { *out = NodeKind::Include; return true; }
-        if (name.eq(mkSlice("build", 5))) { *out = NodeKind::Build; return true; }
-        if (name.eq(mkSlice("schema", 6))) { *out = NodeKind::Schema; return true; }
-        if (name.eq(mkSlice("strict", 6))) { *out = NodeKind::Strict; return true; }
+        if (name.eq(mkSlice("override", 8))) { *out = CrlbNodeKind::Override; return true; }
+        if (name.eq(mkSlice("target", 6))) { *out = CrlbNodeKind::Target; return true; }
+        if (name.eq(mkSlice("link", 4))) { *out = CrlbNodeKind::Link; return true; }
+        if (name.eq(mkSlice("artifact", 8))) { *out = CrlbNodeKind::Artifact; return true; }
+        if (name.eq(mkSlice("features", 8))) { *out = CrlbNodeKind::Features; return true; }
+        if (name.eq(mkSlice("env", 3))) { *out = CrlbNodeKind::Env; return true; }
+        if (name.eq(mkSlice("log", 3))) { *out = CrlbNodeKind::Log; return true; }
+        if (name.eq(mkSlice("metrics", 7))) { *out = CrlbNodeKind::Metrics; return true; }
+        if (name.eq(mkSlice("test", 4))) { *out = CrlbNodeKind::Test; return true; }
+        if (name.eq(mkSlice("bench", 5))) { *out = CrlbNodeKind::Bench; return true; }
+        if (name.eq(mkSlice("hook", 4))) { *out = CrlbNodeKind::Hook; return true; }
+        if (name.eq(mkSlice("phase", 5))) { *out = CrlbNodeKind::Phase; return true; }
+        if (name.eq(mkSlice("task", 4))) { *out = CrlbNodeKind::Task; return true; }
+        if (name.eq(mkSlice("profile", 7))) { *out = CrlbNodeKind::Profile; return true; }
+        if (name.eq(mkSlice("workspace", 9))) { *out = CrlbNodeKind::Workspace; return true; }
+        if (name.eq(mkSlice("deps", 4))) { *out = CrlbNodeKind::Deps; return true; }
+        if (name.eq(mkSlice("remote", 6))) { *out = CrlbNodeKind::Remote; return true; }
+        if (name.eq(mkSlice("ci", 2))) { *out = CrlbNodeKind::Ci; return true; }
+        if (name.eq(mkSlice("lint", 4))) { *out = CrlbNodeKind::Lint; return true; }
+        if (name.eq(mkSlice("format", 6))) { *out = CrlbNodeKind::Format; return true; }
+        if (name.eq(mkSlice("lsp", 3))) { *out = CrlbNodeKind::Lsp; return true; }
+        if (name.eq(mkSlice("include", 7))) { *out = CrlbNodeKind::Include; return true; }
+        if (name.eq(mkSlice("build", 5))) { *out = CrlbNodeKind::Build; return true; }
+        if (name.eq(mkSlice("schema", 6))) { *out = CrlbNodeKind::Schema; return true; }
+        if (name.eq(mkSlice("strict", 6))) { *out = CrlbNodeKind::Strict; return true; }
         return false;
     }
 
     // parse one `{ ... }` body (fields + nested children) into node
-    void parseBlockInto(Node* node)
+    void parseBlockInto(CrlbNode* node)
     {
-        self.expect(TokenKind::LBrace, "expected { to open block");
-        while (!self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof))
+        self.expect(CrlbTokenKind::LBrace, "expected { to open block");
+        while (!self.check(CrlbTokenKind::RBrace) && !self.check(CrlbTokenKind::Eof))
         {
-            if (self.check(TokenKind::Ident))
+            if (self.check(CrlbTokenKind::Ident))
             {
                 Slice name = self.cur.text;
                 self.advance();
-                if (self.check(TokenKind::Equals))
+                if (self.check(CrlbTokenKind::Equals))
                 {
                     self.advance();
-                    if (self.check(TokenKind::LBrace))
+                    if (self.check(CrlbTokenKind::LBrace))
                     {
                         // env = { ... }; style map block
-                        NodeKind mk;
+                        CrlbNodeKind mk;
                         if (!self.childKind(name, &mk))
                         {
                             self.errorAt(self.prev, "unknown block name");
-                            mk = NodeKind::Env;
+                            mk = CrlbNodeKind::Env;
                         }
-                        Node child;
+                        CrlbNode child;
                         child.init(mk, self.arena);
                         child.label = name;
                         child.hasLabel = true;
                         self.parseBlockInto(&child);
-                        self.expect(TokenKind::Semi, "expected ; after block");
+                        self.expect(CrlbTokenKind::Semi, "expected ; after block");
                         node.addChild(&child);
                         continue;
                     }
                     Value v = self.parseValue();
-                    self.expect(TokenKind::Semi, "expected ; after field");
+                    self.expect(CrlbTokenKind::Semi, "expected ; after field");
                     node.addField(name, v);
                     continue;
                 }
-                if (self.check(TokenKind::String) || self.check(TokenKind::LBrace))
+                if (self.check(CrlbTokenKind::String) || self.check(CrlbTokenKind::LBrace))
                 {
                     // labeled or bare nested block: override "x" { ... }
-                    NodeKind mk;
+                    CrlbNodeKind mk;
                     if (!self.childKind(name, &mk))
                     {
                         self.errorAt(self.prev, "unknown block name");
-                        mk = NodeKind::Override;
+                        mk = CrlbNodeKind::Override;
                     }
-                    Node child;
+                    CrlbNode child;
                     child.init(mk, self.arena);
                     child.label = name;
                     child.hasLabel = true;
-                    if (self.check(TokenKind::String))
+                    if (self.check(CrlbTokenKind::String))
                     {
                         child.label = self.cur.text;
                         child.hasLabel = true;
                         self.advance();
                     }
-                    if (self.check(TokenKind::Ident) && self.curIsWord("extends", 7))
+                    if (self.check(CrlbTokenKind::Ident) && self.curIsWord("extends", 7))
                     {
                         self.advance();
-                        if (self.check(TokenKind::String))
+                        if (self.check(CrlbTokenKind::String))
                         {
                             child.extendsTarget = self.cur.text;
                             child.hasExtends = true;
@@ -227,32 +227,32 @@ pub struct Parser
                 self.errorAt(self.cur, "expected = or { after name");
                 continue;
             }
-            if (self.check(TokenKind::String))
+            if (self.check(CrlbTokenKind::String))
             {
                 // dep_entry style: "key" = { ... };
                 Slice key = self.cur.text;
                 self.advance();
-                self.expect(TokenKind::Equals, "expected = after string key");
-                Node child;
-                child.init(NodeKind::DepEntry, self.arena);
+                self.expect(CrlbTokenKind::Equals, "expected = after string key");
+                CrlbNode child;
+                child.init(CrlbNodeKind::DepEntry, self.arena);
                 child.label = key;
                 child.hasLabel = true;
-                if (self.check(TokenKind::LBrace)) self.parseBlockInto(&child);
-                self.expect(TokenKind::Semi, "expected ; after entry");
+                if (self.check(CrlbTokenKind::LBrace)) self.parseBlockInto(&child);
+                self.expect(CrlbTokenKind::Semi, "expected ; after entry");
                 node.addChild(&child);
                 continue;
             }
             self.errorAt(self.cur, "unexpected token in block");
             self.advance();
         }
-        self.expect(TokenKind::RBrace, "expected } to close block");
+        self.expect(CrlbTokenKind::RBrace, "expected } to close block");
     }
 
     // ── top-level declarations ───────────────────────────────────────
 
-    Node* parseTopDecl()
+    CrlbNode* parseTopDecl()
     {
-        if (!self.check(TokenKind::Ident))
+        if (!self.check(CrlbTokenKind::Ident))
         {
             self.errorAt(self.cur, "expected declaration");
             self.advance();
@@ -264,14 +264,14 @@ pub struct Parser
         // schema = 1;   strict = true;
         if (kw.eq(mkSlice("schema", 6)) || kw.eq(mkSlice("strict", 6)))
         {
-            NodeKind k = NodeKind::Schema;
-            if (kw.eq(mkSlice("strict", 6))) k = NodeKind::Strict;
-            Node* n = (Node*)self.arena.alloc(sizeof(Node), 8);
+            CrlbNodeKind k = CrlbNodeKind::Schema;
+            if (kw.eq(mkSlice("strict", 6))) k = CrlbNodeKind::Strict;
+            CrlbNode* n = (CrlbNode*)self.arena.alloc(sizeof(CrlbNode), 8);
             if (n == null) return null;
             n.init(k, self.arena);
-            self.expect(TokenKind::Equals, "expected = in schema/strict decl");
+            self.expect(CrlbTokenKind::Equals, "expected = in schema/strict decl");
             Value v = self.parseValue();
-            self.expect(TokenKind::Semi, "expected ; after schema/strict");
+            self.expect(CrlbTokenKind::Semi, "expected ; after schema/strict");
             n.addField(kw, v);
             return n;
         }
@@ -279,65 +279,65 @@ pub struct Parser
         // alias name = "target";
         if (kw.eq(mkSlice("alias", 5)))
         {
-            Node* n = (Node*)self.arena.alloc(sizeof(Node), 8);
+            CrlbNode* n = (CrlbNode*)self.arena.alloc(sizeof(CrlbNode), 8);
             if (n == null) return null;
-            n.init(NodeKind::Alias, self.arena);
-            if (self.check(TokenKind::Ident))
+            n.init(CrlbNodeKind::Alias, self.arena);
+            if (self.check(CrlbTokenKind::Ident))
             {
                 n.label = self.cur.text;
                 n.hasLabel = true;
                 self.advance();
             }
             else self.errorAt(self.cur, "expected alias name");
-            self.expect(TokenKind::Equals, "expected = in alias decl");
-            if (self.check(TokenKind::String))
+            self.expect(CrlbTokenKind::Equals, "expected = in alias decl");
+            if (self.check(CrlbTokenKind::String))
             {
                 n.payload = self.cur.text;
                 n.hasPayload = true;
                 self.advance();
             }
             else self.errorAt(self.cur, "expected string target in alias");
-            self.expect(TokenKind::Semi, "expected ; after alias");
+            self.expect(CrlbTokenKind::Semi, "expected ; after alias");
             return n;
         }
 
         // include "other.crlb";
         if (kw.eq(mkSlice("include", 7)))
         {
-            Node* n = (Node*)self.arena.alloc(sizeof(Node), 8);
+            CrlbNode* n = (CrlbNode*)self.arena.alloc(sizeof(CrlbNode), 8);
             if (n == null) return null;
-            n.init(NodeKind::Include, self.arena);
-            if (self.check(TokenKind::String))
+            n.init(CrlbNodeKind::Include, self.arena);
+            if (self.check(CrlbTokenKind::String))
             {
                 n.payload = self.cur.text;
                 n.hasPayload = true;
                 self.advance();
             }
             else self.errorAt(self.cur, "expected string path in include");
-            self.expect(TokenKind::Semi, "expected ; after include");
+            self.expect(CrlbTokenKind::Semi, "expected ; after include");
             return n;
         }
 
         // labeled block decl: build "name" [extends "x"] { ... }
-        NodeKind kind;
+        CrlbNodeKind kind;
         if (!self.childKind(kw, &kind))
         {
             self.errorAt(self.prev, "unknown top-level declaration");
             return null;
         }
-        Node* n = (Node*)self.arena.alloc(sizeof(Node), 8);
+        CrlbNode* n = (CrlbNode*)self.arena.alloc(sizeof(CrlbNode), 8);
         if (n == null) return null;
         n.init(kind, self.arena);
-        if (self.check(TokenKind::String))
+        if (self.check(CrlbTokenKind::String))
         {
             n.label = self.cur.text;
             n.hasLabel = true;
             self.advance();
         }
-        if (self.check(TokenKind::Ident) && self.curIsWord("extends", 7))
+        if (self.check(CrlbTokenKind::Ident) && self.curIsWord("extends", 7))
         {
             self.advance();
-            if (self.check(TokenKind::String))
+            if (self.check(CrlbTokenKind::String))
             {
                 n.extendsTarget = self.cur.text;
                 n.hasExtends = true;
@@ -348,14 +348,14 @@ pub struct Parser
         return n;
     }
 
-    Node* parseFile()
+    CrlbNode* parseFile()
     {
-        Node* root = (Node*)self.arena.alloc(sizeof(Node), 8);
+        CrlbNode* root = (CrlbNode*)self.arena.alloc(sizeof(CrlbNode), 8);
         if (root == null) return null;
-        root.init(NodeKind::Root, self.arena);
-        while (!self.check(TokenKind::Eof))
+        root.init(CrlbNodeKind::Root, self.arena);
+        while (!self.check(CrlbTokenKind::Eof))
         {
-            Node* decl = self.parseTopDecl();
+            CrlbNode* decl = self.parseTopDecl();
             if (decl != null) root.addChild(decl);
             if (self.errors > 64) break;
         }

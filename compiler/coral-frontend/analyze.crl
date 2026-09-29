@@ -43,6 +43,112 @@ pub struct AnalyzeResult
     u32 nodes;
 }
 
+/* Like analyze(), but keeps the AST alive for a backend: the context is
+ * heap-allocated and outlives this call. Free with freeUnit(). */
+pub struct CompileUnit
+{
+    AstContext* ctx;
+    File* file;
+    u32 parseErrors;
+    u32 semanticErrors;
+    u32 monoErrors;
+}
+
+pub void freeUnit(CompileUnit* unit)
+{
+    if (unit.ctx != null) {
+        unit.ctx.deinit();
+        free(unit.ctx);
+        unit.ctx = null;
+        unit.file = null;
+    }
+}
+
+CompileUnit analyzeForCompile(u8* src, usize len)
+{
+    CompileUnit unit = CompileUnit {
+        .ctx = null,
+        .file = null,
+        .parseErrors = 0,
+        .semanticErrors = 0,
+        .monoErrors = 0,
+    };
+
+    AstContext* ctx = (AstContext*)malloc(sizeof(AstContext));
+    if (ctx == null) {
+        unit.parseErrors = 1;
+        return unit;
+    }
+    ctx.init(4096, 4096, 4096);
+
+    IdentEntry* entries = (IdentEntry*)malloc(256 * sizeof(IdentEntry));
+    if (entries == null) {
+        unit.parseErrors = 1;
+        ctx.deinit();
+        free(ctx);
+        return unit;
+    }
+
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+
+    DiagnosticEngine engine;
+    engine.init(src, src + len);
+
+    Lexer lexer = Lexer {
+        .bufStart = src,
+        .cur = src,
+        .bufEnd = src + len,
+        .line = 1,
+        .lineStart = src,
+        .diag = &engine,
+        .idents = &idents,
+    };
+
+    Parser parser = Parser {
+        .lexer = &lexer,
+        .ctx = ctx,
+        .panicMode = 0,
+        .pendingGreater = false,
+        .current = lexer.nextToken(),
+    };
+    parser.previous = parser.current;
+
+    File* file = parser.parseFile(ctx.intern("main", 4));
+    unit.parseErrors = parser.errorCount();
+    if (file == null && unit.parseErrors == 0) unit.parseErrors = 1;
+
+    if (file != null) {
+        Sema sema;
+        sema.init(ctx, &engine);
+        sema.checkFile(file);
+
+        MonoContext mono;
+        mono.init(ctx, &sema);
+        mono.collectFile(file);
+        mono.run();
+
+        unit.semanticErrors = sema.errors;
+        unit.monoErrors = mono.errors;
+
+        mono.deinit();
+        sema.deinit();
+    }
+
+    free(entries);
+
+    if (unit.parseErrors > 0 || unit.semanticErrors > 0 || unit.monoErrors > 0) {
+        ctx.deinit();
+        free(ctx);
+        return unit;
+    }
+
+    unit.ctx = ctx;
+    unit.file = file;
+    return unit;
+}
+
 AnalyzeResult analyze(u8* src, usize len)
 {
     AnalyzeResult result = AnalyzeResult{

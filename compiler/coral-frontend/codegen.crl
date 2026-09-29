@@ -1,0 +1,2323 @@
+/* frontend/codegen.crl — backend: analyzed AST → flat C.
+ *
+ * Output shape: labels + gotos for control flow, three-address temporaries
+ * for expression evaluation (declared at function entry). Types come from
+ * Sema's resolvedType / the TypeKind table only — no name heuristics.
+ */
+
+mod id = import "../coral-ast/id";
+import id { Str, NodeId };
+mod types_mod = import "../coral-ast/types";
+import types_mod { Ty, TypeEntry, TypeKind };
+mod node_mod = import "../coral-ast/node";
+import node_mod { Node, NodeKind };
+mod expr_mod = import "../coral-ast/expr";
+import expr_mod { Expr, ExprKind };
+mod stmt_mod = import "../coral-ast/stmt";
+import stmt_mod { Stmt, StmtKind, SwitchCase };
+mod decl_mod = import "../coral-ast/decl";
+import decl_mod { Decl, DeclKind, File, Param, Field };
+mod pat_mod = import "../coral-ast/pat";
+import pat_mod { Pat, PatKind };
+mod context_mod = import "../coral-context/context";
+import context_mod { AstContext, InternEntry };
+mod arena_mod = import "../coral-build/arena";
+import arena_mod { Arena };
+mod slice_mod = import "../coral-common/slice";
+import slice_mod { Slice };
+mod mono_mod = import "../coral-mono/mono";
+import mono_mod { MonoContext, MonoSubstitution, MonoInstance, MonoInstanceKind };
+mod sema_mod = import "../coral-semantics/sema";
+import sema_mod { Sema };
+
+extern("C") usize strlen(u8* s);
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr p, usize size);
+extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
+
+pub struct CodegenResult
+{
+    Slice cCode;
+    u32 errors;
+}
+
+pub struct Stream
+{
+    u8* p;
+    usize len;
+    usize cap;
+    Arena* arena;
+}
+
+pub Stream stNew(Arena* a, usize cap)
+{
+    Stream s;
+    s.arena = a;
+    s.cap = cap;
+    s.len = 0;
+    s.p = (u8*)a.alloc(cap, 1);
+    if (s.p == null) s.cap = 0;
+    return s;
+}
+
+void stPut(Stream* s, u8* data, usize n)
+{
+    if (s.p == null || s.arena == null) return;
+    if (s.len + n + 1 > s.cap)
+    {
+        usize nc = s.cap * 2;
+        while (nc < s.len + n + 1) nc = nc * 2;
+        u8* np = (u8*)s.arena->alloc(nc, 1);
+        if (np == null) return;
+        memcpy(np, s.p, s.len);
+        s.p = np;
+        s.cap = nc;
+    }
+    memcpy(s.p + s.len, data, n);
+    s.len = s.len + n;
+    s.p[s.len] = 0;
+}
+
+void stP(Stream* s, u8* cstr)
+{
+    if (cstr == null) return;
+    stPut(s, cstr, strlen(cstr));
+}
+
+void stPS(Stream* s, Slice v)
+{
+    if (v.ptr == null) return;
+    stPut(s, v.ptr, v.len);
+}
+
+void stCh(Stream* s, u8 c)
+{
+    stPut(s, &c, 1);
+}
+
+void stU64(Stream* s, u64 n)
+{
+    u8 buf[24];
+    usize i = 24;
+    if (n == 0) {
+        stCh(s, '0');
+        return;
+    }
+    while (n > 0 && i > 0) {
+        i = i - 1;
+        buf[i] = (u8)(48 + (n % 10));
+        n = n / 10;
+    }
+    stPut(s, buf + i, 24 - i);
+}
+
+void stI64(Stream* s, i64 n)
+{
+    if (n < 0) {
+        stCh(s, '-');
+        stU64(s, (u64)(0 - n));
+    } else {
+        stU64(s, (u64)n);
+    }
+}
+
+Slice stTail(Stream* s, usize start)
+{
+    if (start > s.len) return Slice::from(null, 0);
+    return Slice::from(s.p + start, s.len - start);
+}
+
+void stNL(Stream* s, u32 ind)
+{
+    stCh(s, '\n');
+    u32 i = 0;
+    while (i < ind) {
+        stP(s, "    ");
+        i = i + 1;
+    }
+}
+
+pub struct Codegen
+{
+    AstContext* ctx;
+    File* file;
+    MonoContext* mono;
+    Sema* sema;
+    Arena* arena;
+    Stream out;
+    Stream fwd;
+    Stream defs;
+    Stream protos;
+    Stream bodies;
+    Stream body;
+    Stream ebuf;
+    Stream tybuf;
+    Stream tdecl;
+    MonoSubstitution* subs;
+    u32 subsLen;
+    u32 errors;
+
+    u32 labelSeq;
+    u32 tempSeq;
+    Slice* tempTys;
+    u32* tempArrs;
+    u32 tempsCap;
+    u32 tempsLen;
+
+    u32* breakStack;
+    u32* contStack;
+    u32 loopDepth;
+    u32 loopCap;
+
+    Slice* regNames;
+    u32 regLen;
+    u32 regCap;
+
+    u32 ind;
+}
+
+u32 cgLabel(Codegen* self)
+{
+    self.labelSeq = self.labelSeq + 1;
+    return self.labelSeq;
+}
+
+u32 cgNewTemp(Codegen* self, Slice ty, u32 arrLen)
+{
+    if (self.tempsLen >= self.tempsCap) {
+        self.errors = self.errors + 1;
+        return 0;
+    }
+    u32 t = self.tempsLen;
+    self.tempTys[t] = ty;
+    self.tempArrs[t] = arrLen;
+    self.tempsLen = self.tempsLen + 1;
+    return t;
+}
+
+Slice cgTempName(Codegen* self, u32 t)
+{
+    usize start = self.tybuf.len;
+    stP(&self.tybuf, "__t");
+    stU64(&self.tybuf, (u64)t);
+    return stTail(&self.tybuf, start);
+}
+
+void cgPushBreak(Codegen* self, u32 lab)
+{
+    if (self.loopDepth >= self.loopCap) { self.errors = self.errors + 1; return; }
+    self.breakStack[self.loopDepth] = lab;
+    self.loopDepth = self.loopDepth + 1;
+}
+
+void cgPopLoop(Codegen* self)
+{
+    if (self.loopDepth > 0) self.loopDepth = self.loopDepth - 1;
+}
+
+Slice cgIntern(Codegen* self, Str s)
+{
+    if (s == 0) return Slice::from(null, 0);
+    InternEntry* e = self.ctx->interns + s;
+    return Slice::from(e.ptr, e.len);
+}
+
+Slice cgTail(Codegen* self, Stream* s, usize start)
+{
+    return stTail(s, start);
+}
+
+/* ── monomorphisation context ────────────────────────────────── */
+
+/* Resolve a type through the current instance's substitutions
+ * (mirrors mono findSubstitution: TypeParam by index/name, or a bare
+ * Named whose name matches a generic parameter). Returns t if none. */
+Ty cgSubstTy(Codegen* self, Ty t)
+{
+    if (t == 0 || self.subsLen == 0 || self.subs == null) return t;
+    TypeEntry* e = self.ctx->types + t;
+    if (e.kind.tag == TypeKind::TypeParam) {
+        u32 i = 0;
+        while (i < self.subsLen) {
+            if (self.subs[i].index == e.kind.payload.TypeParam.index ||
+                self.subs[i].parameter == e.kind.payload.TypeParam.name)
+                return self.subs[i].typeNode;
+            i = i + 1;
+        }
+        return t;
+    }
+    if (e.kind.tag == TypeKind::Named && e.kind.payload.Named.genericArgsLen == 0) {
+        u32 i = 0;
+        while (i < self.subsLen) {
+            if (self.subs[i].parameter == e.kind.payload.Named.name)
+                return self.subs[i].typeNode;
+            i = i + 1;
+        }
+    }
+    return t;
+}
+
+/* Sanitize a C type spelling into a mangled identifier fragment. */
+Slice cgMangleTy(Codegen* self, Ty t)
+{
+    Slice s = tyStr(self, t);
+    usize st = self.tybuf.len;
+    usize i = 0;
+    while (i < s.len)
+    {
+        u8 c = s.ptr[i];
+        bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+        if (ok) stCh(&self.tybuf, c);
+        else if (c == 42) stP(&self.tybuf, "p");
+        else stCh(&self.tybuf, 95);
+        i = i + 1;
+    }
+    return stTail(&self.tybuf, st);
+}
+
+/* name + "_" + mangled arg types — the C name for a mono instance. */
+Slice cgInstanceName(Codegen* self, Str name, Ty* args, u32 argsLen)
+{
+    usize st = self.tybuf.len;
+    stPS(&self.tybuf, cgIntern(self, name));
+    u32 i = 0;
+    while (i < argsLen)
+    {
+        stCh(&self.tybuf, 95);
+        stPS(&self.tybuf, cgMangleTy(self, args[i]));
+        i = i + 1;
+    }
+    return stTail(&self.tybuf, st);
+}
+
+NodeId cgFindDecl(Codegen* self, Str name, DeclKind tag)
+{
+    NodeId none;
+    none.index = 0;
+    if (self.file == null || name == 0) return none;
+    u32 i = 0;
+    while (i < self.file.declsLen)
+    {
+        Node* d = self.ctx->nodes + self.file.decls[i].index;
+        if (d.kind.tag == NodeKind::Decl && d.kind.payload.Decl.value.kind.tag == tag)
+        {
+            Decl* dd = &d.kind.payload.Decl.value;
+            Str dn = 0;
+            switch (dd.kind.tag)
+            {
+                DeclKind::Func => { dn = dd.kind.payload.Func.name; },
+                DeclKind::Struct => { dn = dd.kind.payload.Struct.name; },
+                DeclKind::Enum => { dn = dd.kind.payload.Enum.name; },
+                DeclKind::Variant => { dn = dd.kind.payload.Variant.name; },
+                DeclKind::Union => { dn = dd.kind.payload.Union.name; },
+                DeclKind::TypeAlias => { dn = dd.kind.payload.TypeAlias.name; },
+                DeclKind::Constant => { dn = dd.kind.payload.Constant.name; },
+                else => {},
+            }
+            if (dn == name) return self.file.decls[i];
+        }
+        i = i + 1;
+    }
+    return none;
+}
+
+/* Resolve the callee of a call: plain name for non-generic functions,
+ * mangled instance name for generic ones. Sets *outRet to the concrete
+ * return type. Returns null slice when the declaration is unknown. */
+Slice cgResolveCall(Codegen* self, Str name, NodeId* args, u32 argsLen, Ty* outRet, bool* found)
+{
+    *found = false;
+    *outRet = 0;
+    NodeId declId = cgFindDecl(self, name, DeclKind::Func);
+    if (declId.index == 0) return Slice::from(null, 0);
+    Decl* dd = &cgNode(self, declId).kind.payload.Decl.value;
+    if (self.mono == null || self.mono.genericCount(declId) == 0) {
+        *found = true;
+        *outRet = dd.kind.payload.Func.returnType;
+        return cgIntern(self, name);
+    }
+    /* generic: pick the mono instance whose collected argument types match */
+    u32 total = 0;
+    u32 firstMatch = 0;
+    u32 matches = 0;
+    u32 i = 0;
+    while (i < self.mono.instancesLen)
+    {
+        MonoInstance* inst = self.mono.instances + i;
+        if (inst.kind == MonoInstanceKind::FunctionInstance && inst.declaration.index == declId.index)
+        {
+            if (total == 0) firstMatch = i;
+            total = total + 1;
+            bool ok = true;
+            if (inst.argumentsLen == argsLen) {
+                u32 k = 0;
+                while (k < argsLen) {
+                    Node* an = cgNode(self, args[k]);
+                    Ty at = 0;
+                    if (an.kind.tag == NodeKind::Expr) at = an.kind.payload.Expr.value.resolvedType;
+                    at = cgSubstTy(self, at);
+                    if (at == 0 || !self.sema.sameType(at, inst.arguments[k])) { ok = false; break; }
+                    k = k + 1;
+                }
+            } else {
+                ok = false;
+            }
+            if (ok) {
+                if (matches == 0) firstMatch = i;
+                matches = matches + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (total == 0) return Slice::from(null, 0);
+    u32 pick = firstMatch;
+    if (matches == 0) {
+        /* no argument match: fall back to the first instance (sema already
+           accepted the call) and surface the mismatch */
+        if (total > 1) self.errors = self.errors + 1;
+        pick = firstMatch;
+    }
+    MonoInstance* p = self.mono.instances + pick;
+    *found = true;
+    *outRet = p.returnType;
+    return cgInstanceName(self, p.name, p.arguments, p.argumentsLen);
+}
+
+/* ── C type emission ─────────────────────────────────────────── */
+
+extern("C") Slice tyStr(Codegen* self, Ty t);
+
+Slice tyStr(Codegen* self, Ty t)
+{
+    if (t == 0) return (Slice)Slice::from((u8*)"rawptr", 6);
+    TypeEntry* e = self.ctx->types + t;
+    TypeKind k = e.kind;
+    usize start = self.tybuf.len;
+    switch (k.tag)
+    {
+        TypeKind::Void => { return (Slice)Slice::from((u8*)"void", 4); },
+        TypeKind::Bool => { return (Slice)Slice::from((u8*)"_Bool", 5); },
+        TypeKind::Char => { return (Slice)Slice::from((u8*)"char", 4); },
+        TypeKind::I8 => { return (Slice)Slice::from((u8*)"int8_t", 6); },
+        TypeKind::U8 => { return (Slice)Slice::from((u8*)"uint8_t", 7); },
+        TypeKind::I16 => { return (Slice)Slice::from((u8*)"int16_t", 7); },
+        TypeKind::U16 => { return (Slice)Slice::from((u8*)"uint16_t", 8); },
+        TypeKind::I32 => { return (Slice)Slice::from((u8*)"int32_t", 7); },
+        TypeKind::U32 => { return (Slice)Slice::from((u8*)"uint32_t", 8); },
+        TypeKind::I64 => { return (Slice)Slice::from((u8*)"int64_t", 7); },
+        TypeKind::U64 => { return (Slice)Slice::from((u8*)"uint64_t", 8); },
+        TypeKind::I128 => { return (Slice)Slice::from((u8*)"__int128_t", 10); },
+        TypeKind::U128 => { return (Slice)Slice::from((u8*)"__uint128_t", 11); },
+        TypeKind::F32 => { return (Slice)Slice::from((u8*)"float", 5); },
+        TypeKind::F64 => { return (Slice)Slice::from((u8*)"double", 6); },
+        TypeKind::Isize => { return (Slice)Slice::from((u8*)"intptr_t", 8); },
+        TypeKind::Usize => { return (Slice)Slice::from((u8*)"size_t", 6); },
+        TypeKind::Rawptr => { return (Slice)Slice::from((u8*)"void*", 5); },
+        TypeKind::Str => { return (Slice)Slice::from((u8*)"const char*", 11); },
+        TypeKind::Error => { return (Slice)Slice::from((u8*)"void", 4); },
+        TypeKind::Named => {
+            /* inside an instance: resolve a bare generic parameter name */
+            Ty sub = cgSubstTy(self, t);
+            if (sub != t) return tyStr(self, sub);
+            Str name = k.payload.Named.name;
+            if (k.payload.Named.genericArgsLen > 0) {
+                return cgInstanceName(self, name, k.payload.Named.genericArgs, k.payload.Named.genericArgsLen);
+            }
+            /* alias? find `typedef` decl with this name and follow it */
+            File* file = self.file;
+            if (file != null) {
+                u32 i = 0;
+                while (i < file.declsLen)
+                {
+                    Node* d = self.ctx->nodes + file.decls[i].index;
+                    if (d.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &d.kind.payload.Decl.value;
+                        if (dd.kind.tag == DeclKind::TypeAlias)
+                        {
+                            if (dd.kind.payload.TypeAlias.name == name)
+                                return tyStr(self, dd.kind.payload.TypeAlias.target);
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+            return cgIntern(self, name);
+        },
+        TypeKind::Pointer => {
+            Slice base = tyStr(self, k.payload.Pointer.base);
+            stPS(&self.tybuf, base);
+            stCh(&self.tybuf, '*');
+            return stTail(&self.tybuf, start);
+        },
+        TypeKind::Const => {
+            Ty base = k.payload.Const.base;
+            TypeEntry* be = self.ctx->types + base;
+            if (be.kind.tag == TypeKind::Pointer) {
+                Slice b = tyStr(self, base);
+                stPS(&self.tybuf, b);
+                stP(&self.tybuf, " const");
+                return stTail(&self.tybuf, start);
+            }
+            stP(&self.tybuf, "const ");
+            stPS(&self.tybuf, tyStr(self, base));
+            return stTail(&self.tybuf, start);
+        },
+        TypeKind::Comptime => { return tyStr(self, k.payload.Comptime.base); },
+        TypeKind::TypeParam => {
+            Ty sub = cgSubstTy(self, t);
+            if (sub != t) return tyStr(self, sub);
+            self.errors = self.errors + 1;
+            return (Slice)Slice::from((u8*)"void*", 5);
+        },
+        TypeKind::Slice => { return cgRegName(self, t); },
+        TypeKind::FnPtr => { return cgRegName(self, t); },
+        TypeKind::Tuple => { return cgRegName(self, t); },
+        TypeKind::Array => {
+            Slice b = tyStr(self, k.payload.Array.base);
+            stPS(&self.tybuf, b);
+            stCh(&self.tybuf, '[');
+            stU64(&self.tybuf, (u64)k.payload.Array.len);
+            stCh(&self.tybuf, ']');
+            return stTail(&self.tybuf, start);
+        },
+        else => { return (Slice)Slice::from((u8*)"void*", 5); },
+    }
+    return stTail(&self.tybuf, start);
+}
+
+/* ── registered typedefs (slices, tuples, fn pointers) ───────── */
+
+bool cgRegHas(Codegen* self, Slice name)
+{
+    u32 i = 0;
+    while (i < self.regLen)
+    {
+        Slice r = self.regNames[i];
+        if (r.len == name.len) {
+            bool eq = true;
+            usize j = 0;
+            while (j < name.len) {
+                if (r.ptr[j] != name.ptr[j]) { eq = false; break; }
+                j = j + 1;
+            }
+            if (eq) return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+void cgRegAdd(Codegen* self, Slice name)
+{
+    if (self.regLen >= self.regCap) return;
+    self.regNames[self.regLen] = name;
+    self.regLen = self.regLen + 1;
+}
+
+extern("C") Slice cgRegName(Codegen* self, Ty t);
+
+Slice cgRegName(Codegen* self, Ty t)
+{
+    TypeEntry* e = self.ctx->types + t;
+    TypeKind k = e.kind;
+    usize nstart = self.tybuf.len;
+
+    if (k.tag == TypeKind::Slice) {
+        stP(&self.tybuf, "Slice_");
+        stPS(&self.tybuf, tyStr(self, k.payload.Slice.base));
+    } else if (k.tag == TypeKind::FnPtr) {
+        stP(&self.tybuf, "FnP_");
+        stU64(&self.tybuf, (u64)t);
+    } else {
+        stP(&self.tybuf, "_coral_tuple_");
+        u32 i = 0;
+        while (i < k.payload.Tuple.elemsLen)
+        {
+            if (i > 0) stCh(&self.tybuf, '_');
+            stPS(&self.tybuf, tyStr(self, k.payload.Tuple.elems[i]));
+            i = i + 1;
+        }
+    }
+    Slice name = stTail(&self.tybuf, nstart);
+    if (cgRegHas(self, name)) return name;
+    cgRegAdd(self, name);
+
+    /* dependency typedefs first */
+    if (k.tag == TypeKind::Slice) cgRegEnsure(self, k.payload.Slice.base);
+    if (k.tag == TypeKind::FnPtr) {
+        cgRegEnsure(self, k.payload.FnPtr.returnType);
+        u32 i = 0;
+        while (i < k.payload.FnPtr.paramsLen) {
+            cgRegEnsure(self, k.payload.FnPtr.params[i]);
+            i = i + 1;
+        }
+    }
+    if (k.tag == TypeKind::Tuple) {
+        u32 i = 0;
+        while (i < k.payload.Tuple.elemsLen) {
+            cgRegEnsure(self, k.payload.Tuple.elems[i]);
+            i = i + 1;
+        }
+    }
+
+    /* emit the typedef */
+    if (k.tag == TypeKind::Slice) {
+        stP(&self.tdecl, "typedef struct ");
+        stPS(&self.tdecl, name);
+        stP(&self.tdecl, " { ");
+        stPS(&self.tdecl, tyStr(self, k.payload.Slice.base));
+        stP(&self.tdecl, "* ptr; size_t len; } ");
+        stPS(&self.tdecl, name);
+        stP(&self.tdecl, ";\n");
+    } else if (k.tag == TypeKind::FnPtr) {
+        stP(&self.tdecl, "typedef ");
+        stPS(&self.tdecl, tyStr(self, k.payload.FnPtr.returnType));
+        stP(&self.tdecl, " (*");
+        stPS(&self.tdecl, name);
+        stP(&self.tdecl, ")(");
+        u32 i = 0;
+        while (i < k.payload.FnPtr.paramsLen)
+        {
+            if (i > 0) stP(&self.tdecl, ", ");
+            stPS(&self.tdecl, tyStr(self, k.payload.FnPtr.params[i]));
+            i = i + 1;
+        }
+        stP(&self.tdecl, ");\n");
+    } else {
+        stP(&self.tdecl, "typedef struct ");
+        stPS(&self.tdecl, name);
+        stP(&self.tdecl, " {\n");
+        u32 i = 0;
+        while (i < k.payload.Tuple.elemsLen)
+        {
+            stP(&self.tdecl, "    ");
+            stPS(&self.tdecl, tyStr(self, k.payload.Tuple.elems[i]));
+            stP(&self.tdecl, " _");
+            stU64(&self.tdecl, (u64)i);
+            stP(&self.tdecl, ";\n");
+            i = i + 1;
+        }
+        stP(&self.tdecl, "} ");
+        stPS(&self.tdecl, name);
+        stP(&self.tdecl, ";\n");
+    }
+    return name;
+}
+
+void cgRegEnsure(Codegen* self, Ty t)
+{
+    if (t == 0) return;
+    TypeEntry* e = self.ctx->types + t;
+    TypeKind k = e.kind;
+    if (k.tag == TypeKind::Slice || k.tag == TypeKind::FnPtr || k.tag == TypeKind::Tuple)
+        cgRegName(self, t);
+}
+
+/* ── helpers ─────────────────────────────────────────────────── */
+
+Node* cgNode(Codegen* self, NodeId id)
+{
+    return self.ctx->nodes + id.index;
+}
+
+/* C type text for a value expression node (0-safe). */
+Slice cgValExprTy(Codegen* self, NodeId id)
+{
+    if (id.index == 0) return (Slice)Slice::from((u8*)"rawptr", 6);
+    Node* n = cgNode(self, id);
+    if (n.kind.tag != NodeKind::Expr) return (Slice)Slice::from((u8*)"rawptr", 6);
+    return cgResultTy(self, id, &n.kind.payload.Expr.value);
+}
+
+Slice cgResultTy(Codegen* self, NodeId id, Expr* e)
+{
+    if (e.resolvedType != 0) return tyStr(self, cgSubstTy(self, e.resolvedType));
+    switch (e.kind.tag)
+    {
+        ExprKind::Not => { return (Slice)Slice::from((u8*)"_Bool", 5); },
+        ExprKind::AddressOf => {
+            NodeId c = e.kind.payload.AddressOf.expr;
+            Node* cn = cgNode(self, c);
+            Slice base = (Slice)Slice::from((u8*)"rawptr", 6);
+            if (cn.kind.tag == NodeKind::Expr)
+                base = cgResultTy(self, c, &cn.kind.payload.Expr.value);
+            usize s = self.tybuf.len;
+            stPS(&self.tybuf, base);
+            stCh(&self.tybuf, '*');
+            return stTail(&self.tybuf, s);
+        },
+        ExprKind::Assign => { return cgValExprTy(self, e.kind.payload.Assign.value); },
+        ExprKind::AssignAdd => { return cgValExprTy(self, e.kind.payload.AssignAdd.value); },
+        ExprKind::AssignSub => { return cgValExprTy(self, e.kind.payload.AssignSub.value); },
+        ExprKind::AssignMul => { return cgValExprTy(self, e.kind.payload.AssignMul.value); },
+        ExprKind::AssignDiv => { return cgValExprTy(self, e.kind.payload.AssignDiv.value); },
+        ExprKind::AssignMod => { return cgValExprTy(self, e.kind.payload.AssignMod.value); },
+        ExprKind::AssignBitAnd => { return cgValExprTy(self, e.kind.payload.AssignBitAnd.value); },
+        ExprKind::AssignBitOr => { return cgValExprTy(self, e.kind.payload.AssignBitOr.value); },
+        ExprKind::AssignBitXor => { return cgValExprTy(self, e.kind.payload.AssignBitXor.value); },
+        ExprKind::AssignShl => { return cgValExprTy(self, e.kind.payload.AssignShl.value); },
+        ExprKind::AssignShr => { return cgValExprTy(self, e.kind.payload.AssignShr.value); },
+        else => {},
+    }
+    return (Slice)Slice::from((u8*)"rawptr", 6);
+}
+
+void cgEmitStmt(Codegen* self, u8* text)
+{
+    stNL(&self.body, self.ind);
+    stPS(&self.body, Slice::from(text, strlen(text)));
+    stCh(&self.body, ';');
+}
+
+void cgEmitLine(Codegen* self, Slice a, u8* mid, Slice b)
+{
+    stNL(&self.body, self.ind);
+    stPS(&self.body, a);
+    stP(&self.body, mid);
+    stPS(&self.body, b);
+    stCh(&self.body, ';');
+}
+
+void cgEmitLabel(Codegen* self, u32 lab)
+{
+    stNL(&self.body, self.ind);
+    stP(&self.body, "__L");
+    stU64(&self.body, (u64)lab);
+    stP(&self.body, ": ;");
+}
+
+void cgEmitGoto(Codegen* self, u32 lab)
+{
+    stNL(&self.body, self.ind);
+    stP(&self.body, "goto __L");
+    stU64(&self.body, (u64)lab);
+    stCh(&self.body, ';');
+}
+
+bool cgIsCrtFn(Str name, Slice text)
+{
+    /* provided by the preamble headers */
+    u8* names[18];
+    usize lens[18];
+    names[0] = (u8*)"printf"; lens[0] = 6;
+    names[1] = (u8*)"write"; lens[1] = 5;
+    names[2] = (u8*)"read"; lens[2] = 4;
+    names[3] = (u8*)"malloc"; lens[3] = 6;
+    names[4] = (u8*)"calloc"; lens[4] = 6;
+    names[5] = (u8*)"realloc"; lens[5] = 7;
+    names[6] = (u8*)"free"; lens[6] = 4;
+    names[7] = (u8*)"memcpy"; lens[7] = 6;
+    names[8] = (u8*)"memset"; lens[8] = 6;
+    names[9] = (u8*)"strlen"; lens[9] = 6;
+    names[10] = (u8*)"strcmp"; lens[10] = 6;
+    names[11] = (u8*)"exit"; lens[11] = 4;
+    names[12] = (u8*)"abort"; lens[12] = 5;
+    names[13] = (u8*)"puts"; lens[13] = 4;
+    names[14] = (u8*)"memcmp"; lens[14] = 6;
+    names[15] = (u8*)"strchr"; lens[15] = 6;
+    names[16] = (u8*)"strncpy"; lens[16] = 7;
+    names[17] = (u8*)"abs"; lens[17] = 3;
+    u32 i = 0;
+    while (i < 18)
+    {
+        if (text.len == lens[i]) {
+            bool eq = true;
+            usize j = 0;
+            while (j < text.len) {
+                if (text.ptr[j] != names[i][j]) { eq = false; break; }
+                j = j + 1;
+            }
+            if (eq) return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/* owner name for a method self type: strip one pointer level */
+Slice cgOwnerName(Codegen* self, Ty selfTy)
+{
+    TypeEntry* e = self.ctx->types + selfTy;
+    if (e.kind.tag == TypeKind::Pointer)
+        return tyStr(self, e.kind.payload.Pointer.base);
+    return tyStr(self, selfTy);
+}
+
+/* ── expressions ─────────────────────────────────────────────── */
+
+extern("C") Slice cgExpr(Codegen* self, NodeId id);
+extern("C") Slice cgLvalue(Codegen* self, NodeId id);
+extern("C") Slice cgValBody(Codegen* self, NodeId id);
+extern("C") void cgStmt(Codegen* self, NodeId id);
+
+Slice cgMakeTemp(Codegen* self, Slice ty, u8* assignText)
+{
+    u32 t = cgNewTemp(self, ty, 0);
+    Slice tn = cgTempName(self, t);
+    stNL(&self.body, self.ind);
+    stPS(&self.body, tn);
+    stP(&self.body, " = ");
+    stP(&self.body, assignText);
+    stCh(&self.body, ';');
+    return tn;
+}
+
+Slice cgCall(Codegen* self, Slice callee, NodeId* args, u32 argsLen, Ty retTy)
+{
+    /* evaluate arguments in order (each may emit temps), then the call */
+    u32 i = 0;
+    while (i < argsLen)
+    {
+        Slice a = cgExpr(self, args[i]);
+        i = i + 1;
+    }
+    /* rebuild argument text: args were emitted into ebuf in order;
+       capture each arg's returned slice now — must collect DURING the loop.
+       (handled by cgCallOrdered below) */
+    return Slice::from(null, 0);
+}
+
+Slice cgCallOrdered(Codegen* self, Slice callee, NodeId* args, u32 argsLen, Slice retTy)
+{
+    usize as = self.ebuf.len;
+    Slice argTexts[16];
+    u32 n = 0;
+    u32 i = 0;
+    while (i < argsLen && n < 16)
+    {
+        argTexts[n] = cgExpr(self, args[i]);
+        n = n + 1;
+        i = i + 1;
+    }
+    if (argsLen >= 16) { self.errors = self.errors + 1; }
+
+    /* call line into body */
+    u32 t = cgNewTemp(self, retTy, 0);
+    Slice tn = cgTempName(self, t);
+    stNL(&self.body, self.ind);
+    stPS(&self.body, tn);
+    stP(&self.body, " = ");
+    stPS(&self.body, callee);
+    stCh(&self.body, '(');
+    u32 k = 0;
+    while (k < n)
+    {
+        if (k > 0) stP(&self.body, ", ");
+        stPS(&self.body, argTexts[k]);
+        k = k + 1;
+    }
+    stP(&self.body, ");");
+
+    stPS(&self.ebuf, tn);
+    return stTail(&self.ebuf, as);
+}
+
+Slice cgExpr(Codegen* self, NodeId id)
+{
+    if (id.index == 0) {
+        stP(&self.ebuf, "0");
+        return stTail(&self.ebuf, self.ebuf.len - 1);
+    }
+    Node* n = cgNode(self, id);
+    if (n.kind.tag != NodeKind::Expr) {
+        stP(&self.ebuf, "0");
+        return stTail(&self.ebuf, self.ebuf.len - 1);
+    }
+    Expr* e = &n.kind.payload.Expr.value;
+    usize es = self.ebuf.len;
+
+    switch (e.kind.tag)
+    {
+        /* atoms */
+        ExprKind::IntLit => {
+            if (e.kind.payload.IntLit.flags & 1) stCh(&self.ebuf, '-');
+            stU64(&self.ebuf, e.kind.payload.IntLit.value);
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::FloatLit => {
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.FloatLit.value));
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::StringLit => {
+            Slice s = cgIntern(self, e.kind.payload.StringLit.value);
+            stCh(&self.ebuf, '"');
+            usize i = 0;
+            while (i < s.len)
+            {
+                u8 c = s.ptr[i];
+                if (c == '"') stP(&self.ebuf, "\\\"");
+                else if (c == '\\') stP(&self.ebuf, "\\\\");
+                else if (c == '\n') stP(&self.ebuf, "\\n");
+                else if (c == '\t') stP(&self.ebuf, "\\t");
+                else if (c == '\r') stP(&self.ebuf, "\\r");
+                else if (c < 32 || c > 126) {
+                    stP(&self.ebuf, "\\");
+                    u8 b[4];
+                    u8 v = c;
+                    b[3] = (u8)(48 + (v % 8)); v = v / 8;
+                    b[2] = (u8)(48 + (v % 8)); v = v / 8;
+                    b[1] = (u8)(48 + (v % 8));
+                    stPut(&self.ebuf, b + 1, 3);
+                } else {
+                    stCh(&self.ebuf, c);
+                }
+                i = i + 1;
+            }
+            stCh(&self.ebuf, '"');
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::CharLit => {
+            u32 v = e.kind.payload.CharLit.value;
+            if (v == 39 || v == 92) {
+                stCh(&self.ebuf, '\'');
+                stCh(&self.ebuf, '\\');
+                stCh(&self.ebuf, (u8)v);
+                stCh(&self.ebuf, '\'');
+            } else if (v >= 32 && v < 127) {
+                stCh(&self.ebuf, '\'');
+                stCh(&self.ebuf, (u8)v);
+                stCh(&self.ebuf, '\'');
+            } else {
+                stP(&self.ebuf, "(char)");
+                stU64(&self.ebuf, (u64)v);
+            }
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::BoolLit => {
+            if (e.kind.payload.BoolLit.flags & 1) stP(&self.ebuf, "1");
+            else stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::NullLit => {
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Ident => {
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.Ident.name));
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Path => {
+            u32 last = e.kind.payload.Path.segmentsLen;
+            if (last == 0) { stP(&self.ebuf, "0"); return stTail(&self.ebuf, es); }
+            return cgExpr(self, e.kind.payload.Path.segments[last - 1]);
+        },
+        ExprKind::Sizeof => {
+            stP(&self.ebuf, "sizeof(");
+            stPS(&self.ebuf, tyStr(self, e.kind.payload.Sizeof.targetType));
+            stCh(&self.ebuf, ')');
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Alignof => {
+            stP(&self.ebuf, "__alignof__(");
+            stPS(&self.ebuf, tyStr(self, e.kind.payload.Alignof.targetType));
+            stCh(&self.ebuf, ')');
+            return stTail(&self.ebuf, es);
+        },
+
+        /* pure inline: children become temps first, result parenthesized */
+        ExprKind::Neg => {
+            Slice c = cgExpr(self, e.kind.payload.Neg.expr);
+            stCh(&self.ebuf, "(-(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Not => {
+            Slice c = cgExpr(self, e.kind.payload.Not.expr);
+            stP(&self.ebuf, "(!(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::AddressOf => {
+            Slice c = cgLvalue(self, e.kind.payload.AddressOf.expr);
+            stP(&self.ebuf, "(&(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Deref => {
+            Slice c = cgExpr(self, e.kind.payload.Deref.expr);
+            stP(&self.ebuf, "(*(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Cast => {
+            Slice c = cgExpr(self, e.kind.payload.Cast.expr);
+            stP(&self.ebuf, "((");
+            stPS(&self.ebuf, tyStr(self, e.kind.payload.Cast.targetType));
+            stP(&self.ebuf, ")(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+
+        /* binary → three-address temp */
+        ExprKind::Add, ExprKind::Sub, ExprKind::Mul, ExprKind::Div, ExprKind::Mod,
+        ExprKind::Eq, ExprKind::Ne, ExprKind::Lt, ExprKind::Le, ExprKind::Gt, ExprKind::Ge,
+        ExprKind::BitAnd, ExprKind::BitOr, ExprKind::BitXor, ExprKind::Shl, ExprKind::Shr => {
+            NodeId left;
+            NodeId right;
+            u8* op = (u8*)"+";
+            switch (e.kind.tag)
+            {
+                ExprKind::Add => { op = (u8*)" + "; },
+                ExprKind::Sub => { op = (u8*)" - "; },
+                ExprKind::Mul => { op = (u8*)" * "; },
+                ExprKind::Div => { op = (u8*)" / "; },
+                ExprKind::Mod => { op = (u8*)" % "; },
+                ExprKind::Eq => { op = (u8*)" == "; },
+                ExprKind::Ne => { op = (u8*)" != "; },
+                ExprKind::Lt => { op = (u8*)" < "; },
+                ExprKind::Le => { op = (u8*)" <= "; },
+                ExprKind::Gt => { op = (u8*)" > "; },
+                ExprKind::Ge => { op = (u8*)" >= "; },
+                ExprKind::BitAnd => { op = (u8*)" & "; },
+                ExprKind::BitOr => { op = (u8*)" | "; },
+                ExprKind::BitXor => { op = (u8*)" ^ "; },
+                ExprKind::Shl => { op = (u8*)" << "; },
+                ExprKind::Shr => { op = (u8*)" >> "; },
+                else => {},
+            }
+            left = e.kind.payload.Add.left;
+            right = e.kind.payload.Add.right;
+            Slice l = cgExpr(self, left);
+            Slice r = cgExpr(self, right);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, l);
+            stP(&self.body, op);
+            stPS(&self.body, r);
+            stP(&self.body, ");");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        /* short-circuit → labels */
+        ExprKind::And => {
+            Slice l = cgExpr(self, e.kind.payload.And.left);
+            Slice r = cgExpr(self, e.kind.payload.And.right);
+            u32 t = cgNewTemp(self, (Slice)Slice::from((u8*)"_Bool", 5), 0);
+            Slice tn = cgTempName(self, t);
+            u32 lf = cgLabel(self);
+            u32 le = cgLabel(self);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, l);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lf);
+            stCh(&self.body, ';');
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, r);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lf);
+            stCh(&self.body, ';');
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = 1;");
+            cgEmitGoto(self, le);
+            cgEmitLabel(self, lf);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = 0;");
+            cgEmitLabel(self, le);
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Or => {
+            Slice l = cgExpr(self, e.kind.payload.Or.left);
+            Slice r = cgExpr(self, e.kind.payload.Or.right);
+            u32 t = cgNewTemp(self, (Slice)Slice::from((u8*)"_Bool", 5), 0);
+            Slice tn = cgTempName(self, t);
+            u32 lt = cgLabel(self);
+            u32 le = cgLabel(self);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if ((");
+            stPS(&self.body, l);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lt);
+            stCh(&self.body, ';');
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if ((");
+            stPS(&self.body, r);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lt);
+            stCh(&self.body, ';');
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = 0;");
+            cgEmitGoto(self, le);
+            cgEmitLabel(self, lt);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = 1;");
+            cgEmitLabel(self, le);
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::Call => {
+            NodeId calleeId = e.kind.payload.Call.callee;
+            Node* cn = cgNode(self, calleeId);
+            Slice calleeText;
+            Slice retTy;
+            Ty rty = 0;
+            bool resolved = false;
+            NodeId fdecl;
+            fdecl.index = 0;
+            if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
+                Str fname = cn.kind.payload.Expr.value.kind.payload.Ident.name;
+                fdecl = cgFindDecl(self, fname, DeclKind::Func);
+                calleeText = cgResolveCall(self, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
+                if (resolved) {
+                    retTy = tyStr(self, cgSubstTy(self, rty));
+                } else {
+                    calleeText = cgExpr(self, calleeId);
+                    retTy = cgResultTy(self, id, e);
+                }
+            } else {
+                calleeText = cgExpr(self, calleeId);
+                retTy = cgResultTy(self, id, e);
+            }
+            /* comptime (type-level) parameters are erased from the C
+               signature — skip their arguments here as well */
+            u8 skip[16];
+            u32 si = 0;
+            while (si < 16) { skip[si] = 0; si = si + 1; }
+            if (fdecl.index != 0) {
+                Decl* fd = &cgNode(self, fdecl).kind.payload.Decl.value;
+                u32 k = 0;
+                while (k < fd.kind.payload.Func.paramsLen && k < 16) {
+                    Node* pn = cgNode(self, fd.kind.payload.Func.params[k]);
+                    if (pn.kind.tag == NodeKind::Param && (pn.kind.payload.Param.value.flags & 8) != 0) skip[k] = 1;
+                    k = k + 1;
+                }
+            }
+            Slice argTexts[16];
+            u32 n = 0;
+            NodeId* args = e.kind.payload.Call.args;
+            u32 argsLen = e.kind.payload.Call.argsLen;
+            u32 i = 0;
+            while (i < argsLen && i < 16) {
+                if (skip[i] == 0) {
+                    argTexts[n] = cgExpr(self, args[i]);
+                    n = n + 1;
+                }
+                i = i + 1;
+            }
+            if (argsLen > 16) self.errors = self.errors + 1;
+            u32 t = cgNewTemp(self, retTy, 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, calleeText);
+            stCh(&self.body, '(');
+            u32 k = 0;
+            while (k < n) {
+                if (k > 0) stP(&self.body, ", ");
+                stPS(&self.body, argTexts[k]);
+                k = k + 1;
+            }
+            stP(&self.body, ");");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::MethodCall => {
+            NodeId recv = e.kind.payload.MethodCall.receiver;
+            Node* rn = cgNode(self, recv);
+            Ty recvTy = 0;
+            if (rn.kind.tag == NodeKind::Expr) recvTy = rn.kind.payload.Expr.value.resolvedType;
+            Slice owner;
+            if (recvTy != 0) {
+                TypeEntry* re = self.ctx->types + recvTy;
+                if (re.kind.tag == TypeKind::Pointer) recvTy = re.kind.payload.Pointer.base;
+                owner = cgOwnerName(self, recvTy);
+            } else {
+                owner = (Slice)Slice::from((u8*)"Unknown", 7);
+            }
+            Slice recvText = cgExpr(self, recv);
+            bool recvIsPtr = false;
+            if (rn.kind.tag == NodeKind::Expr) {
+                Ty rt = rn.kind.payload.Expr.value.resolvedType;
+                if (rt != 0 && (self.ctx->types + rt).kind.tag == TypeKind::Pointer) recvIsPtr = true;
+            }
+            /* method name */
+            usize cs = self.ebuf.len;
+            stPS(&self.ebuf, owner);
+            stCh(&self.ebuf, '_');
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.MethodCall.method));
+            Slice callee = stTail(&self.ebuf, cs);
+
+            Slice argTexts[16];
+            u32 n = 0;
+            if (n < 16) {
+                if (recvIsPtr) argTexts[n] = recvText;
+                else {
+                    usize ps = self.ebuf.len;
+                    stP(&self.ebuf, "&(");
+                    stPS(&self.ebuf, recvText);
+                    stCh(&self.ebuf, ')');
+                    argTexts[n] = stTail(&self.ebuf, ps);
+                }
+                n = n + 1;
+            }
+            NodeId* args = e.kind.payload.MethodCall.args;
+            u32 argsLen = e.kind.payload.MethodCall.argsLen;
+            u32 i = 0;
+            while (i < argsLen && n < 16) {
+                argTexts[n] = cgExpr(self, args[i]);
+                n = n + 1;
+                i = i + 1;
+            }
+            if (argsLen + 1 > 16) self.errors = self.errors + 1;
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, callee);
+            stCh(&self.body, '(');
+            u32 k = 0;
+            while (k < n) {
+                if (k > 0) stP(&self.body, ", ");
+                stPS(&self.body, argTexts[k]);
+                k = k + 1;
+            }
+            stP(&self.body, ");");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::StaticCall => {
+            usize cs = self.ebuf.len;
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.StaticCall.typeName));
+            stCh(&self.ebuf, '_');
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.StaticCall.method));
+            Slice callee = stTail(&self.ebuf, cs);
+            Slice argTexts[16];
+            u32 n = 0;
+            NodeId* args = e.kind.payload.StaticCall.args;
+            u32 argsLen = e.kind.payload.StaticCall.argsLen;
+            u32 i = 0;
+            while (i < argsLen && n < 16) {
+                argTexts[n] = cgExpr(self, args[i]);
+                n = n + 1;
+                i = i + 1;
+            }
+            if (argsLen > 16) self.errors = self.errors + 1;
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, callee);
+            stCh(&self.body, '(');
+            u32 k = 0;
+            while (k < n) {
+                if (k > 0) stP(&self.body, ", ");
+                stPS(&self.body, argTexts[k]);
+                k = k + 1;
+            }
+            stP(&self.body, ");");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::Field, ExprKind::DerefField => {
+            NodeId obj;
+            Str field;
+            if (e.kind.tag == ExprKind::Field) {
+                obj = e.kind.payload.Field.obj;
+                field = e.kind.payload.Field.field;
+            } else {
+                obj = e.kind.payload.DerefField.obj;
+                field = e.kind.payload.DerefField.field;
+            }
+            Slice o = cgExpr(self, obj);
+            Node* on = cgNode(self, obj);
+            bool isPtr = false;
+            if (on.kind.tag == NodeKind::Expr) {
+                Ty ot = on.kind.payload.Expr.value.resolvedType;
+                if (ot != 0 && (self.ctx->types + ot).kind.tag == TypeKind::Pointer) isPtr = true;
+            }
+            usize cs = self.ebuf.len;
+            stPS(&self.ebuf, o);
+            if (isPtr) stP(&self.ebuf, "->");
+            else stCh(&self.ebuf, '.');
+            stPS(&self.ebuf, cgIntern(self, field));
+            Slice fieldText = stTail(&self.ebuf, cs);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, fieldText);
+            stCh(&self.body, ';');
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::Index => {
+            Slice o = cgExpr(self, e.kind.payload.Index.obj);
+            Slice ix = cgExpr(self, e.kind.payload.Index.index);
+            usize cs = self.ebuf.len;
+            stPS(&self.ebuf, o);
+            stCh(&self.ebuf, '[');
+            stPS(&self.ebuf, ix);
+            stCh(&self.ebuf, ']');
+            Slice idxText = stTail(&self.ebuf, cs);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, idxText);
+            stCh(&self.body, ';');
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::TupleField => {
+            Slice o = cgExpr(self, e.kind.payload.TupleField.obj);
+            usize cs = self.ebuf.len;
+            stPS(&self.ebuf, o);
+            stCh(&self.ebuf, '.');
+            stP(&self.ebuf, "_");
+            stU64(&self.ebuf, (u64)e.kind.payload.TupleField.index);
+            Slice ttext = stTail(&self.ebuf, cs);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = ");
+            stPS(&self.body, ttext);
+            stCh(&self.body, ';');
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::StructLiteral => {
+            Slice vals[16];
+            u32 n = 0;
+            u32 fvLen = e.kind.payload.StructLiteral.fieldValuesLen;
+            u32 i = 0;
+            while (i < fvLen && n < 16) {
+                vals[n] = cgExpr(self, e.kind.payload.StructLiteral.fieldValues[i]);
+                n = n + 1;
+                i = i + 1;
+            }
+            if (fvLen > 16) self.errors = self.errors + 1;
+            Slice lty = tyStr(self, e.kind.payload.StructLiteral.typeNode);
+            u32 t = cgNewTemp(self, lty, 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, lty);
+            stP(&self.body, "){");
+            i = 0;
+            while (i < n)
+            {
+                if (i > 0) stP(&self.body, ", ");
+                stP(&self.body, ".");
+                stPS(&self.body, cgIntern(self, e.kind.payload.StructLiteral.fieldNames[i]));
+                stP(&self.body, " = ");
+                stPS(&self.body, vals[i]);
+                i = i + 1;
+            }
+            stP(&self.body, "};");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::ArrayLiteral => {
+            Slice vals[16];
+            u32 n = 0;
+            u32 alen = e.kind.payload.ArrayLiteral.elemsLen;
+            u32 i = 0;
+            while (i < alen && n < 16) {
+                vals[n] = cgExpr(self, e.kind.payload.ArrayLiteral.elems[i]);
+                n = n + 1;
+                i = i + 1;
+            }
+            if (alen > 16) self.errors = self.errors + 1;
+            Slice aty = cgResultTy(self, id, e);
+            u32 t = cgNewTemp(self, aty, 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, aty);
+            stP(&self.body, "){");
+            i = 0;
+            while (i < n) {
+                if (i > 0) stP(&self.body, ", ");
+                stPS(&self.body, vals[i]);
+                i = i + 1;
+            }
+            stP(&self.body, "};");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::TupleExpr => {
+            Slice vals[16];
+            u32 n = 0;
+            u32 elen = e.kind.payload.TupleExpr.elemsLen;
+            u32 i = 0;
+            while (i < elen && n < 16) {
+                vals[n] = cgExpr(self, e.kind.payload.TupleExpr.elems[i]);
+                n = n + 1;
+                i = i + 1;
+            }
+            if (elen > 16) self.errors = self.errors + 1;
+            Slice tty = cgResultTy(self, id, e);
+            u32 t = cgNewTemp(self, tty, 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, tty);
+            stP(&self.body, "){");
+            i = 0;
+            while (i < n) {
+                if (i > 0) stP(&self.body, ", ");
+                stPS(&self.body, vals[i]);
+                i = i + 1;
+            }
+            stP(&self.body, "};");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::Ternary => {
+            Slice c = cgExpr(self, e.kind.payload.Ternary.cond);
+            Slice tt = cgExpr(self, e.kind.payload.Ternary.thenExpr);
+            Slice ee = cgExpr(self, e.kind.payload.Ternary.elseExpr);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            u32 le = cgLabel(self);
+            u32 lend = cgLabel(self);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, c);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)le);
+            stCh(&self.body, ';');
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, tt);
+            stP(&self.body, ");");
+            cgEmitGoto(self, lend);
+            cgEmitLabel(self, le);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, ee);
+            stP(&self.body, ");");
+            cgEmitLabel(self, lend);
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::IfExpr => {
+            Slice c = cgExpr(self, e.kind.payload.IfExpr.cond);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            u32 le = cgLabel(self);
+            u32 lend = cgLabel(self);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, c);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)le);
+            stCh(&self.body, ';');
+            Slice thenc = cgValBody(self, e.kind.payload.IfExpr.thenBody);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, thenc);
+            stP(&self.body, ");");
+            cgEmitGoto(self, lend);
+            cgEmitLabel(self, le);
+            Slice elsec = cgValBody(self, e.kind.payload.IfExpr.elseBody);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, elsec);
+            stP(&self.body, ");");
+            cgEmitLabel(self, lend);
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::BlockExpr => {
+            u32 i = 0;
+            u32 n = e.kind.payload.BlockExpr.stmtsLen;
+            while (i < n) {
+                cgStmt(self, e.kind.payload.BlockExpr.stmts[i]);
+                i = i + 1;
+            }
+            if (e.kind.payload.BlockExpr.result.index != 0)
+                return cgExpr(self, e.kind.payload.BlockExpr.result);
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::PostInc, ExprKind::PostDec, ExprKind::PreInc, ExprKind::PreDec => {
+            NodeId target;
+            u8* op = (u8*)"++";
+            if (e.kind.tag == ExprKind::PostInc) { target = e.kind.payload.PostInc.expr; op = (u8*)"++"; }
+            if (e.kind.tag == ExprKind::PostDec) { target = e.kind.payload.PostDec.expr; op = (u8*)"--"; }
+            if (e.kind.tag == ExprKind::PreInc) { target = e.kind.payload.PreInc.expr; op = (u8*)"++"; }
+            if (e.kind.tag == ExprKind::PreDec) { target = e.kind.payload.PreDec.expr; op = (u8*)"--"; }
+            Slice lv = cgLvalue(self, target);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            if (e.kind.tag == ExprKind::PostInc || e.kind.tag == ExprKind::PostDec) {
+                stNL(&self.body, self.ind);
+                stPS(&self.body, tn);
+                stP(&self.body, " = ");
+                stPS(&self.body, lv);
+                stP(&self.body, op);
+                stCh(&self.body, ';');
+            } else {
+                stNL(&self.body, self.ind);
+                stP(&self.body, op);
+                stPS(&self.body, lv);
+                stP(&self.body, ";");
+                stNL(&self.body, self.ind);
+                stPS(&self.body, tn);
+                stP(&self.body, " = ");
+                stPS(&self.body, lv);
+                stCh(&self.body, ';');
+            }
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::Assign, ExprKind::AssignAdd, ExprKind::AssignSub,
+        ExprKind::AssignMul, ExprKind::AssignDiv, ExprKind::AssignMod,
+        ExprKind::AssignBitAnd, ExprKind::AssignBitOr, ExprKind::AssignBitXor,
+        ExprKind::AssignShl, ExprKind::AssignShr => {
+            NodeId target;
+            NodeId value;
+            u8* op = (u8*)"=";
+            if (e.kind.tag == ExprKind::Assign) { target = e.kind.payload.Assign.target; value = e.kind.payload.Assign.value; }
+            else if (e.kind.tag == ExprKind::AssignAdd) { target = e.kind.payload.AssignAdd.target; value = e.kind.payload.AssignAdd.value; op = (u8*)"+="; }
+            else if (e.kind.tag == ExprKind::AssignSub) { target = e.kind.payload.AssignSub.target; value = e.kind.payload.AssignSub.value; op = (u8*)"-="; }
+            else if (e.kind.tag == ExprKind::AssignMul) { target = e.kind.payload.AssignMul.target; value = e.kind.payload.AssignMul.value; op = (u8*)"*="; }
+            else if (e.kind.tag == ExprKind::AssignDiv) { target = e.kind.payload.AssignDiv.target; value = e.kind.payload.AssignDiv.value; op = (u8*)"/="; }
+            else if (e.kind.tag == ExprKind::AssignMod) { target = e.kind.payload.AssignMod.target; value = e.kind.payload.AssignMod.value; op = (u8*)"%="; }
+            else if (e.kind.tag == ExprKind::AssignBitAnd) { target = e.kind.payload.AssignBitAnd.target; value = e.kind.payload.AssignBitAnd.value; op = (u8*)"&="; }
+            else if (e.kind.tag == ExprKind::AssignBitOr) { target = e.kind.payload.AssignBitOr.target; value = e.kind.payload.AssignBitOr.value; op = (u8*)"|="; }
+            else if (e.kind.tag == ExprKind::AssignBitXor) { target = e.kind.payload.AssignBitXor.target; value = e.kind.payload.AssignBitXor.value; op = (u8*)"^="; }
+            else if (e.kind.tag == ExprKind::AssignShl) { target = e.kind.payload.AssignShl.target; value = e.kind.payload.AssignShl.value; op = (u8*)"<<="; }
+            else { target = e.kind.payload.AssignShr.target; value = e.kind.payload.AssignShr.value; op = (u8*)">>="; }
+            Slice lv = cgLvalue(self, target);
+            Slice rv = cgExpr(self, value);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, tn);
+            stP(&self.body, " = (");
+            stPS(&self.body, lv);
+            stP(&self.body, " ");
+            stP(&self.body, op);
+            stP(&self.body, " ");
+            stPS(&self.body, rv);
+            stP(&self.body, ");");
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::BuiltinCall => {
+            Slice name = cgIntern(self, e.kind.payload.BuiltinCall.name);
+            bool isAssert = false;
+            if (name.len == 6) {
+                isAssert = true;
+                usize i = 0;
+                u8* want = (u8*)"assert";
+                while (i < 6) { if (name.ptr[i] != want[i]) { isAssert = false; break; } i = i + 1; }
+            }
+            if (isAssert && e.kind.payload.BuiltinCall.argsLen == 1) {
+                Slice a = cgExpr(self, e.kind.payload.BuiltinCall.args[0]);
+                stNL(&self.body, self.ind);
+                stP(&self.body, "assert(");
+                stPS(&self.body, a);
+                stP(&self.body, ");");
+                stP(&self.ebuf, "0");
+                return stTail(&self.ebuf, es);
+            }
+            self.errors = self.errors + 1;
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::SwitchExpr => {
+            Slice scrut = cgExpr(self, e.kind.payload.SwitchExpr.expr);
+            u32 t = cgNewTemp(self, cgResultTy(self, id, e), 0);
+            Slice tn = cgTempName(self, t);
+            cgEmitSwitch(self, scrut, e.kind.payload.SwitchExpr.cases, e.kind.payload.SwitchExpr.casesLen, tn);
+            stPS(&self.ebuf, tn);
+            return stTail(&self.ebuf, es);
+        },
+
+        ExprKind::TypeRef => {
+            self.errors = self.errors + 1;
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Typeof => {
+            self.errors = self.errors + 1;
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+
+        else => {
+            self.errors = self.errors + 1;
+            stP(&self.ebuf, "0");
+            return stTail(&self.ebuf, es);
+        },
+    }
+    return stTail(&self.ebuf, es);
+}
+
+Slice cgLvalue(Codegen* self, NodeId id)
+{
+    if (id.index == 0) {
+        stP(&self.ebuf, "0");
+        return stTail(&self.ebuf, self.ebuf.len - 1);
+    }
+    Node* n = cgNode(self, id);
+    if (n.kind.tag != NodeKind::Expr) {
+        self.errors = self.errors + 1;
+        stP(&self.ebuf, "0");
+        return stTail(&self.ebuf, self.ebuf.len - 1);
+    }
+    Expr* e = &n.kind.payload.Expr.value;
+    usize es = self.ebuf.len;
+    switch (e.kind.tag)
+    {
+        ExprKind::Ident => {
+            stPS(&self.ebuf, cgIntern(self, e.kind.payload.Ident.name));
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Deref => {
+            Slice c = cgExpr(self, e.kind.payload.Deref.expr);
+            stP(&self.ebuf, "(*(");
+            stPS(&self.ebuf, c);
+            stP(&self.ebuf, "))");
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Field, ExprKind::DerefField => {
+            NodeId obj;
+            Str field;
+            if (e.kind.tag == ExprKind::Field) {
+                obj = e.kind.payload.Field.obj;
+                field = e.kind.payload.Field.field;
+            } else {
+                obj = e.kind.payload.DerefField.obj;
+                field = e.kind.payload.DerefField.field;
+            }
+            Slice o = cgLvalue(self, obj);
+            Node* on = cgNode(self, obj);
+            bool isPtr = false;
+            if (on.kind.tag == NodeKind::Expr) {
+                Ty ot = on.kind.payload.Expr.value.resolvedType;
+                if (ot != 0 && (self.ctx->types + ot).kind.tag == TypeKind::Pointer) isPtr = true;
+            }
+            stPS(&self.ebuf, o);
+            if (isPtr) stP(&self.ebuf, "->");
+            else stCh(&self.ebuf, '.');
+            stPS(&self.ebuf, cgIntern(self, field));
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::Index => {
+            Slice o = cgExpr(self, e.kind.payload.Index.obj);
+            Slice ix = cgExpr(self, e.kind.payload.Index.index);
+            stPS(&self.ebuf, o);
+            stCh(&self.ebuf, '[');
+            stPS(&self.ebuf, ix);
+            stCh(&self.ebuf, ']');
+            return stTail(&self.ebuf, es);
+        },
+        ExprKind::TupleField => {
+            Slice o = cgLvalue(self, e.kind.payload.TupleField.obj);
+            stPS(&self.ebuf, o);
+            stCh(&self.ebuf, '.');
+            stP(&self.ebuf, "_");
+            stU64(&self.ebuf, (u64)e.kind.payload.TupleField.index);
+            return stTail(&self.ebuf, es);
+        },
+        else => {
+            /* not an lvalue — fall back to value path (error surfaces in C) */
+            return cgExpr(self, id);
+        },
+    }
+    return stTail(&self.ebuf, es);
+}
+
+/* ── value of a body used as expression (if/switch branches) ─── */
+
+Slice cgValBody(Codegen* self, NodeId id)
+{
+    if (id.index == 0) return (Slice)Slice::from((u8*)"0", 1);
+    Node* n = cgNode(self, id);
+    if (n.kind.tag == NodeKind::Expr) return cgExpr(self, id);
+    if (n.kind.tag != NodeKind::Stmt) {
+        self.errors = self.errors + 1;
+        return (Slice)Slice::from((u8*)"0", 1);
+    }
+    Stmt* s = &n.kind.payload.Stmt.value;
+    if (s.kind.tag == StmtKind::ExprStmt) return cgExpr(self, s.kind.payload.ExprStmt.expr);
+    if (s.kind.tag == StmtKind::Block)
+    {
+        u32 i = 0;
+        u32 cnt = s.kind.payload.Block.stmtsLen;
+        while (i + 1 < cnt)
+        {
+            cgStmt(self, s.kind.payload.Block.stmts[i]);
+            i = i + 1;
+        }
+        if (cnt == 0) return (Slice)Slice::from((u8*)"0", 1);
+        NodeId last = s.kind.payload.Block.stmts[cnt - 1];
+        Node* ln = cgNode(self, last);
+        if (ln.kind.tag == NodeKind::Stmt && ln.kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
+            return cgExpr(self, ln.kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+        cgStmt(self, last);
+        return (Slice)Slice::from((u8*)"0", 1);
+    }
+    self.errors = self.errors + 1;
+    return (Slice)Slice::from((u8*)"0", 1);
+}
+
+/* ── switch lowering: compare chains + labels ────────────────── */
+
+extern("C") Slice cgPatTest(Codegen* self, NodeId patId, Slice scrut, bool* isWildcard);
+
+Slice cgPatTest(Codegen* self, NodeId patId, Slice scrut, bool* isWildcard)
+{
+    *isWildcard = false;
+    if (patId.index == 0) { *isWildcard = true; return Slice::from(null, 0); }
+    Node* n = cgNode(self, patId);
+    if (n.kind.tag == NodeKind::Pat)
+    {
+        Pat* p = &n.kind.payload.Pat.value;
+        switch (p.kind.tag)
+        {
+            PatKind::Wildcard => { *isWildcard = true; return Slice::from(null, 0); },
+            PatKind::Lit => {
+                Slice l = cgExpr(self, p.kind.payload.Lit.expr);
+                usize s = self.ebuf.len;
+                stCh(&self.ebuf, '(');
+                stPS(&self.ebuf, scrut);
+                stP(&self.ebuf, " == ");
+                stPS(&self.ebuf, l);
+                stCh(&self.ebuf, ')');
+                return stTail(&self.ebuf, s);
+            },
+            PatKind::Or => {
+                usize s = self.ebuf.len;
+                stCh(&self.ebuf, '(');
+                u32 i = 0;
+                while (i < p.kind.payload.Or.alternativesLen)
+                {
+                    bool w = false;
+                    if (i > 0) stP(&self.ebuf, " || ");
+                    Slice t = cgPatTest(self, p.kind.payload.Or.alternatives[i], scrut, &w);
+                    if (w) stP(&self.ebuf, "1");
+                    else stPS(&self.ebuf, t);
+                    i = i + 1;
+                }
+                stCh(&self.ebuf, ')');
+                return stTail(&self.ebuf, s);
+            },
+            PatKind::Range => {
+                Slice a = cgExpr(self, p.kind.payload.Range.start);
+                Slice b = cgExpr(self, p.kind.payload.Range.end);
+                usize s = self.ebuf.len;
+                stCh(&self.ebuf, '(');
+                stPS(&self.ebuf, scrut);
+                stP(&self.ebuf, " >= ");
+                stPS(&self.ebuf, a);
+                if (p.kind.payload.Range.flags & 1) stP(&self.ebuf, " && ");
+                else stP(&self.ebuf, " && ");
+                stPS(&self.ebuf, scrut);
+                if (p.kind.payload.Range.flags & 1) stP(&self.ebuf, " <= ");
+                else stP(&self.ebuf, " < ");
+                stPS(&self.ebuf, b);
+                stCh(&self.ebuf, ')');
+                return stTail(&self.ebuf, s);
+            },
+            else => {
+                self.errors = self.errors + 1;
+                *isWildcard = true;
+                return Slice::from(null, 0);
+            },
+        }
+    }
+    if (n.kind.tag == NodeKind::Expr)
+    {
+        /* bare expression pattern (e.g. enum variant) */
+        Slice l = cgExpr(self, patId);
+        usize s = self.ebuf.len;
+        stCh(&self.ebuf, '(');
+        stPS(&self.ebuf, scrut);
+        stP(&self.ebuf, " == ");
+        stPS(&self.ebuf, l);
+        stCh(&self.ebuf, ')');
+        return stTail(&self.ebuf, s);
+    }
+    self.errors = self.errors + 1;
+    *isWildcard = true;
+    return Slice::from(null, 0);
+}
+
+/* cases: statement bodies (resultTemp empty) or expression bodies
+ * (resultTemp names the temp each branch assigns). */
+void cgEmitSwitch(Codegen* self, Slice scrut, SwitchCase* cases, u32 casesLen, Slice resultTemp)
+{
+    u32* chkL = (u32*)self.arena->alloc(64 * 4, 4);
+    u32* bodyL = (u32*)self.arena->alloc(64 * 4, 4);
+    if (chkL == null || bodyL == null || casesLen > 64) {
+        self.errors = self.errors + 1;
+        return;
+    }
+
+    u32 lend = cgLabel(self);
+    u32 ldef = 0;
+    bool hasDefault = false;
+    u32 i = 0;
+    while (i < casesLen)
+    {
+        chkL[i] = cgLabel(self);
+        bodyL[i] = cgLabel(self);
+        SwitchCase* c = cases + i;
+        if ((c.flags & 4) != 0 || c.patternsLen == 0) hasDefault = true;
+        i = i + 1;
+    }
+
+    /* test chain */
+    i = 0;
+    while (i < casesLen)
+    {
+        SwitchCase* c = cases + i;
+        bool isDef = ((c.flags & 4) != 0 || c.patternsLen == 0);
+        if (!isDef)
+        {
+            cgEmitLabel(self, chkL[i]);
+            u32 p = 0;
+            bool matched = false;
+            while (p < c.patternsLen)
+            {
+                bool w = false;
+                Slice t = cgPatTest(self, c.patterns[p], scrut, &w);
+                if (w) {
+                    stNL(&self.body, self.ind);
+                    stP(&self.body, "goto __L");
+                    stU64(&self.body, (u64)bodyL[i]);
+                    stCh(&self.body, ';');
+                    matched = true;
+                    break;
+                }
+                stNL(&self.body, self.ind);
+                stP(&self.body, "if (");
+                stPS(&self.body, t);
+                stP(&self.body, ") goto __L");
+                stU64(&self.body, (u64)bodyL[i]);
+                stCh(&self.body, ';');
+                matched = true;
+                p = p + 1;
+            }
+            if (!matched) {
+                stNL(&self.body, self.ind);
+                stP(&self.body, "goto __L");
+                stU64(&self.body, (u64)chkL[i]);
+                stCh(&self.body, ';');
+            }
+        }
+        i = i + 1;
+    }
+    /* fallthrough: no default matched */
+    stNL(&self.body, self.ind);
+    if (hasDefault) {
+        /* find default index */
+        u32 d = 0;
+        while (d < casesLen) {
+            SwitchCase* c = cases + d;
+            if ((c.flags & 4) != 0 || c.patternsLen == 0) break;
+            d = d + 1;
+        }
+        ldef = d;
+        stP(&self.body, "goto __L");
+        stU64(&self.body, (u64)bodyL[d]);
+        stCh(&self.body, ';');
+    } else {
+        stP(&self.body, "goto __L");
+        stU64(&self.body, (u64)lend);
+        stCh(&self.body, ';');
+    }
+
+    /* bodies (break inside a case targets the enclosing loop) */
+    i = 0;
+    while (i < casesLen)
+    {
+        SwitchCase* c = cases + i;
+        bool isDef = ((c.flags & 4) != 0 || c.patternsLen == 0);
+        cgEmitLabel(self, bodyL[i]);
+        if (!isDef && (c.flags & 1) != 0 && c.guard.index != 0)
+        {
+            Slice g = cgExpr(self, c.guard);
+            u32 nextChk = lend;
+            if (i + 1 < casesLen) nextChk = chkL[i + 1];
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, g);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)nextChk);
+            stCh(&self.body, ';');
+        }
+        /* body */
+        Node* bn = cgNode(self, c.body);
+        if (bn.kind.tag == NodeKind::Expr && resultTemp.len > 0)
+        {
+            Slice v = cgExpr(self, c.body);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, resultTemp);
+            stP(&self.body, " = (");
+            stPS(&self.body, v);
+            stP(&self.body, ");");
+            cgEmitGoto(self, lend);
+        }
+        else if (bn.kind.tag == NodeKind::Stmt && bn.kind.payload.Stmt.value.kind.tag == StmtKind::Block && resultTemp.len > 0)
+        {
+            /* value block: stmts then last expr result */
+            Stmt* bs = &bn.kind.payload.Stmt.value;
+            u32 si = 0;
+            u32 cnt = bs.kind.payload.Block.stmtsLen;
+            while (si + 1 < cnt) {
+                cgStmt(self, bs.kind.payload.Block.stmts[si]);
+                si = si + 1;
+            }
+            if (cnt > 0) {
+                NodeId last = bs.kind.payload.Block.stmts[cnt - 1];
+                Node* ln = cgNode(self, last);
+                if (ln.kind.tag == NodeKind::Stmt && ln.kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt) {
+                    Slice v = cgExpr(self, ln.kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+                    stNL(&self.body, self.ind);
+                    stPS(&self.body, resultTemp);
+                    stP(&self.body, " = (");
+                    stPS(&self.body, v);
+                    stP(&self.body, ");");
+                }
+            }
+            cgEmitGoto(self, lend);
+        }
+        else
+        {
+            if (c.body.index != 0) cgStmt(self, c.body);
+            if (resultTemp.len > 0) {
+                stNL(&self.body, self.ind);
+                stPS(&self.body, resultTemp);
+                stP(&self.body, " = 0;");
+            }
+            cgEmitGoto(self, lend);
+        }
+        i = i + 1;
+    }
+
+    cgEmitLabel(self, lend);
+}
+
+/* ── statements ──────────────────────────────────────────────── */
+
+void cgStmt(Codegen* self, NodeId id)
+{
+    if (id.index == 0) return;
+    Node* n = cgNode(self, id);
+    if (n.kind.tag != NodeKind::Stmt) {
+        if (n.kind.tag == NodeKind::Expr) {
+            Slice t = cgExpr(self, id);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, t);
+            stCh(&self.body, ';');
+            return;
+        }
+        self.errors = self.errors + 1;
+        return;
+    }
+    Stmt* s = &n.kind.payload.Stmt.value;
+
+    switch (s.kind.tag)
+    {
+        StmtKind::Block => {
+            stNL(&self.body, self.ind);
+            stCh(&self.body, '{');
+            self.ind = self.ind + 1;
+            u32 i = 0;
+            while (i < s.kind.payload.Block.stmtsLen)
+            {
+                cgStmt(self, s.kind.payload.Block.stmts[i]);
+                i = i + 1;
+            }
+            self.ind = self.ind - 1;
+            stNL(&self.body, self.ind);
+            stCh(&self.body, '}');
+            return;
+        },
+
+        StmtKind::ExprStmt => {
+            Slice t = cgExpr(self, s.kind.payload.ExprStmt.expr);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, t);
+            stCh(&self.body, ';');
+            return;
+        },
+
+        StmtKind::VarDecl => {
+            Str name = s.kind.payload.VarDecl.name;
+            Ty ty = s.kind.payload.VarDecl.typeNode;
+            NodeId init = s.kind.payload.VarDecl.init;
+            Slice tyText;
+            if (ty != 0) tyText = tyStr(self, ty);
+            else if (init.index != 0) {
+                Node* inn = cgNode(self, init);
+                if (inn.kind.tag == NodeKind::Expr)
+                    tyText = cgResultTy(self, init, &inn.kind.payload.Expr.value);
+                else tyText = (Slice)Slice::from((u8*)"rawptr", 6);
+            } else tyText = (Slice)Slice::from((u8*)"rawptr", 6);
+
+            /* array-typed local: declarator form, braced initializer */
+            bool isArray = false;
+            if (ty != 0 && (self.ctx->types + ty).kind.tag == TypeKind::Array) isArray = true;
+
+            Node* inn = (init.index != 0) ? cgNode(self, init) : null;
+            bool initIsArrayLit = false;
+            if (inn != null && inn.kind.tag == NodeKind::Expr &&
+                inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral) initIsArrayLit = true;
+
+            stNL(&self.body, self.ind);
+            if (isArray) {
+                TypeEntry* te = self.ctx->types + ty;
+                stPS(&self.body, tyStr(self, te.kind.payload.Array.base));
+                stCh(&self.body, ' ');
+                stPS(&self.body, cgIntern(self, name));
+                stCh(&self.body, '[');
+                stU64(&self.body, (u64)te.kind.payload.Array.len);
+                stCh(&self.body, ']');
+                if (initIsArrayLit) {
+                    Expr* al = &inn.kind.payload.Expr.value;
+                    stP(&self.body, " = {");
+                    u32 i = 0;
+                    while (i < al.kind.payload.ArrayLiteral.elemsLen) {
+                        if (i > 0) stP(&self.body, ", ");
+                        Slice v = cgExpr(self, al.kind.payload.ArrayLiteral.elems[i]);
+                        stPS(&self.body, v);
+                        i = i + 1;
+                    }
+                    stCh(&self.body, '}');
+                } else if (init.index != 0) {
+                    self.errors = self.errors + 1;
+                    stP(&self.body, " = {0}");
+                } else {
+                    stP(&self.body, " = {0}");
+                }
+            } else {
+                stPS(&self.body, tyText);
+                stCh(&self.body, ' ');
+                stPS(&self.body, cgIntern(self, name));
+                if (init.index != 0) {
+                    Slice initText = cgExpr(self, init);
+                    stP(&self.body, " = ");
+                    stPS(&self.body, initText);
+                }
+            }
+            stCh(&self.body, ';');
+            return;
+        },
+
+        StmtKind::Assign => {
+            Slice lv = cgLvalue(self, s.kind.payload.Assign.target);
+            Slice rv = cgExpr(self, s.kind.payload.Assign.value);
+            Slice op = cgIntern(self, s.kind.payload.Assign.op);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, lv);
+            stCh(&self.body, ' ');
+            stPS(&self.body, op);
+            stCh(&self.body, ' ');
+            stPS(&self.body, rv);
+            stCh(&self.body, ';');
+            return;
+        },
+
+        StmtKind::Return => {
+            NodeId v = s.kind.payload.Return.value;
+            if (v.index == 0) {
+                cgEmitStmt(self, "return");
+                return;
+            }
+            Slice t = cgExpr(self, v);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "return ");
+            stPS(&self.body, t);
+            stCh(&self.body, ';');
+            return;
+        },
+
+        StmtKind::Break => {
+            if (self.loopDepth == 0) { self.errors = self.errors + 1; return; }
+            cgEmitGoto(self, self.breakStack[self.loopDepth - 1]);
+            return;
+        },
+
+        StmtKind::Continue => {
+            /* continue targets the innermost loop's continue label: stored in
+               contStack parallel to breakStack but loops push both */
+            if (self.loopDepth == 0) { self.errors = self.errors + 1; return; }
+            cgEmitGoto(self, self.contStack[self.loopDepth - 1]);
+            return;
+        },
+
+        StmtKind::If => {
+            Slice c = cgExpr(self, s.kind.payload.If.cond);
+            u32 le = cgLabel(self);
+            u32 lend = cgLabel(self);
+            bool hasElse = s.kind.payload.If.elseBody.index != 0;
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, c);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)(hasElse ? le : lend));
+            stCh(&self.body, ';');
+            cgStmt(self, s.kind.payload.If.thenBody);
+            if (hasElse) {
+                cgEmitGoto(self, lend);
+                cgEmitLabel(self, le);
+                cgStmt(self, s.kind.payload.If.elseBody);
+            }
+            cgEmitLabel(self, lend);
+            return;
+        },
+
+        StmtKind::While => {
+            u32 ltop = cgLabel(self);
+            u32 lbrk = cgLabel(self);
+            cgEmitLabel(self, ltop);
+            Slice c = cgExpr(self, s.kind.payload.While.cond);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, c);
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lbrk);
+            stCh(&self.body, ';');
+            /* push: break=lbrk, continue=ltop */
+            if (self.loopDepth < self.loopCap) {
+                self.breakStack[self.loopDepth] = lbrk;
+                self.contStack[self.loopDepth] = ltop;
+                self.loopDepth = self.loopDepth + 1;
+            }
+            cgStmt(self, s.kind.payload.While.body);
+            cgPopLoop(self);
+            cgEmitGoto(self, ltop);
+            cgEmitLabel(self, lbrk);
+            return;
+        },
+
+        StmtKind::Loop => {
+            u32 ltop = cgLabel(self);
+            u32 lbrk = cgLabel(self);
+            cgEmitLabel(self, ltop);
+            if (self.loopDepth < self.loopCap) {
+                self.breakStack[self.loopDepth] = lbrk;
+                self.contStack[self.loopDepth] = ltop;
+                self.loopDepth = self.loopDepth + 1;
+            }
+            cgStmt(self, s.kind.payload.Loop.body);
+            cgPopLoop(self);
+            cgEmitGoto(self, ltop);
+            cgEmitLabel(self, lbrk);
+            return;
+        },
+
+        StmtKind::For => {
+            if (s.kind.payload.For.flags & 1) cgStmt(self, s.kind.payload.For.init);
+            else if (s.kind.payload.For.init.index != 0) cgStmt(self, s.kind.payload.For.init);
+            u32 ltop = cgLabel(self);
+            u32 lbrk = cgLabel(self);
+            u32 lcont = cgLabel(self);
+            cgEmitLabel(self, ltop);
+            if (s.kind.payload.For.flags & 2) {
+                Slice c = cgExpr(self, s.kind.payload.For.cond);
+                stNL(&self.body, self.ind);
+                stP(&self.body, "if (!(");
+                stPS(&self.body, c);
+                stP(&self.body, ")) goto __L");
+                stU64(&self.body, (u64)lbrk);
+                stCh(&self.body, ';');
+            }
+            if (self.loopDepth < self.loopCap) {
+                self.breakStack[self.loopDepth] = lbrk;
+                self.contStack[self.loopDepth] = lcont;
+                self.loopDepth = self.loopDepth + 1;
+            }
+            cgStmt(self, s.kind.payload.For.body);
+            cgPopLoop(self);
+            cgEmitLabel(self, lcont);
+            if (s.kind.payload.For.flags & 4) {
+                Slice p = cgExpr(self, s.kind.payload.For.post);
+                stNL(&self.body, self.ind);
+                stPS(&self.body, p);
+                stCh(&self.body, ';');
+            }
+            cgEmitGoto(self, ltop);
+            cgEmitLabel(self, lbrk);
+            return;
+        },
+
+        StmtKind::ForIn => {
+            NodeId iter = s.kind.payload.ForIn.iterExpr;
+            Slice it = cgExpr(self, iter);
+            Node* in = cgNode(self, iter);
+            Ty iterTy = 0;
+            if (in.kind.tag == NodeKind::Expr) iterTy = in.kind.payload.Expr.value.resolvedType;
+
+            TypeEntry* te = null;
+            if (iterTy != 0) te = self.ctx->types + iterTy;
+            if (te == null || (te.kind.tag != TypeKind::Slice && te.kind.tag != TypeKind::Array)) {
+                self.errors = self.errors + 1;
+                return;
+            }
+            Slice elemTy = tyStr(self, te.kind.payload.Slice.base);
+            u32 idx = cgNewTemp(self, (Slice)Slice::from((u8*)"size_t", 6), 0);
+            Slice ix = cgTempName(self, idx);
+            u32 ltop = cgLabel(self);
+            u32 lbrk = cgLabel(self);
+            u32 lcont = cgLabel(self);
+
+            stNL(&self.body, self.ind);
+            stPS(&self.body, ix);
+            stP(&self.body, " = 0;");
+
+            cgEmitLabel(self, ltop);
+            stNL(&self.body, self.ind);
+            stP(&self.body, "if (!(");
+            stPS(&self.body, ix);
+            stP(&self.body, " < ");
+            if (te.kind.tag == TypeKind::Array) {
+                stU64(&self.body, (u64)te.kind.payload.Array.len);
+            } else {
+                stPS(&self.body, it);
+                stP(&self.body, ".len");
+            }
+            stP(&self.body, ")) goto __L");
+            stU64(&self.body, (u64)lbrk);
+            stCh(&self.body, ';');
+
+            /* bind */
+            stNL(&self.body, self.ind);
+            stPS(&self.body, elemTy);
+            stCh(&self.body, ' ');
+            stPS(&self.body, cgIntern(self, s.kind.payload.ForIn.bindName));
+            stP(&self.body, " = ");
+            stPS(&self.body, it);
+            if (te.kind.tag == TypeKind::Array) {
+                stCh(&self.body, '[');
+                stPS(&self.body, ix);
+                stCh(&self.body, ']');
+            } else {
+                stP(&self.body, ".ptr[");
+                stPS(&self.body, ix);
+                stCh(&self.body, ']');
+            }
+            stCh(&self.body, ';');
+
+            if (self.loopDepth < self.loopCap) {
+                self.breakStack[self.loopDepth] = lbrk;
+                self.contStack[self.loopDepth] = lcont;
+                self.loopDepth = self.loopDepth + 1;
+            }
+            cgStmt(self, s.kind.payload.ForIn.body);
+            cgPopLoop(self);
+
+            cgEmitLabel(self, lcont);
+            stNL(&self.body, self.ind);
+            stPS(&self.body, ix);
+            stP(&self.body, " = ");
+            stPS(&self.body, ix);
+            stP(&self.body, " + 1;");
+            cgEmitGoto(self, ltop);
+            cgEmitLabel(self, lbrk);
+            return;
+        },
+
+        StmtKind::Switch => {
+            Slice scrut = cgExpr(self, s.kind.payload.Switch.expr);
+            cgEmitSwitch(self, scrut, s.kind.payload.Switch.cases, s.kind.payload.Switch.casesLen, Slice::from(null, 0));
+            return;
+        },
+
+        StmtKind::Defer => {
+            self.errors = self.errors + 1;
+            stNL(&self.body, self.ind);
+            stP(&self.body, "/* unsupported: defer */");
+            return;
+        },
+
+        StmtKind::Comptime => {
+            u32 i = 0;
+            while (i < s.kind.payload.Comptime.stmtsLen)
+            {
+                cgStmt(self, s.kind.payload.Comptime.stmts[i]);
+                i = i + 1;
+            }
+            return;
+        },
+
+        StmtKind::Asm => {
+            stNL(&self.body, self.ind);
+            if (s.kind.payload.Asm.flags & 1) stP(&self.body, "__asm__ volatile (");
+            else stP(&self.body, "__asm__ (");
+            /* template: string literal pieces only */
+            u8* built = (u8*)"";
+            usize blen = 0;
+            u32 i = 0;
+            while (i < s.kind.payload.Asm.templateLen)
+            {
+                NodeId tnid = s.kind.payload.Asm.template[i];
+                Node* tn = cgNode(self, tnid);
+                if (tn.kind.tag == NodeKind::Expr && tn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit) {
+                    Slice piece = cgIntern(self, tn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                    u8* nb = (u8*)self.arena->alloc(blen + piece.len + 1, 1);
+                    if (nb != null) {
+                        memcpy(nb, built, blen);
+                        memcpy(nb + blen, piece.ptr, piece.len);
+                        built = nb;
+                        blen = blen + piece.len;
+                    }
+                } else {
+                    self.errors = self.errors + 1;
+                }
+                i = i + 1;
+            }
+            stCh(&self.body, '"');
+            stPut(&self.body, built, blen);
+            stP(&self.body, ");");
+            return;
+        },
+
+        else => {
+            self.errors = self.errors + 1;
+            return;
+        },
+    }
+}
