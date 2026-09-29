@@ -8,6 +8,7 @@ extern("C") i32 printf(u8* fmt, ...);
 extern("C") i32 open(u8* path, i32 flags, i32 mode);
 extern("C") i32 read(i32 fd, u8* buf, usize len);
 extern("C") i32 close(i32 fd);
+extern("C") i32 write(i32 fd, u8* buf, usize len);
 extern("C") rawptr malloc(usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
 extern("C") void free(rawptr ptr);
@@ -47,10 +48,20 @@ Slice readFile(u8* cpath, usize* outLen)
     return s;
 }
 
+void writeFixture(u8* cpath, u8* data)
+{
+    usize len = 0;
+    while (data[len] != 0) len = len + 1;
+    i32 fd = open(cpath, 577, 420);
+    if (fd < 0) return;
+    write(fd, data, len);
+    close(fd);
+}
+
 i32 main()
 {
     Arena a;
-    a.init(1048576);
+    a.init(4194304);
 
     usize len = 0;
     Slice src = readFile("example.crlb", &len);
@@ -70,8 +81,27 @@ i32 main()
     }
     printf("parsed ok, children=%d\n", (i32)root.children.len);
 
-    i32 errs = builderRun(root, &a, false, false);
+    writeFixture(".coral/graph", "# test fixture\ncoral-lexer -> coral-common\n");
+    Builder bOut;
+    i32 errs = builderRun(root, &a, false, false, &bOut);
     printf("builder errors=%d\n", errs);
-    if (errs == 0) return 0;
+    u32 totalEdges = 0;
+    u32 mi = 0;
+    while (mi < bOut.modulesLen)
+    {
+        totalEdges = totalEdges + bOut.mods[mi].depsLen;
+        mi = mi + 1;
+    }
+    printf("graph edges loaded=%d\n", (i32)totalEdges);
+    bool edgesOk = errs == 0 && totalEdges == 1;
+
+    writeFixture(".coral/graph", "coral-ast -> coral-build\ncoral-build -> coral-ast\n");
+    Builder bCycle;
+    i32 cycleErrs = builderRun(root, &a, false, false, &bCycle);
+    bool cycleOk = cycleErrs > 0;
+    printf("cycle rejected=%d\n", cycleOk ? 1 : 0);
+    writeFixture(".coral/graph", "# coral module graph — `from -> to`, written by coralc\n");
+
+    if (errs == 0 && edgesOk && cycleOk) return 0;
     return 3;
 }
