@@ -1050,7 +1050,12 @@ class Parser:
 
     def parse_if(self):
         self.expect(TokenKind.If)
-        cond = self.parse_expr()
+        if self.peek().kind == TokenKind.LParen:
+            self.advance()
+            cond = self.parse_expr()
+            self.expect(TokenKind.Rparen)
+        else:
+            cond = self.parse_expr()
         if self.peek().kind == TokenKind.LBrace:
             then_body = self.parse_block()
         else:
