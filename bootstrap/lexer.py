@@ -113,8 +113,6 @@ class TokenKind:
     RBrace = "RBrace"
     LBracket = "LBracket"
     RBracket = "RBracket"
-    AttrOpen = "AttrOpen"
-    AttrClose = "AttrClose"
     At = "At"
     Unknown = "Unknown"
     Question = "Question"
@@ -205,7 +203,6 @@ class Lexer:
         self.line = 1
         self.line_start = 0
         self.tokens = []
-        self.attr_depth = 0
 
     def is_at_end(self):
         return self.pos >= len(self.source)
@@ -486,19 +483,6 @@ class Lexer:
             if c == ":" and nxt == ":":
                 self.advance()
                 return self.make_token(TokenKind.ColonColon, start)
-            if c == "[" and nxt == "[":
-                self.advance()
-                self.attr_depth += 1
-                return self.make_token(TokenKind.AttrOpen, start)
-            if c == "]" and nxt == "]":
-                # only a real attribute close is ]] (after an unclosed [[);
-                # otherwise two separate RBrackets, e.g. a[b[c]]
-                if self.attr_depth > 0:
-                    self.advance()
-                    self.attr_depth -= 1
-                    return self.make_token(TokenKind.AttrClose, start)
-                self.advance()
-                return self.make_token(TokenKind.RBracket, start)
             if c == "%" and nxt == "=":
                 self.advance()
                 return self.make_token(TokenKind.PercentEqual, start)

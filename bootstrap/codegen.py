@@ -378,7 +378,7 @@ class CodeGen:
         if isinstance(node, IndexExpr):
             return f"{self.gen_expr(node.obj)}[{self.gen_expr(node.index)}]"
         if isinstance(node, Assign):
-            return f"({self.gen_expr(node.target)} {node.op} {self.gen_expr(node.value)})"
+            return f"({self.gen_assign_target(node.target)} {node.op} {self.gen_expr(node.value)})"
         if isinstance(node, TernaryExpr):
             return f"({self.gen_expr(node.cond)} ? {self.gen_expr(node.then_expr)} : {self.gen_expr(node.else_expr)})"
         if isinstance(node, SizeofExpr):
@@ -410,6 +410,12 @@ class CodeGen:
             return "(void)0"
         return "/* unhandled expr */"
 
+    def gen_assign_target(self, target):
+        # self is always a pointer in methods: `self = x` writes through it
+        if isinstance(target, Ident) and target.name == "self":
+            return "*self"
+        return self.gen_expr(target)
+
     def gen_stmt(self, node):
         self.emit_indent()
         if isinstance(node, ReturnStmt):
@@ -434,7 +440,7 @@ class CodeGen:
                 self.emit(f"{tp} {name};\n")
             return
         if isinstance(node, Assign):
-            self.emit(f"{self.gen_expr(node.target)} = {self.gen_expr(node.value)};\n")
+            self.emit(f"{self.gen_assign_target(node.target)} = {self.gen_expr(node.value)};\n")
             return
         if isinstance(node, BreakStmt):
             self.emit("break;\n")

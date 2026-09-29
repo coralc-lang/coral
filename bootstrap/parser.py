@@ -790,6 +790,9 @@ class Parser:
                 if self.peek().kind != TokenKind.RBrace:
                     self.expect(TokenKind.Dot)
                     fname = self.expect_name().value
+                    while self.peek().kind == TokenKind.Dot and self.peek2().kind == TokenKind.Ident:
+                        self.advance()
+                        fname = fname + "." + self.expect_name().value
                     self.expect(TokenKind.Equal)
                     fval = self.parse_expr()
                     field_names.append(fname)
@@ -799,6 +802,9 @@ class Parser:
                             break
                         self.expect(TokenKind.Dot)
                         fname = self.expect_name().value
+                        while self.peek().kind == TokenKind.Dot and self.peek2().kind == TokenKind.Ident:
+                            self.advance()
+                            fname = fname + "." + self.expect_name().value
                         self.expect(TokenKind.Equal)
                         fval = self.parse_expr()
                         field_names.append(fname)
