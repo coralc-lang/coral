@@ -16,7 +16,7 @@ import scope { Symbol };
 import sema { Sema };
 import diagnostics { ErrorCode };
 
-extend Sema
+pub extend Sema
 {
     bool checkStmt(NodeId id)
     {
@@ -26,18 +26,19 @@ extend Sema
         Stmt* stmt = &node->kind.payload.Stmt.value;
         switch (stmt->kind.tag)
         {
-            StmtKind::ExprStmt => { return self.checkExpr(stmt->kind.payload.ExprStmt.expr); },
             StmtKind::VarDecl => {
                 if (!self.checkExpr(stmt->kind.payload.VarDecl.init)) return false;
                 Ty declaredType = stmt->kind.payload.VarDecl.typeNode;
                 if (!self.checkType(declaredType)) return false;
                 Ty actualType = self.exprType(stmt->kind.payload.VarDecl.init);
-                if (declaredType != 0 && !self.compatible(actualType, declaredType)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "initializer type does not match variable type");
+                if (declaredType != 0 && !self.compatible(actualType, declaredType))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "initializer type does not match variable type");
                 if (declaredType == 0) declaredType = actualType;
                 if (stmt->kind.payload.VarDecl.name != 0)
                     self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags);
                 return true;
             },
+            
             StmtKind::Block => {
                 self.scopes.enter();
                 bool ok = true;
@@ -50,20 +51,25 @@ extend Sema
                 self.scopes.leave();
                 return ok;
             },
+            
             StmtKind::Return => {
                 if (!self.checkExpr(stmt->kind.payload.Return.value)) return false;
-                if (!self.compatible(self.exprType(stmt->kind.payload.Return.value), self.currentReturnType)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "return type does not match function return type");
+                if (!self.compatible(self.exprType(stmt->kind.payload.Return.value), self.currentReturnType))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "return type does not match function return type");
                 return true;
             },
+            
             StmtKind::If => {
                 if (!self.checkExpr(stmt->kind.payload.If.cond)) return false;
                 if (!self.checkStmt(stmt->kind.payload.If.thenBody)) return false;
                 return self.checkStmt(stmt->kind.payload.If.elseBody);
             },
+            
             StmtKind::While => {
                 if (!self.checkExpr(stmt->kind.payload.While.cond)) return false;
                 return self.checkStmt(stmt->kind.payload.While.body);
             },
+            
             StmtKind::ForIn => {
                 if (!self.checkExpr(stmt->kind.payload.ForIn.iterExpr)) return false;
                 self.scopes.enter();
@@ -72,13 +78,14 @@ extend Sema
                 self.scopes.leave();
                 return ok;
             },
+            
             StmtKind::For => {
                 if (!self.checkStmt(stmt->kind.payload.For.init)) return false;
                 if (!self.checkExpr(stmt->kind.payload.For.cond)) return false;
                 if (!self.checkExpr(stmt->kind.payload.For.post)) return false;
                 return self.checkStmt(stmt->kind.payload.For.body);
             },
-            StmtKind::Defer => { return self.checkStmt(stmt->kind.payload.Defer.stmt); },
+            
             StmtKind::Comptime => {
                 u32 i = 0;
                 while (i < stmt->kind.payload.Comptime.stmtsLen)
@@ -88,6 +95,7 @@ extend Sema
                 }
                 return true;
             },
+            
             StmtKind::Asm => {
                 u32 i = 0;
                 while (i < stmt->kind.payload.Asm.templateLen)
@@ -97,35 +105,33 @@ extend Sema
                 }
                 return true;
             },
+            
+            StmtKind::Defer => { return self.checkStmt(stmt->kind.payload.Defer.stmt); },
             StmtKind::Break => { return true; },
             StmtKind::Continue => { return true; },
             StmtKind::Loop => { return self.checkStmt(stmt->kind.payload.Loop.body); },
+            StmtKind::ExprStmt => { return self.checkExpr(stmt->kind.payload.ExprStmt.expr); },
+
+    
             StmtKind::Switch => {
                 if (!self.checkExpr(stmt->kind.payload.Switch.expr)) return false;
                 bool ok = true;
                 u32 i = 0;
-                while (i < stmt->kind.payload.Switch.casesLen)
-                {
+                while (i < stmt->kind.payload.Switch.casesLen) {
                     SwitchCase* switchCase = stmt->kind.payload.Switch.cases + i;
                     u32 p = 0;
-                    while (p < switchCase->patternsLen)
-                    {
+                    while (p < switchCase->patternsLen) {
                         if (!self.checkExpr(switchCase->patterns[p])) ok = false;
                         p = p + 1;
                     }
-                    if (switchCase->guard.index != 0)
-                    {
+                    if (switchCase->guard.index != 0) {
                         if (!self.checkExpr(switchCase->guard)) ok = false;
                     }
-                    if (switchCase->body.index != 0)
-                    {
+                    if (switchCase->body.index != 0) {
                         Node* bodyNode = self.ctx.nodes + switchCase->body.index;
-                        if (bodyNode->kind.tag == NodeKind::Expr)
-                        {
+                        if (bodyNode->kind.tag == NodeKind::Expr) {
                             if (!self.checkExpr(switchCase->body)) ok = false;
-                        }
-                        else
-                        {
+                        } else {
                             if (!self.checkStmt(switchCase->body)) ok = false;
                         }
                     }
@@ -167,19 +173,13 @@ extend Sema
             {
                 Param* param = &paramNode->kind.payload.Param.value;
                 if ((param->flags & 1) != 0) hasSelfParam = true;
-                if (param->name != 0)
-                {
-                    if ((param->flags & 8) != 0)
-                    {
+                if (param->name != 0) {
+                    if ((param->flags & 8) != 0) {
                         Ty typeNode = self.typeParamType(param->name, i);
                         if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0)) ok = false;
-                    }
-                    else if ((param->flags & 1) != 0 && selfType != 0)
-                    {
+                    } else if ((param->flags & 1) != 0 && selfType != 0) {
                         if (!self.scopes.declare(param->name, 1, selfType, paramId, 0)) ok = false;
-                    }
-                    else
-                    {
+                    } else {
                         if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0)) ok = false;
                     }
                 }
@@ -187,9 +187,9 @@ extend Sema
             }
             i = i + 1;
         }
-        if (selfType != 0 && !hasSelfParam)
-        {
-            Str selfStr = self.ctx.intern("self", 4);
+        if (selfType != 0 && !hasSelfParam) {
+            Str selfStr = self.ctx.intern("self", 4); // placeholder, Str is supposed to be a built in type,
+            // for literlas, the compiler is to know the lenth already
             self.scopes.declare(selfStr, 1, selfType, decl->kind.payload.Func.body, 0);
         }
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
