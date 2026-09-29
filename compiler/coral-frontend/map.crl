@@ -1,0 +1,418 @@
+/* frontend/map.crl — `coralc map`: discover lib.crl folders under the build
+ * file's root and splice them into the modules = [...] array as commented
+ * entries. Line splice on raw text — no reserialize, formatting preserved.
+ */
+
+mod slice_mod = import "../coral-common/slice" { Slice };
+mod arena_mod = import "../coral-build/arena" { Arena };
+mod ast_mod = import "../coral-build/ast" { Node, NodeKind };
+mod builder_mod = import "../coral-build/builder" {
+    bEq, bJoin, bCStr, bFileExists, bFieldStr, bFieldList, bListDir, bWriteFile,
+    DirEnt, builderRun, Builder
+};
+mod args_mod = import "args" { Options };
+mod io_mod = import "io" { sliceCStr };
+
+extern("C") i32 printf(u8* fmt, ...);
+extern("C") usize strlen(u8* s);
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr p);
+extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
+
+struct MapArr
+{
+    usize open;
+    usize close;
+    usize insPos;
+    usize eiLen;
+    usize modsIndent;
+    bool multiline;
+}
+
+bool mIdentChar(u8 c)
+{
+    if (c >= 97 && c <= 122) return true;
+    if (c >= 65 && c <= 90) return true;
+    if (c >= 48 && c <= 57) return true;
+    if (c == 95) return true;
+    return false;
+}
+
+bool mHasAt(Slice s, usize i, u8* sub, usize subLen)
+{
+    if (i + subLen > s.len) return false;
+    usize k = 0;
+    while (k < subLen)
+    {
+        if (s.ptr[i + k] != sub[k]) return false;
+        k = k + 1;
+    }
+    return true;
+}
+
+bool mSliceEq(Slice a, Slice b)
+{
+    if (a.len != b.len) return false;
+    usize i = 0;
+    while (i < a.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+bool mInList(Slice name, Slice* list, u32 len)
+{
+    u32 i = 0;
+    while (i < len)
+    {
+        if (bEq(name, list[i].ptr, list[i].len)) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+// locate the first `modules = [` array and its closing ']' (quote/comment aware)
+bool mFindModules(Slice raw, MapArr* out)
+{
+    u8* kw = "modules";
+    usize i = 0;
+    usize open = 0;
+    bool foundOpen = false;
+    while (i < raw.len)
+    {
+        if (mHasAt(raw, i, kw, 7))
+        {
+            bool okBefore = i == 0 || !mIdentChar(raw.ptr[i - 1]);
+            usize j = i + 7;
+            while (j < raw.len && (raw.ptr[j] == 32 || raw.ptr[j] == 9)) j = j + 1;
+            if (okBefore && j < raw.len && raw.ptr[j] == 61)
+            {
+                j = j + 1;
+                while (j < raw.len && (raw.ptr[j] == 32 || raw.ptr[j] == 9)) j = j + 1;
+                if (j < raw.len && raw.ptr[j] == 91)
+                {
+                    open = j;
+                    foundOpen = true;
+                    break;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (!foundOpen) return false;
+
+    usize k = open + 1;
+    bool inStr = false;
+    usize close = 0;
+    bool foundClose = false;
+    while (k < raw.len)
+    {
+        u8 ch = raw.ptr[k];
+        if (inStr)
+        {
+            if (ch == 92)
+            {
+                k = k + 2;
+                continue;
+            }
+            if (ch == 34) inStr = false;
+        }
+        else
+        {
+            if (ch == 34) inStr = true;
+            else if (ch == 47 && k + 1 < raw.len && raw.ptr[k + 1] == 47)
+            {
+                while (k < raw.len && raw.ptr[k] != 10) k = k + 1;
+                continue;
+            }
+            else if (ch == 93)
+            {
+                close = k;
+                foundClose = true;
+                break;
+            }
+        }
+        k = k + 1;
+    }
+    if (!foundClose) return false;
+
+    out->open = open;
+    out->close = close;
+    out->insPos = close;
+    out->eiLen = 0;
+    out->modsIndent = 0;
+    out->multiline = false;
+
+    usize nl = open + 1;
+    while (nl < close && raw.ptr[nl] != 10) nl = nl + 1;
+    if (nl < close)
+    {
+        out->multiline = true;
+        usize p = nl + 1;
+        while (p < close && (raw.ptr[p] == 32 || raw.ptr[p] == 9)) p = p + 1;
+        out->eiLen = p - (nl + 1);
+
+        usize q = close;
+        while (q > open && (raw.ptr[q - 1] == 32 || raw.ptr[q - 1] == 9)) q = q - 1;
+        usize ci = 0;
+        if (q > open && raw.ptr[q - 1] == 10) ci = close - q;
+        out->insPos = close - ci;
+    }
+    else
+    {
+        usize ls = open;
+        while (ls > 0 && raw.ptr[ls - 1] != 10) ls = ls - 1;
+        usize m = ls;
+        while (m < open && (raw.ptr[m] == 32 || raw.ptr[m] == 9)) m = m + 1;
+        out->modsIndent = m - ls;
+    }
+    return true;
+}
+
+// true when `"name"` appears anywhere inside the array (live or commented)
+bool mListed(Slice raw, usize from, usize to, Slice name)
+{
+    usize i = from;
+    while (i < to)
+    {
+        if (raw.ptr[i] == 34)
+        {
+            i = i + 1;
+            usize st = i;
+            while (i < to && raw.ptr[i] != 34) i = i + 1;
+            Slice got = Slice::from(raw.ptr + st, i - st);
+            if (mSliceEq(got, name)) return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+void mWalk(Arena* a, Slice root, Slice rel, Slice* found, u32* foundLen, u32 cap, Slice* skips, u32 skipLen)
+{
+    u8* dirC = (u8*)a.alloc(root.len + rel.len + 4, 1);
+    if (dirC == null) return;
+    usize dirLen = bJoin(dirC, root.len + rel.len + 4, root, rel);
+    u32 n = 0;
+    DirEnt* ents = bListDir(a, dirC, &n);
+    if (ents == null) return;
+    u32 i = 0;
+    while (i < n)
+    {
+        Slice nm = Slice::from(ents[i].name, strlen(ents[i].name));
+        bool hidden = nm.len > 0 && nm.ptr[0] == 46;
+        if (!hidden && !mInList(nm, skips, skipLen))
+        {
+            if (ents[i].dtype == 4)
+            {
+                u8* childRel = (u8*)a.alloc(rel.len + nm.len + 4, 1);
+                if (childRel == null) return;
+                usize clen = 0;
+                if (rel.len > 0)
+                {
+                    memcpy(childRel, rel.ptr, rel.len);
+                    childRel[rel.len] = 47;
+                    clen = rel.len + 1;
+                }
+                memcpy(childRel + clen, nm.ptr, nm.len);
+                clen = clen + nm.len;
+                childRel[clen] = 0;
+
+                u8* libP = (u8*)a.alloc(dirLen + nm.len + 12, 1);
+                if (libP != null)
+                {
+                    usize lp = bJoin(libP, dirLen + nm.len + 12, Slice::from(dirC, dirLen), nm);
+                    u8* suf = "/lib.crl";
+                    usize s = 0;
+                    while (s < 8 && lp + s + 1 < dirLen + nm.len + 12)
+                    {
+                        libP[lp + s] = suf[s];
+                        s = s + 1;
+                    }
+                    libP[lp + s] = 0;
+                    if (bFileExists(libP) && *foundLen < cap)
+                    {
+                        found[*foundLen] = Slice::from(childRel, clen);
+                        *foundLen = *foundLen + 1;
+                    }
+                }
+                mWalk(a, root, Slice::from(childRel, clen), found, foundLen, cap, skips, skipLen);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+bool mLess(Slice a, Slice b)
+{
+    usize i = 0;
+    while (i < a.len && i < b.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return a.ptr[i] < b.ptr[i];
+        i = i + 1;
+    }
+    return a.len < b.len;
+}
+
+void mSort(Slice* arr, u32 len)
+{
+    u32 i = 1;
+    while (i < len)
+    {
+        Slice key = arr[i];
+        i32 j = (i32)i - 1;
+        while (j >= 0 && mLess(key, arr[j]))
+        {
+            arr[j + 1] = arr[j];
+            j = j - 1;
+        }
+        arr[j + 1] = key;
+        i = i + 1;
+    }
+}
+
+void mAppend(u8* buf, usize* len, u8* src, usize n)
+{
+    usize i = 0;
+    while (i < n)
+    {
+        buf[*len] = src[i];
+        *len = *len + 1;
+        i = i + 1;
+    }
+}
+
+void mAppendSpaces(u8* buf, usize* len, usize n)
+{
+    usize i = 0;
+    while (i < n)
+    {
+        buf[*len] = 32;
+        *len = *len + 1;
+        i = i + 1;
+    }
+}
+
+bool mSplice(Options* opts, Arena* a, Slice raw, MapArr* arr, Slice* adds, u32 addLen)
+{
+    u8* insert = (u8*)malloc(raw.len + 4096);
+    if (insert == null) return false;
+    usize ilen = 0;
+    u32 i = 0;
+    while (i < addLen)
+    {
+        if (arr->multiline)
+        {
+            mAppendSpaces(insert, &ilen, arr->eiLen);
+            mAppend(insert, &ilen, (u8*)"# \"", 3);
+            mAppend(insert, &ilen, adds[i].ptr, adds[i].len);
+            mAppend(insert, &ilen, (u8*)"\",\n", 3);
+        }
+        else
+        {
+            mAppend(insert, &ilen, (u8*)"\n", 1);
+            mAppendSpaces(insert, &ilen, arr->modsIndent + 4);
+            mAppend(insert, &ilen, (u8*)"# \"", 3);
+            mAppend(insert, &ilen, adds[i].ptr, adds[i].len);
+            mAppend(insert, &ilen, (u8*)"\",\n", 3);
+            mAppendSpaces(insert, &ilen, arr->modsIndent);
+        }
+        i = i + 1;
+    }
+
+    usize total = raw.len + ilen;
+    u8* buf = (u8*)malloc(total + 1);
+    if (buf == null)
+    {
+        free(insert);
+        return false;
+    }
+    memcpy(buf, raw.ptr, arr->insPos);
+    memcpy(buf + arr->insPos, insert, ilen);
+    memcpy(buf + arr->insPos + ilen, raw.ptr + arr->insPos, raw.len - arr->insPos);
+    free(insert);
+    u8* pathC = sliceCStr(opts->buildFile);
+    if (pathC == null)
+    {
+        free(buf);
+        return false;
+    }
+    bool ok = bWriteFile(pathC, buf, total);
+    free(buf);
+    return ok;
+}
+
+pub i32 runMap(Options* opts, Node* root, Arena* a, Slice raw)
+{
+    Node* build = null;
+    u32 i = 0;
+    while (i < root.children.len)
+    {
+        Node* c = root.children.data + i;
+        if (c.kind == NodeKind::Build)
+        {
+            build = c;
+            break;
+        }
+        i = i + 1;
+    }
+    if (build == null)
+    {
+        printf("coralc: no build block in build file\n");
+        return 2;
+    }
+    Slice rootDir;
+    if (!bFieldStr(build, Slice::from("root", 4), &rootDir))
+    {
+        printf("coralc: build block has no root\n");
+        return 2;
+    }
+
+    MapArr arr;
+    if (!mFindModules(raw, &arr))
+    {
+        printf("coralc: no modules = [...] in build file\n");
+        return 2;
+    }
+
+    Slice* skips = (Slice*)a.alloc(512 * sizeof(Slice), 8);
+    u32 skipLen = bFieldList(build, Slice::from("skip", 4), a, skips, 512);
+
+    Slice* found = (Slice*)a.alloc(512 * sizeof(Slice), 8);
+    u32 foundLen = 0;
+    mWalk(a, rootDir, Slice::from("", 0), found, &foundLen, 512, skips, skipLen);
+    mSort(found, foundLen);
+
+    Slice* adds = (Slice*)a.alloc(512 * sizeof(Slice), 8);
+    u32 addLen = 0;
+    i = 0;
+    while (i < foundLen)
+    {
+        if (!mListed(raw, arr.open + 1, arr.close, found[i]))
+        {
+            adds[addLen] = found[i];
+            addLen = addLen + 1;
+            printf("+ added   %s\n", bCStr(a, found[i]));
+        }
+        i = i + 1;
+    }
+
+    if (opts->dryRun)
+    {
+        printf("~ dry run, build file not written\n");
+        return 0;
+    }
+
+    if (addLen > 0 && !mSplice(opts, a, raw, &arr, adds, addLen))
+    {
+        printf("coralc: failed to write build file\n");
+        return 1;
+    }
+
+    Builder bOut;
+    i32 errs = builderRun(root, a, false, true, &bOut);
+    if (errs != 0) return 3;
+    return 0;
+}
