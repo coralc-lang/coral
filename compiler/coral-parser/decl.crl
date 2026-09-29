@@ -21,6 +21,13 @@ import types_ast { Ty, TypeEntry, TypeKind };
 extern("C") rawptr malloc(usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
 
+struct ImportSymList
+{
+    ImportSymbol* items;
+    u32 len;
+    u32 cap;
+}
+
 pub extend Parser
 {
     NodeId storeDecl(DeclKind kind)
@@ -677,23 +684,10 @@ pub extend Parser
         return self.allocNode();
     }
 
-    Str parseNamespacePath()
+    Str strListJoin(StrListBuilder* parts)
     {
-        StrListBuilder parts;
-        self.ctx.strListInit(&parts);
-        while (true)
-        {
-            Token tok = self.expectName();
-            Str part = self.ctx.intern(tok.data.ptr, tok.data.len);
-            if (!self.ctx.strListAppend(&parts, part))
-            {
-                self.addError();
-                break;
-            }
-            if (!self.match(TokenKind::ColonColon)) break;
-        }
-        u32 count = parts.len;
-        Str* values = self.ctx.strListFinish(&parts);
+        u32 count = parts->len;
+        Str* values = self.ctx.strListFinish(parts);
         if (count == 0 || values == null) return 0;
         if (count == 1) return values[0];
         usize total = 0;
@@ -738,57 +732,114 @@ pub extend Parser
         return result;
     }
 
+    Str parseNamespacePath()
+    {
+        StrListBuilder parts;
+        self.ctx.strListInit(&parts);
+        while (true)
+        {
+            Token tok = self.expectName();
+            Str part = self.ctx.intern(tok.data.ptr, tok.data.len);
+            if (!self.ctx.strListAppend(&parts, part))
+            {
+                self.addError();
+                break;
+            }
+            if (!self.match(TokenKind::ColonColon)) break;
+        }
+        return self.strListJoin(&parts);
+    }
+
+    bool parseSymbolList(Str prefix, ImportSymList* list)
+    {
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            ImportSymbol value;
+            value.name = 0;
+            value.alias = 0;
+            value.flags = 0;
+            if (self.match(TokenKind::Star))
+            {
+                value.flags = 2;
+                if (list->len >= list->cap)
+                {
+                    u32 newCap = list->cap * 2;
+                    if (newCap == 0) newCap = 4;
+                    rawptr raw = realloc((rawptr)list->items, (usize)newCap * sizeof(ImportSymbol));
+                    if (raw == null)
+                    {
+                        self.addError();
+                        return false;
+                    }
+                    list->items = (ImportSymbol*)raw;
+                    list->cap = newCap;
+                }
+                list->items[list->len] = value;
+                list->len = list->len + 1;
+            }
+            else
+            {
+                Token nameTok = self.expectName();
+                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                if (prefix != 0)
+                {
+                    StrListBuilder parts;
+                    self.ctx.strListInit(&parts);
+                    self.ctx.strListAppend(&parts, prefix);
+                    self.ctx.strListAppend(&parts, name);
+                    name = self.strListJoin(&parts);
+                }
+                if (self.current.kind == TokenKind::LBrace)
+                {
+                    self.advance();
+                    if (!self.parseSymbolList(name, list)) return false;
+                    self.expect(TokenKind::RBrace);
+                }
+                else
+                {
+                    value.name = name;
+                    if (self.match(TokenKind::As))
+                    {
+                        Token aliasTok = self.expectName();
+                        value.alias = self.ctx.intern(aliasTok.data.ptr, aliasTok.data.len);
+                        value.flags = value.flags | 1;
+                    }
+                    if (list->len >= list->cap)
+                    {
+                        u32 newCap = list->cap * 2;
+                        if (newCap == 0) newCap = 4;
+                        rawptr raw = realloc((rawptr)list->items, (usize)newCap * sizeof(ImportSymbol));
+                        if (raw == null)
+                        {
+                            self.addError();
+                            return false;
+                        }
+                        list->items = (ImportSymbol*)raw;
+                        list->cap = newCap;
+                    }
+                    list->items[list->len] = value;
+                    list->len = list->len + 1;
+                }
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        return true;
+    }
+
     void parseImportSymbols(rawptr* outSymbols, u32* outLen)
     {
         *outSymbols = null;
         *outLen = 0;
         if (!self.match(TokenKind::LBrace)) return;
-        ImportSymbol* symbols = null;
-        u32 len = 0;
-        u32 cap = 0;
-        if (self.current.kind != TokenKind::RBrace)
-        {
-            while (true)
-            {
-                ImportSymbol value;
-                value.name = 0;
-                value.alias = 0;
-                value.flags = 0;
-                if (self.match(TokenKind::Star)) value.flags = 2;
-                else
-                {
-                    Token name = self.expectName();
-                    value.name = self.ctx.intern(name.data.ptr, name.data.len);
-                    if (self.match(TokenKind::As))
-                    {
-                        Token alias = self.expectName();
-                        value.alias = self.ctx.intern(alias.data.ptr, alias.data.len);
-                        value.flags = value.flags | 1;
-                    }
-                }
-                if (len >= cap)
-                {
-                    u32 newCap = cap * 2;
-                    if (newCap == 0) newCap = 4;
-                    rawptr raw = realloc((rawptr)symbols, (usize)newCap * sizeof(ImportSymbol));
-                    if (raw == null)
-                    {
-                        self.addError();
-                        break;
-                    }
-                    symbols = (ImportSymbol*)raw;
-                    cap = newCap;
-                }
-                symbols[len] = value;
-                len = len + 1;
-                if (!self.match(TokenKind::Comma)) break;
-                if (self.current.kind == TokenKind::RBrace) break;
-            }
-        }
+        ImportSymList list;
+        list.items = null;
+        list.len = 0;
+        list.cap = 0;
+        self.parseSymbolList(0, &list);
         self.expect(TokenKind::RBrace);
-        if (symbols != null && !self.ctx.track((rawptr)symbols)) self.addError();
-        *outSymbols = (rawptr)symbols;
-        *outLen = len;
+        if (list.items != null && !self.ctx.track((rawptr)list.items)) self.addError();
+        *outSymbols = (rawptr)list.items;
+        *outLen = list.len;
     }
 
     NodeId parseImportDecl()
@@ -804,9 +855,8 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            Token pathToken = self.advance();
-            path = self.ctx.intern(pathToken.data.ptr + 1, pathToken.data.len - 2);
             self.addError();
+            self.advance();
         }
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;
@@ -833,8 +883,8 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            Token pathToken = self.advance();
-            path = self.ctx.intern(pathToken.data.ptr + 1, pathToken.data.len - 2);
+            self.addError();
+            self.advance();
         }
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;

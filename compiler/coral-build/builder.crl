@@ -354,6 +354,8 @@ pub struct ModNode
     u32* deps;
     u32 depsLen;
     u32 depsCap;
+    Slice* files;
+    u32 filesLen;
     u64 fingerprint;
     bool stale;
 }
@@ -458,6 +460,8 @@ bool bInit(Builder* b, Arena* a, Node* root, bool forceIn, bool emitMapOnlyIn)
         b.mods[m].deps = null;
         b.mods[m].depsLen = 0;
         b.mods[m].depsCap = 0;
+        b.mods[m].files = null;
+        b.mods[m].filesLen = 0;
         b.mods[m].fingerprint = 14695981039346656037;
         b.mods[m].stale = true;
         m = m + 1;
@@ -693,15 +697,15 @@ bool bWriteMap(Builder* b)
     return ok;
 }
 
-// scan all .crl files for `import prefix::name` / `import folder {` → edges
-bool bScanImports(Builder* b)
+// walk each module's files, store the list, and fold content into the
+// fingerprint. import resolution is the compiler's job, not the builder's.
+bool bFingerprint(Builder* b)
 {
     u32 m = 0;
     while (m < b.modulesLen)
     {
-        Slice dirS = b.rootDir;
-        // dir for collect = rootDir + module
         u8* dirBuf = (u8*)malloc(4096);
+        if (dirBuf == null) return false;
         usize dl = bJoin(dirBuf, 4096, b.rootDir, b.modules[m]);
 
         Slice* files = (Slice*)b.arena.alloc(512 * sizeof(Slice), 8);
@@ -709,6 +713,8 @@ bool bScanImports(Builder* b)
         u32 filesLen = 0;
         bCollectCrl(b.arena, dirBuf, Slice::from(dirBuf, dl), b.skips, b.skipsLen, files, 512, &filesLen);
         bSortFiles(files, filesLen);
+        b.mods[m].files = files;
+        b.mods[m].filesLen = filesLen;
 
         u32 f = 0;
         while (f < filesLen)
@@ -719,89 +725,6 @@ bool bScanImports(Builder* b)
             {
                 b.mods[m].fingerprint = bFnv(b.mods[m].fingerprint, files[f].ptr, files[f].len);
                 b.mods[m].fingerprint = bFnv(b.mods[m].fingerprint, content.ptr, flen);
-
-                usize i = 0;
-                while (i < flen)
-                {
-                    usize lineStart = i;
-                    while (i < flen && content.ptr[i] != '\n') i = i + 1;
-                    usize lineEnd = i;
-                    if (i < flen) i = i + 1;
-                    usize p = lineStart;
-                    while (p < lineEnd && (content.ptr[p] == ' ' || content.ptr[p] == '\t')) p = p + 1;
-                    if (lineEnd - p >= 7)
-                    {
-                        bool isImport = true;
-                        u8* kw = "import ";
-                        u32 k = 0;
-                        while (k < 7)
-                        {
-                            if (content.ptr[p + k] != kw[k]) { isImport = false; break; }
-                            k = k + 1;
-                        }
-                        if (isImport)
-                        {
-                            usize q = p + 7;
-                            usize nameStart = q;
-                            while (q < lineEnd && ((content.ptr[q] >= 'A' && content.ptr[q] <= 'Z') || (content.ptr[q] >= 'a' && content.ptr[q] <= 'z') || (content.ptr[q] == '_') || (q > nameStart && content.ptr[q] >= '0' && content.ptr[q] <= '9'))) q = q + 1;
-                            Slice prefix = Slice::from(content.ptr + nameStart, q - nameStart);
-                            if (prefix.len > 0)
-                            {
-                                Slice folder;
-                                if (bResolvePrefix(b, prefix, &folder))
-                                {
-                                    i32 targetIdx = bModuleIdx(b, folder);
-                                    if (targetIdx >= 0 && (u32)targetIdx != m)
-                                    {
-                                        // the compiler validates that `prefix::export` exists
-                                        // in lib.crl; the builder only records the folder edge
-                                        bool okEntry = true;
-                                        if (okEntry || (u32)targetIdx < b.modulesLen)
-                                        {
-                                            ModNode* node = b.mods + m;
-                                            bool dup = false;
-                                            u32 d = 0;
-                                            while (d < node.depsLen)
-                                            {
-                                                if (node.deps[d] == (u32)targetIdx) { dup = true; break; }
-                                                d = d + 1;
-                                            }
-                                            if (!dup)
-                                            {
-                                                if (node.depsLen >= node.depsCap)
-                                                {
-                                                    u32 newCap = 8;
-                                                    if (node.depsCap != 0) newCap = node.depsCap * 2;
-                                                    u32* fresh = (u32*)b.arena.alloc(newCap * sizeof(u32), 4);
-                                                    if (fresh == null) return false;
-                                                    u32 d2 = 0;
-                                                    while (d2 < node.depsLen) { fresh[d2] = node.deps[d2]; d2 = d2 + 1; }
-                                                    node.deps = fresh;
-                                                    node.depsCap = newCap;
-                                                }
-                                                node.deps[node.depsLen] = (u32)targetIdx;
-                                                node.depsLen = node.depsLen + 1;
-                                            }
-                                        }
-                                    }
-                                }
-                                else
-                                {
-                                    u8* fileBuf = (u8*)malloc(4096);
-                                    usize fi = 0;
-                                    while (fi < files[f].len && fi < 4095) { fileBuf[fi] = files[f].ptr[fi]; fi = fi + 1; }
-                                    fileBuf[fi] = 0;
-                                    u8* impBuf = (u8*)malloc(512);
-                                    usize ii = 0;
-                                    while (ii < prefix.len && ii < 511) { impBuf[ii] = prefix.ptr[ii]; ii = ii + 1; }
-                                    impBuf[ii] = 0;
-                                    bError(b, "E1005", "unresolved module import", "file", fileBuf, "import", impBuf,
-                                           "is coral-common in `modules`?");
-                                }
-                            }
-                        }
-                    }
-                }
             }
             f = f + 1;
         }
@@ -874,7 +797,74 @@ bool bTopo(Builder* b)
     return true;
 }
 
-bool bWriteGraph(Builder* b)
+pub bool bAddEdge(Builder* b, u32 from, u32 to)
+{
+    if (from >= b.modulesLen || to >= b.modulesLen) return false;
+    if (from == to) return true;
+    ModNode* node = b->mods + from;
+    u32 d = 0;
+    while (d < node->depsLen)
+    {
+        if (node->deps[d] == to) return true;
+        d = d + 1;
+    }
+    if (node->depsLen >= node->depsCap)
+    {
+        u32 newCap = 8;
+        if (node->depsCap != 0) newCap = node->depsCap * 2;
+        u32* fresh = (u32*)b->arena.alloc(newCap * sizeof(u32), 4);
+        if (fresh == null) return false;
+        u32 d2 = 0;
+        while (d2 < node->depsLen)
+        {
+            fresh[d2] = node->deps[d2];
+            d2 = d2 + 1;
+        }
+        node->deps = fresh;
+        node->depsCap = newCap;
+    }
+    node->deps[node->depsLen] = to;
+    node->depsLen = node->depsLen + 1;
+    return true;
+}
+
+// load persisted edges: `.coral/graph` lines are `from -> to`, `#` comments
+bool bLoadGraph(Builder* b)
+{
+    usize len = 0;
+    Slice content = bReadFile(b->arena, ".coral/graph", &len);
+    if (content.ptr == null) return true;
+    usize i = 0;
+    while (i < len)
+    {
+        usize lineStart = i;
+        while (i < len && content.ptr[i] != '\n') i = i + 1;
+        usize lineEnd = i;
+        if (i < len) i = i + 1;
+        usize p = lineStart;
+        while (p < lineEnd && (content.ptr[p] == ' ' || content.ptr[p] == '\t' || content.ptr[p] == '\r')) p = p + 1;
+        if (p >= lineEnd) continue;
+        if (content.ptr[p] == '#') continue;
+        usize fromStart = p;
+        while (p < lineEnd && content.ptr[p] != ' ') p = p + 1;
+        Slice from = Slice::from(content.ptr + fromStart, p - fromStart);
+        while (p < lineEnd && content.ptr[p] == ' ') p = p + 1;
+        if (p + 1 >= lineEnd) continue;
+        if (content.ptr[p] != 45 || content.ptr[p + 1] != 62) continue;
+        p = p + 2;
+        while (p < lineEnd && content.ptr[p] == ' ') p = p + 1;
+        usize toStart = p;
+        while (p < lineEnd && content.ptr[p] != ' ' && content.ptr[p] != '\r') p = p + 1;
+        Slice to = Slice::from(content.ptr + toStart, p - toStart);
+        if (from.len == 0 || to.len == 0) continue;
+        i32 fi = bModuleIdx(b, from);
+        i32 ti = bModuleIdx(b, to);
+        if (fi >= 0 && ti >= 0) bAddEdge(b, (u32)fi, (u32)ti);
+    }
+    return true;
+}
+
+pub bool bWriteGraph(Builder* b)
 {
     syscall(83, ".coral", 493);
     usize cap = 65536;
@@ -907,10 +897,39 @@ bool bWriteGraph(Builder* b)
         printf("E1000  cannot write .coral/graph.dot\n");
         b.errors = b.errors + 1;
     }
-    return ok;
+
+    usize cap2 = 65536;
+    u8* buf2 = (u8*)malloc(cap2);
+    if (buf2 == null) return false;
+    usize len2 = 0;
+    u8* header2 = "# coral module graph — `from -> to`, written by coralc\n";
+    bApp(buf2, cap2, &len2, header2, strlen(header2));
+    u32 m2 = 0;
+    while (m2 < b.modulesLen)
+    {
+        u32 d2 = 0;
+        while (d2 < b.mods[m2].depsLen)
+        {
+            bApp(buf2, cap2, &len2, b.mods[m2].name.ptr, b.mods[m2].name.len);
+            bApp(buf2, cap2, &len2, " -> ", 4);
+            u32 dep2 = b.mods[m2].deps[d2];
+            bApp(buf2, cap2, &len2, b.mods[dep2].name.ptr, b.mods[dep2].name.len);
+            bApp(buf2, cap2, &len2, "\n", 1);
+            d2 = d2 + 1;
+        }
+        m2 = m2 + 1;
+    }
+    bool ok2 = bWriteFile(".coral/graph", buf2, len2);
+    free(buf2);
+    if (!ok2)
+    {
+        printf("E1000  cannot write .coral/graph\n");
+        b.errors = b.errors + 1;
+    }
+    return ok && ok2;
 }
 
-bool bWriteFp(Builder* b, u32 modIdx)
+pub bool bWriteFp(Builder* b, u32 modIdx)
 {
     syscall(83, ".coral", 493);
     syscall(83, ".coral/cache", 493);
@@ -969,7 +988,7 @@ bool bCheckFp(Builder* b, u32 modIdx)
     return false;
 }
 
-pub i32 builderRun(Node* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn)
+pub i32 builderRun(Node* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn, Builder* out)
 {
     Builder b;
     if (!bInit(&b, a, cfgRoot, forceIn, emitMapOnlyIn)) return b.errors;
@@ -988,7 +1007,8 @@ pub i32 builderRun(Node* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn)
 
     if (!bValidateAliases(&b)) return b.errors;
     if (!bWriteMap(&b)) return b.errors;
-    if (!bScanImports(&b)) return b.errors;
+    if (!bFingerprint(&b)) return b.errors;
+    if (!bLoadGraph(&b)) return b.errors;
     if (!bTopo(&b)) return b.errors;
     if (!bWriteGraph(&b)) return b.errors;
 
@@ -1022,5 +1042,6 @@ pub i32 builderRun(Node* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn)
             i = i + 1;
         }
     }
+    if (out != null) *out = b;
     return b.errors;
 }
