@@ -5,9 +5,17 @@ import lexer { Lexer };
 mod table = import "../coral-lexer/table";
 import table { IdentifierTable, IdentEntry };
 mod context = import "../coral-context/context";
-import context { AstContext };
+import context { AstContext, InternEntry };
 mod decl_ast = import "../coral-ast/decl";
-import decl_ast { File };
+import decl_ast { File, Decl, DeclKind };
+mod node_ast = import "../coral-ast/node";
+import node_ast { Node, NodeKind };
+mod id_ast = import "../coral-ast/id";
+import id_ast { NodeId };
+mod slice_mod = import "../coral-common/slice";
+import slice_mod { Slice };
+mod io_mod = import "io";
+import io_mod { readFile };
 mod parser_lib = import "../coral-parser/lib";
 import parser_lib { Parser };
 mod sema = import "../coral-semantics/sema";
@@ -34,6 +42,7 @@ extern("C") u64 write(i32 fd, u8* buf, u64 n);
 
 extern("C") rawptr malloc(usize size);
 extern("C") void free(rawptr ptr);
+extern("C") rawptr realloc(rawptr ptr, usize size);
 
 pub struct AnalyzeResult
 {
@@ -76,6 +85,433 @@ pub void freeUnit(CompileUnit* unit)
         unit.ctx = null;
         unit.file = null;
     }
+}
+
+/* ── import(lib) loader ─────────────────────────────────────────── *
+ * Resolves `import(lib) a::b::c` against the lib/ roots:
+ *   1. <root>/a/b/c.crl            direct module file
+ *   2. <root>/a/b/c/lib.crl        directory manifest
+ *   3. <root>/a/lib.crl entry `b`  package manifest — entries are
+ *      `pub mod name = import <path>;` and their targets resolve
+ *      relative to the manifest's directory (nesting recurses).
+ * Roots: <dir(input)>/../../lib, then ./lib.  The resolved file is
+ * parsed into the shared context and merged flat, dependencies first,
+ * ahead of the importing file's own decls. */
+
+struct LibSeg
+{
+    u8* ptr;
+    u32 len;
+}
+
+struct LibLoader
+{
+    AstContext* ctx;
+    IdentifierTable* idents;
+    u8* inputPath;
+    u8** loaded;
+    u32 loadedLen;
+    u32 loadedCap;
+    File** files;
+    u32 filesLen;
+    u32 filesCap;
+    u32 errors;
+}
+
+usize libLen(u8* s)
+{
+    usize n = 0;
+    if (s == null) return 0;
+    while (s[n] != 0) n = n + 1;
+    return n;
+}
+
+bool libBytesEq(u8* a, usize al, u8* b, usize bl)
+{
+    if (a == null || b == null) return false;
+    if (al != bl) return false;
+    usize i = 0;
+    while (i < al)
+    {
+        if (a[i] != b[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, u8* suffix, usize suffixLen)
+{
+    u8* p = (u8*)malloc(dirLen + 1 + segLen + suffixLen + 1);
+    if (p == null) return null;
+    usize k = 0;
+    usize i = 0;
+    while (i < dirLen) { p[k] = dir[i]; k = k + 1; i = i + 1; }
+    p[k] = 47; k = k + 1;
+    i = 0;
+    while (i < segLen) { p[k] = seg[i]; k = k + 1; i = i + 1; }
+    i = 0;
+    while (i < suffixLen) { p[k] = suffix[i]; k = k + 1; i = i + 1; }
+    p[k] = 0;
+    return p;
+}
+
+u8* libDir(u8* path)
+{
+    usize n = libLen(path);
+    usize i = n;
+    while (i > 0)
+    {
+        i = i - 1;
+        if (path[i] == 47)
+        {
+            if (i == 0) return null;
+            u8* d = (u8*)malloc(i + 1);
+            if (d == null) return null;
+            usize k = 0;
+            while (k < i) { d[k] = path[k]; k = k + 1; }
+            d[i] = 0;
+            return d;
+        }
+    }
+    return null;
+}
+
+u8* libRead(u8* cpath, usize* outLen)
+{
+    *outLen = 0;
+    Slice s = readFile(cpath, outLen);
+    if (s.ptr == null || s.len == 0)
+    {
+        if (s.ptr != null) free(s.ptr);
+        return null;
+    }
+    return (u8*)s.ptr;
+}
+
+u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
+{
+    u32 count = 0;
+    usize start = 0;
+    usize i = 0;
+    while (i <= n)
+    {
+        bool atEnd = (i == n);
+        bool atSep = false;
+        if (!atEnd && (i + 1) < n && s[i] == 58 && s[i + 1] == 58) atSep = true;
+        if (atEnd || atSep)
+        {
+            if (count < max)
+            {
+                out[count].ptr = s + start;
+                out[count].len = (u32)(i - start);
+                count = count + 1;
+            }
+            if (atEnd) break;
+            i = i + 2;
+            start = i;
+            continue;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath)
+{
+    DiagnosticEngine engine;
+    engine.init(buf, buf + len);
+    Lexer lexer = Lexer {
+        .bufStart = buf,
+        .cur = buf,
+        .bufEnd = buf + len,
+        .line = 1,
+        .lineStart = buf,
+        .diag = &engine,
+        .idents = L->idents,
+    };
+    Parser parser = Parser {
+        .lexer = &lexer,
+        .ctx = L->ctx,
+        .panicMode = 0,
+        .pendingGreater = false,
+        .current = lexer.nextToken(),
+    };
+    parser.previous = parser.current;
+    AstContext* c = L->ctx;
+    File* f = parser.parseFile(c.intern(cpath, libLen(cpath)));
+    L->errors = L->errors + parser.errorCount();
+    return f;
+}
+
+u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32 depth)
+{
+    if (L == null || segs == null || dir == null || n == 0) return null;
+    if (depth > 16) return null;
+    if (n == 1)
+    {
+        /* existence probe only — the file is re-read by the loader later,
+         * and nothing here interns into this buffer, so it can be freed */
+        usize len = 0;
+        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, ".crl", 4);
+        if (cand != null)
+        {
+            u8* buf = libRead(cand, &len);
+            if (buf != null)
+            {
+                free(buf);
+                return cand;
+            }
+            free(cand);
+        }
+        cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "/lib.crl", 8);
+        if (cand != null)
+        {
+            u8* buf = libRead(cand, &len);
+            if (buf != null)
+            {
+                free(buf);
+                return cand;
+            }
+            free(cand);
+        }
+        return null;
+    }
+    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "", 0);
+    if (sub == null) return null;
+    usize subLen = dirLen + 1 + segs[0].len;
+    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "/lib.crl", 8);
+    if (mpath != null)
+    {
+        usize mlen = 0;
+        u8* mbuf = libRead(mpath, &mlen);
+        if (mbuf != null)
+        {
+            File* mf = libParse(L, mbuf, mlen, mpath);
+            if (mf != null)
+            {
+                u32 d = 0;
+                while (d < mf->declsLen)
+                {
+                    Node* dn = L->ctx->nodes + mf->decls[d].index;
+                    if (dn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &dn->kind.payload.Decl.value;
+                        if (dd->kind.tag == DeclKind::ModReexport && dd->kind.payload.ModReexport.path != 0)
+                        {
+                            InternEntry* entry = L->ctx->interns + dd->kind.payload.ModReexport.alias;
+                            if (libBytesEq(entry->ptr, entry->len, segs[1].ptr, segs[1].len))
+                            {
+                                InternEntry* target = L->ctx->interns + dd->kind.payload.ModReexport.path;
+                                u32 maxT = (u32)(target->len / 2) + 1;
+                                LibSeg* next = (LibSeg*)malloc(((usize)maxT + n) * sizeof(LibSeg));
+                                if (next != null)
+                                {
+                                    u32 got = libSplit(target->ptr, target->len, next, maxT);
+                                    u32 j = 2;
+                                    while (j < n)
+                                    {
+                                        next[got] = segs[j];
+                                        got = got + 1;
+                                        j = j + 1;
+                                    }
+                                    u8* r = libResolveSegs(L, next, got, sub, subLen, depth + 1);
+                                    free(next);
+                                    if (r != null)
+                                    {
+                                        free(mpath);
+                                        return r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    d = d + 1;
+                }
+            }
+        }
+        free(mpath);
+    }
+    /* no export entry (or its target failed) — descend as a directory */
+    return libResolveSegs(L, segs + 1, n - 1, sub, subLen, depth + 1);
+}
+
+u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
+{
+    if (nsPtr == null || nsLen == 0) return null;
+    u32 maxSegs = 1;
+    usize i = 0;
+    while (i + 1 < nsLen)
+    {
+        if (nsPtr[i] == 58 && nsPtr[i + 1] == 58) maxSegs = maxSegs + 1;
+        i = i + 1;
+    }
+    LibSeg* segs = (LibSeg*)malloc((usize)maxSegs * sizeof(LibSeg));
+    if (segs == null) return null;
+    u32 n = libSplit(nsPtr, nsLen, segs, maxSegs);
+    u8* result = null;
+    u8* base = libDir(L->inputPath);
+    if (base != null)
+    {
+        usize bl = libLen(base);
+        u8* up = libCandidate(base, bl, "..", 2, "/..", 3);
+        if (up != null)
+        {
+            u8* root1 = libCandidate(up, libLen(up), "lib", 3, "", 0);
+            if (root1 != null)
+            {
+                result = libResolveSegs(L, segs, n, root1, libLen(root1), 0);
+                free(root1);
+            }
+            free(up);
+        }
+        free(base);
+    }
+    if (result == null)
+        result = libResolveSegs(L, segs, n, (u8*)"lib", 3, 0);
+    free(segs);
+    return result;
+}
+
+bool libHas(LibLoader* L, u8* path)
+{
+    usize plen = libLen(path);
+    u32 i = 0;
+    while (i < L->loadedLen)
+    {
+        if (libBytesEq(L->loaded[i], libLen(L->loaded[i]), path, plen)) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+bool libPush(LibLoader* L, u8* path)
+{
+    if (L->loadedLen >= L->loadedCap)
+    {
+        u32 newCap = L->loadedCap * 2;
+        rawptr raw = realloc((rawptr)L->loaded, (usize)newCap * sizeof(u8*));
+        if (raw == null) return false;
+        L->loaded = (u8**)raw;
+        L->loadedCap = newCap;
+    }
+    L->loaded[L->loadedLen] = path;
+    L->loadedLen = L->loadedLen + 1;
+    return true;
+}
+
+bool libPushFile(LibLoader* L, File* f)
+{
+    if (L->filesLen >= L->filesCap)
+    {
+        u32 newCap = L->filesCap * 2;
+        rawptr raw = realloc((rawptr)L->files, (usize)newCap * sizeof(File*));
+        if (raw == null) return false;
+        L->files = (File**)raw;
+        L->filesCap = newCap;
+    }
+    L->files[L->filesLen] = f;
+    L->filesLen = L->filesLen + 1;
+    return true;
+}
+
+void libLoadImports(LibLoader* L, File* f)
+{
+    if (f == null) return;
+    u32 i = 0;
+    while (i < f->declsLen)
+    {
+        Node* dn = L->ctx->nodes + f->decls[i].index;
+        if (dn->kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &dn->kind.payload.Decl.value;
+            if (dd->kind.tag == DeclKind::Import && (dd->kind.payload.Import.flags & 1) != 0 && dd->kind.payload.Import.path != 0)
+            {
+                /* copy out before libResolve — parsing manifests grows the
+                 * intern table, invalidating InternEntry pointers */
+                InternEntry* ie = L->ctx->interns + dd->kind.payload.Import.path;
+                u8* nsPtr = ie->ptr;
+                usize nsLen = ie->len;
+                u8* resolved = libResolve(L, nsPtr, nsLen);
+                if (resolved == null)
+                {
+                    write(2, "coral: cannot resolve import(lib) ", 34);
+                    write(2, nsPtr, nsLen);
+                    write(2, "\n", 1);
+                    L->errors = L->errors + 1;
+                }
+                else if (!libHas(L, resolved))
+                {
+                    if (!libPush(L, resolved))
+                    {
+                        L->errors = L->errors + 1;
+                    }
+                    else
+                    {
+                        usize len = 0;
+                        u8* buf = libRead(resolved, &len);
+                        File* lf = null;
+                        if (buf != null) lf = libParse(L, buf, len, resolved);
+                        if (lf == null)
+                        {
+                            write(2, "coral: cannot read import(lib) file ", 36);
+                            write(2, resolved, libLen(resolved));
+                            write(2, "\n", 1);
+                            L->errors = L->errors + 1;
+                        }
+                        else
+                        {
+                            libLoadImports(L, lf);   /* dependencies first */
+                            if (!libPushFile(L, lf)) L->errors = L->errors + 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+bool libMerge(LibLoader* L, File* file)
+{
+    if (L->filesLen == 0) return true;
+    u32 total = file->declsLen;
+    u32 i = 0;
+    while (i < L->filesLen)
+    {
+        total = total + L->files[i]->declsLen;
+        i = i + 1;
+    }
+    NodeId* merged = (NodeId*)malloc((usize)total * sizeof(NodeId));
+    if (merged == null) return false;
+    u32 k = 0;
+    i = 0;
+    while (i < L->filesLen)
+    {
+        u32 j = 0;
+        while (j < L->files[i]->declsLen)
+        {
+            merged[k] = L->files[i]->decls[j];
+            k = k + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < file->declsLen)
+    {
+        merged[k] = file->decls[i];
+        k = k + 1;
+        i = i + 1;
+    }
+    AstContext* c = L->ctx;
+    if (!c.track((rawptr)merged))
+    {
+        free((rawptr)merged);
+        return false;
+    }
+    file->decls = merged;
+    file->declsLen = total;
+    return true;
 }
 
 CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
@@ -143,7 +579,44 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
     unit.parseErrors = parser.errorCount();
     if (file == null && unit.parseErrors == 0) unit.parseErrors = 1;
 
-    if (file != null) {
+    /* import(lib): resolve + parse + merge library decls, deps first */
+    bool loadOk = true;
+    if (file != null)
+    {
+        LibLoader loader;
+        loader.ctx = ctx;
+        loader.idents = &idents;
+        loader.inputPath = path;
+        loader.loaded = (u8**)malloc(8 * sizeof(u8*));
+        loader.loadedLen = 0;
+        loader.loadedCap = 8;
+        loader.files = (File**)malloc(8 * sizeof(File*));
+        loader.filesLen = 0;
+        loader.filesCap = 8;
+        loader.errors = 0;
+        if (loader.loaded == null || loader.files == null)
+        {
+            loader.errors = loader.errors + 1;
+        }
+        else
+        {
+            libLoadImports(&loader, file);
+            if (loader.errors == 0 && !libMerge(&loader, file))
+            {
+                write(2, "coral: failed to merge import(lib) decls\n", 41);
+                loader.errors = loader.errors + 1;
+            }
+        }
+        if (loader.loaded != null) free(loader.loaded);
+        if (loader.files != null) free(loader.files);
+        if (loader.errors > 0)
+        {
+            unit.parseErrors = unit.parseErrors + loader.errors;
+            loadOk = false;
+        }
+    }
+
+    if (file != null && loadOk) {
         Sema* sema = (Sema*)malloc(sizeof(Sema));
         MonoContext* mono = (MonoContext*)malloc(sizeof(MonoContext));
         if (sema == null || mono == null) {

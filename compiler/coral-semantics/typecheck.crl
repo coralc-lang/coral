@@ -50,6 +50,54 @@ pub extend Sema
         return self.allocType(kind);
     }
 
+    Ty u8Type()
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            if (self.ctx.types[i].kind.tag == TypeKind::U8) return i;
+            i++;
+        }
+        TypeKind kind;
+        kind.tag = TypeKind::U8;
+        return self.allocType(kind);
+    }
+
+    Ty u16Type()
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            if (self.ctx.types[i].kind.tag == TypeKind::U16) return i;
+            i++;
+        }
+        TypeKind kind;
+        kind.tag = TypeKind::U16;
+        return self.allocType(kind);
+    }
+
+    Ty u64Type()
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            if (self.ctx.types[i].kind.tag == TypeKind::U64) return i;
+            i++;
+        }
+        TypeKind kind;
+        kind.tag = TypeKind::U64;
+        return self.allocType(kind);
+    }
+
+    Ty rawptrType()
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            if (self.ctx.types[i].kind.tag == TypeKind::Rawptr) return i;
+            i++;
+        }
+        TypeKind kind;
+        kind.tag = TypeKind::Rawptr;
+        return self.allocType(kind);
+    }
+
     Ty usizeType()
     {
         u32 i = 1;
@@ -87,6 +135,18 @@ pub extend Sema
         }
         TypeKind kind;
         kind.tag = TypeKind::I32;
+        return self.allocType(kind);
+    }
+
+    Ty i64Type()
+    {
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            if (self.ctx.types[i].kind.tag == TypeKind::I64) return i;
+            i++;
+        }
+        TypeKind kind;
+        kind.tag = TypeKind::I64;
         return self.allocType(kind);
     }
 
@@ -389,6 +449,62 @@ pub extend Sema
         return genericNode->kind.payload.GenericParam.value.name;
     }
 
+    /* Structural match where TypeParam entries in `pattern` act as wildcards —
+     * used to match an extend's self type (`Option<T>`) against a concrete
+     * receiver (`Option<f64>`) */
+    bool sameTypePattern(Ty pattern, Ty concrete)
+    {
+        if (pattern == concrete) return true;
+        if (pattern == 0 || concrete == 0) return false;
+        TypeEntry* a = self.ctx.types + pattern;
+        TypeEntry* b = self.ctx.types + concrete;
+        if (a->kind.tag == TypeKind::TypeParam) return true;
+        if (a->kind.tag != b->kind.tag) return false;
+        switch (a->kind.tag)
+        {
+            TypeKind::Named => {
+                if (a->kind.payload.Named.name != b->kind.payload.Named.name) return false;
+                if (a->kind.payload.Named.genericArgsLen != b->kind.payload.Named.genericArgsLen) return false;
+                u32 i = 0;
+                while (i < a->kind.payload.Named.genericArgsLen)
+                {
+                    if (!self.sameTypePattern(a->kind.payload.Named.genericArgs[i], b->kind.payload.Named.genericArgs[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            TypeKind::Pointer => { return self.sameTypePattern(a->kind.payload.Pointer.base, b->kind.payload.Pointer.base); },
+            TypeKind::Const => { return self.sameTypePattern(a->kind.payload.Const.base, b->kind.payload.Const.base); },
+            TypeKind::Comptime => { return self.sameTypePattern(a->kind.payload.Comptime.base, b->kind.payload.Comptime.base); },
+            TypeKind::Slice => { return self.sameTypePattern(a->kind.payload.Slice.base, b->kind.payload.Slice.base); },
+            TypeKind::Array => {
+                if (a->kind.payload.Array.len != b->kind.payload.Array.len) return false;
+                return self.sameTypePattern(a->kind.payload.Array.base, b->kind.payload.Array.base);
+            },
+            TypeKind::FnPtr => {
+                if (a->kind.payload.FnPtr.paramsLen != b->kind.payload.FnPtr.paramsLen) return false;
+                if (!self.sameTypePattern(a->kind.payload.FnPtr.returnType, b->kind.payload.FnPtr.returnType)) return false;
+                u32 i = 0;
+                while (i < a->kind.payload.FnPtr.paramsLen) {
+                    if (!self.sameTypePattern(a->kind.payload.FnPtr.params[i], b->kind.payload.FnPtr.params[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            TypeKind::Tuple => {
+                if (a->kind.payload.Tuple.elemsLen != b->kind.payload.Tuple.elemsLen) return false;
+                u32 i = 0;
+                while (i < a->kind.payload.Tuple.elemsLen) {
+                    if (!self.sameTypePattern(a->kind.payload.Tuple.elems[i], b->kind.payload.Tuple.elems[i])) return false;
+                    i++;
+                }
+                return true;
+            },
+            else => { return true; }
+        }
+        return true;
+    }
+
     Ty substituteFieldTy(Ty fieldType, Ty objectType)
     {
         if (fieldType == 0 || objectType == 0) return fieldType;
@@ -507,6 +623,8 @@ pub extend Sema
             return self.compatible(from, target->kind.payload.Const.base);
         if (target->kind.tag == TypeKind::Comptime)
             return self.compatible(from, target->kind.payload.Comptime.base);
+        if (source->kind.tag == TypeKind::Str && target->kind.tag == TypeKind::Pointer)
+            return true;
         if (source->kind.tag == TypeKind::Pointer && target->kind.tag == TypeKind::Pointer)
             return self.compatible(source->kind.payload.Pointer.base, target->kind.payload.Pointer.base);
         return false;

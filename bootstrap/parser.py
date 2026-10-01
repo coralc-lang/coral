@@ -552,9 +552,9 @@ class Parser:
                 size = self.parse_expr()
                 self.expect(TokenKind.RBracket)
                 return ArrayType(base, size)
-            if self.peek().kind == TokenKind.Star:
+            while self.peek().kind == TokenKind.Star:
                 self.advance()
-                return PointerType(base)
+                base = PointerType(base)
             return base
         if t.kind in (TokenKind.Void, TokenKind.Bool, TokenKind.CharType,
                        TokenKind.U8, TokenKind.I8, TokenKind.U16, TokenKind.I16,
@@ -563,13 +563,13 @@ class Parser:
                        TokenKind.Usize, TokenKind.Isize, TokenKind.Rawptr, TokenKind.Str):
             self.advance()
             base = TypeIdent(t.value)
-            if self.peek().kind == TokenKind.Star:
-                self.advance()
-                return PointerType(base)
             if self.peek().kind == TokenKind.LBracket:
                 size = self.parse_expr()
                 self.expect(TokenKind.RBracket)
                 return ArrayType(base, size)
+            while self.peek().kind == TokenKind.Star:
+                self.advance()
+                base = PointerType(base)
             return base
         raise SyntaxError(f"{self.filename}:{t.line}:{t.col}: unexpected token in type: {t.kind} ({t.value!r})")
 

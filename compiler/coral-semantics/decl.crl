@@ -73,6 +73,18 @@ pub extend Sema
                 kind = 1;
                 name = decl->kind.payload.Constant.name;
                 typeNode = decl->kind.payload.Constant.typeNode;
+                if (typeNode == 0 && decl->kind.payload.Constant.value.index != 0)
+                {
+                    if (self.checkExpr(decl->kind.payload.Constant.value))
+                    {
+                        Ty inferred = self.exprType(decl->kind.payload.Constant.value);
+                        if (inferred != 0)
+                        {
+                            typeNode = inferred;
+                            decl->kind.payload.Constant.typeNode = inferred;
+                        }
+                    }
+                }
             },
             DeclKind::ModReexport => {
                 kind = 5;
@@ -196,6 +208,43 @@ pub extend Sema
         {
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "missing import path");
             return false;
+        }
+        if ((decl->kind.payload.Import.flags & 1) != 0)
+        {
+            /* import(lib): the target file's decls are merged flat into this
+             * unit by the loader, so plain symbols must already be declared
+             * before this import is checked; `name as alias` bindings get an
+             * extra declaration here */
+            u32 i = 0;
+            while (i < decl->kind.payload.Import.symbolsLen)
+            {
+                ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
+                if ((symbol->flags & 2) != 0)
+                {
+                    /* `*` — members resolve at use sites */
+                }
+                else if (symbol->alias != 0 && symbol->name != 0)
+                {
+                    Symbol* real = self.scopes.lookup(symbol->name);
+                    if (real == null)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported library");
+                        return false;
+                    }
+                    if (!self.scopes.declare(symbol->alias, real->kind, real->typeNode, real->declaration, 0))
+                        return false;
+                }
+                else if (symbol->name != 0)
+                {
+                    if (self.scopes.lookup(symbol->name) == null)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported library");
+                        return false;
+                    }
+                }
+                i = i + 1;
+            }
+            return true;
         }
         Decl* modDecl = null;
         if ((decl->kind.payload.Import.flags & 1) == 0)

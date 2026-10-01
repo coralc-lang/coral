@@ -33,10 +33,30 @@ pub extend Lexer
                 self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "invalid digit for integer base");
                 break;
             }
-            value = value * (u64)base + (u64)digit;
+            u64 prod = value * (u64)base;
+            if (value != 0 && prod / (u64)base != value) {
+                self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "integer literal out of range");
+                break;
+            }
+            u64 next = prod + (u64)digit;
+            if (next < prod) {
+                self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "integer literal out of range");
+                break;
+            }
+            value = next;
             i = i + 1;
         }
         return value;
+    }
+
+    /* true when p sits on a token boundary (a u/U here is an unsigned
+     * suffix, not the start of an identifier like `u8` or `usize`) */
+    bool numSuffixBoundary(u8* p)
+    {
+        if (p >= self.bufEnd) return true;
+        u8 c = p[0];
+        bool ident = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        return !ident;
     }
 
     Token lexNumber(u8* start)
@@ -67,6 +87,11 @@ pub extend Lexer
         Token token = self.makeToken(kind, start);
         token.data.ptr = start + 2;
         token.data.len = self.cur - (start + 2);
+        if (!self.isAtEnd() && (self.cur[0] == 'u' || self.cur[0] == 'U') && self.numSuffixBoundary(self.cur + 1))
+        {
+            token.numFlags = 1;
+            self.cur = self.cur + 1;
+        }
         u32 base = 0;
         switch (kind)
         {
@@ -175,6 +200,11 @@ pub extend Lexer
         Token token;
         if (isFloat) token = self.makeToken(TokenKind::Float, start);
         else token = self.makeToken(TokenKind::Dec, start);
+        if (!isFloat && !self.isAtEnd() && (self.cur[0] == 'u' || self.cur[0] == 'U') && self.numSuffixBoundary(self.cur + 1))
+        {
+            token.numFlags = 1;
+            self.cur = self.cur + 1;
+        }
         if (!isFloat) token.number = self.parseInteger(token.data, 10);
         return token;
     }

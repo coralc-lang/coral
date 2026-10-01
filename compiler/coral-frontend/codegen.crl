@@ -330,6 +330,28 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
     return none;
 }
 
+/* str → const T* argument decay: true when the callee's parameter is a
+ * pointer and the argument expression has type str (emit `<arg>.ptr`) */
+bool cgStrToPtr(Codegen* cg, Ty paramTy, NodeId argId)
+{
+    if (paramTy == 0) return false;
+    Node* an = cgNode(cg, argId);
+    if (an.kind.tag != NodeKind::Expr) return false;
+    Ty at = cgSubstTy(cg, an.kind.payload.Expr.value.resolvedType);
+    if (at == 0) return false;
+    if ((cg.ctx->types + at)->kind.tag != TypeKind::Str) return false;
+    Ty t = paramTy;
+    TypeEntry* e = cg.ctx->types + t;
+    while (e.kind.tag == TypeKind::Const || e.kind.tag == TypeKind::Comptime)
+    {
+        if (e.kind.tag == TypeKind::Const) t = e.kind.payload.Const.base;
+        else t = e.kind.payload.Comptime.base;
+        if (t == 0) return false;
+        e = cg.ctx->types + t;
+    }
+    return e.kind.tag == TypeKind::Pointer;
+}
+
 /* variant decl behind a (possibly pointer/const-qualified) type plus the
  * ordinal of `variantName` within it; returns the decl or index 0 */
 NodeId cgFindVariantOfTy(Codegen* cg, Ty t, Str variantName, u32* outIdx)
@@ -1052,6 +1074,14 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.ebuf, "))");
             return stTail(&cg.ebuf, rs);
         },
+        ExprKind::BitNot => {
+            Slice c = cgExpr(cg, e.kind.payload.BitNot.expr);
+            usize rs = cg.ebuf.len;
+            stP(&cg.ebuf, "(~(");
+            stPS(&cg.ebuf, c);
+            stP(&cg.ebuf, "))");
+            return stTail(&cg.ebuf, rs);
+        },
         ExprKind::Not => {
             Slice c = cgExpr(cg, e.kind.payload.Not.expr);
             usize rs = cg.ebuf.len;
@@ -1255,18 +1285,24 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 u32 i = 0;
                 while (i < argsLen && i < 16) {
                     bool skip = false;
+                    bool dec = false;
                     if (fdecl.index != 0) {
                         Node* fdn = cgNode(cg, fdecl);
                         Decl* fd = &fdn.kind.payload.Decl.value;
                         if (i < fd.kind.payload.Func.paramsLen) {
                             Node* pn = cgNode(cg, fd.kind.payload.Func.params[i]);
-                            if (pn.kind.tag == NodeKind::Param && (pn.kind.payload.Param.value.flags & 8) != 0) skip = true;
+                            if (pn.kind.tag == NodeKind::Param) {
+                                Param* pp = &pn.kind.payload.Param.value;
+                                if ((pp->flags & 8) != 0) skip = true;
+                                else dec = cgStrToPtr(cg, pp->typeNode, args[i]);
+                            }
                         }
                     }
                     if (!skip) {
                         if (first) first = false;
                         else stP(&abuf, ", ");
                         stPS(&abuf, cgExpr(cg, args[i]));
+                        if (dec) stP(&abuf, ".ptr");
                         n = n + 1;
                     }
                     i = i + 1;
@@ -2669,6 +2705,14 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
         {
             Param* p = &pn.kind.payload.Param.value;
             if ((p.flags & 8) != 0) { i = i + 1; continue; }
+            if ((p.flags & 16) != 0)
+            {
+                if (any) stP(s, ", ");
+                stP(s, "...");
+                any = true;
+                i = i + 1;
+                continue;
+            }
             if (any) stP(s, ", ");
             any = true;
             if ((p.flags & 1) != 0)
@@ -3327,6 +3371,10 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
     stP(&cg.out, "#include <string.h>\n#include <stdlib.h>\n#include <stdio.h>\n");
     stP(&cg.out, "#include <unistd.h>\n#include <assert.h>\n\n");
+    /* limits.crl defines the same names — drop the stdint macros so the
+       emitted constants win */
+    stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
+    stP(&cg.out, "#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");
     stP(&cg.out, "typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n");
     stPS(&cg.out, Slice::from(cg.fwd.p, cg.fwd.len));
     stPS(&cg.out, Slice::from(cg.tdecl.p, cg.tdecl.len));

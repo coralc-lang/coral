@@ -91,7 +91,23 @@ pub extend Sema
         if (declNode->kind.tag != NodeKind::Decl) return true;
         Decl* decl = &declNode->kind.payload.Decl.value;
         if (decl->kind.tag != DeclKind::Func) return true;
-        if (decl->kind.payload.Func.paramsLen != argsLen)
+        u32 paramsLen = decl->kind.payload.Func.paramsLen;
+        bool variadic = false;
+        if (paramsLen > 0)
+        {
+            NodeId lastParamId = decl->kind.payload.Func.params[paramsLen - 1];
+            Node* lastParamNode = self.ctx.nodes + lastParamId.index;
+            if (lastParamNode->kind.tag == NodeKind::Param)
+            {
+                Param* lastParam = &lastParamNode->kind.payload.Param.value;
+                if ((lastParam->flags & 16) != 0)
+                {
+                    variadic = true;
+                    paramsLen = paramsLen - 1;
+                }
+            }
+        }
+        if (argsLen < paramsLen || (!variadic && argsLen != paramsLen))
         {
             self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, "wrong number of arguments in call");
             return false;
@@ -99,14 +115,17 @@ pub extend Sema
         u32 i = 0;
         while (i < argsLen)
         {
-            NodeId paramId = decl->kind.payload.Func.params[i];
-            Node* paramNode = self.ctx.nodes + paramId.index;
-            if (paramNode->kind.tag == NodeKind::Param)
+            if (i < paramsLen)
             {
-                Param* param = &paramNode->kind.payload.Param.value;
-                if (!self.genericArgParam(decl, param))
+                NodeId paramId = decl->kind.payload.Func.params[i];
+                Node* paramNode = self.ctx.nodes + paramId.index;
+                if (paramNode->kind.tag == NodeKind::Param)
                 {
-                    if (!self.compatible(self.exprType(args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+                    Param* param = &paramNode->kind.payload.Param.value;
+                    if (!self.genericArgParam(decl, param))
+                    {
+                        if (!self.compatible(self.exprType(args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+                    }
                 }
             }
             i = i + 1;
@@ -210,7 +229,26 @@ pub extend Sema
         Expr* expr = &node->kind.payload.Expr.value;
         switch (expr->kind.tag)
         {
-            ExprKind::IntLit => { self.setExprType(id, self.i32Type()); return true; },
+            ExprKind::IntLit => {
+                u64 v = expr->kind.payload.IntLit.value;
+                Ty t;
+                if ((expr->kind.payload.IntLit.flags & 1) != 0)
+                {
+                    /* unsigned suffix: smallest unsigned type that fits */
+                    if (v <= 255) t = self.u8Type();
+                    else if (v <= 65535) t = self.u16Type();
+                    else if (v <= 4294967295) t = self.u32Type();
+                    else t = self.u64Type();
+                }
+                else
+                {
+                    if (v <= 2147483647) t = self.i32Type();
+                    else if (v <= 9223372036854775807) t = self.i64Type();
+                    else t = self.u64Type();
+                }
+                self.setExprType(id, t);
+                return true;
+            },
             ExprKind::FloatLit => { self.setExprType(id, self.f64Type()); return true; },
             ExprKind::StringLit => { self.setExprType(id, self.strType()); return true; },
             ExprKind::CharLit => { self.setExprType(id, self.charType()); return true; },
@@ -336,10 +374,62 @@ pub extend Sema
             ExprKind::Sizeof => { return true; },
             ExprKind::Alignof => { return true; },
             ExprKind::Typeof => { return self.checkExpr(expr->kind.payload.Typeof.expr); },
-            ExprKind::AddressOf => { return self.checkExpr(expr->kind.payload.AddressOf.expr); },
-            ExprKind::Deref => { return self.checkExpr(expr->kind.payload.Deref.expr); },
-            ExprKind::Neg => { return self.checkExpr(expr->kind.payload.Neg.expr); },
-            ExprKind::Not => { return self.checkExpr(expr->kind.payload.Not.expr); },
+            ExprKind::AddressOf => {
+                if (!self.checkExpr(expr->kind.payload.AddressOf.expr)) return false;
+                Ty inner = self.exprType(expr->kind.payload.AddressOf.expr);
+                if (inner != 0)
+                {
+                    TypeKind k = TypeKind::Pointer{ .base = inner };
+                    self.setExprType(id, self.allocType(k));
+                }
+                return true;
+            },
+            ExprKind::Deref => {
+                if (!self.checkExpr(expr->kind.payload.Deref.expr)) return false;
+                Ty inner = self.exprType(expr->kind.payload.Deref.expr);
+                if (inner != 0)
+                {
+                    TypeEntry* te = self.ctx.types + inner;
+                    if (te->kind.tag == TypeKind::Pointer) self.setExprType(id, te->kind.payload.Pointer.base);
+                }
+                return true;
+            },
+            ExprKind::Neg => {
+                if (!self.checkExpr(expr->kind.payload.Neg.expr)) return false;
+                Ty t = self.exprType(expr->kind.payload.Neg.expr);
+                /* `-` applied to a bare literal narrows to the smallest
+                 * signed type that can hold the negative value
+                 * (-2147483648 → i32, -9223372036854775808 → i64) */
+                NodeId negInner = expr->kind.payload.Neg.expr;
+                if (negInner.index != 0)
+                {
+                    Node* inner = self.ctx.nodes + negInner.index;
+                    if (inner->kind.tag == NodeKind::Expr && inner->kind.payload.Expr.value.kind.tag == ExprKind::IntLit)
+                    {
+                        u64 v = inner->kind.payload.Expr.value.kind.payload.IntLit.value;
+                        if (v <= 2147483648) t = self.i32Type();
+                        else if (v <= 9223372036854775808) t = self.i64Type();
+                        else
+                        {
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "negative literal out of range");
+                            t = self.i64Type();
+                        }
+                    }
+                }
+                if (t != 0) self.setExprType(id, t);
+                return true;
+            },
+            ExprKind::BitNot => {
+                if (!self.checkExpr(expr->kind.payload.BitNot.expr)) return false;
+                Ty t = self.exprType(expr->kind.payload.BitNot.expr);
+                if (t != 0) self.setExprType(id, t);
+                return true;
+            },
+            ExprKind::Not => {
+                if (!self.checkExpr(expr->kind.payload.Not.expr)) return false;
+                self.setExprType(id, self.boolType());
+                return true;
+            },
             ExprKind::Add => { return self.checkBinary(id, expr->kind.payload.Add.left, expr->kind.payload.Add.right); },
             ExprKind::Sub => { return self.checkBinary(id, expr->kind.payload.Sub.left, expr->kind.payload.Sub.right); },
             ExprKind::Mul => { return self.checkBinary(id, expr->kind.payload.Mul.left, expr->kind.payload.Mul.right); },

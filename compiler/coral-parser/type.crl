@@ -31,6 +31,28 @@ pub extend Parser
             return self.makeComptime(inner);
         }
         Ty base = self.parseBaseType();
+        if (self.current.kind == TokenKind::LParen && base != 0)
+        {
+            /* fn-pointer type over a keyword base: `void(i32)`,
+             * `rawptr(rawptr)`, `u32(rawptr)` — RET(params) */
+            self.advance();
+            TyListBuilder fpParams;
+            self.ctx.tyListInit(&fpParams);
+            if (self.current.kind != TokenKind::RParen)
+            {
+                Ty fpParam = self.parseType();
+                if (!self.ctx.tyListAppend(&fpParams, fpParam)) self.addError();
+                while (self.match(TokenKind::Comma))
+                {
+                    fpParam = self.parseType();
+                    if (!self.ctx.tyListAppend(&fpParams, fpParam)) self.addError();
+                }
+            }
+            self.expect(TokenKind::RParen);
+            u32 fpCount = fpParams.len;
+            Ty* fpValues = self.ctx.tyListFinish(&fpParams);
+            base = self.makeFunctionPointer(0, base, fpValues, fpCount);
+        }
         while (self.match(TokenKind::Star)) {
              base = self.makePointer(base); }
         
@@ -216,7 +238,9 @@ pub extend Parser
                 self.expect(TokenKind::RParen);
                 u32 count = params.len;
                 Ty* values = self.ctx.tyListFinish(&params);
-                return self.makeFunctionPointer(name, 0, values, count);
+                /* `T(params)` — a function type returning T taking params */
+                Ty ret = self.makeNamedArgs(name, genericArgs, genericArgsLen);
+                return self.makeFunctionPointer(name, ret, values, count);
             }
              return self.makeNamedArgs(name, genericArgs, genericArgsLen);
         }

@@ -208,6 +208,25 @@ pub extend Parser
             self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
             return;
         }
+        if (entry->kind.tag == TypeKind::FnPtr) {
+            self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);
+            u32 p = 0;
+            while (p < entry->kind.payload.FnPtr.paramsLen)
+            {
+                self.rebindTypeParams(entry->kind.payload.FnPtr.params[p], genericValues, genericCount);
+                p = p + 1;
+            }
+            return;
+        }
+        if (entry->kind.tag == TypeKind::Tuple) {
+            u32 e = 0;
+            while (e < entry->kind.payload.Tuple.elemsLen)
+            {
+                self.rebindTypeParams(entry->kind.payload.Tuple.elems[e], genericValues, genericCount);
+                e = e + 1;
+            }
+            return;
+        }
     }
 
     NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
@@ -306,6 +325,14 @@ pub extend Parser
             param.name = self.ctx.intern("self", 4);
             param.typeNode = 0;
             param.flags = 1;
+            return self.storeParam(param);
+        }
+        if (self.current.kind == TokenKind::Ellipsis)
+        {
+            self.advance();
+            param.name = 0;
+            param.typeNode = 0;
+            param.flags = 16;
             return self.storeParam(param);
         }
         param.typeNode = self.parseType();
@@ -638,8 +665,25 @@ pub extend Parser
     {
         self.expect(TokenKind::Const);
         Ty typeNode = self.parseType();
-        Token name = self.expectName();
-        Str nameId = self.ctx.intern(name.data.ptr, name.data.len);
+        Str nameId = 0;
+        if (self.current.kind == TokenKind::Equal)
+        {
+            /* untyped constant: `const NAME = value;` — what parseType
+             * consumed was actually the constant's name */
+            if (typeNode != 0)
+            {
+                TypeEntry* te = self.ctx.types + typeNode;
+                if (te->kind.tag == TypeKind::Named && te->kind.payload.Named.genericArgsLen == 0)
+                    nameId = te->kind.payload.Named.name;
+            }
+            typeNode = 0;
+        }
+        else
+        {
+            Token name = self.expectName();
+            nameId = self.ctx.intern(name.data.ptr, name.data.len);
+        }
+        if (nameId == 0) self.addError();
         self.expect(TokenKind::Equal);
         NodeId value = self.parseExpr();
         self.expect(TokenKind::Semicolon);

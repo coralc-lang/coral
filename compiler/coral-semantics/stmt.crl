@@ -3,6 +3,7 @@ mod types = import "../coral-ast/types";
 mod node = import "../coral-ast/node";
 mod decl_ast = import "../coral-ast/decl";
 mod stmt_ast = import "../coral-ast/stmt";
+mod expr_ast = import "../coral-ast/expr";
 mod pat = import "../coral-ast/pat";
 mod scope = import "scope";
 mod sema = import "sema";
@@ -35,7 +36,24 @@ pub extend Sema
                 Ty actualType = self.exprType(stmt->kind.payload.VarDecl.init);
                 if (declaredType != 0 && !self.compatible(actualType, declaredType))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "initializer type does not match variable type");
-                if (declaredType == 0) declaredType = actualType;
+                if (declaredType == 0)
+                {
+                    /* `var x = expr;` — infer from the initializer */
+                    declaredType = actualType;
+                    if (declaredType == 0 && stmt->kind.payload.VarDecl.init.index != 0)
+                    {
+                        /* `var p = null;` — a bare null has no type of its own */
+                        Node* inn = self.ctx.nodes + stmt->kind.payload.VarDecl.init.index;
+                        if (inn->kind.tag == NodeKind::Expr && inn->kind.payload.Expr.value.kind.tag == ExprKind::NullLit)
+                            declaredType = self.rawptrType();
+                    }
+                    if (declaredType == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot infer type: add an explicit type annotation");
+                        return false;
+                    }
+                    stmt->kind.payload.VarDecl.typeNode = declaredType;
+                }
                 if (stmt->kind.payload.VarDecl.name != 0)
                     self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags);
                 return true;
