@@ -128,6 +128,7 @@ pub extend Parser
 
             Token op = self.advance();
             bool rightAssoc = self.isAssignOp(op.kind);
+            if (rightAssoc) self.lastAssignPtr = op.data.ptr;
             NodeId right;
             if (rightAssoc) {
                 right = self.parseBinaryExpr(p - 1); }
@@ -263,6 +264,10 @@ pub extend Parser
                 u32 count = segments.len;
                 NodeId* values = self.ctx.nodeListFinish(&segments);
                 expr = self.storeExpr(ExprKind::Path{ .segments = values, .segmentsLen = count });
+                if (self.current.kind == TokenKind::LBrace) {
+                    Ty litTy = self.pathHeadType(expr);
+                    expr = self.parseLiteralFields(litTy, partName);
+                }
             } else if (self.current.kind == TokenKind::LBracket) {
                 self.advance();
                 NodeId index = self.parseExpr();
@@ -351,27 +356,7 @@ pub extend Parser
                 Ty namedType = self.makeNamedArgs(name, genericArgs, genericArgsLen);
                 if (self.current.kind == TokenKind::LBrace)
                 {
-                    self.advance();
-                    StrListBuilder fields;
-                    NodeListBuilder values;
-                    self.ctx.strListInit(&fields);
-                    self.ctx.nodeListInit(&values);
-                    while (self.current.kind != TokenKind::RBrace && !self.atEnd())
-                    {
-                        self.match(TokenKind::Dot);
-                        Token field = self.expectName();
-                        Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
-                        self.expect(TokenKind::Equal);
-                        NodeId value = self.parseExpr();
-                        if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
-                        if (!self.ctx.nodeListAppend(&values, value)) self.addError();
-                        if (!self.match(TokenKind::Comma)) break;
-                    }
-                    self.expect(TokenKind::RBrace);
-                    u32 count = fields.len;
-                    Str* fieldNames = self.ctx.strListFinish(&fields);
-                    NodeId* fieldValues = self.ctx.nodeListFinish(&values);
-                     return self.storeExpr(ExprKind::StructLiteral{ .typeNode = namedType, .fieldNames = fieldNames, .fieldValues = fieldValues, .fieldValuesLen = count });
+                     return self.parseLiteralFields(namedType, 0);
                 }
                 if (hasGenericArgs)
                     return self.storeExpr(ExprKind::TypeRef{ .name = name, .typeNode = namedType });
@@ -579,6 +564,47 @@ pub extend Parser
                 return self.noneNode();
             }
         }
+    }
+
+    /* `{ .name = expr, ... }` fields of a struct literal, or of a
+     * variant construction (`Type::Variant { ... }`, variant != 0) */
+    NodeId parseLiteralFields(Ty typeNode, Str variantName)
+    {
+        self.expect(TokenKind::LBrace);
+        StrListBuilder fields;
+        NodeListBuilder values;
+        self.ctx.strListInit(&fields);
+        self.ctx.nodeListInit(&values);
+        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        {
+            self.match(TokenKind::Dot);
+            Token field = self.expectName();
+            Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+            self.expect(TokenKind::Equal);
+            NodeId value = self.parseExpr();
+            if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
+            if (!self.ctx.nodeListAppend(&values, value)) self.addError();
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        u32 count = fields.len;
+        Str* fieldNames = self.ctx.strListFinish(&fields);
+        NodeId* fieldValues = self.ctx.nodeListFinish(&values);
+        return self.storeExpr(ExprKind::StructLiteral{ .typeNode = typeNode, .variantName = variantName, .fieldNames = fieldNames, .fieldValues = fieldValues, .fieldValuesLen = count });
+    }
+
+    /* type carried by the head segment of a path (for `T::V { ... }`) */
+    Ty pathHeadType(NodeId e)
+    {
+        Node* n = self.ctx.nodes + e.index;
+        if (n.kind.tag != NodeKind::Expr) return 0;
+        Expr* x = &n.kind.payload.Expr.value;
+        if (x.kind.tag == ExprKind::TypeRef) return x.kind.payload.TypeRef.typeNode;
+        if (x.kind.tag == ExprKind::Ident) return self.makeNamed(x.kind.payload.Ident.name);
+        if (x.kind.tag == ExprKind::Path) {
+            if (x.kind.payload.Path.segmentsLen > 0) return self.pathHeadType(x.kind.payload.Path.segments[0]);
+        }
+        return 0;
     }
 
     SwitchCase parseSwitchExprCase()

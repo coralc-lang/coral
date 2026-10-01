@@ -3,15 +3,17 @@ mod types = import "../coral-ast/types";
 mod node = import "../coral-ast/node";
 mod decl_ast = import "../coral-ast/decl";
 mod stmt_ast = import "../coral-ast/stmt";
+mod pat = import "../coral-ast/pat";
 mod scope = import "scope";
 mod sema = import "sema";
 mod diagnostics = import "../coral-diagnostics/code";
 
 import id { Str, NodeId };
-import types { Ty };
+import types { Ty, TypeEntry, TypeKind };
 import node { Node, NodeKind };
-import decl_ast { Decl, DeclKind, Param, GenericParam };
+import decl_ast { Decl, DeclKind, Param, GenericParam, VariantVariant };
 import stmt_ast { Stmt, StmtKind, SwitchCase };
+import pat { Pat, PatKind };
 import scope { Symbol };
 import sema { Sema };
 import diagnostics { ErrorCode };
@@ -115,13 +117,15 @@ pub extend Sema
     
             StmtKind::Switch => {
                 if (!self.checkExpr(stmt->kind.payload.Switch.expr)) return false;
+                Ty scrutTy = self.exprType(stmt->kind.payload.Switch.expr);
                 bool ok = true;
                 u32 i = 0;
                 while (i < stmt->kind.payload.Switch.casesLen) {
                     SwitchCase* switchCase = stmt->kind.payload.Switch.cases + i;
+                    self.scopes.enter();
                     u32 p = 0;
                     while (p < switchCase->patternsLen) {
-                        if (!self.checkExpr(switchCase->patterns[p])) ok = false;
+                        if (!self.declarePatternBindings(switchCase->patterns[p], scrutTy)) ok = false;
                         p = p + 1;
                     }
                     if (switchCase->guard.index != 0) {
@@ -135,6 +139,7 @@ pub extend Sema
                             if (!self.checkStmt(switchCase->body)) ok = false;
                         }
                     }
+                    self.scopes.leave();
                     i = i + 1;
                 }
                 return ok;

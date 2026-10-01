@@ -7,14 +7,18 @@ mod token = import "../coral-common/token";
 mod id = import "../coral-ast/id";
 mod stmt_ast = import "../coral-ast/stmt";
 mod node = import "../coral-ast/node";
+mod expr_ast = import "../coral-ast/expr";
+mod diagnostics = import "../coral-diagnostics/code";
 
 import base { Parser, ParserMark };
 import parser { Parser };
 import context { AstContext, NodeListBuilder, SwitchListBuilder };
-import token { TokenKind };
+import token { Token, TokenKind };
 import id { NodeId };
 import stmt_ast { Stmt, StmtKind, SwitchCase };
 import node { Node, NodeKind };
+import expr_ast { Expr, ExprKind };
+import diagnostics { ErrorCode };
 
 pub extend Parser
 {
@@ -30,11 +34,14 @@ pub extend Parser
 
     NodeId parseStmt()
     {
+        self.condAssignAttr = false;
         while (self.match(TokenKind::Hash))
         {
             self.expect(TokenKind::LBracket);
             self.expect(TokenKind::LBracket);
-            self.expect(TokenKind::Ident);
+            Token attrTok = self.expect(TokenKind::Ident);
+            Str attrName = self.ctx.intern(attrTok.data.ptr, attrTok.data.len);
+            if (attrName == self.ctx.intern((u8*)"condassign", 10)) self.condAssignAttr = true;
             if (self.current.kind == TokenKind::LParen)
             {
                 self.advance();
@@ -107,11 +114,34 @@ pub extend Parser
         return self.storeStmt(StmtKind::Return{ .value = val });
     }
 
+    /* `=` at the top level of a condition is rejected unless the
+     * statement carries #[[condassign]] */
+    void checkCondAssign(NodeId cond)
+    {
+        if (self.condAssignAttr) return;
+        Node* n = self.ctx.nodes + cond.index;
+        if (n.kind.tag != NodeKind::Expr) return;
+        ExprKind k = n.kind.payload.Expr.value.kind.tag;
+        if (k != ExprKind::Assign && k != ExprKind::AssignAdd &&
+            k != ExprKind::AssignSub && k != ExprKind::AssignMul &&
+            k != ExprKind::AssignDiv && k != ExprKind::AssignMod &&
+            k != ExprKind::AssignBitAnd && k != ExprKind::AssignBitOr &&
+            k != ExprKind::AssignBitXor && k != ExprKind::AssignShl &&
+            k != ExprKind::AssignShr) return;
+        Token t;
+        t.kind = TokenKind::Equal;
+        t.number = 0;
+        t.data.ptr = self.lastAssignPtr;
+        t.data.len = 1;
+        self.reportError(ErrorCode::ParseCondAssign, t, "use of '=' in condition; mark with #[[condassign]] to allow it");
+    }
+
     NodeId parseIfStmt()
     {
         self.advance();
         self.expect(TokenKind::LParen);
         NodeId cond = self.parseExpr();
+        self.checkCondAssign(cond);
         self.expect(TokenKind::RParen);
         NodeId thenBody = self.parseStmt();
         NodeId elseBody = self.noneNode();
@@ -126,6 +156,7 @@ pub extend Parser
         self.advance();
         self.expect(TokenKind::LParen);
         NodeId cond = self.parseExpr();
+        self.checkCondAssign(cond);
         self.expect(TokenKind::RParen);
         NodeId body = self.parseStmt();
         return self.storeStmt(StmtKind::While{ .cond = cond, .body = body });
@@ -186,6 +217,7 @@ pub extend Parser
         if (self.current.kind != TokenKind::Semicolon)
         {
             cond = self.parseExpr();
+            self.checkCondAssign(cond);
             flags = flags | 2;
         }
         self.expect(TokenKind::Semicolon);
@@ -211,6 +243,7 @@ pub extend Parser
         self.advance();
         self.expect(TokenKind::LParen);
         NodeId sexpr = self.parseExpr();
+        self.checkCondAssign(sexpr);
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::LBrace);
         SwitchListBuilder cases;

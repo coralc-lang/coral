@@ -8,9 +8,9 @@ mod sema = import "sema";
 mod diagnostics = import "../coral-diagnostics/code";
 
 import id { Str, NodeId };
-import types { Ty };
+import types { Ty, TypeEntry, TypeKind };
 import node { Node, NodeKind };
-import decl_ast { File, Decl, DeclKind, ImportSymbol };
+import decl_ast { File, Decl, DeclKind, ImportSymbol, GenericParam };
 import context { InternEntry };
 import scope { Symbol, ScopeStack };
 import sema { Sema };
@@ -87,29 +87,66 @@ pub extend Sema
         if (decl->kind.tag == DeclKind::Func)
             return self.checkFunction(decl, 0);
         if (decl->kind.tag == DeclKind::Struct)
-            return self.checkMethods(decl->kind.payload.Struct.methods, decl->kind.payload.Struct.methodsLen, self.namedType(decl->kind.payload.Struct.name));
+            return self.checkMethods(decl->kind.payload.Struct.methods, decl->kind.payload.Struct.methodsLen, self.namedType(decl->kind.payload.Struct.name), decl->kind.payload.Struct.genericParams, decl->kind.payload.Struct.genericParamsLen);
         if (decl->kind.tag == DeclKind::Union)
-            return self.checkMethods(decl->kind.payload.Union.methods, decl->kind.payload.Union.methodsLen, self.namedType(decl->kind.payload.Union.name));
+            return self.checkMethods(decl->kind.payload.Union.methods, decl->kind.payload.Union.methodsLen, self.namedType(decl->kind.payload.Union.name), decl->kind.payload.Union.genericParams, decl->kind.payload.Union.genericParamsLen);
         if (decl->kind.tag == DeclKind::Trait)
-            return self.checkMethods(decl->kind.payload.Trait.methods, decl->kind.payload.Trait.methodsLen, self.namedType(decl->kind.payload.Trait.name));
+            return self.checkMethods(decl->kind.payload.Trait.methods, decl->kind.payload.Trait.methodsLen, self.namedType(decl->kind.payload.Trait.name), decl->kind.payload.Trait.genericParams, decl->kind.payload.Trait.genericParamsLen);
         if (decl->kind.tag == DeclKind::Variant)
-            return self.checkMethods(decl->kind.payload.Variant.methods, decl->kind.payload.Variant.methodsLen, self.namedType(decl->kind.payload.Variant.name));
+            return self.checkMethods(decl->kind.payload.Variant.methods, decl->kind.payload.Variant.methodsLen, self.namedType(decl->kind.payload.Variant.name), decl->kind.payload.Variant.genericParams, decl->kind.payload.Variant.genericParamsLen);
         if (decl->kind.tag == DeclKind::Extend)
         {
             self.addExtend(id);
-            return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen, decl->kind.payload.Extend.selfType);
+            return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen, decl->kind.payload.Extend.selfType, decl->kind.payload.Extend.genericParams, decl->kind.payload.Extend.genericParamsLen);
         }
         if (decl->kind.tag == DeclKind::ExtendTrait)
         {
             self.addExtend(id);
-            return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen, decl->kind.payload.ExtendTrait.selfType);
+            return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen, decl->kind.payload.ExtendTrait.selfType, decl->kind.payload.ExtendTrait.genericParams, decl->kind.payload.ExtendTrait.genericParamsLen);
         }
         return true;
     }
 
-    bool checkMethods(NodeId* methods, u32 methodsLen, Ty selfType)
+    bool checkMethods(NodeId* methods, u32 methodsLen, Ty selfType, NodeId* genericParams, u32 genericParamsLen)
     {
+        self.scopes.enter();
         bool ok = true;
+        u32 genericIndex = 0;
+        while (genericIndex < genericParamsLen)
+        {
+            NodeId genericId = genericParams[genericIndex];
+            Node* genericNode = self.ctx.nodes + genericId.index;
+            if (genericNode->kind.tag == NodeKind::GenericParam)
+            {
+                GenericParam* generic = &genericNode->kind.payload.GenericParam.value;
+                Ty typeNode = self.typeParamType(generic->name, genericIndex);
+                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0)) ok = false;
+            }
+            genericIndex = genericIndex + 1;
+        }
+        /* legacy `extend Option<T>`: parameter names live in the self
+         * type's generic args when no explicit list was given */
+        if (genericParamsLen == 0 && selfType != 0)
+        {
+            TypeEntry* te = self.ctx.types + selfType;
+            if (te->kind.tag == TypeKind::Named)
+            {
+                u32 a = 0;
+                while (a < te->kind.payload.Named.genericArgsLen)
+                {
+                    Ty arg = te->kind.payload.Named.genericArgs[a];
+                    TypeEntry* ae = self.ctx.types + arg;
+                    if (ae->kind.tag == TypeKind::Named)
+                    {
+                        Ty typeNode = self.typeParamType(ae->kind.payload.Named.name, a);
+                        NodeId nid;
+                        nid.index = 0;
+                        self.scopes.declare(ae->kind.payload.Named.name, 4, typeNode, nid, 0);
+                    }
+                    a = a + 1;
+                }
+            }
+        }
         u32 i = 0;
         while (i < methodsLen)
         {
@@ -124,6 +161,7 @@ pub extend Sema
             }
             i = i + 1;
         }
+        self.scopes.leave();
         return ok;
     }
 
