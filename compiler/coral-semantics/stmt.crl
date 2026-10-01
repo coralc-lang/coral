@@ -178,6 +178,21 @@ pub extend Sema
             {
                 Param* param = &paramNode->kind.payload.Param.value;
                 if ((param->flags & 1) != 0) hasSelfParam = true;
+            }
+            i = i + 1;
+        }
+        if (selfType != 0 && !hasSelfParam) {
+            Str selfStr = self.ctx.intern("self", 4);
+            self.scopes.declare(selfStr, 1, selfType, decl->kind.payload.Func.body, 0);
+        }
+        i = 0;
+        while (i < decl->kind.payload.Func.paramsLen)
+        {
+            NodeId paramId = decl->kind.payload.Func.params[i];
+            Node* paramNode = self.ctx.nodes + paramId.index;
+            if (paramNode->kind.tag == NodeKind::Param)
+            {
+                Param* param = &paramNode->kind.payload.Param.value;
                 if (param->name != 0) {
                     if ((param->flags & 8) != 0) {
                         Ty typeNode = self.typeParamType(param->name, i);
@@ -192,16 +207,77 @@ pub extend Sema
             }
             i = i + 1;
         }
-        if (selfType != 0 && !hasSelfParam) {
-            Str selfStr = self.ctx.intern("self", 4); // placeholder, Str is supposed to be a built in type,
-            // for literlas, the compiler is to know the lenth already
-            self.scopes.declare(selfStr, 1, selfType, decl->kind.payload.Func.body, 0);
-        }
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
         self.currentReturnType = decl->kind.payload.Func.returnType;
         if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
         self.currentReturnType = 0;
         self.scopes.leave();
+        return ok;
+    }
+
+    /* declares the fields bound by a variant pattern (`Some { value }`)
+     * in the case scope, typed against the scrutinee's variant decl */
+    bool declarePatternBindings(NodeId patId, Ty scrutTy)
+    {
+        if (patId.index == 0) return true;
+        Node* n = self.ctx.nodes + patId.index;
+        if (n.kind.tag != NodeKind::Pat) return true;
+        Pat* p = &n.kind.payload.Pat.value;
+        if (p->kind.tag != PatKind::Variant) return true;
+        Ty base = self.stripType(scrutTy);
+        if (base == 0) return true;
+        TypeEntry* te = self.ctx.types + base;
+        if (te->kind.tag != TypeKind::Named) return true;
+        Symbol* symbol = self.scopes.lookup(te->kind.payload.Named.name);
+        if (symbol == null || symbol->declaration.index == 0) return true;
+        Node* dn = self.ctx.nodes + symbol->declaration.index;
+        if (dn->kind.tag != NodeKind::Decl) return true;
+        Decl* decl = &dn->kind.payload.Decl.value;
+        if (decl->kind.tag != DeclKind::Variant) return true;
+        VariantVariant* vv = null;
+        u32 v = 0;
+        while (v < decl->kind.payload.Variant.variantsLen)
+        {
+            if (decl->kind.payload.Variant.variants[v].name == p->kind.payload.Variant.variantName)
+            {
+                vv = decl->kind.payload.Variant.variants + v;
+                break;
+            }
+            v = v + 1;
+        }
+        if (vv == null)
+        {
+            self.semaErrorNode(ErrorCode::SemaUnknownMember, patId, "unknown variant in pattern");
+            return false;
+        }
+        bool ok = true;
+        u32 f = 0;
+        while (f < p->kind.payload.Variant.fieldNamesLen)
+        {
+            Str fieldName = p->kind.payload.Variant.fieldNames[f];
+            Ty ft = 0;
+            u32 k = 0;
+            while (k < vv->fieldsLen)
+            {
+                if (vv->fieldNames[k] == fieldName)
+                {
+                    ft = vv->fieldTypes[k];
+                    break;
+                }
+                k = k + 1;
+            }
+            if (ft == 0)
+            {
+                self.semaErrorNode(ErrorCode::SemaUnknownMember, patId, "unknown field in pattern");
+                ok = false;
+            }
+            else
+            {
+                Ty boundTy = self.substituteFieldTy(ft, scrutTy);
+                if (!self.scopes.declare(fieldName, 1, boundTy, patId, 0)) ok = false;
+            }
+            f = f + 1;
+        }
         return ok;
     }
 }

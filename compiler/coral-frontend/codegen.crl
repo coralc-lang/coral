@@ -330,6 +330,42 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
     return none;
 }
 
+/* variant decl behind a (possibly pointer/const-qualified) type plus the
+ * ordinal of `variantName` within it; returns the decl or index 0 */
+NodeId cgFindVariantOfTy(Codegen* cg, Ty t, Str variantName, u32* outIdx)
+{
+    NodeId none;
+    none.index = 0;
+    *outIdx = 0;
+    if (t == 0 || variantName == 0) return none;
+    TypeEntry* e = cg.ctx->types + t;
+    while (e.kind.tag == TypeKind::Pointer || e.kind.tag == TypeKind::Const ||
+           e.kind.tag == TypeKind::Comptime)
+    {
+        if (e.kind.tag == TypeKind::Pointer) t = e.kind.payload.Pointer.base;
+        else if (e.kind.tag == TypeKind::Const) t = e.kind.payload.Const.base;
+        else t = e.kind.payload.Comptime.base;
+        if (t == 0) return none;
+        e = cg.ctx->types + t;
+    }
+    if (e.kind.tag != TypeKind::Named) return none;
+    NodeId d = cgFindDecl(cg, e.kind.payload.Named.name, (u32)DeclKind::Variant);
+    if (d.index == 0) return none;
+    Node* dn = cgNode(cg, d);
+    Decl* dd = &dn.kind.payload.Decl.value;
+    u32 v = 0;
+    while (v < dd.kind.payload.Variant.variantsLen)
+    {
+        if (dd.kind.payload.Variant.variants[v].name == variantName)
+        {
+            *outIdx = v;
+            return d;
+        }
+        v = v + 1;
+    }
+    return none;
+}
+
 /* Resolve the callee of a call: plain name for non-generic functions,
  * mangled instance name for generic ones. Sets *outRet to the concrete
  * return type. Returns null slice when the declaration is unknown. */
@@ -954,6 +990,44 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                 }
             }
+            /* variant: `Option<f64>::None` → (Option_f64){ .tag = v } */
+            if (last == 2)
+            {
+                Node* s0n = cgNode(cg, e.kind.payload.Path.segments[0]);
+                Node* s1n = cgNode(cg, e.kind.payload.Path.segments[1]);
+                if (s0n.kind.tag == NodeKind::Expr && s1n.kind.tag == NodeKind::Expr)
+                {
+                    Expr* s0 = &s0n.kind.payload.Expr.value;
+                    Expr* s1 = &s1n.kind.payload.Expr.value;
+                    if (s1.kind.tag == ExprKind::Ident)
+                    {
+                        Ty hty = 0;
+                        if (s0.kind.tag == ExprKind::TypeRef) hty = s0.kind.payload.TypeRef.typeNode;
+                        else if (s0.kind.tag == ExprKind::Ident) hty = e.resolvedType;
+                        if (hty != 0)
+                        {
+                            u32 vidx = 0;
+                            NodeId vd = cgFindVariantOfTy(cg, hty, s1.kind.payload.Ident.name, &vidx);
+                            if (vd.index != 0)
+                            {
+                                Ty rty = e.resolvedType;
+                                if (rty == 0) rty = hty;
+                                Slice lty = tyStr(cg, cgSubstTy(cg, rty));
+                                u32 t = cgNewTemp(cg, lty, 0);
+                                Slice tn = cgTempName(cg, t);
+                                stNL(&cg.body, cg.ind);
+                                stPS(&cg.body, tn);
+                                stP(&cg.body, " = (");
+                                stPS(&cg.body, lty);
+                                stP(&cg.body, "){ .tag = ");
+                                stU64(&cg.body, (u64)vidx);
+                                stP(&cg.body, "};");
+                                return tn;
+                            }
+                        }
+                    }
+                }
+            }
             return cgExpr(cg, e.kind.payload.Path.segments[last - 1]);
         },
         ExprKind::Sizeof => {
@@ -1412,7 +1486,28 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stP(&cg.body, " = (");
             stPS(&cg.body, lty);
             stP(&cg.body, "){");
-            stPS(&cg.body, stTail(&vs, 0));
+            Str vname = e.kind.payload.StructLiteral.variantName;
+            if (vname != 0)
+            {
+                /* variant construction: tag + payload union member */
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, e.kind.payload.StructLiteral.typeNode, vname, &vidx);
+                if (vd.index == 0) cg.errors = cg.errors + 1;
+                stP(&cg.body, " .tag = ");
+                stU64(&cg.body, (u64)vidx);
+                if (fvLen > 0)
+                {
+                    stP(&cg.body, ", .u.v");
+                    stU64(&cg.body, (u64)vidx);
+                    stP(&cg.body, " = {");
+                    stPS(&cg.body, stTail(&vs, 0));
+                    stCh(&cg.body, '}');
+                }
+            }
+            else
+            {
+                stPS(&cg.body, stTail(&vs, 0));
+            }
             stP(&cg.body, "};");
             return tn;
         },
@@ -1632,9 +1727,14 @@ Slice cgExpr(Codegen* cg, NodeId id)
 
         ExprKind::SwitchExpr => {
             Slice scrut = cgExpr(cg, e.kind.payload.SwitchExpr.expr);
+            Ty scrutTy = 0;
+            {
+                Node* sn = cgNode(cg, e.kind.payload.SwitchExpr.expr);
+                if (sn.kind.tag == NodeKind::Expr) scrutTy = sn.kind.payload.Expr.value.resolvedType;
+            }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
-            cgEmitSwitch(cg, scrut, e.kind.payload.SwitchExpr.cases, e.kind.payload.SwitchExpr.casesLen, tn);
+            cgEmitSwitch(cg, scrut, scrutTy, e.kind.payload.SwitchExpr.cases, e.kind.payload.SwitchExpr.casesLen, tn);
             return tn;
         },
 
@@ -1775,9 +1875,9 @@ Slice cgValBody(Codegen* cg, NodeId id)
 
 /* ── switch lowering: compare chains + labels ────────────────── */
 
-extern("C") Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard);
+extern("C") Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWildcard);
 
-Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard)
+Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWildcard)
 {
     *isWildcard = false;
     if (patId.index == 0) { *isWildcard = true; return Slice::from(null, 0); }
@@ -1788,6 +1888,22 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard)
         switch (p.kind.tag)
         {
             PatKind::Wildcard => { *isWildcard = true; return Slice::from(null, 0); },
+            PatKind::Variant => {
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, scrutTy, p.kind.payload.Variant.variantName, &vidx);
+                if (vd.index == 0) {
+                    cg.errors = cg.errors + 1;
+                    *isWildcard = true;
+                    return Slice::from(null, 0);
+                }
+                usize s = cg.ebuf.len;
+                stCh(&cg.ebuf, '(');
+                stPS(&cg.ebuf, scrut);
+                stP(&cg.ebuf, ".tag == ");
+                stU64(&cg.ebuf, (u64)vidx);
+                stCh(&cg.ebuf, ')');
+                return stTail(&cg.ebuf, s);
+            },
             PatKind::Lit => {
                 Slice l = cgExpr(cg, p.kind.payload.Lit.expr);
                 usize s = cg.ebuf.len;
@@ -1806,7 +1922,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard)
                 {
                     bool w = false;
                     if (i > 0) stP(&cg.ebuf, " || ");
-                    Slice t = cgPatTest(cg, p.kind.payload.Or.alternatives[i], scrut, &w);
+                    Slice t = cgPatTest(cg, p.kind.payload.Or.alternatives[i], scrut, scrutTy, &w);
                     if (w) stP(&cg.ebuf, "1");
                     else stPS(&cg.ebuf, t);
                     i = i + 1;
@@ -1857,7 +1973,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, bool* isWildcard)
 
 /* cases: statement bodies (resultTemp empty) or expression bodies
  * (resultTemp names the temp each branch assigns). */
-void cgEmitSwitch(Codegen* cg, Slice scrut, SwitchCase* cases, u32 casesLen, Slice resultTemp)
+void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 casesLen, Slice resultTemp)
 {
     u32* chkL = (u32*)cg.arena.alloc(64 * 4, 4);
     u32* bodyL = (u32*)cg.arena.alloc(64 * 4, 4);
@@ -1879,6 +1995,69 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, SwitchCase* cases, u32 casesLen, Sli
         i = i + 1;
     }
 
+    /* pattern bindings: declared before the switch (a C label cannot be
+     * followed by a declaration), assigned when the case is entered */
+    {
+        Str* bindNames = (Str*)cg.arena.alloc(64 * 4, 4);
+        u32 bindCount = 0;
+        if (bindNames != null)
+        {
+            u32 ci = 0;
+            while (ci < casesLen)
+            {
+                SwitchCase* cc = cases + ci;
+                u32 pp = 0;
+                while (pp < cc.patternsLen)
+                {
+                    Node* pn = cgNode(cg, cc.patterns[pp]);
+                    if (pn.kind.tag == NodeKind::Pat)
+                    {
+                        Pat* pv = &pn.kind.payload.Pat.value;
+                        if (pv.kind.tag == PatKind::Variant && pv.kind.payload.Variant.fieldNamesLen > 0 && bindCount < 64)
+                        {
+                            u32 vidx0 = 0;
+                            NodeId vd0 = cgFindVariantOfTy(cg, scrutTy, pv.kind.payload.Variant.variantName, &vidx0);
+                            if (vd0.index != 0)
+                            {
+                                Node* vdn = cgNode(cg, vd0);
+                                Decl* vdd = &vdn.kind.payload.Decl.value;
+                                VariantVariant* vv0 = vdd.kind.payload.Variant.variants + vidx0;
+                                u32 ff = 0;
+                                while (ff < pv.kind.payload.Variant.fieldNamesLen && bindCount < 64)
+                                {
+                                    Str fname = pv.kind.payload.Variant.fieldNames[ff];
+                                    u32 kk = 0;
+                                    bool dup = false;
+                                    while (kk < bindCount) { if (bindNames[kk] == fname) { dup = true; break; } kk = kk + 1; }
+                                    Ty ft = 0;
+                                    u32 fi = 0;
+                                    while (fi < vv0->fieldsLen)
+                                    {
+                                        if (vv0->fieldNames[fi] == fname) { ft = vv0->fieldTypes[fi]; break; }
+                                        fi = fi + 1;
+                                    }
+                                    if (ft != 0 && !dup)
+                                    {
+                                        stNL(&cg.body, cg.ind);
+                                        stPS(&cg.body, tyStr(cg, cgSubstTy(cg, ft)));
+                                        stCh(&cg.body, ' ');
+                                        stPS(&cg.body, cgIntern(cg, fname));
+                                        stCh(&cg.body, ';');
+                                        bindNames[bindCount] = fname;
+                                        bindCount = bindCount + 1;
+                                    }
+                                    ff = ff + 1;
+                                }
+                            }
+                        }
+                    }
+                    pp = pp + 1;
+                }
+                ci = ci + 1;
+            }
+        }
+    }
+
     /* test chain */
     i = 0;
     while (i < casesLen)
@@ -1893,7 +2072,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, SwitchCase* cases, u32 casesLen, Sli
             while (p < c.patternsLen)
             {
                 bool w = false;
-                Slice t = cgPatTest(cg, c.patterns[p], scrut, &w);
+                Slice t = cgPatTest(cg, c.patterns[p], scrut, scrutTy, &w);
                 if (w) {
                     stNL(&cg.body, cg.ind);
                     stP(&cg.body, "goto __L");
@@ -1947,6 +2126,42 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, SwitchCase* cases, u32 casesLen, Sli
         SwitchCase* c = cases + i;
         bool isDef = ((c.flags & 4) != 0 || c.patternsLen == 0);
         cgEmitLabel(cg, bodyL[i]);
+        /* bind the fields of this case's variant pattern(s) */
+        {
+            u32 pp = 0;
+            while (pp < c.patternsLen)
+            {
+                Node* pn = cgNode(cg, c.patterns[pp]);
+                if (pn.kind.tag == NodeKind::Pat)
+                {
+                    Pat* pv = &pn.kind.payload.Pat.value;
+                    if (pv.kind.tag == PatKind::Variant && pv.kind.payload.Variant.fieldNamesLen > 0)
+                    {
+                        u32 vidx = 0;
+                        NodeId vd = cgFindVariantOfTy(cg, scrutTy, pv.kind.payload.Variant.variantName, &vidx);
+                        if (vd.index != 0)
+                        {
+                            u32 ff = 0;
+                            while (ff < pv.kind.payload.Variant.fieldNamesLen)
+                            {
+                                Str fname = pv.kind.payload.Variant.fieldNames[ff];
+                                stNL(&cg.body, cg.ind);
+                                stPS(&cg.body, cgIntern(cg, fname));
+                                stP(&cg.body, " = ");
+                                stPS(&cg.body, scrut);
+                                stP(&cg.body, ".u.v");
+                                stU64(&cg.body, (u64)vidx);
+                                stCh(&cg.body, '.');
+                                stPS(&cg.body, cgIntern(cg, fname));
+                                stCh(&cg.body, ';');
+                                ff = ff + 1;
+                            }
+                        }
+                    }
+                }
+                pp = pp + 1;
+            }
+        }
         if (!isDef && (c.flags & 1) != 0 && c.guard.index != 0)
         {
             Slice g = cgExpr(cg, c.guard);
@@ -2337,7 +2552,12 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Switch => {
             Slice scrut = cgExpr(cg, s.kind.payload.Switch.expr);
-            cgEmitSwitch(cg, scrut, s.kind.payload.Switch.cases, s.kind.payload.Switch.casesLen, Slice::from(null, 0));
+            Ty scrutTy = 0;
+            {
+                Node* sn = cgNode(cg, s.kind.payload.Switch.expr);
+                if (sn.kind.tag == NodeKind::Expr) scrutTy = sn.kind.payload.Expr.value.resolvedType;
+            }
+            cgEmitSwitch(cg, scrut, scrutTy, s.kind.payload.Switch.cases, s.kind.payload.Switch.casesLen, Slice::from(null, 0));
             return;
         },
 
@@ -2421,7 +2641,13 @@ bool cgTyHasParam(Codegen* cg, Ty t)
         TypeKind::Named => {
             u32 i = 0;
             while (i < e.kind.payload.Named.genericArgsLen) {
-                if (cgTyHasParam(cg, e.kind.payload.Named.genericArgs[i])) return true;
+                Ty arg = e.kind.payload.Named.genericArgs[i];
+                TypeEntry* ae = cg.ctx->types + arg;
+                /* a bare name used as a generic argument (`Option<T>`)
+                 * is a parameter reference */
+                if (ae.kind.tag == TypeKind::Named && ae.kind.payload.Named.genericArgsLen == 0)
+                    return true;
+                if (cgTyHasParam(cg, arg)) return true;
                 i = i + 1;
             }
             return false;
@@ -2898,8 +3124,8 @@ bool cgOwnerGeneric(Codegen* cg, Decl* dd)
         DeclKind::Struct => { return dd.kind.payload.Struct.genericParamsLen > 0; },
         DeclKind::Union => { return dd.kind.payload.Union.genericParamsLen > 0; },
         DeclKind::Variant => { return dd.kind.payload.Variant.genericParamsLen > 0; },
-        DeclKind::Extend => { return cgTyHasParam(cg, dd.kind.payload.Extend.selfType); },
-        DeclKind::ExtendTrait => { return cgTyHasParam(cg, dd.kind.payload.ExtendTrait.selfType); },
+        DeclKind::Extend => { return dd.kind.payload.Extend.genericParamsLen > 0 || cgTyHasParam(cg, dd.kind.payload.Extend.selfType); },
+        DeclKind::ExtendTrait => { return dd.kind.payload.ExtendTrait.genericParamsLen > 0 || cgTyHasParam(cg, dd.kind.payload.ExtendTrait.selfType); },
         else => { return false; },
     }
     return false;

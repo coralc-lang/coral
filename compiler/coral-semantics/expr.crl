@@ -13,7 +13,7 @@ import id { Str, NodeId };
 import types { Ty, TypeEntry, TypeKind };
 import node { Node, NodeKind };
 import expr { Expr, ExprKind };
-import decl_ast { Decl, DeclKind, Param };
+import decl_ast { Decl, DeclKind, Param, VariantVariant };
 import stmt { SwitchCase };
 import scope { Symbol };
 import member { MemberInfo };
@@ -129,6 +129,12 @@ pub extend Sema
         if (leftNode->kind.tag != NodeKind::Expr) return true;
         Expr* leftExpr = &leftNode->kind.payload.Expr.value;
         if (leftExpr->kind.tag == ExprKind::Path) return self.checkPath(segments[0]);
+        if (leftExpr->kind.tag == ExprKind::TypeRef)
+        {
+            /* `Option<f64>::None` — type of the path is the head type */
+            self.setExprType(id, leftExpr->kind.payload.TypeRef.typeNode);
+            return true;
+        }
         if (leftExpr->kind.tag != ExprKind::Ident) return true;
         Node* rightNode = self.ctx.nodes + segments[1].index;
         if (rightNode->kind.tag != NodeKind::Expr) return true;
@@ -150,6 +156,13 @@ pub extend Sema
             {
                 Decl* edecl = &edeclNode->kind.payload.Decl.value;
                 self.setExprType(id, self.namedType(edecl->kind.payload.Enum.name));
+                return true;
+            }
+            /* bare variant: Option::None — type is the variant decl */
+            if (edeclNode->kind.tag == NodeKind::Decl && edeclNode->kind.payload.Decl.value.kind.tag == DeclKind::Variant)
+            {
+                Decl* edecl = &edeclNode->kind.payload.Decl.value;
+                self.setExprType(id, self.namedType(edecl->kind.payload.Variant.name));
                 return true;
             }
         }
@@ -406,6 +419,81 @@ pub extend Sema
             ExprKind::TupleField => { return self.checkExpr(expr->kind.payload.TupleField.obj); },
             ExprKind::StructLiteral => {
                 if (!self.checkType(expr->kind.payload.StructLiteral.typeNode)) return false;
+                Str variantName = expr->kind.payload.StructLiteral.variantName;
+                if (variantName != 0)
+                {
+                    /* variant construction: fields must belong to the
+                     * named variant of the variant decl behind typeNode */
+                    Ty base = self.stripType(expr->kind.payload.StructLiteral.typeNode);
+                    if (base == 0) return false;
+                    TypeEntry* te = self.ctx.types + base;
+                    if (te->kind.tag != TypeKind::Named)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "variant construction needs a variant type");
+                        return false;
+                    }
+                    Symbol* symbol = self.scopes.lookup(te->kind.payload.Named.name);
+                    if (symbol == null || symbol->declaration.index == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "unknown type name");
+                        return false;
+                    }
+                    Node* dn = self.ctx.nodes + symbol->declaration.index;
+                    if (dn->kind.tag != NodeKind::Decl)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "variant construction needs a variant type");
+                        return false;
+                    }
+                    Decl* decl = &dn->kind.payload.Decl.value;
+                    if (decl->kind.tag != DeclKind::Variant)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "not a variant type");
+                        return false;
+                    }
+                    VariantVariant* vv = null;
+                    u32 v = 0;
+                    while (v < decl->kind.payload.Variant.variantsLen)
+                    {
+                        if (decl->kind.payload.Variant.variants[v].name == variantName)
+                        {
+                            vv = decl->kind.payload.Variant.variants + v;
+                            break;
+                        }
+                        v = v + 1;
+                    }
+                    if (vv == null)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant");
+                        return false;
+                    }
+                    u32 i = 0;
+                    while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
+                    {
+                        Str fieldName = expr->kind.payload.StructLiteral.fieldNames[i];
+                        Ty ft = 0;
+                        u32 k = 0;
+                        while (k < vv->fieldsLen)
+                        {
+                            if (vv->fieldNames[k] == fieldName)
+                            {
+                                ft = vv->fieldTypes[k];
+                                break;
+                            }
+                            k = k + 1;
+                        }
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in variant construction");
+                            return false;
+                        }
+                        if (!self.checkExpr(expr->kind.payload.StructLiteral.fieldValues[i])) return false;
+                        Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
+                        if (!self.compatible(self.exprType(expr->kind.payload.StructLiteral.fieldValues[i]), expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
+                        i = i + 1;
+                    }
+                    self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
+                    return true;
+                }
                 u32 i = 0;
                 while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
                 {
