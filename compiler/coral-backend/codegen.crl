@@ -802,7 +802,29 @@ bool cgIsCrtFn(Str name, Slice text)
            slEqU8(text, (u8*)"memcmp", 6) ||
            slEqU8(text, (u8*)"strchr", 6) ||
            slEqU8(text, (u8*)"strncpy", 7) ||
-           slEqU8(text, (u8*)"abs", 3);
+           slEqU8(text, (u8*)"abs", 3) ||
+           slEqU8(text, (u8*)"fflush", 6) ||
+           slEqU8(text, (u8*)"strcpy", 6) ||
+           slEqU8(text, (u8*)"memmove", 7) ||
+           slEqU8(text, (u8*)"snprintf", 8) ||
+           slEqU8(text, (u8*)"chdir", 5) ||
+           slEqU8(text, (u8*)"rmdir", 5) ||
+           slEqU8(text, (u8*)"unlink", 6) ||
+           slEqU8(text, (u8*)"rename", 6) ||
+           slEqU8(text, (u8*)"access", 6) ||
+           slEqU8(text, (u8*)"fopen", 5) ||
+           slEqU8(text, (u8*)"fclose", 6) ||
+           slEqU8(text, (u8*)"fread", 5) ||
+           slEqU8(text, (u8*)"fwrite", 6) ||
+           slEqU8(text, (u8*)"feof", 4) ||
+           slEqU8(text, (u8*)"ferror", 6) ||
+           slEqU8(text, (u8*)"mkstemp", 7) ||
+           slEqU8(text, (u8*)"mkdtemp", 7) ||
+           slEqU8(text, (u8*)"execvp", 6) ||
+           slEqU8(text, (u8*)"getenv", 6) ||
+           slEqU8(text, (u8*)"setenv", 6) ||
+           slEqU8(text, (u8*)"unsetenv", 8) ||
+           slEqU8(text, (u8*)"readlink", 8);
 }
 
 /* owner name for a method receiver type: strip one pointer level */
@@ -910,7 +932,6 @@ Slice cgExpr(Codegen* cg, NodeId id)
     {
         /* atoms */
         ExprKind::IntLit => {
-            if (e.kind.payload.IntLit.flags & 1) stCh(&cg.ebuf, '-');
             stU64(&cg.ebuf, e.kind.payload.IntLit.value);
             return stTail(&cg.ebuf, es);
         },
@@ -2914,14 +2935,35 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
             if ((ev.flags & 1) != 0 && ev.value.index != 0)
             {
                 Node* valNode = cgNode(cg, ev.value);
-                if (valNode.kind.tag == NodeKind::Expr && valNode.kind.payload.Expr.value.kind.tag == ExprKind::IntLit)
+                i64 evVal = 0;
+                bool evNeg = false;
+                bool evOk = false;
+                if (valNode.kind.tag == NodeKind::Expr)
                 {
                     Expr* iv = &valNode.kind.payload.Expr.value;
+                    if (iv.kind.tag == ExprKind::IntLit)
+                    {
+                        evVal = (i64)iv.kind.payload.IntLit.value;
+                        evOk = true;
+                    }
+                    else if (iv.kind.tag == ExprKind::Neg)
+                    {
+                        Node* inn = cgNode(cg, iv.kind.payload.Neg.expr);
+                        if (inn.kind.tag == NodeKind::Expr && inn.kind.payload.Expr.value.kind.tag == ExprKind::IntLit)
+                        {
+                            evVal = (i64)inn.kind.payload.Expr.value.kind.payload.IntLit.value;
+                            evNeg = true;
+                            evOk = true;
+                        }
+                    }
+                }
+                if (evOk)
+                {
                     stP(&cg.defs, " = ");
-                    if (iv.kind.payload.IntLit.flags & 1) stCh(&cg.defs, '-');
-                    stU64(&cg.defs, iv.kind.payload.IntLit.value);
-                    nextVal = (i64)iv.kind.payload.IntLit.value;
-                    if (iv.kind.payload.IntLit.flags & 1) nextVal = 0 - nextVal;
+                    if (evNeg) stCh(&cg.defs, '-');
+                    stU64(&cg.defs, (u64)evVal);
+                    nextVal = evVal;
+                    if (evNeg) nextVal = -nextVal;
                     nextVal = nextVal + 1;
                 }
                 else
@@ -2993,11 +3035,51 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
             }
             stP(&cg.defs, "\n        } v");
             stU64(&cg.defs, (u64)v);
+            stCh(&cg.defs, ';');
             v = v + 1;
         }
         stP(&cg.defs, "\n    } u;");
     }
     stP(&cg.defs, "\n};\n");
+}
+
+/* file-scope constant values must lower to C constant expressions:
+ * literals, casts, and unary/binary operators over the same */
+bool cgConstAtom(Codegen* cg, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    u32 k = e->kind.tag;
+    if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
+        k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit) return true;
+    if (k == ExprKind::Neg) return cgConstAtom(cg, e->kind.payload.Neg.expr);
+    if (k == ExprKind::Not) return cgConstAtom(cg, e->kind.payload.Not.expr);
+    if (k == ExprKind::BitNot) return cgConstAtom(cg, e->kind.payload.BitNot.expr);
+    if (k == ExprKind::AddressOf) return true;
+    if (k == ExprKind::Cast) return cgConstAtom(cg, e->kind.payload.Cast.expr);
+    if (k == ExprKind::Ternary)
+        return cgConstAtom(cg, e->kind.payload.Ternary.cond) && cgConstAtom(cg, e->kind.payload.Ternary.thenExpr) && cgConstAtom(cg, e->kind.payload.Ternary.elseExpr);
+    if (k == ExprKind::Add) return cgConstAtom(cg, e->kind.payload.Add.left) && cgConstAtom(cg, e->kind.payload.Add.right);
+    if (k == ExprKind::Sub) return cgConstAtom(cg, e->kind.payload.Sub.left) && cgConstAtom(cg, e->kind.payload.Sub.right);
+    if (k == ExprKind::Mul) return cgConstAtom(cg, e->kind.payload.Mul.left) && cgConstAtom(cg, e->kind.payload.Mul.right);
+    if (k == ExprKind::Div) return cgConstAtom(cg, e->kind.payload.Div.left) && cgConstAtom(cg, e->kind.payload.Div.right);
+    if (k == ExprKind::Mod) return cgConstAtom(cg, e->kind.payload.Mod.left) && cgConstAtom(cg, e->kind.payload.Mod.right);
+    if (k == ExprKind::Eq) return cgConstAtom(cg, e->kind.payload.Eq.left) && cgConstAtom(cg, e->kind.payload.Eq.right);
+    if (k == ExprKind::Ne) return cgConstAtom(cg, e->kind.payload.Ne.left) && cgConstAtom(cg, e->kind.payload.Ne.right);
+    if (k == ExprKind::Lt) return cgConstAtom(cg, e->kind.payload.Lt.left) && cgConstAtom(cg, e->kind.payload.Lt.right);
+    if (k == ExprKind::Le) return cgConstAtom(cg, e->kind.payload.Le.left) && cgConstAtom(cg, e->kind.payload.Le.right);
+    if (k == ExprKind::Gt) return cgConstAtom(cg, e->kind.payload.Gt.left) && cgConstAtom(cg, e->kind.payload.Gt.right);
+    if (k == ExprKind::Ge) return cgConstAtom(cg, e->kind.payload.Ge.left) && cgConstAtom(cg, e->kind.payload.Ge.right);
+    if (k == ExprKind::And) return cgConstAtom(cg, e->kind.payload.And.left) && cgConstAtom(cg, e->kind.payload.And.right);
+    if (k == ExprKind::Or) return cgConstAtom(cg, e->kind.payload.Or.left) && cgConstAtom(cg, e->kind.payload.Or.right);
+    if (k == ExprKind::BitAnd) return cgConstAtom(cg, e->kind.payload.BitAnd.left) && cgConstAtom(cg, e->kind.payload.BitAnd.right);
+    if (k == ExprKind::BitOr) return cgConstAtom(cg, e->kind.payload.BitOr.left) && cgConstAtom(cg, e->kind.payload.BitOr.right);
+    if (k == ExprKind::BitXor) return cgConstAtom(cg, e->kind.payload.BitXor.left) && cgConstAtom(cg, e->kind.payload.BitXor.right);
+    if (k == ExprKind::Shl) return cgConstAtom(cg, e->kind.payload.Shl.left) && cgConstAtom(cg, e->kind.payload.Shl.right);
+    if (k == ExprKind::Shr) return cgConstAtom(cg, e->kind.payload.Shr.left) && cgConstAtom(cg, e->kind.payload.Shr.right);
+    return false;
 }
 
 void cgEmitTypeDefs(Codegen* cg)
@@ -3079,23 +3161,32 @@ void cgEmitTypeDefs(Codegen* cg)
             Decl* dd = &d.kind.payload.Decl.value;
             if (dd.kind.tag == DeclKind::Constant)
             {
-                Node* vn = cgNode(cg, dd.kind.payload.Constant.value);
-                bool atom = false;
-                if (vn.kind.tag == NodeKind::Expr)
+                u8 cflags = dd.kind.payload.Constant.flags;
+                NodeId cval = dd.kind.payload.Constant.value;
+                if ((cflags & 2) != 0)
                 {
-                    u32 ktag = vn.kind.payload.Expr.value.kind.tag;
-                    if (ktag == ExprKind::IntLit || ktag == ExprKind::FloatLit || ktag == ExprKind::BoolLit ||
-                        ktag == ExprKind::StringLit || ktag == ExprKind::CharLit || ktag == ExprKind::NullLit) atom = true;
+                    /* extern variable: declaration only */
+                    stP(&cg.defs, "extern ");
+                    stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
+                    stCh(&cg.defs, ' ');
+                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Constant.name));
+                    stP(&cg.defs, ";\n");
                 }
-                if (!atom) { cg.errors = cg.errors + 1; }
-                stP(&cg.defs, "static ");
-                stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
-                stCh(&cg.defs, ' ');
-                stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Constant.name));
-                stP(&cg.defs, " = ");
-                Slice v = cgExpr(cg, dd.kind.payload.Constant.value);
-                stPS(&cg.defs, v);
-                stP(&cg.defs, ";\n");
+                else
+                {
+                    if (cval.index != 0 && !cgConstAtom(cg, cval)) cg.errors = cg.errors + 1;
+                    stP(&cg.defs, "static ");
+                    stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
+                    stCh(&cg.defs, ' ');
+                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Constant.name));
+                    if (cval.index != 0)
+                    {
+                        stP(&cg.defs, " = ");
+                        Slice v = cgExpr(cg, cval);
+                        stPS(&cg.defs, v);
+                    }
+                    stP(&cg.defs, ";\n");
+                }
             }
         }
         i = i + 1;
