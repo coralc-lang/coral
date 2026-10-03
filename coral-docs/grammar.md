@@ -179,3 +179,22 @@ Tuple, `TypeParam`, `Distinct`, plus `Str` used as a `u8*` interned-id in AST.
 - `#[[inline]]` etc.: parsed but not semantic.
 - `pub distinct X = flag(…)`, `any TraitName`, switch `|` syntax — decided but
   unimplemented.
+
+## Imports — nested path-listed items (decided, NOT implemented)
+An allow-list may specify nested module→symbol mappings using distinct-scope braces
+with `::` selectors, one item per line/comma:
+
+```crl
+import(lib) std::text {
+    string::{ String },
+    strutil::{ splitVec, trim, indexOfChar }
+};
+```
+meaning: from the `std::text` library surface, bring in
+`std::text::string::String` and `std::text::strutil::{splitVec, trim, indexOfChar}`.
+
+Note: the current parser already supports a braces-only nesting
+(`std::text { string { String } }`) by recursing with a `::`-joined prefix,
+but does **not** accept the `module::{ … }` form above (the `::` before the inner
+`{` is a parse error). Decide and implement the latter before the lib port relies on it.
+See `compiler/coral-test/nested_import.crl`.

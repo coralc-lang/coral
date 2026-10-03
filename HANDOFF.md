@@ -324,3 +324,16 @@ These must be declared in the definition of the `trait` keyword's language and h
 - A generic param may be `comptime T` (`print<comptime T>(T fmt, …)`): the caller does NOT supply T — it is auto-deduced by the function's `comptime { … }` block.
 - Semantic rule: every function with a `comptime T` generic param MUST contain a `comptime { … }` block. Add to sema (and produce a proper compile error when absent).
 - Not yet implemented: parser acceptance of `comptime T` in the generic-param list, comptime evaluation, `@compileError` / `@isFormatLiteral` handling.
+
+### Nested path-listed import (decided, NOT implemented)
+```crl
+import(lib) std::text {
+    string::{ String },
+    strutil::{ splitVec, trim, indexOfChar }
+};
+```
+- Brings `std::text::string::String` and `std::text::strutil::{…}` into scope.
+- The parser supports brace nesting *without* `::` (`string { String }`) by
+  recursing with a `::`-joined prefix, but the `module::{ … }` form is a parse
+  error today. Needs implementation before the lib port can use it.
+- Demo: `compiler/coral-test/nested_import.crl` (expected to fail to parse until implemented).
