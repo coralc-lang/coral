@@ -402,7 +402,7 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     if (cg.mono == null || cg.mono.genericCount(declId) == 0) {
         *found = true;
         *outRet = dd.kind.payload.Func.returnType;
-        return cgIntern(cg, name);
+        return cgIdent(cg, name);
     }
     /* generic: pick the mono instance whose collected argument types match */
     u32 total = 0;
@@ -465,7 +465,7 @@ Slice tyStrPut(Codegen* cg, Slice text, usize start)
 
 Slice tyStr(Codegen* cg, Ty t)
 {
-    if (t == 0) return Slice::from((u8*)"rawptr", 6);
+    if (t == 0) return Slice::from((u8*)"void*", 5);
     TypeEntry* e = cg.ctx->types + t;
     TypeKind k = e.kind;
     usize start = cg.tybuf.len;
@@ -519,7 +519,7 @@ Slice tyStr(Codegen* cg, Ty t)
                     i = i + 1;
                 }
             }
-            return tyStrPut(cg, cgIntern(cg, name), start);
+            return tyStrPut(cg, cgIdent(cg, name), start);
         },
         TypeKind::Pointer => {
             tyStr(cg, k.payload.Pointer.base);
@@ -698,9 +698,9 @@ Node* cgNode(Codegen* cg, NodeId id)
 /* C type text for a value expression node (0-safe). */
 Slice cgValExprTy(Codegen* cg, NodeId id)
 {
-    if (id.index == 0) return Slice::from((u8*)"rawptr", 6);
+    if (id.index == 0) return Slice::from((u8*)"void*", 5);
     Node* n = cgNode(cg, id);
-    if (n.kind.tag != NodeKind::Expr) return Slice::from((u8*)"rawptr", 6);
+    if (n.kind.tag != NodeKind::Expr) return Slice::from((u8*)"void*", 5);
     return cgResultTy(cg, id, &n.kind.payload.Expr.value);
 }
 
@@ -713,7 +713,7 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
         ExprKind::AddressOf => {
             NodeId c = e.kind.payload.AddressOf.expr;
             Node* cn = cgNode(cg, c);
-            Slice base = Slice::from((u8*)"rawptr", 6);
+            Slice base = Slice::from((u8*)"void*", 5);
             usize s = cg.tybuf.len;
             if (cn.kind.tag == NodeKind::Expr)
                 base = cgResultTy(cg, c, &cn.kind.payload.Expr.value);
@@ -735,7 +735,7 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
         ExprKind::AssignShr => { return cgValExprTy(cg, e.kind.payload.AssignShr.value); },
         else => {},
     }
-    return Slice::from((u8*)"rawptr", 6);
+    return Slice::from((u8*)"void*", 5);
 }
 
 void cgEmitStmt(Codegen* cg, u8* text)
@@ -779,6 +779,59 @@ bool slEqU8(Slice a, u8* b, usize bl)
         i = i + 1;
     }
     return true;
+}
+
+/* identifiers that collide with a C keyword (or a stdlib macro) get a
+ * trailing underscore so the generated C stays valid */
+Slice cgIdent(Codegen* cg, Str name)
+{
+    Slice t = cgIntern(cg, name);
+    if (slEqU8(t, (u8*)"auto", 4) ||
+        slEqU8(t, (u8*)"break", 5) ||
+        slEqU8(t, (u8*)"case", 4) ||
+        slEqU8(t, (u8*)"char", 4) ||
+        slEqU8(t, (u8*)"const", 5) ||
+        slEqU8(t, (u8*)"continue", 8) ||
+        slEqU8(t, (u8*)"default", 7) ||
+        slEqU8(t, (u8*)"do", 2) ||
+        slEqU8(t, (u8*)"double", 6) ||
+        slEqU8(t, (u8*)"else", 4) ||
+        slEqU8(t, (u8*)"enum", 4) ||
+        slEqU8(t, (u8*)"extern", 6) ||
+        slEqU8(t, (u8*)"float", 5) ||
+        slEqU8(t, (u8*)"for", 3) ||
+        slEqU8(t, (u8*)"goto", 4) ||
+        slEqU8(t, (u8*)"if", 2) ||
+        slEqU8(t, (u8*)"inline", 6) ||
+        slEqU8(t, (u8*)"int", 3) ||
+        slEqU8(t, (u8*)"long", 4) ||
+        slEqU8(t, (u8*)"register", 8) ||
+        slEqU8(t, (u8*)"restrict", 8) ||
+        slEqU8(t, (u8*)"return", 6) ||
+        slEqU8(t, (u8*)"short", 5) ||
+        slEqU8(t, (u8*)"signed", 6) ||
+        slEqU8(t, (u8*)"sizeof", 6) ||
+        slEqU8(t, (u8*)"static", 6) ||
+        slEqU8(t, (u8*)"struct", 6) ||
+        slEqU8(t, (u8*)"switch", 6) ||
+        slEqU8(t, (u8*)"typedef", 7) ||
+        slEqU8(t, (u8*)"union", 5) ||
+        slEqU8(t, (u8*)"unsigned", 8) ||
+        slEqU8(t, (u8*)"void", 4) ||
+        slEqU8(t, (u8*)"volatile", 8) ||
+        slEqU8(t, (u8*)"while", 5) ||
+        slEqU8(t, (u8*)"bool", 4) ||
+        slEqU8(t, (u8*)"true", 4) ||
+        slEqU8(t, (u8*)"false", 5) ||
+        slEqU8(t, (u8*)"size_t", 6) ||
+        slEqU8(t, (u8*)"NULL", 4))
+    {
+        usize ns = cg.tybuf.len;
+        stPS(&cg.tybuf, t);
+        stCh(&cg.tybuf, '_');
+        return stTail(&cg.tybuf, ns);
+    }
+    return t;
 }
 
 bool cgIsCrtFn(Str name, Slice text)
@@ -836,10 +889,11 @@ Slice cgOwnerName(Codegen* cg, Ty selfTy)
     return tyStr(cg, selfTy);
 }
 
-/* does `Type.method` take a receiver (first param flagged as self)? */
-bool cgMethodHasSelf(Codegen* cg, Ty recvTy, Str method)
+/* receiver for a method call: 0 = none (static), 1 = by value,
+ * 2 = explicit `self` parameter (pointer) */
+u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method)
 {
-    if (recvTy == 0 || cg.file == null) return true;
+    if (recvTy == 0 || cg.file == null) return 1;
     TypeEntry* e = cg.ctx->types + recvTy;
     while (e.kind.tag == TypeKind::Pointer || e.kind.tag == TypeKind::Const || e.kind.tag == TypeKind::Comptime)
     {
@@ -848,7 +902,7 @@ bool cgMethodHasSelf(Codegen* cg, Ty recvTy, Str method)
         else recvTy = e.kind.payload.Comptime.base;
         e = cg.ctx->types + recvTy;
     }
-    if (e.kind.tag != TypeKind::Named) return true;
+    if (e.kind.tag != TypeKind::Named) return 1;
     Str typeName = e.kind.payload.Named.name;
     u32 i = 0;
     while (i < cg.file.declsLen)
@@ -891,11 +945,13 @@ bool cgMethodHasSelf(Codegen* cg, Ty recvTy, Str method)
                         Decl* md = &mn.kind.payload.Decl.value;
                         if (md.kind.payload.Func.name == method)
                         {
-                            if (md.kind.payload.Func.paramsLen == 0) return false;
-                            Node* p0 = cg.ctx->nodes + md.kind.payload.Func.params[0].index;
-                            if (p0.kind.tag == NodeKind::Param)
-                                return (p0.kind.payload.Param.value.flags & 1) != 0;
-                            return false;
+                            if ((md.kind.payload.Func.flags & 4) != 0) return 0;
+                            if (md.kind.payload.Func.paramsLen > 0)
+                            {
+                                Node* p0 = cg.ctx->nodes + md.kind.payload.Func.params[0].index;
+                                if (p0.kind.tag == NodeKind::Param && (p0.kind.payload.Param.value.flags & 1) != 0) return 2;
+                            }
+                            return 1;
                         }
                     }
                     m = m + 1;
@@ -904,7 +960,7 @@ bool cgMethodHasSelf(Codegen* cg, Ty recvTy, Str method)
         }
         i = i + 1;
     }
-    return true;
+    return 1;
 }
 
 /* ── expressions ─────────────────────────────────────────────── */
@@ -1011,7 +1067,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Ident => {
-            stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.Ident.name));
+            stPS(&cg.ebuf, cgIdent(cg, e.kind.payload.Ident.name));
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Path => {
@@ -1376,13 +1432,18 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 bool first = true;
                 Ty rawRecvTy = 0;
                 if (rn.kind.tag == NodeKind::Expr) rawRecvTy = rn.kind.payload.Expr.value.resolvedType;
-                bool hasSelf = cgMethodHasSelf(cg, rawRecvTy, e.kind.payload.MethodCall.method);
-                if (hasSelf) {
-                    if (recvIsPtr) stPS(&abuf, recvText);
-                    else {
+                u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, e.kind.payload.MethodCall.method);
+                if (recvKind != 0) {
+                    if (recvKind == 2 && !recvIsPtr) {
                         stP(&abuf, "&(");
                         stPS(&abuf, recvText);
                         stCh(&abuf, ')');
+                    } else if (recvKind == 1 && recvIsPtr) {
+                        stP(&abuf, "*(");
+                        stPS(&abuf, recvText);
+                        stCh(&abuf, ')');
+                    } else {
+                        stPS(&abuf, recvText);
                     }
                     first = false;
                     n = n + 1;
@@ -1397,7 +1458,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen + (hasSelf ? 1 : 0) > 16) cg.errors = cg.errors + 1;
+                if (argsLen + (recvKind != 0 ? 1 : 0) > 16) cg.errors = cg.errors + 1;
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
@@ -1469,7 +1530,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.ebuf, o);
             if (isPtr) stP(&cg.ebuf, "->");
             else stCh(&cg.ebuf, '.');
-            stPS(&cg.ebuf, cgIntern(cg, field));
+            stPS(&cg.ebuf, cgIdent(cg, field));
             Slice fieldText = stTail(&cg.ebuf, cs);
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
@@ -1529,7 +1590,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (first) first = false;
                 else stP(&vs, ", ");
                 stP(&vs, ".");
-                stPS(&vs, cgIntern(cg, e.kind.payload.StructLiteral.fieldNames[i]));
+                stPS(&vs, cgIdent(cg, e.kind.payload.StructLiteral.fieldNames[i]));
                 stP(&vs, " = ");
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i = i + 1;
@@ -1832,7 +1893,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
     switch (e.kind.tag)
     {
         ExprKind::Ident => {
-            stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.Ident.name));
+            stPS(&cg.ebuf, cgIdent(cg, e.kind.payload.Ident.name));
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Deref => {
@@ -1864,7 +1925,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             stPS(&cg.ebuf, o);
             if (isPtr) stP(&cg.ebuf, "->");
             else stCh(&cg.ebuf, '.');
-            stPS(&cg.ebuf, cgIntern(cg, field));
+            stPS(&cg.ebuf, cgIdent(cg, field));
             return stTail(&cg.ebuf, rs);
         },
         ExprKind::Index => {
@@ -2338,8 +2399,8 @@ void cgStmt(Codegen* cg, NodeId id)
                 Node* inn = cgNode(cg, init);
                 if (inn.kind.tag == NodeKind::Expr)
                     tyText = cgResultTy(cg, init, &inn.kind.payload.Expr.value);
-                else tyText = Slice::from((u8*)"rawptr", 6);
-            } else tyText = Slice::from((u8*)"rawptr", 6);
+                else tyText = Slice::from((u8*)"void*", 5);
+            } else tyText = Slice::from((u8*)"void*", 5);
 
             /* array-typed local: declarator form, braced initializer */
             bool isArray = false;
@@ -2355,7 +2416,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 TypeEntry* te = cg.ctx->types + ty;
                 stPS(&cg.body, tyStr(cg, te.kind.payload.Array.base));
                 stCh(&cg.body, ' ');
-                stPS(&cg.body, cgIntern(cg, name));
+                stPS(&cg.body, cgIdent(cg, name));
                 stCh(&cg.body, '[');
                 stU64(&cg.body, (u64)te.kind.payload.Array.len);
                 stCh(&cg.body, ']');
@@ -2383,7 +2444,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stNL(&cg.body, cg.ind);
                 stPS(&cg.body, tyText);
                 stCh(&cg.body, ' ');
-                stPS(&cg.body, cgIntern(cg, name));
+                stPS(&cg.body, cgIdent(cg, name));
                 if (hasInit) {
                     stP(&cg.body, " = ");
                     stPS(&cg.body, initText);
@@ -2718,6 +2779,20 @@ bool cgTyHasParam(Codegen* cg, Ty t)
 void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
 {
     bool any = false;
+    /* methods without an explicit `self` still take the receiver as their
+     * first parameter — sema declares an implicit `self` for them */
+    bool explicitSelf = false;
+    if (dd.kind.payload.Func.paramsLen > 0)
+    {
+        Node* p0n = cgNode(cg, dd.kind.payload.Func.params[0]);
+        if (p0n.kind.tag == NodeKind::Param && (p0n.kind.payload.Param.value.flags & 1) != 0) explicitSelf = true;
+    }
+    if (owner.len != 0 && !explicitSelf && (dd.kind.payload.Func.flags & 4) == 0)
+    {
+        stPS(s, owner);
+        stP(s, " self");
+        any = true;
+    }
     u32 i = 0;
     while (i < dd.kind.payload.Func.paramsLen)
     {
@@ -2755,7 +2830,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
                     TypeEntry* te = cg.ctx->types + pt;
                     stPS(s, tyStr(cg, te.kind.payload.Array.base));
                     stCh(s, ' ');
-                    if (p.name != 0) stPS(s, cgIntern(cg, p.name));
+                    if (p.name != 0) stPS(s, cgIdent(cg, p.name));
                     else { stP(s, "_p"); stU64(s, (u64)i); }
                     stP(s, "[]");
                 }
@@ -2763,7 +2838,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
                 {
                     stPS(s, tyStr(cg, pt));
                     stCh(s, ' ');
-                    if (p.name != 0) stPS(s, cgIntern(cg, p.name));
+                    if (p.name != 0) stPS(s, cgIdent(cg, p.name));
                     else { stP(s, "_p"); stU64(s, (u64)i); }
                 }
             }
@@ -2871,25 +2946,25 @@ void cgEmitFwd(Codegen* cg)
                 DeclKind::Struct => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef struct ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Struct.name));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Struct.name));
                     stP(&cg.fwd, ";\n");
                 },
                 DeclKind::Union => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef union ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Union.name));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Union.name));
                     stP(&cg.fwd, ";\n");
                 },
                 DeclKind::Variant => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef struct ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Variant.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Variant.name));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIntern(cg, dd.kind.payload.Variant.name));
+                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Variant.name));
                     stP(&cg.fwd, ";\n");
                 },
                 else => {},
@@ -2929,9 +3004,9 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
         {
             EnumVariant* ev = &vn.kind.payload.EnumVariant.value;
             stP(&cg.defs, "    ");
-            stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Enum.name));
+            stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Enum.name));
             stCh(&cg.defs, '_');
-            stPS(&cg.defs, cgIntern(cg, ev.name));
+            stPS(&cg.defs, cgIdent(cg, ev.name));
             if ((ev.flags & 1) != 0 && ev.value.index != 0)
             {
                 Node* valNode = cgNode(cg, ev.value);
@@ -2983,7 +3058,7 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
         v = v + 1;
     }
     stP(&cg.defs, "} ");
-    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Enum.name));
+    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Enum.name));
     stP(&cg.defs, ";\n");
 }
 
@@ -3000,7 +3075,7 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
             stP(&cg.defs, "\n    ");
             stPS(&cg.defs, tyStr(cg, fd.typeNode));
             stCh(&cg.defs, ' ');
-            stPS(&cg.defs, cgIntern(cg, fd.name));
+            stPS(&cg.defs, cgIdent(cg, fd.name));
             stCh(&cg.defs, ';');
             any = true;
         }
@@ -3029,7 +3104,7 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
                 stP(&cg.defs, "\n            ");
                 stPS(&cg.defs, tyStr(cg, vv.fieldTypes[f]));
                 stCh(&cg.defs, ' ');
-                stPS(&cg.defs, cgIntern(cg, vv.fieldNames[f]));
+                stPS(&cg.defs, cgIdent(cg, vv.fieldNames[f]));
                 stCh(&cg.defs, ';');
                 f = f + 1;
             }
@@ -3097,7 +3172,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 stP(&cg.defs, "typedef ");
                 stPS(&cg.defs, tyStr(cg, dd.kind.payload.TypeAlias.target));
                 stCh(&cg.defs, ' ');
-                stPS(&cg.defs, cgIntern(cg, dd.kind.payload.TypeAlias.name));
+                stPS(&cg.defs, cgIdent(cg, dd.kind.payload.TypeAlias.name));
                 stP(&cg.defs, ";\n");
             }
         }
@@ -3129,7 +3204,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 DeclKind::Struct => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.defs, "struct ");
-                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Struct.name));
                     stP(&cg.defs, " {");
                     cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
                     stP(&cg.defs, "\n};\n");
@@ -3137,14 +3212,14 @@ void cgEmitTypeDefs(Codegen* cg)
                 DeclKind::Union => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.defs, "union ");
-                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Union.name));
                     stP(&cg.defs, " {");
                     cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
                     stP(&cg.defs, "\n};\n");
                 },
                 DeclKind::Variant => {
                     if (cgDeclIsGeneric(cg, id)) break;
-                    cgEmitVariantDef(cg, dd, cgIntern(cg, dd.kind.payload.Variant.name));
+                    cgEmitVariantDef(cg, dd, cgIdent(cg, dd.kind.payload.Variant.name));
                 },
                 else => {},
             }
@@ -3169,7 +3244,7 @@ void cgEmitTypeDefs(Codegen* cg)
                     stP(&cg.defs, "extern ");
                     stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
                     stCh(&cg.defs, ' ');
-                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Constant.name));
+                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Constant.name));
                     stP(&cg.defs, ";\n");
                 }
                 else
@@ -3178,7 +3253,7 @@ void cgEmitTypeDefs(Codegen* cg)
                     stP(&cg.defs, "static ");
                     stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
                     stCh(&cg.defs, ' ');
-                    stPS(&cg.defs, cgIntern(cg, dd.kind.payload.Constant.name));
+                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Constant.name));
                     if (cval.index != 0)
                     {
                         stP(&cg.defs, " = ");
@@ -3242,9 +3317,9 @@ Slice cgDeclOwner(Codegen* cg, Decl* dd)
 {
     switch (dd.kind.tag)
     {
-        DeclKind::Struct => { return cgIntern(cg, dd.kind.payload.Struct.name); },
-        DeclKind::Union => { return cgIntern(cg, dd.kind.payload.Union.name); },
-        DeclKind::Variant => { return cgIntern(cg, dd.kind.payload.Variant.name); },
+        DeclKind::Struct => { return cgIdent(cg, dd.kind.payload.Struct.name); },
+        DeclKind::Union => { return cgIdent(cg, dd.kind.payload.Union.name); },
+        DeclKind::Variant => { return cgIdent(cg, dd.kind.payload.Variant.name); },
         DeclKind::Extend => { return cgOwnerName(cg, dd.kind.payload.Extend.selfType); },
         DeclKind::ExtendTrait => { return cgOwnerName(cg, dd.kind.payload.ExtendTrait.selfType); },
         else => { return Slice::from(null, 0); },
@@ -3314,6 +3389,101 @@ void cgEmitMethodSet(Codegen* cg, Decl* dd, bool withBodies)
     }
 }
 
+/* an extend's self type matched against a concrete instance */
+bool cgSelfTyMatches(Codegen* cg, Ty selfTy, Str instName, Ty* args, u32 argsLen)
+{
+    if (selfTy == 0) return false;
+    TypeEntry* e = cg.ctx->types + selfTy;
+    if (e.kind.tag == TypeKind::Const) return cgSelfTyMatches(cg, e.kind.payload.Const.base, instName, args, argsLen);
+    if (e.kind.tag != TypeKind::Named) return false;
+    if (e.kind.payload.Named.name != instName) return false;
+    if (e.kind.payload.Named.genericArgsLen != argsLen) return false;
+    u32 i = 0;
+    while (i < argsLen)
+    {
+        Ty a = e.kind.payload.Named.genericArgs[i];
+        TypeEntry* ae = cg.ctx->types + a;
+        if (ae.kind.tag != TypeKind::TypeParam && a != args[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+void cgEmitInstMethodList(Codegen* cg, NodeId* methods, u32 mlen, Slice m, MonoInstance* inst, bool withBodies)
+{
+    u32 k = 0;
+    while (k < mlen)
+    {
+        NodeId mid = methods[k];
+        Node* mn = cgNode(cg, mid);
+        if (mn.kind.tag == NodeKind::Decl && mn.kind.payload.Decl.value.kind.tag == DeclKind::Func)
+        {
+            Decl* md = &mn.kind.payload.Decl.value;
+            if (!cgDeclIsGeneric(cg, mid))
+            {
+                usize ns = cg.tybuf.len;
+                stPS(&cg.tybuf, m);
+                stCh(&cg.tybuf, '_');
+                stPS(&cg.tybuf, cgIntern(cg, md.kind.payload.Func.name));
+                Slice cname = stTail(&cg.tybuf, ns);
+                u8 flags = md.kind.payload.Func.flags;
+                if (withBodies)
+                {
+                    if ((flags & 8) != 0 && (flags & 2) == 0)
+                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, inst.substitutions, inst.substitutionsLen, m, (flags & 4) != 0 ? 1 : 0);
+                }
+                else
+                {
+                    if ((flags & 2) != 0 && cgIsCrtFn(md.kind.payload.Func.name, cgIntern(cg, md.kind.payload.Func.name)))
+                        { k = k + 1; continue; }
+                    cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, inst.substitutions, inst.substitutionsLen, m);
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+/* methods for a monomorphised type instance: the type's own methods plus
+ * every extend whose self type matches it */
+void cgEmitInstanceMethods(Codegen* cg, Decl* dd, MonoInstance* inst, bool withBodies)
+{
+    Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+    NodeId* methods = null;
+    u32 mlen = 0;
+    switch (dd.kind.tag)
+    {
+        DeclKind::Struct => { methods = dd.kind.payload.Struct.methods; mlen = dd.kind.payload.Struct.methodsLen; },
+        DeclKind::Union => { methods = dd.kind.payload.Union.methods; mlen = dd.kind.payload.Union.methodsLen; },
+        DeclKind::Variant => { methods = dd.kind.payload.Variant.methods; mlen = dd.kind.payload.Variant.methodsLen; },
+        else => {},
+    }
+    if (methods != null) cgEmitInstMethodList(cg, methods, mlen, m, inst, withBodies);
+    u32 d = 0;
+    while (d < cg.file.declsLen)
+    {
+        Node* dn = cgNode(cg, cg.file.decls[d]);
+        if (dn.kind.tag == NodeKind::Decl)
+        {
+            Decl* xd = &dn.kind.payload.Decl.value;
+            bool matches = false;
+            if (xd.kind.tag == DeclKind::Extend)
+                matches = cgSelfTyMatches(cg, xd.kind.payload.Extend.selfType, inst.name, inst.arguments, inst.argumentsLen);
+            else if (xd.kind.tag == DeclKind::ExtendTrait)
+                matches = cgSelfTyMatches(cg, xd.kind.payload.ExtendTrait.selfType, inst.name, inst.arguments, inst.argumentsLen);
+            if (matches)
+            {
+                NodeId* em = null;
+                u32 eml = 0;
+                if (xd.kind.tag == DeclKind::Extend) { em = xd.kind.payload.Extend.methods; eml = xd.kind.payload.Extend.methodsLen; }
+                else { em = xd.kind.payload.ExtendTrait.methods; eml = xd.kind.payload.ExtendTrait.methodsLen; }
+                cgEmitInstMethodList(cg, em, eml, m, inst, withBodies);
+            }
+        }
+        d = d + 1;
+    }
+}
+
 void cgEmitProtos(Codegen* cg)
 {
     u32 i = 0;
@@ -3330,7 +3500,7 @@ void cgEmitProtos(Codegen* cg)
                 u8 flags = dd.kind.payload.Func.flags;
                 if ((flags & 2) != 0 && cgIsCrtFn(dd.kind.payload.Func.name, cgIntern(cg, dd.kind.payload.Func.name)))
                     { i = i + 1; continue; }
-                cgEmitProto(cg, id, cgIntern(cg, dd.kind.payload.Func.name),
+                cgEmitProto(cg, id, cgIdent(cg, dd.kind.payload.Func.name),
                             dd.kind.payload.Func.returnType, null, null, 0, Slice::from(null, 0));
             }
             else if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union ||
@@ -3354,6 +3524,16 @@ void cgEmitProtos(Codegen* cg)
                 cgEmitProto(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
                             inst.substitutions, inst.substitutionsLen, Slice::from(null, 0));
             }
+            else if (inst.kind == MonoInstanceKind::TypeInstance)
+            {
+                Node* dn = cgNode(cg, inst.declaration);
+                if (dn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &dn.kind.payload.Decl.value;
+                    if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union || dd.kind.tag == DeclKind::Variant)
+                        cgEmitInstanceMethods(cg, dd, inst, false);
+                }
+            }
             i = i + 1;
         }
     }
@@ -3373,7 +3553,7 @@ void cgEmitBodies(Codegen* cg)
             {
                 u8 flags = dd.kind.payload.Func.flags;
                 if ((flags & 8) != 0 && (flags & 2) == 0 && !cgDeclIsGeneric(cg, id))
-                    cgEmitFuncCommon(cg, id, cgIntern(cg, dd.kind.payload.Func.name),
+                    cgEmitFuncCommon(cg, id, cgIdent(cg, dd.kind.payload.Func.name),
                                      dd.kind.payload.Func.returnType, null, null, 0,
                                      Slice::from(null, 0), (flags & 4) != 0 ? 1 : 0);
             }
@@ -3401,6 +3581,16 @@ void cgEmitBodies(Codegen* cg)
                     Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
                     cgEmitFuncCommon(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
                                      inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0);
+                }
+            }
+            else if (inst.kind == MonoInstanceKind::TypeInstance)
+            {
+                Node* dn = cgNode(cg, inst.declaration);
+                if (dn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &dn.kind.payload.Decl.value;
+                    if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union || dd.kind.tag == DeclKind::Variant)
+                        cgEmitInstanceMethods(cg, dd, inst, true);
                 }
             }
             i = i + 1;

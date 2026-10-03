@@ -79,7 +79,35 @@ pub extend Sema
         return false;
     }
 
-    bool checkCall(NodeId callId, Str name, NodeId* args, u32 argsLen)
+    /* a call through a function-pointer value (parameter, local, field):
+     * arity + argument types + result type all come from the FnPtr type */
+    bool checkFnPtrCall(NodeId callId, Ty calleeTy, NodeId* args, u32 argsLen)
+    {
+        if (calleeTy == 0) return true;
+        TypeEntry* te = self.ctx.types + calleeTy;
+        while (te->kind.tag == TypeKind::Const || te->kind.tag == TypeKind::Comptime)
+        {
+            if (te->kind.tag == TypeKind::Const) te = self.ctx.types + te->kind.payload.Const.base;
+            else te = self.ctx.types + te->kind.payload.Comptime.base;
+        }
+        if (te->kind.tag != TypeKind::FnPtr) return true;
+        if (argsLen != te->kind.payload.FnPtr.paramsLen)
+        {
+            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, "wrong number of arguments in call");
+            return false;
+        }
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            if (!self.compatible(self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+            i = i + 1;
+        }
+        self.setExprType(callId, te->kind.payload.FnPtr.returnType);
+        return true;
+    }
+
+    bool checkCall(NodeId callId, Str name, NodeId* args, u32 argsLen, Ty calleeTy)
     {
         Symbol* symbol = self.scopes.lookup(name);
         if (symbol == null)
@@ -88,9 +116,9 @@ pub extend Sema
             return false;
         }
         Node* declNode = self.ctx.nodes + symbol->declaration.index;
-        if (declNode->kind.tag != NodeKind::Decl) return true;
+        if (declNode->kind.tag != NodeKind::Decl) return self.checkFnPtrCall(callId, calleeTy, args, argsLen);
         Decl* decl = &declNode->kind.payload.Decl.value;
-        if (decl->kind.tag != DeclKind::Func) return true;
+        if (decl->kind.tag != DeclKind::Func) return self.checkFnPtrCall(callId, calleeTy, args, argsLen);
         u32 paramsLen = decl->kind.payload.Func.paramsLen;
         bool variadic = false;
         if (paramsLen > 0)
@@ -280,7 +308,8 @@ pub extend Sema
                 {
                     Expr* callee = &calleeNode->kind.payload.Expr.value;
                     if (callee->kind.tag == ExprKind::Ident)
-                        return self.checkCall(id, callee->kind.payload.Ident.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen);
+                        return self.checkCall(id, callee->kind.payload.Ident.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, callee->resolvedType);
+                    return self.checkFnPtrCall(id, callee->resolvedType, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen);
                 }
                 return true;
             },
