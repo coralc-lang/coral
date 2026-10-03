@@ -179,6 +179,11 @@ file: `pub extend str { ... }`.
 | `pub mod x = import(lib, "path/file.crl");` (in a lib.crl) | `pub mod x = import path::file;` |
 | `std::tlsf::Tlsf`, `std::mimalloc::MiAlloc` | items under `std::allocator { tlsf { Tlsf }, mimalloc { MiAlloc } }`; siblings inside `allocators/` |
 | `std::mman::_mmap` / `std::mman::_munmap` | `import(lib) std::intrinsics { mmap, munmap };` (mman no longer wraps them) |
+| `std::libc::*` | `import(lib) platform::libc { ... };` (libc surface is `lib/platform/libc.crl`) |
+| `std::ios::*` | `std::io::ios::*` (io folder surface, §8) |
+| `std::string::*` | `std::text::string::*` (text category ports later — FLAG) |
+| `std::fmt::*` | `std::fmt::*` (own folder, ports later — FLAG) |
+| `std::{ fios, fs, net, term, ... }` | `std::io::{ fios, fs, net, term, ... }` (§8) |
 
 ## 7. Porting rules
 
@@ -202,3 +207,140 @@ file: `pub extend str { ... }`.
 6. If a construct has no clean equivalent, port it as faithfully as
    possible and flag the judgment call in your report.
 7. Do not modify files outside your assigned destinations.
+
+## 8. The io port — 12 files, print family redesign
+
+Source `lib_old/std/io/`: bio, cmd, env, fios, fs, ios, log, net, path,
+process, temp, term. Destination `lib/std/x86_64/linux/io/` — every file
+talks to libc, so the whole category is platform-dependent.
+
+### 8.1 Surface and imports
+
+- Create `lib/std/x86_64/linux/io/lib.crl` with one
+  `pub mod ios = import ios;` line per file (all 12).
+- Add exactly one line to `lib/std/x86_64/linux/lib.crl`:
+  `pub mod io = import io;`. That file is user-owned — change nothing
+  else in it; if its shape has moved, report the line you would add
+  instead of forcing it.
+- Import form for io files:
+  - `import(lib) std { libc, ... }` → `import(lib) platform::libc { write, strlen, ... };`
+  - `import(lib) std { string }` → `import(lib) std::text::string { String };` (ported later — FLAG)
+  - `import(lib) std { fmt }` → see 8.3: the print path should NOT need fmt
+  - `import(lib) std { fios }` → sibling `import fios { ... };`
+  - `cchar` comes bare (cf. `lib/platform/libc.crl` which uses it with no
+    import); if a file needs it explicitly, `import core { cchar };`
+- The libc surface has no `getchar`, `vsnprintf`, `strtod`, etc. — declare
+  missing symbols as local `extern("C")` in the file that needs them
+  (precedent: mimalloc's local `sched_yield`). Never edit
+  `lib/platform/libc.crl`.
+
+### 8.2 Print family redesign (ios.crl)
+
+Old `print!` / `nprint!` / `eprint!` / `neprint!` compile-time variadics
+are replaced by two mechanisms:
+
+**Rust-style print** — format string first, parsed at compile time:
+
+```coral
+pub void print<comptime T>(T fmt, ...)    // stdout
+pub void println<comptime T>(T fmt, ...)  // stdout + '\n'   (replaces nprint)
+pub void eprint<comptime T>(T fmt, ...)   // stderr          (replaces eprint!)
+pub void eprintln<comptime T>(T fmt, ...) // stderr + '\n'   (replaces neprint)
+```
+
+- `comptime T` marks the format type as compile-time evaluated — the
+  compiler parses the format string, never the runtime.
+- Placeholders: `{}` (one per following argument), `{{` / `}}` escapes.
+  Specifiers (our chosen set — port exactly these): `{}` default,
+  `{:d}` decimal, `{:x}` hex, `{:b}` binary, `{:p}` pointer.
+- Wrong placeholder/argument count, unknown specifier, or a format
+  string containing `{}` passed with no arguments → **compile error**.
+- Dispatch is the old `_fprintOne` shape: a `comptime` switch over `T`,
+  zero runtime type dispatch.
+- Manipulators (`spaces`, `repeat`, `hex`, `bin`, `fixed` and their
+  `Spaces`/`Repeat`/`Hex`/`Bin`/`Fixed` structs) stay and work as `{}`
+  arguments.
+
+**Type-not-specified rule (toStr)** — any argument that is not part of a
+comptime format-string call:
+
+- `print(x)` / `print(a, b)` (no string-literal format first): every
+  argument's type must provide `toStr`. The compiler auto-wires the
+  `toStr` call and prints the returned `str`.
+- Types handled by the built-in comptime switch (ints, floats, bool,
+  char, str, cstr, rawptr, String, manipulators) count as having it.
+- A type with no `toStr` → **compile error** ("type does not implement
+  toStr; implement it or pass a format string").
+- A runtime `str` variable as first argument is a value, not a format
+  (formats must be comptime literals) — it prints via its own `toStr`.
+
+**vaprint — the printf-like equivalent** (replaces printf-style output):
+
+```coral
+pub void vaprint(const cchar* fmt, ...)   // stdout, C printf semantics
+```
+
+- Runtime C-style variadic: `%d %i %u %x %X %s %c %f %p %%` plus width,
+  precision, `-`/`0` flags (whatever `vsnprintf` supports).
+- Anything, indefinitely: unbounded argument count and output length —
+  format into a 1024-byte stack buffer with a local
+  `extern("C") i32 vsnprintf(...)`, write, advance, loop until done;
+  long `%s` runs and literal runs can be written directly.
+- No heap allocation, no argument-count limit.
+
+**Optimizations (all print paths):**
+
+1. Comptime format parsing — literal chunks are written directly, no
+   runtime scanning of `{}`.
+2. Accumulate into one stack buffer (`u8 outBuf[1024]`) and issue ONE
+   `write` per call (old code wrote once per argument); flush when full,
+   finish with the remainder. stdout and stderr never share a buffer.
+3. Integers/hex/bin: hand-rolled itoa into a stack buffer (i64 needs 21
+   bytes) — no `String` alloc/free per number (old `_fprintI32`
+   heap-allocated). This removes the `std::fmt` dependency from the
+   print path entirely.
+4. Floats: `snprintf` (`%.6g` / `%.15g` / precision for `Fixed`) into a
+   stack buffer.
+5. Helpers `[[inline]]`.
+
+**Carry over unchanged:** `_sysReadByte`, `_sysReadLine`, `readChar`,
+`readLine`, `read<T>`, `readVal<T>` (same comptime switch), `parseI64`,
+`parseU64`, `parseF64`, `flush`, the manipulator structs/factories.
+Known source bug: `_readBool` uses undefined `v.equals` → `sv.equals`
+(fix it and note it in your report). The old musings comment above
+`print!` (ios.crl ~249–257) describes this design being debated —
+replace it with a short comment stating the final rules.
+
+### 8.3 The other 11 files
+
+Faithful ports under §7 rules — every function survives. Notes:
+
+- `term.crl`: `std::libc::snprintf` → `platform::libc` import; CSI
+  writes unchanged; `u8 buf[24]` stack-array syntax is already valid in
+  new coral (cf. `mman.crl` `stackBuf`).
+- `fios` is a sibling of the other io files — import it as
+  `import fios { ... };`, never through the std surface.
+- `net.crl` may need socket externs absent from the libc surface →
+  local `extern("C")` declarations (8.1 rule).
+- Name mapping for the rest of the lib when it ports later (no
+  already-ported file references the old names — verified):
+  `nprint` → `println`, `eprint!` → `eprint`, `neprint` → `eprintln`,
+  `print!` → `print`, `std::ios::x` → `std::io::ios::x`.
+
+### 8.4 FLAGGED (rely on these; do not investigate)
+
+1. `comptime T` parameter spelling and comptime format-string parsing
+   emitting direct writes.
+2. Compile errors: placeholder/argument mismatch, unknown specifier,
+   missing `toStr`.
+3. Trait mechanism in new syntax — spec `toStr` as a trait shaped like
+   old `pub trait drop` (`lib_old/std/traits/destructor.crl`); the
+   compiler model adapts the spelling. "Compiler auto-adds toStr"
+   means: the compiler resolves and inserts the `toStr` call itself —
+   users implement `toStr`, they never write dispatch code.
+4. Import paths `std::text::string` and `std::fmt` (categories port
+   after io); nested surface `std::io::ios::print` resolving through
+   `io/lib.crl` + the platform root (same assumption as the allocator
+   surface).
+5. Local `extern("C")` symbols (`vsnprintf`, `getchar`, sockets) link
+   against libc without being in the surface.
