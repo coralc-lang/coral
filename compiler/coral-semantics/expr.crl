@@ -392,7 +392,11 @@ pub extend Sema
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot dereference this type");
                     return false;
                 }
-                return self.checkExpr(expr->kind.payload.Index.index);
+                if (!self.checkExpr(expr->kind.payload.Index.index)) return false;
+                Ty indexTy = self.exprType(expr->kind.payload.Index.index);
+                if (indexTy != 0 && !self.integerType(indexTy))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "array index must be an integer type");
+                return true;
             },
             ExprKind::Cast => {
                 if (!self.checkExpr(expr->kind.payload.Cast.expr)) return false;
@@ -420,6 +424,7 @@ pub extend Sema
                 {
                     TypeEntry* te = self.ctx.types + inner;
                     if (te->kind.tag == TypeKind::Pointer) self.setExprType(id, te->kind.payload.Pointer.base);
+                    else self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot dereference non-pointer type");
                 }
                 return true;
             },
@@ -668,6 +673,9 @@ pub extend Sema
             },
             ExprKind::Ternary => {
                 if (!self.checkExpr(expr->kind.payload.Ternary.cond)) return false;
+                Ty ternCondTy = self.exprType(expr->kind.payload.Ternary.cond);
+                if (ternCondTy != 0 && ternCondTy != self.boolType())
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary condition must be bool");
                 if (!self.checkExpr(expr->kind.payload.Ternary.thenExpr)) return false;
                 if (!self.checkExpr(expr->kind.payload.Ternary.elseExpr)) return false;
                 Ty thenTy = self.exprType(expr->kind.payload.Ternary.thenExpr);
@@ -678,12 +686,15 @@ pub extend Sema
                 self.setExprType(id, thenTy);
                 return true;
             },
-            ExprKind::PostInc => { return self.assignExpr(expr->kind.payload.PostInc.expr); },
-            ExprKind::PostDec => { return self.assignExpr(expr->kind.payload.PostDec.expr); },
-            ExprKind::PreInc => { return self.assignExpr(expr->kind.payload.PreInc.expr); },
-            ExprKind::PreDec => { return self.assignExpr(expr->kind.payload.PreDec.expr); },
+            ExprKind::PostInc => { if (!self.assignExpr(expr->kind.payload.PostInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostInc.expr)); return true; },
+            ExprKind::PostDec => { if (!self.assignExpr(expr->kind.payload.PostDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostDec.expr)); return true; },
+            ExprKind::PreInc => { if (!self.assignExpr(expr->kind.payload.PreInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreInc.expr)); return true; },
+            ExprKind::PreDec => { if (!self.assignExpr(expr->kind.payload.PreDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreDec.expr)); return true; },
             ExprKind::IfExpr => {
                 if (!self.checkExpr(expr->kind.payload.IfExpr.cond)) return false;
+                Ty ifExprCondTy = self.exprType(expr->kind.payload.IfExpr.cond);
+                if (ifExprCondTy != 0 && ifExprCondTy != self.boolType())
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if-expression condition must be bool");
                 if (!self.checkExpr(expr->kind.payload.IfExpr.thenBody)) return false;
                 if (!self.checkExpr(expr->kind.payload.IfExpr.elseBody)) return false;
                 Ty thenTy = self.exprType(expr->kind.payload.IfExpr.thenBody);
