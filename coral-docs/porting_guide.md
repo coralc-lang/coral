@@ -281,28 +281,22 @@ comptime format-string call:
 - A runtime `str` variable as first argument is a value, not a format
   (formats must be comptime literals) — it prints via its own toStr.
 
-**vaprint — printf directive syntax on the print machinery** (replaces
-printf-style output; NOT a thin libc forwarder):
+**vaprint — lib_old print!'s equivalent** (the inferring one):
 
 ```coral
-pub void vaprint(const cchar* fmt, ...)   // stdout
+pub void vaprint(... args)   // stdout, no newline
 ```
 
-- C directives: `%d %i %u %x %X %o %f %e %g %s %c %p %%` plus flags,
-  width, precision and length modifiers — but the format is walked in
-  the file's own comptime emitter: each directive is rebuilt as a
-  one-value format (integers forced to `ll`, length modifiers dropped)
-  and rendered with `snprintf` into a temp buffer, then appended to the
-  shared 1024-byte `_Buf`; `%s`/`%c`/`%p` are handled directly (`str`
-  need not be NUL-terminated).
-- Arguments are compile-time variadic — any count, any types (builtin
-  switch / `any toStr`); unbounded output via buffer flush. Format must
-  be a comptime literal (`@isFormatLiteral`, same rule as print).
-- Lenient mismatches, never UB: a directive whose class doesn't fit the
-  argument falls back to the argument's default rendering; extra
-  arguments past the format print default; a dangling `%` and extra
-  directives past the last argument copy through raw. Unknown conversion
-  char → `@compileError`.
+- A compile-time variadic of VALUES: no format string first (the first
+  argument is never treated as text) and no format specifiers at all —
+  there is no order to encode, so arguments print in sequence, each
+  inferred through the built-in comptime switch or `any toStr`.
+- Print indefinitely: unbounded argument count AND output length — one
+  1024-byte stack `_Buf` per call, flushed whenever it fills.
+- Sole-parameter `... args` is this file's C-style variadic (used after
+  typed params in `print`); the old spelling was
+  `print!<T...>(T... args)` — if new coral requires a type pack instead,
+  FLAGGED.
 
 **Optimizations (all print paths):**
 
