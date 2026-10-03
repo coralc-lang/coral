@@ -82,6 +82,13 @@ Verified by running `/tmp/opencode/coralc <file>` on samples:
 ## Sema — pointer.crl is unused
 - `compiler/coral-semantics/pointer.crl` is a 407-line comment-only file (no code). It is not imported/used. Decisions about in-built drop, pointer safety etc. captured there are NOT enforced. Either delete it or implement its analysis.
 
+## Type inference — largely unimplemented
+- `var x = expr;` can only infer when the initializer already has a concrete/known type; there is **no constraint solving / type-unification** (no "unknown" type vars solved across usages). `var x = expr;` with an un-inferable initializer → "cannot infer type: add an explicit type annotation".
+- Generic calls are **not** type-inferred from arguments: `obj.map(fn)` does not bind `T` from the receiver or from `fn`; there is no substitution/`satisfy` check for generic params on generic fn/method calls (`genericArgParam` skips checks). Mono collects specializations from concrete receiver types but has no argument-driven inference.
+- `Alloc/constructors`/`Option::Some{...}` do not infer the generic from designated fields; enum/variant case expressions type by position only.
+- `distinct`/`comptime`/`FnPtr`/`Tuple` types are not propagated by inference.
+Give this a roadmap slot before relying on inference for lib code.
+
 ## Language rules NOT yet enforced by sema
 (Language rules exist in docs/`coral-docs/reason.crl`, `imports.md`, but the sema doesn't enforce them)
 - `compatible()` is not sound: any pointer ↔ any pointer, int/float interconvert, `from==0/to==0` pass-through, generic params match everything (`dependentType→true`). 
@@ -223,3 +230,69 @@ Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang 
 ### Conditional assignment
 - An assignment expression (`x = v`, `x += v`, …) appearing directly as the controlling condition of `if` / `while` / `for` is a **compile-time error** (`ParseCondAssign`), because it is usually a mistaken `==`.
 - It is permitted only when explicitly allowed via the attribute `#[[condassign]]` on that `if`/`while`/`for` statement (parser carries `condAssignAttr` for the immediately-enclosed condition).
+
+## HIR text format (proposed; in-memory, single-parseable, backend-neutral)
+Goal: a single, self-contained textual form produced *after* sema + import resolution + comptime folding + monomorphization + drop-trait/scope resolution — everything the backend needs already resolved/named. Only lives in memory; its text form is for debugging/tests and is re-parseable by a single pass.
+
+### 1) Module header & items
+```crl
+module @std::x86_64::linux    // fully qualified path
+
+  imports   // resolved, no longer imported at compile time
+    @core::limits as _limits (INT64_MAX)
+    @core::cchar  as _cchar  (cchar)
+
+  // items, each fully typed + named
+  pub variant Option<...>;  // each generic instantiated below with a concrete name
+  // monomorph instances get fresh concrete names
+  struct Option_doubledouble { tag: i64, u: union { _0: {}, u1: { value: f64 } } }
+  extend Option_doubledouble {
+    pub isSome  :: (self: Option_doubledouble*) -> bool
+    pub unwrap  :: (self: Option_doubledouble*) -> f64
+  }
+  extern printf :: (fmt: cchar*, ...) -> i32
+  const INT64_MAX :: i64 = 0x7fffffffffffffff
+  fn checkedPow :: (base: f64, exp: f64) -> Option<f64>;
+  // ^ signatures declare everything; body lowered below
+```
+
+### 2) Type spellings (no inference, all resolved)
+- Scalars: `u8 u16 u32 u64 i8 i16 i32 i64 usize isize f32 f64 bool cchar str rawptr void`
+- `T*`, `const T*`, `T[N]`, `T[]` (slice), `struct#Name`, `union#Name`, `variant#Name`, `enum#Name`, `distinct#Name(T)`, `fn (T,…)->U` (fnptr), `any Trait` (object), `Option_doubledouble`-style mono names.
+- Generic params of a *definition* are declared inline: `fn @foo< T: TypeBound? >(arg: T) -> T`.
+- Instantiation: `Option<f64>` or its canonical name `Option_f64` (either acceptable, same meaning).
+
+### 3) Item body — A-normal-ish typed local form
+```crl
+  fn @checkedPow :: (base: f64, exponent: f64) -> Option<f64> {
+  locals:
+    tmp0 : Option<f64>;
+    tmp1 : f64;
+  entry:
+    tmp0 = copy _limits$checkedPow(base, exponent);  // cross-module fully-qualified call
+    br label %then_%return;
+  then:
+    tmp1 = load %x;  // every use is typed
+    store %tmp1 into %r;
+    ret { kind: Some, payload: tmp1 } into $slot;
+  }
+```
+- Every local/temp has a name and a type. Every expression yields a typed slot; no unparsed sugar.
+- Control flow is explicit blocks ending in `ret`/`br`/`switch`/`unreachable`.
+- Drop markers: `drop %name` explicit points (resolved from drop-trait impls during sema).
+- Comptime args/fold results are literal already (`const`/`comptime` resolved).
+
+### 4) Monomorphization table
+```crl
+  mono:
+    #0 = Option<f64>      :: struct { ... }           // concrete struct
+    #1 = Option<f64>::isSome  :: (self: Option<f64>*) -> bool  // instance method
+    #2 = Option<f64>::unwrap :: (self: Option<f64>*) -> f64
+       monos #1 requires #0; #2 requires #0
+```
+- Each generic decl's specialization listed with argument types; bodies reference mono ids.
+
+### 5) Parsing the HIR back
+- The text is a single grammar from `module`/`imports`/`struct`/`extend`/`fn`/`mono`/`locals`/`entry` down to `load/store/call/ret/br/switch/drop`; one pass, every symbol and type already resolved — no imports, comptime, or type inference needed when reading it.
+
+(We will finalize the exact punctuation/keywords when we stabilize the IR; above is the minimal shape that satisfies "everything resolved + single-parseable + backend-neutral".)
