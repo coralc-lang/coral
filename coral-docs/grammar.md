@@ -32,10 +32,26 @@ consumes any `#[[ attr ]]` attributes and then dispatched on modifiers:
 - Sonst: `<Type> <name>` → `parseFuncOrVarDecl`, and `Name<…>` → field types /
   extends handled structurally.
 
-`#[[attr]]` lists may name `inline`, `const`, `threadlocal`, `noalias`,
-`condassign`, `calleesees`… — today they are parsed but **not** stored/honored
-(the parser already accepts idents/keywords/args, so `#[[myAttr(1, "x")]]`
-parses).
+`#[[attr]]` attributes are the only annotation channel. Today they parse but
+are **not** stored/honored. The full set coralc should eventually support:
+
+- `#[[inline]]` — hint the fn is inlinable (recognized spelling like inline)
+- `#[[const]]` — const method/fn (cannot mutate self/params) ⇐ also spelled
+  `Type name(params) const {}`.
+- `#[[no_std]]`? not yet. `#[[extern]]`? fn extern already uses `extern("C")`.
+- `#[[threadlocal]]` — static storage is thread-local
+- `#[[noalias]]` — the pointer arg does not alias
+- `#[[condassign]]` — allow `=` (assign) at the top level of the next condition
+- `#[[pub]]` on items? no—`pub` is the visibility keyword itself.
+- `#[[derive(...)]]` (planned) — the **generator** attribute like Rust `derive`,
+  produces trait/impl boilerplate. Suggested spelling: `#[[derive(Debug, Eq)]]`
+  (see "derive vs import" below).
+- `#[[no_mangle]]`, `#[[test]]`, `#[[bench]]`, `#[[cfg]]`,
+  `#[[link]]`, `#[[simd]]` — future slots.
+
+Renaming idea: the `mod name = import …;` keyword is a candidate to become
+`derive` (same length, so lexing is unchanged and it slots in where `mod` sits
+— noted for a future keyword audit).
 
 ## 3. Type syntax
 
@@ -44,13 +60,14 @@ parses).
 - `Const` prefix: `const T` → `Const(T)`.
 - `Comptime` prefix: `comptime T` → `ComptimeT`.
 - Base ( `parseBaseType` ): scalar keyword, named type, `(T)`, `struct(…)` tuple,
-  `(…)` fn-ptr, type refs, `self(s)`, `str`, etc.
+  `(…)` fn-ptr, type refs, `str`, etc.
 - Fn-ptr over a base: `base(Params)` → `makeFunctionPointer(0, base, params)`:
   `void(u64)`, `u32(rawptr)`, `bool(T, T) less`.
 - Pointers/arrays: postfix `T*` → `makePointer`, `T[N]` → array, `[]` → slice.
 - Named type with generics: `Option<T>`, `HashMap<K, V>`.
 - `any <Trait>` (dyn-trait object type) — decided syntax, not implemented.
-- Parameter `self` variants: bare `self` or explicily for const: `type name(const self)`, which will throw error if self is modified
+- No explicit `self` parameter is written; a method's receiver is implicit.
+  `const` methods (declared via `#[[const]]` or trailing `const`) may not mutate `self`.
 
 ## 4. Types (used as annotations)
 
@@ -82,18 +99,20 @@ Tuple, `TypeParam`, `Distinct`, plus `Str` used as a `u8*` interned-id in AST.
 
 `Type name<[T,…]>[(params)][const] { body } | extern("C") | static ...`
 - Params: `type name, …`; unnamed `type, …`; variadic last `...` (Param.flags&16).
-- Methods omit `self` (sema injects an implicit `*self` receiver); explicit
-  /`const self` are also allowed (`Param.flags & 1`).
+- Methods: no explicit `self` parameter in the source (the receiver is implicit
+  and a pointer in the generated C). `const` (or `#[[const]]`) on a method forbids
+  mutating `self`/params.
 - Static fn: `flags & 4` → no receiver; instance methods and `const` methods
   (flags bit 16 — decided, currently: `#[[const]]` or post-parens `const`).
 
 ## 7. Statements (parser/stmt.crl)
 
-- `var name [: Ty] = expr;` / `let name = expr;` / `Name name = expr;`
-  (`parseExprOrDecl`); `var` + `= expr` in for/while/if is decided with the
-  `condassign` attribute (assign-in-condition allowed only with it).
-- `if (cond) {…}[else if (…){…}][else {…}]`, `while (cond) {…}`,
-  `for (init; cond; inc) {…}`, `for (name in expr) {… }`?, `switch (expr) {…}`,
+- Local declaration `var name = expr;` — `var` exists to drive **type inference**;
+  the concrete `Type name = expr;` and `name: Type` forms are not part of local decl.
+- `flag` declarations are also allowed as statements where the flag value is
+  evaluated for its side effect.
+- `for (init; cond; inc) {…}` (C-style) and `for (Type name : iterable) {…}` (range-based), plus `if`/`else`, `while`, and `switch` may
+  all be expressions and may appear at statement level.
   `comptime {…}` (stub), `defer expr;` (unsupported in codegen), `asm "…" {outputs}` (partially supported), `return expr;`, `break;`,
   `continue;`, `<block as expr>`, expression-statements, `defer expr;`.
 - Switch cases: `pattern => { body },`; patterns via `PatternKind`:

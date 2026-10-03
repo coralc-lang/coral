@@ -95,6 +95,9 @@ Give this a roadmap slot before relying on inference for lib code.
 - No return-type check on assignments failures silently; no redeclaration diagnostic; `While`/`If` conditions not required to be `bool`; `ForIn` not validated as iterable; `Switch` patterns not type-checked; `Cast` accepts any→any; `Index` index not checked as int; casts/inc/dec not int-checked; `Not`/`BitNot` operand unchecked; variadic args unchecked; generic args skipped in checks; `checkPath` only validates first two segments; many Expr kinds untyped (`TupleField`, `ArrayLiteral`, `Ternary`, `IfExpr`, `BlockExpr`, `Sizeof`/`Alignof`/`Typeof`, `BuiltinCall`); `StaticCall` not sema'd (always `addError`); single-pass order-dependent (mutual recursion / forward refs broken); extends collected during same pass as method resolution.
 - Many diagnostics missing the error *message* payload (`addError()` counts but prints nothing) — several codegen silent-`errors++` too.
 
+## Grammar reference
+- See `coral-docs/grammar.md` for the full concrete grammar (tokens, decls, types, exprs, precedence, self/const semantics, attributes).
+
 ## Constraint for new work: production-level, C++-similar grammar
 Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang for those aspects specifically to avoid naivety. New parsing/precedence/lexical/diagnostic decisions should match Clang's equivalents where Coral adopts the same surface syntax, so the grammar stays principled and the front-end does not bake in one-off heuristics. References: `coral-docs/reason.crl`, `coral-docs/imports.md`, `coral-docs/compiler-pipeline.md`, `coral-docs/build_sys.md`.
 
