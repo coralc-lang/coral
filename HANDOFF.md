@@ -34,6 +34,7 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
+- 2026-10-03 enforced: If/While/For/Ternary/IfExpr conditions must be `bool`; Index's index operand must be an integer type; `Deref` of non-pointer is an error; `++`/`--` exprs now resolve their type (fixes void* temp in for-post).
 - `compatible()` is unsound (any pointer ↔ any pointer; int/float freely interconvert; `from==0` always true).
 - Silent errors: assignment failures, redeclaration errors, `Deref` of non-pointer, calling a non-function value.
 - `StaticCall` not type-checked in sema; `checkCallee`/`cgResolveCall`/cgMethodRecvKind do linear single-file searches — attach resolved decls to AST nodes (clang-style).
