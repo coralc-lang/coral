@@ -20,7 +20,29 @@ import token { TokenKind, Token };          // sibling: ./token.crl next to this
 import lexer::table { TokenTable };         // module import (builder-resolved)
 import(lib) std::mman { alloc, dealloc };   // import from the lib surface
 import(lib) core;                           // whole surface, no item list
+import(lib) std::allocator { Allocator, mimalloc { MiAlloc }, tlsf { Tlsf } };  // nested items
 ```
+
+Nested item braces are supported: `mimalloc { MiAlloc }` inside an item
+list is equivalent to the flat path `mimalloc::MiAlloc`. Use whichever;
+both are correct.
+
+**Allocator surface:** there is no `std::tlsf` and no `std::mimalloc`.
+Allocators hang under `std::allocator` (the `allocators/` folder whose
+`lib.crl` re-exports `allocator`, `tlsf`, and `mimalloc`), so always
+`import(lib) std::allocator { mimalloc { MiAlloc }, tlsf { Tlsf } }`.
+Inside the `allocators/` folder itself, use sibling imports
+(`import allocator { Allocator };`, `import tlsf { Tlsf };`) — never the
+`std::allocator` surface from a file that the surface itself re-exports.
+
+**FLAGGED — assumed working, not verified:** (a) nested item lists
+(`mimalloc { MiAlloc }`) and flat paths (`mimalloc::MiAlloc`) both
+resolve; (b) a flat `Allocator` item resolves through the
+`std::allocator` surface even though `lib.crl` re-exports it as a
+sub-module; (c) the `std` surface picks up the platform surface's
+`pub mod allocator` entry. If any of these fail at build time it is a
+sema/loader gap to report — not a port bug. Do not work around them,
+and do not read the compiler to check.
 
 Re-exports live in a folder's `lib.crl`:
 
@@ -155,6 +177,8 @@ file: `pub extend str { ... }`.
 | `import "allocator";` | `import allocator;` |
 | `mod std = import(lib, "std");` + `std::mman::alloc<T>(x)` | `import(lib) std::mman { alloc };` + `alloc<T>(x)` |
 | `pub mod x = import(lib, "path/file.crl");` (in a lib.crl) | `pub mod x = import path::file;` |
+| `std::tlsf::Tlsf`, `std::mimalloc::MiAlloc` | items under `std::allocator { tlsf { Tlsf }, mimalloc { MiAlloc } }`; siblings inside `allocators/` |
+| `std::mman::_mmap` / `std::mman::_munmap` | `import(lib) std::intrinsics { mmap, munmap };` (mman no longer wraps them) |
 
 ## 7. Porting rules
 
