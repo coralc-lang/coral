@@ -186,6 +186,25 @@ pub extend Sema
         return self.allocType(kind);
     }
 
+    Ty selfNamedType(Str name, NodeId* genericParams, u32 genericParamsLen)
+    {
+        if (genericParamsLen == 0) return self.namedType(name);
+        TypeKind kind;
+        Ty* args = null;
+        if (genericParamsLen > 0) args = (Ty*)malloc(genericParamsLen * sizeof(Ty));
+        u32 i = 0;
+        while (i < genericParamsLen)
+        {
+            Node* gn = self.ctx.nodes + genericParams[i].index;
+            Str pname = 0;
+            if (gn->kind.tag == NodeKind::GenericParam) pname = gn->kind.payload.GenericParam.value.name;
+            args[i] = self.typeParamType(pname, i);
+            i = i + 1;
+        }
+        kind = TypeKind::Named { .name = name, .genericArgs = args, .genericArgsLen = genericParamsLen };
+        return self.allocType(kind);
+    }
+
     Ty namedType(Str name)
     {
         u32 i = 1;
@@ -227,6 +246,13 @@ pub extend Sema
         if (left == 0 || right == 0) return false;
         TypeEntry* a = self.ctx.types + left;
         TypeEntry* b = self.ctx.types + right;
+        /* During generic checking a type param may appear on one side and its
+         * unparameterised Named placeholder (pre-binding parse form) on the
+         * other; they denote the same type when the names match. */
+        if (a->kind.tag == TypeKind::TypeParam && b->kind.tag == TypeKind::Named && b->kind.payload.Named.genericArgsLen == 0 &&
+            a->kind.payload.TypeParam.name == b->kind.payload.Named.name) return true;
+        if (b->kind.tag == TypeKind::TypeParam && a->kind.tag == TypeKind::Named && a->kind.payload.Named.genericArgsLen == 0 &&
+            b->kind.payload.TypeParam.name == a->kind.payload.Named.name) return true;
         if (a->kind.tag != b->kind.tag) return false;
         switch (a->kind.tag)
         {
@@ -607,26 +633,45 @@ pub extend Sema
     bool compatible(Ty from, Ty to)
     {
         if (from == 0 || to == 0) return true;
-        if (self.dependentType(from) || self.dependentType(to)) return true;
         if (self.sameType(from, to)) return true;
-        if (self.integerType(from) && self.integerType(to)) return true;
-        if (self.floatType(from) && self.integerType(to)) return true;
-        if (self.integerType(from) && self.floatType(to)) return true;
-        if (self.floatType(from) && self.floatType(to)) return true;
+
         TypeEntry* source = self.ctx.types + from;
+        TypeEntry* target = self.ctx.types + to;
         if (source->kind.tag == TypeKind::Const)
             return self.compatible(source->kind.payload.Const.base, to);
         if (source->kind.tag == TypeKind::Comptime)
             return self.compatible(source->kind.payload.Comptime.base, to);
-        TypeEntry* target = self.ctx.types + to;
         if (target->kind.tag == TypeKind::Const)
             return self.compatible(from, target->kind.payload.Const.base);
         if (target->kind.tag == TypeKind::Comptime)
             return self.compatible(from, target->kind.payload.Comptime.base);
-        if (source->kind.tag == TypeKind::Str && target->kind.tag == TypeKind::Pointer)
-            return true;
+
+        /* Pointer structure first: adding qualification to the target is
+         * allowed (T* -> const T*), matching element type is required. */
         if (source->kind.tag == TypeKind::Pointer && target->kind.tag == TypeKind::Pointer)
-            return self.compatible(source->kind.payload.Pointer.base, target->kind.payload.Pointer.base);
+        {
+            Ty sb = source->kind.payload.Pointer.base;
+            Ty tb = target->kind.payload.Pointer.base;
+            while (tb != 0)
+            {
+                TypeEntry* te = self.ctx.types + tb;
+                if (te->kind.tag == TypeKind::Const) tb = te->kind.payload.Const.base;
+                else if (te->kind.tag == TypeKind::Comptime) tb = te->kind.payload.Comptime.base;
+                else break;
+            }
+            if (self.sameType(sb, tb)) return true;
+        }
+        if (source->kind.tag == TypeKind::Pointer && target->kind.tag == TypeKind::Rawptr)
+            return true;
+
+        /* Dependent/generic flexibility (no bounds yet — mono boundary is
+         * the enforcement point): one side dependent fits anything, BUT two
+         * distinct dependent types are not interchangeable unless their
+         * shapes already matched above. */
+        bool fromDep = self.dependentType(from);
+        bool toDep = self.dependentType(to);
+        if (fromDep && toDep) return false;
+        if (fromDep || toDep) return true;
         return false;
     }
 }

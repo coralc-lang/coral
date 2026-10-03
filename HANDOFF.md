@@ -35,7 +35,7 @@
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
 - 2026-10-03 enforced: If/While/For/Ternary/IfExpr conditions must be `bool`; Index's index operand must be an integer type; `Deref` of non-pointer is an error; `++`/`--` exprs now resolve their type (fixes void* temp in for-post).
-- `compatible()` is unsound (any pointer ↔ any pointer; int/float freely interconvert; `from==0` always true).
+- ~~`compatible()` unsound~~ PARTIALLY DONE 2026-10-03: int/float no longer interconvert; `Str`⇄pointer removed; pointer↔pointer now requires same element type (adding `const` on the target is allowed; `T*`→`rawptr` ok, reverse needs cast). `from==0/to==0` still passes through; exactly-one-dependent-side still permissive (documented: mono boundary is the enforcement point). Also: method receiver self is typed `Pointer(selfType)` in sema and `self = x` now checks against the pointee (C backend writes through it); Struct/Union/Trait/Variant methodself args built via `selfNamedType` so fields/methods see generic args; `T*` vs `const T*` returns allowed. VERIFIED: option.crl is sema/codegen-clean again.
 - Silent errors: assignment failures, redeclaration errors, `Deref` of non-pointer, calling a non-function value.
 - `StaticCall` not type-checked in sema; `checkCallee`/`cgResolveCall`/cgMethodRecvKind do linear single-file searches — attach resolved decls to AST nodes (clang-style).
 ### Codegen
