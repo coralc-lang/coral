@@ -59,6 +59,45 @@ pub extend Lexer
         return !ident;
     }
 
+    /* Consume a numeric literal suffix: u/U (unsigned), l/L/ll (long),
+     * f/F (float). `ul`/`ull` etc. combine; `uf`/`lf` after digits are
+     * kept separate by numSuffixBoundary. */
+    u8 lexNumSuffix(bool isFloat)
+    {
+        u8 flags = 0;
+        u8* sufStart = self.cur;
+        while (!self.isAtEnd())
+        {
+            u8 c = self.cur[0];
+            if (c == 'u' || c == 'U') { flags = flags | 1; self.cur++; }
+            else if (c == 'f' || c == 'F') { flags = flags | 2; self.cur++; }
+            else if (c == 'l' || c == 'L') { flags = flags | 4; self.cur++; }
+            else break;
+        }
+        if (self.cur > sufStart && self.numSuffixBoundary(self.cur))
+        {
+            if ((flags & 1) != 0 && (flags & 2) != 0)
+            {
+                self.reportError(self.bufStart, self.bufEnd, sufStart, "invalid mix of float and unsigned suffix");
+                return 0;
+            }
+            if ((flags & 2) != 0 && (flags & 4) != 0)
+            {
+                self.reportError(self.bufStart, self.bufEnd, sufStart, "invalid mix of float and long suffix");
+                return 0;
+            }
+            if (!isFloat && (flags & 2) != 0)
+            {
+                self.cur = sufStart;
+                self.reportError(self.bufStart, self.bufEnd, sufStart, "float suffix on an integer literal");
+                return 0;
+            }
+            return flags;
+        }
+        self.cur = sufStart;
+        return 0;
+    }
+
     Token lexNumber(u8* start)
     {
         if (!self.isAtEnd() && self.cur[0] == 'x' &&
@@ -87,11 +126,7 @@ pub extend Lexer
         Token token = self.makeToken(kind, start);
         token.data.ptr = start + 2;
         token.data.len = self.cur - (start + 2);
-        if (!self.isAtEnd() && (self.cur[0] == 'u' || self.cur[0] == 'U') && self.numSuffixBoundary(self.cur + 1))
-        {
-            token.numFlags = 1;
-            self.cur = self.cur + 1;
-        }
+        token.numFlags = self.lexNumSuffix(false);
         u32 base = 0;
         switch (kind)
         {
@@ -187,7 +222,7 @@ pub extend Lexer
                 u8* digits = self.cur + 1;
                 if (digits < self.bufEnd && (digits[0] == '+' || digits[0] == '-')) digits++;
                 u8* firstDigit = digits;
-                while (digits < self.bufEnd && ((digits[0] >= '0' && digits[0] <= '9') || digits[0] == '_')) digits++;
+                while (digits < self.bufEnd && (digits[0] >= '0' && digits[0] <= '9')) digits++;
                 if (digits == firstDigit) break;
                 isFloat = true;
                 self.cur = digits;
@@ -200,11 +235,7 @@ pub extend Lexer
         Token token;
         if (isFloat) token = self.makeToken(TokenKind::Float, start);
         else token = self.makeToken(TokenKind::Dec, start);
-        if (!isFloat && !self.isAtEnd() && (self.cur[0] == 'u' || self.cur[0] == 'U') && self.numSuffixBoundary(self.cur + 1))
-        {
-            token.numFlags = 1;
-            self.cur = self.cur + 1;
-        }
+        token.numFlags = self.lexNumSuffix(isFloat);
         if (!isFloat) token.number = self.parseInteger(token.data, 10);
         return token;
     }
