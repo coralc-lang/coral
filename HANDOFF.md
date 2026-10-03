@@ -219,3 +219,7 @@ Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang 
 - Numeric: grammar-allowed literals only; overflow must be a diagnostic (`parseInteger out of range`); float literal invalid tokens diagnosed; `_` separators; valid integer suffixes (`u`,`ul`,`ull`) map to distinct types; invalid suffix is an error.
 - String/char literal must terminate before EOF/newline (unless triple quote design say otherwise); unknown escape is an error.
 - Identifiers follow XID-Start/XID-Continue; C++-similar keywords/literals reserved; emitted C is keyworded-escaped (cgIdent).
+
+### Conditional assignment
+- An assignment expression (`x = v`, `x += v`, …) appearing directly as the controlling condition of `if` / `while` / `for` is a **compile-time error** (`ParseCondAssign`), because it is usually a mistaken `==`.
+- It is permitted only when explicitly allowed via the attribute `#[[condassign]]` on that `if`/`while`/`for` statement (parser carries `condAssignAttr` for the immediately-enclosed condition).
