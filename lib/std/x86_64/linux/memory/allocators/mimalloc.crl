@@ -284,32 +284,27 @@ static MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
     return (MiBlock*)raw;
 }
 
-// Hash function for segment map
+// Hash function for the page map: 4 MiB windows, so every address
+// inside a page (pages are <= 4 MiB) hashes to the same bucket.
 static u32 _miSegmentMapHash(u8* addr)
 {
-    u64 val = (u64)addr;
-    val = (val >> 12) ^ (val >> 24); // use page-aligned bits
+    u64 val = (u64)addr >> 22;
+    val = val ^ (val >> 16);
     return (u32)(val % MI_SEGMENT_MAP_SIZE);
 }
 
-// Segment map operations
-static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
+static void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* page)
 {
-    _miLockAcquire(&_miMapLockWord);
-    u32 idx = _miSegmentMapHash(pageBase);
     MiSegmentMapEntry* entry = (MiSegmentMapEntry*)mmap(null, sizeof(MiSegmentMapEntry), 3, 0x22, -1, 0);
-    if (entry == null) { _miLockRelease(&_miMapLockWord); return; }
+    if (entry == null) return;
     entry->pageBase = pageBase;
     entry->page = page;
     entry->next = map->buckets[idx];
     map->buckets[idx] = entry;
-    _miLockRelease(&_miMapLockWord);
 }
 
-static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase)
+static void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
 {
-    _miLockAcquire(&_miMapLockWord);
-    u32 idx = _miSegmentMapHash(pageBase);
     MiSegmentMapEntry* prev = null;
     MiSegmentMapEntry* entry = map->buckets[idx];
     while (entry != null)
@@ -319,10 +314,38 @@ static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase)
             if (prev != null) prev->next = entry->next;
             else map->buckets[idx] = entry->next;
             munmap((rawptr)entry, sizeof(MiSegmentMapEntry));
-            break;
+            return;
         }
         prev = entry;
         entry = entry->next;
+    }
+}
+
+// Segment map operations. A page is indexed once per 4 MiB window it
+// touches so lookups by any interior pointer resolve to it.
+static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
+{
+    _miLockAcquire(&_miMapLockWord);
+    u64 size = (u64)page->capacity * page->blockSize;
+    if (size == 0) size = 1;
+    u64 start = (u64)pageBase & ~(u64)0x3FFFFF;
+    u64 end = ((u64)pageBase + size - 1) & ~(u64)0x3FFFFF;
+    for (u64 w = start; w <= end; w += (u64)0x400000)
+    {
+        _miMapInsertChain(map, _miSegmentMapHash((u8*)w), pageBase, page);
+    }
+    _miLockRelease(&_miMapLockWord);
+}
+
+static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, u64 size)
+{
+    _miLockAcquire(&_miMapLockWord);
+    if (size == 0) size = 1;
+    u64 start = (u64)pageBase & ~(u64)0x3FFFFF;
+    u64 end = ((u64)pageBase + size - 1) & ~(u64)0x3FFFFF;
+    for (u64 w = start; w <= end; w += (u64)0x400000)
+    {
+        _miMapRemoveChain(map, _miSegmentMapHash((u8*)w), pageBase);
     }
     _miLockRelease(&_miMapLockWord);
 }
@@ -553,7 +576,7 @@ static bool _miPageExtend(MiHeap* heap, MiPage* page)
     for (u32 i = page->capacity; i < newCap; i++)
     {
         MiBlock* block = (MiBlock*)(page->base + (u64)i * page->blockSize);
-        _miFreeBlockEncode(block, head, page->key1, page->key2);
+        _miFreeBlockEncode(block, head, page);
         head = block;
     }
     page->free = head;
@@ -565,7 +588,7 @@ static bool _miPageExtend(MiHeap* heap, MiPage* page)
 static void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Remove from segment map
-    _miSegmentMapRemove(&heap->segmentMap, page->base);
+    _miSegmentMapRemove(&_miGlobalPages, page->base, (u64)page->capacity * page->blockSize);
 
     // Unlink from heap
     if (page->prev != null) page->prev->next = page->next;
@@ -579,34 +602,10 @@ static void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
         _miSegmentFree(heap, seg);
 }
 
-// Collect cross-thread free list into local free list
-static void _miPageCollect(MiPage* page)
-{
-    MiBlock* xfree = page->xthreadFree;
-    if (xfree == null) return;
-
-    // Atomically swap xthreadFree to null (single-threaded for now)
-    MiBlock* old = xfree;
-    page->xthreadFree = null;
-    page->xthreadFreeCount = 0;
-
-    // Decode and prepend to localFree
-    MiBlock* tail = old;
-    while (tail != null)
-    {
-        MiBlock* decoded = _miFreeBlockDecode(tail, page->key1, page->key2);
-        MiBlock* next = tail->next; // save before overwriting
-        tail->next = page->localFree;
-        page->localFree = tail;
-        tail = next != null ? decoded : null;
-    }
-}
-
 // Retire a page with expiry to prevent thrashing
 static void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
 {
-    if (page->used > 0) { page->retireCount = 0; return; }
-
+    if (page->used > 0 || page->inFull) { page->retireCount = 0; return; }
     // Only retire if this is not the only page with free blocks
     u32 freePages = 0;
     MiPage* p = heap->pages[sc];
@@ -628,14 +627,20 @@ static void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
     page->retired = true;
 }
 
-// Move page to fullPages list when it becomes full
+// Move page to fullPages list when it becomes full. The delayed flag
+// is set FIRST: while the page sits in fullPages its cross-thread
+// frees must also notify the owner via heap->delayedFree, because the
+// normal pages[] walk no longer sees it.
 static void _miPageMoveToFull(MiHeap* heap, MiPage* page, u32 sc)
 {
+    u64 raw;
+    while (!_miAtomicCAS((u64*)&page->xthreadFree, &raw, raw | (u64)1)) { raw = _miAtomicLoad((u64*)&page->xthreadFree); }
     // Unlink from pages[sc]
     if (page->prev != null) page->prev->next = page->next;
     else heap->pages[sc] = page->next;
     if (page->next != null) page->next->prev = page->prev;
     heap->pageCounts[sc]--;
+    page->inFull = true;
 
     // Link into fullPages
     page->next = heap->fullPages;
@@ -644,13 +649,17 @@ static void _miPageMoveToFull(MiHeap* heap, MiPage* page, u32 sc)
     heap->fullPages = page;
 }
 
-// Move page from fullPages back to pages[sc] when a block is freed
+// Move page from fullPages back to pages[sc] when a block is freed.
+// Linked back into the walkable list before the flag clears, so a
+// concurrent cross-thread free either sees the flag (queues to the
+// delayed list) or sees a walkable page (normal collect) - never lost.
 static void _miPageMoveFromFull(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Unlink from fullPages
     if (page->prev != null) page->prev->next = page->next;
     else heap->fullPages = page->next;
     if (page->next != null) page->next->prev = page->prev;
+    page->inFull = false;
 
     // Link into pages[sc]
     page->next = heap->pages[sc];
@@ -658,6 +667,57 @@ static void _miPageMoveFromFull(MiHeap* heap, MiPage* page, u32 sc)
     if (heap->pages[sc] != null) heap->pages[sc]->prev = page;
     heap->pages[sc] = page;
     heap->pageCounts[sc]++;
+
+    u64 raw;
+    do
+    {
+        raw = _miAtomicLoad((u64*)&page->xthreadFree);
+    }
+    while (!_miAtomicCAS((u64*)&page->xthreadFree, &raw, raw & ~(u64)1));
+}
+
+// Collect the cross-thread free list into localFree. Takes the list
+// head atomically while preserving the delayed flag in the low bit,
+// decodes the chain (validated against the page), and applies the
+// deferred used/freeCount updates for each block.
+static void _miPageCollect(MiHeap* heap, MiPage* page)
+{
+    u64 raw = _miAtomicLoad((u64*)&page->xthreadFree);
+    MiBlock* head = null;
+    while (true)
+    {
+        if ((raw & ~(u64)1) == 0) return; // fast path: nothing there
+        u64 next = raw & ~(u64)1;
+        if (_miAtomicCAS((u64*)&page->xthreadFree, &raw, raw & (u64)1))
+        {
+            head = (MiBlock*)next;
+            break;
+        }
+    }
+
+    // Decode the chain into localFree, counting blocks
+    MiBlock* current = head;
+    u32 count = 0;
+    while (current != null)
+    {
+        MiBlock* decoded = _miFreeBlockDecode(current, page);
+        _miFreeBlockEncode(current, page->localFree, page);
+        page->localFree = current;
+        page->used--;
+        page->freeCount++;
+        heap->totalFreed += page->blockSize;
+        count++;
+        if (count > page->capacity)
+        {
+            printf((const cchar*)"mimalloc: corrupted thread-free list\n");
+            return;
+        }
+        current = decoded;
+    }
+
+    // Page has room again: take it out of the full list
+    if (count > 0 && page->inFull)
+        _miPageMoveFromFull(heap, page, page->sizeClass);
 }
 
 // Allocation Fast Path
@@ -670,7 +730,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
     if (page != null && page->free != null)
     {
         MiBlock* block = page->free;
-        MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+        MiBlock* next = _miFreeBlockDecode(block, page);
         page->free = next;
         page->used++;
         page->freeCount--;
@@ -678,9 +738,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
 
         // If page becomes full, move to fullPages
         if (page->freeCount == 0)
-        {
             _miPageMoveToFull(heap, page, sc);
-        }
 
         return (rawptr)block;
     }
@@ -688,7 +746,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
     // Collect cross-thread frees
     if (page != null)
     {
-        _miPageCollect(page);
+        _miPageCollect(heap, page);
         if (page->free == null && page->localFree != null)
         {
             page->free = page->localFree;
@@ -697,7 +755,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
         if (page->free != null)
         {
             MiBlock* block = page->free;
-            MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+            MiBlock* next = _miFreeBlockDecode(block, page);
             page->free = next;
             page->used++;
             page->freeCount--;
@@ -705,9 +763,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
 
             // If page becomes full, move to fullPages
             if (page->freeCount == 0)
-            {
                 _miPageMoveToFull(heap, page, sc);
-            }
 
             return (rawptr)block;
         }
@@ -722,32 +778,50 @@ static void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
 {
     MiBlock* block = (MiBlock*)ptr;
 
-    // Check if this is a cross-thread free (thread ID doesn't match)
-    bool isCrossThread = false;
-    if (page->segment != null && page->segment->arena != null)
+    // Cross-thread when the segment was created by another thread (thread
+    // identity from pthread_self via libc). The owning heap drains the
+    // notification lists; this heap must not touch the page's counters.
+    MiHeap* owner = heap;
+    if (page->segment != null && page->segment->threadId != heap->threadId)
     {
-        // For arena-backed segments, thread IDs would need to match
-        // For now, use simple heuristic: always local free in single-threaded mode
-        isCrossThread = false;
+        owner = page->segment->owner;
+        if (owner == null) owner = heap;
+
+        u64 raw = _miAtomicLoad((u64*)&page->xthreadFree);
+        if ((raw & (u64)1) != 0)
+        {
+            // Flagged: page sits in fullPages, the owner's pages[] walk
+            // cannot see it - queue onto the owner's delayed list instead.
+            u64 head = _miAtomicLoad((u64*)&owner->delayedFree);
+            while (true)
+            {
+                block->next = (MiBlock*)head;
+                if (_miAtomicCAS((u64*)&owner->delayedFree, &head, (u64)block)) break;
+                head = _miAtomicLoad((u64*)&owner->delayedFree);
+            }
+            return;
+        }
+
+        // Walkable: chain onto the page's cross-thread list, preserving the flag.
+        while (true)
+        {
+            _miFreeBlockEncode(block, (MiBlock*)(raw & ~(u64)1), page);
+            if (_miAtomicCAS((u64*)&page->xthreadFree, &raw, (u64)block | (raw & (u64)1))) break;
+            raw = _miAtomicLoad((u64*)&page->xthreadFree);
+        }
+        return;
     }
 
-    if (isCrossThread) {
-        // Cross-thread: push to delayedFree
-        _miFreeBlockEncode(block, heap->delayedFree, page->key1, page->key2);
-        heap->delayedFree = block;
-    }
-    else {
-        // Same thread: add to localFree with encoding
-        _miFreeBlockEncode(block, page->localFree, page->key1, page->key2);
-        page->localFree = block;
-    }
+    // Same thread: add to localFree with encoding
+    _miFreeBlockEncode(block, page->localFree, page);
+    page->localFree = block;
 
     page->used--;
     page->freeCount++;
     heap->totalFreed += page->blockSize;
 
-    // If page was full, move it back to pages[sc]
-    if (page->freeCount == 1 && page->prev == null && heap->fullPages == page)
+    // Page in fullPages: give it back to the walkable list
+    if (page->inFull)
     {
         _miPageMoveFromFull(heap, page, page->sizeClass);
     }
@@ -757,111 +831,57 @@ static void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
         _miPageMaybeRetire(heap, page, page->sizeClass);
 }
 
-// Process delayed free list - drain into appropriate pages
-static void _miProcessDelayedFree(MiHeap* heap)
-{
-    MiBlock* current = heap->delayedFree;
-    heap->delayedFree = null;
-
-    while (current != null)
-    {
-        // Decode the pointer to find the next block in the delayed list
-        MiBlock* next = current->next;
-
-        // Find which page this block belongs to using segment map
-        u8* addr = (u8*)current;
-        u32 hashIdx = _miSegmentMapHash(addr);
-        MiSegmentMapEntry* entry = heap->segmentMap.buckets[hashIdx];
-        MiPage* page = null;
-
-        // Search hash chain
-        while (entry != null)
-        {
-            u8* pageEnd = entry->page->base + (u64)entry->page->capacity * entry->page->blockSize;
-            if (addr >= entry->page->base && addr < pageEnd)
-            {
-                // Verify alignment
-                u64 offset = (u64)(addr - entry->page->base);
-                if (offset % entry->page->blockSize == 0)
-                {
-                    page = entry->page;
-                    break;
-                }
-            }
-            entry = entry->next;
-        }
-
-        if (page != null)
-        {
-            // Add to page's localFree
-            _miFreeBlockEncode(current, page->localFree, page->key1, page->key2);
-            page->localFree = current;
-            page->used--;
-            page->freeCount++;
-
-            // If page was full, move it back to pages[sc]
-            if (page->freeCount == 1 && page->prev == null && heap->fullPages == page)
-            {
-                _miPageMoveFromFull(heap, page, page->sizeClass);
-            }
-        }
-        current = next;
-    }
-}
-
-// Find which page a pointer belongs to - O(1) via segment map
+// Find which page a pointer belongs to: hash the address into its
+// 4 MiB window bucket in the global page map, then range-check.
 static MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
 {
     u8* p = (u8*)ptr;
-
-    // O(1) lookup via segment map
-    u32 hashIdx = _miSegmentMapHash(p);
-    MiSegmentMapEntry* entry = heap->segmentMap.buckets[hashIdx];
+    u32 idx = _miSegmentMapHash(p);
+    MiSegmentMapEntry* entry = _miGlobalPages.buckets[idx];
     while (entry != null)
     {
         u8* pageEnd = entry->page->base + (u64)entry->page->capacity * entry->page->blockSize;
         if (p >= entry->page->base && p < pageEnd)
         {
-            // Verify alignment
             u64 offset = (u64)(p - entry->page->base);
             if (offset % entry->page->blockSize == 0)
                 return entry->page;
         }
         entry = entry->next;
     }
-
-    // Fallback: search fullPages list
-    MiPage* page = heap->fullPages;
-    while (page != null)
-    {
-        u8* pageEnd = page->base + (u64)page->capacity * page->blockSize;
-        if (p >= page->base && p < pageEnd)
-        {
-            u64 offset = (u64)(p - page->base);
-            if (offset % page->blockSize == 0)
-                return page;
-        }
-        page = page->next;
-    }
-
-    // Fallback: search freePages
-    for (u32 sc = 0; sc < MI_SIZE_CLASS_COUNT; sc++)
-    {
-        page = heap->freePages[sc];
-        while (page != null)
-        {
-            u8* pageEnd = page->base + (u64)page->capacity * page->blockSize;
-            if (p >= page->base && p < pageEnd)
-            {
-                u64 offset = (u64)(p - page->base);
-                if (offset % page->blockSize == 0)
-                    return page;
-            }
-            page = page->next;
-        }
-    }
-
     return null;
+}
+
+// Process delayed free list - drain into appropriate pages. The list
+// crosses pages (blocks were queued here because their page was full),
+// so the chain is plain pointers; each block is resolved through the
+// global page map and gets its deferred counters applied.
+static void _miProcessDelayedFree(MiHeap* heap)
+{
+    u64 head = _miAtomicExchange((u64*)&heap->delayedFree, 0);
+    MiBlock* current = (MiBlock*)head;
+
+    while (current != null)
+    {
+        MiBlock* next = current->next; // plain chain (mixed pages)
+
+        MiPage* page = _miPageFind(heap, current);
+        if (page != null)
+        {
+            _miFreeBlockEncode(current, page->localFree, page);
+            page->localFree = current;
+            page->used--;
+            page->freeCount++;
+            heap->totalFreed += page->blockSize;
+
+            if (page->inFull)
+                _miPageMoveFromFull(heap, page, page->sizeClass);
+            if (page->used == 0)
+                _miPageMaybeRetire(heap, page, page->sizeClass);
+        }
+
+        current = next;
+    }
 }
 
 // Public API
@@ -872,22 +892,15 @@ pub struct MiAlloc
 
     void init(usize reserveSize)
     {
-        self = MiHeap {
-            .heap.totalAllocated = 0,
-            .heap.totalFreed = 0,
-            .heap.mapped = 0,
-            .heap.arenas = null,
-            .heap.segments = null,
-            .heap.threadId = 0,
-            .heap.lock.locked = 0,
-            .heap.delayedFree = null,
-            .heap.fullPages = null,
-            .heap.hugePages = null
-        };
-
-        // Initialize segment map
-        for (u32 i = 0; i < MI_SEGMENT_MAP_SIZE; i++)
-            self.heap.segmentMap.buckets[i] = null;
+        self.heap.totalAllocated = 0;
+        self.heap.totalFreed = 0;
+        self.heap.mapped = 0;
+        self.heap.arenas = null;
+        self.heap.segments = null;
+        self.heap.threadId = (u64)pthread_self();
+        self.heap.delayedFree = null;
+        self.heap.fullPages = null;
+        self.heap.hugePages = null;
 
         for (u32 i = 0; i < MI_SIZE_CLASS_COUNT; i++)
         {
@@ -907,7 +920,7 @@ pub struct MiAlloc
         if (size == 0) return null;
 
         // Process any delayed frees from other threads
-        if (self.heap.delayedFree != null)
+        if (_miAtomicLoad((u64*)&self.heap.delayedFree) != 0)
             _miProcessDelayedFree(&self.heap);
 
         u32 sc = _miSizeClass(size);
@@ -942,10 +955,14 @@ pub struct MiAlloc
             page->retireCount = 0;
             page->key1 = _miRandomU64() % 64;
             page->key2 = _miRandomU64();
+            page->inFull = false;
 
             // Link into hugePages
             page->next = self.heap.hugePages;
             self.heap.hugePages = page;
+
+            // Register in the global page map so frees resolve
+            _miSegmentMapInsert(&_miGlobalPages, page->base, page);
 
             self.heap.totalAllocated += allocSize;
             return (rawptr)mem;
@@ -955,11 +972,21 @@ pub struct MiAlloc
         rawptr ptr = _miAllocFast(&self.heap, sc);
         if (ptr != null) return ptr;
 
+        // Sweep fullPages: cross-thread frees that raced with the
+        // move-to-full flag may be sitting on flagged full pages.
+        MiPage* full = self.heap.fullPages;
+        while (full != null)
+        {
+            MiPage* nextFull = full->next;
+            _miPageCollect(&self.heap, full);
+            full = nextFull;
+        }
+
         // Try allocating from a different page in the same size class
         MiPage* page = self.heap.pages[sc];
         while (page != null && page->free == null)
         {
-            _miPageCollect(page);
+            _miPageCollect(&self.heap, page);
             if (page->free == null && page->localFree != null)
             {
                 page->free = page->localFree;
@@ -972,7 +999,7 @@ pub struct MiAlloc
         if (page != null && page->free != null)
         {
             MiBlock* block = page->free;
-            MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+            MiBlock* next = _miFreeBlockDecode(block, page);
             page->free = next;
             page->used++;
             page->freeCount--;
@@ -996,7 +1023,7 @@ pub struct MiAlloc
                 if (_miPageExtend(&self.heap, page))
                 {
                     MiBlock* block = page->free;
-                    MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+                    MiBlock* next = _miFreeBlockDecode(block, page);
                     page->free = next;
                     page->used++;
                     page->freeCount--;
@@ -1031,7 +1058,7 @@ pub struct MiAlloc
             if (page->free != null)
             {
                 MiBlock* block = page->free;
-                MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+                MiBlock* next = _miFreeBlockDecode(block, page);
                 page->free = next;
                 page->used++;
                 page->freeCount--;
@@ -1045,7 +1072,7 @@ pub struct MiAlloc
         if (page == null) return null;
 
         MiBlock* block = page->free;
-        MiBlock* next = _miFreeBlockDecode(block, page->key1, page->key2);
+        MiBlock* next = _miFreeBlockDecode(block, page);
         page->free = next;
         page->used++;
         page->freeCount--;
@@ -1075,6 +1102,7 @@ pub struct MiAlloc
                 pp = &(*pp)->next;
             }
             usize allocSize = (usize)page->blockSize;
+            _miSegmentMapRemove(&_miGlobalPages, page->base, allocSize);
             munmap((rawptr)page, sizeof(MiPage));
             munmap(ptr, allocSize);
             self.heap.totalFreed += allocSize;
