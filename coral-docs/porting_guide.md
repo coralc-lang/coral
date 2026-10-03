@@ -250,7 +250,9 @@ pub void eprintln<comptime T>(T fmt, ...) // stderr + '\n'   (replaces neprint)
 
 - `comptime T` marks the format type as compile-time evaluated — the
   compiler parses the format string, never the runtime.
-- Placeholders: `{}` (one per following argument), `{{` / `}}` escapes.
+- Placeholders: `{}` (one per following argument), `{{` / `}}` escapes,
+  `{..}` spreads an iterable collection (range-for over the argument,
+  elements through the default `{}` dispatch, separated by `", "`).
   Specifiers (our chosen set — port exactly these): `{}` default,
   `{:d}` decimal, `{:x}` hex, `{:b}` binary, `{:p}` pointer.
 - Wrong placeholder/argument count, unknown specifier, or a format
@@ -264,29 +266,43 @@ pub void eprintln<comptime T>(T fmt, ...) // stderr + '\n'   (replaces neprint)
 **Type-not-specified rule (toStr)** — any argument that is not part of a
 comptime format-string call:
 
+- `toStr` is an **inbuilt trait** (same class as `@drop`) — never
+  declare it. User types provide impls (spelling FLAGGED, e.g.
+  `extend X : @toStr { str toStr() { ... } }`).
+- The comptime switch in the print path ends with the case
+  **`any toStr`** — coral's `any <traitName>` is the dyn-trait
+  equivalent: it matches any type implementing the trait, and the
+  compiler auto-wires the `toStr` call (users never write dispatch).
 - `print(x)` / `print(a, b)` (no string-literal format first): every
-  argument's type must provide `toStr`. The compiler auto-wires the
-  `toStr` call and prints the returned `str`.
-- Types handled by the built-in comptime switch (ints, floats, bool,
-  char, str, cstr, rawptr, String, manipulators) count as having it.
-- A type with no `toStr` → **compile error** ("type does not implement
-  toStr; implement it or pass a format string").
+  argument must hit the built-in comptime switch (ints, floats, bool,
+  char, str, cstr, rawptr, String, manipulators) or the `any toStr`
+  case. A type matching neither → **compile error** (place a trailing
+  `@compileError` after the switch so a non-matching type fails loudly).
 - A runtime `str` variable as first argument is a value, not a format
-  (formats must be comptime literals) — it prints via its own `toStr`.
+  (formats must be comptime literals) — it prints via its own toStr.
 
-**vaprint — the printf-like equivalent** (replaces printf-style output):
+**vaprint — printf directive syntax on the print machinery** (replaces
+printf-style output; NOT a thin libc forwarder):
 
 ```coral
-pub void vaprint(const cchar* fmt, ...)   // stdout, C printf semantics
+pub void vaprint(const cchar* fmt, ...)   // stdout
 ```
 
-- Runtime C-style variadic: `%d %i %u %x %X %s %c %f %p %%` plus width,
-  precision, `-`/`0` flags (whatever `vsnprintf` supports).
-- Anything, indefinitely: unbounded argument count and output length —
-  format into a 1024-byte stack buffer with a local
-  `extern("C") i32 vsnprintf(...)`, write, advance, loop until done;
-  long `%s` runs and literal runs can be written directly.
-- No heap allocation, no argument-count limit.
+- C directives: `%d %i %u %x %X %o %f %e %g %s %c %p %%` plus flags,
+  width, precision and length modifiers — but the format is walked in
+  the file's own comptime emitter: each directive is rebuilt as a
+  one-value format (integers forced to `ll`, length modifiers dropped)
+  and rendered with `snprintf` into a temp buffer, then appended to the
+  shared 1024-byte `_Buf`; `%s`/`%c`/`%p` are handled directly (`str`
+  need not be NUL-terminated).
+- Arguments are compile-time variadic — any count, any types (builtin
+  switch / `any toStr`); unbounded output via buffer flush. Format must
+  be a comptime literal (`@isFormatLiteral`, same rule as print).
+- Lenient mismatches, never UB: a directive whose class doesn't fit the
+  argument falls back to the argument's default rendering; extra
+  arguments past the format print default; a dangling `%` and extra
+  directives past the last argument copy through raw. Unknown conversion
+  char → `@compileError`.
 
 **Optimizations (all print paths):**
 
@@ -333,11 +349,15 @@ Faithful ports under §7 rules — every function survives. Notes:
    emitting direct writes.
 2. Compile errors: placeholder/argument mismatch, unknown specifier,
    missing `toStr`.
-3. Trait mechanism in new syntax — spec `toStr` as a trait shaped like
-   old `pub trait drop` (`lib_old/std/traits/destructor.crl`); the
-   compiler model adapts the spelling. "Compiler auto-adds toStr"
-   means: the compiler resolves and inserts the `toStr` call itself —
+3. Trait mechanism in new syntax: `toStr` is inbuilt like `@drop` (old
+   code has plain `pub trait drop` for contrast); the switch case is
+   `any toStr` (user's term: `any <traitName>` = Rust `dyn Trait`
+   equivalent) — FLAG whether patterns/impls want `@` qualification
+   (`any @toStr`, `extend X : @toStr`) or bare names. "Compiler
+   auto-adds toStr" means: the compiler resolves and inserts the call —
    users implement `toStr`, they never write dispatch code.
+   Also FLAGGED: `{..}` assumes range-for over collections (the old
+   `iterable` trait was callback-based — `lib_old/std/traits/iterator.crl`).
 4. Import paths `std::text::string` and `std::fmt` (categories port
    after io); nested surface `std::io::ios::print` resolving through
    `io/lib.crl` + the platform root (same assumption as the allocator

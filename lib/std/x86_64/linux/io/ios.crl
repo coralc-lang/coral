@@ -1,4 +1,4 @@
-import(lib) platform::libc { write, strlen, snprintf, strdod };
+import(lib) platform::libc { write, strlen, snprintf, strtod, getchar };
 import(lib) std::mman { copy };
 import(lib) std::text::string { String };
 import(lib) core::limits { INT64_MAX, INT64_MIN };
@@ -225,9 +225,10 @@ static usize _sysReadLine(u8* buf, usize maxBytes)
 }
 
 // The built-in comptime switch — zero runtime type dispatch. These types
-// count as covered by the type-not-specified rule; any other type passed
-// to print must provide toStr (trait below) and the compiler resolves and
-// inserts that call itself — no dispatch code is written here.
+// count as covered by the type-not-specified rule; every other type is
+// matched by the `any toStr` prong (the inbuilt toStr trait) and the
+// compiler resolves and inserts that call itself — no dispatch code is
+// written here.
 static void _fprintOne<T>(_Buf* out, T val)
 {
     comptime {
@@ -287,8 +288,20 @@ static void _fprintOne<T>(_Buf* out, T val)
                 Fixed v = val;
                 _fprintFixed(out, v.value, v.precision);
                 return;
+            },
+
+            // Any type implementing the inbuilt toStr trait (same class
+            // as @drop): the compiler resolves the toStr call itself —
+            // no dispatch code here. A type matching no prong above and
+            // no `any toStr` falls through to the error below.
+            any toStr => {
+                str s = val.toStr();
+                _fprintBytes(out, s.ptr, s.len);
+                return;
             }
         }
+
+        @compileError("print: type implements neither a builtin printer nor toStr");
     }
 }
 
@@ -310,7 +323,8 @@ static void _eprintOne<T>(T val)
 
 // Renders one {} placeholder: spec 0 is the default dispatch (so the
 // manipulators work as {} arguments); {:d} {:x} {:b} re-render an integer
-// in that base; {:p} prints a pointer. Anything else is a compile error.
+// in that base; {:p} prints a pointer; {..} spreads an iterable
+// collection. Anything else is a compile error.
 static void _fprintSpec<T>(_Buf* out, T val, u8 spec)
 {
     comptime
@@ -322,7 +336,26 @@ static void _fprintSpec<T>(_Buf* out, T val, u8 spec)
             'x' => { _fprintInt(out, val, 16); },
             'b' => { _fprintInt(out, val, 2); },
             'p' => { _fprintPtrVal(out, val); },
+            '.' => { _fprintIter(out, val); },
             else => { @compileError("print: unknown format specifier"); }
+        }
+    }
+}
+
+// {..}: an iterable collection, every element through the default {}
+// dispatch, elements separated by ", ". Relies on range-for over the
+// collection (old `iterable` trait class) — a non-iterable argument is
+// a compile error.
+static void _fprintIter<T>(_Buf* out, T val)
+{
+    comptime
+    {
+        bool first = true;
+        for (var elem : val)
+        {
+            if (!first) { _pbyte(out, ','); _pbyte(out, ' '); }
+            first = false;
+            _fprintOne(out, elem);
         }
     }
 }
@@ -411,7 +444,13 @@ static void _printEmit<T>(_Buf* out, T fmt, ... args)
 
                 i++; // consume the opening brace of the placeholder
                 u8 spec = 0;
-                if (i < f.len && f.ptr[i] == ':')
+                if (i + 2 < f.len && f.ptr[i] == '.' && f.ptr[i + 1] == '.' && f.ptr[i + 2] == '}')
+                {
+                    // {..} — iterable spread
+                    spec = '.';
+                    i += 2; // the closing '}' is consumed by the check below
+                }
+                else if (i < f.len && f.ptr[i] == ':')
                 {
                     i++;
                     if (i >= f.len) { @compileError("print: malformed placeholder"); }
@@ -456,24 +495,22 @@ static void _printEmit<T>(_Buf* out, T fmt, ... args)
     }
 }
 
-// The rule for arguments that are not part of a comptime format-string
-// call: their type must provide toStr (built-in comptime-switch types
-// count as covered). Implementations are user-side; the compiler
-// resolves and inserts the call.
-pub trait toStr
-{
-    str toStr();
-}
+// toStr is an INBUILT trait (same class as @drop) — nothing is declared
+// here. User types provide impls (extend ... : @toStr, spelling FLAGGED)
+// and the `any toStr` prong above is where the compiler auto-wires the
+// call. A type matching no prong (no builtin, no toStr) is a compile
+// error. Built-in comptime-switch types don't need an impl.
 
 // Final rules: print/println/eprint/eprintln take the format string FIRST
 // as `comptime T` — the compiler parses the literal ({} one placeholder
-// per following argument, {{ }} escapes, {:d} {:x} {:b} {:p} specifiers);
+// per following argument, {{ }} escapes, {:d} {:x} {:b} {:p} specifiers,
+// {..} spreads an iterable collection with ", " separators);
 // placeholder/argument mismatch, an unknown specifier, or {} with no
 // argument is a compile error. Without a comptime format literal
 // (print(x), print(a, b)) every argument must render through the built-in
-// comptime switch or its own toStr. One 1024-byte stack buffer per call:
-// a single write(2) per call, hand-rolled itoa for integers, snprintf for
-// floats.
+// comptime switch or its `any toStr` case. One 1024-byte stack buffer per
+// call: a single write(2) per call, hand-rolled itoa for integers,
+// snprintf for floats.
 pub void print<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
@@ -508,27 +545,335 @@ pub void eprintln<comptime T>(T fmt, ...)
     _pflush(&out);
 }
 
-// i did not ask for printf equivalent, but the equivalent of tthe print function in 
-// The printf-like equivalent: runtime C variadic with full vsnprintf
-// semantics (%d %i %u %x %X %s %c %f %p %%, widths, precisions, -/0
-// flags — whatever vsnprintf supports). Formatted into a 1024-byte stack
-// buffer, written, cursor advanced, looped until done: unbounded argument
-// count and output length, no heap allocation.
-// pub void vaprint(const cchar* fmt, ...)
-// {
-//     u8 outBuf[1024];
-//     usize sent = 0;
-//     loop {
-//         i32 n = vsnprintf(outBuf, 1024u, fmt, ...);
-//         if (n <= 0) return;
-//         usize total = (usize)n;
-//         if (sent >= total) return;
-//         usize avail = total - sent;
-//         if (avail > 1023u) avail = 1023u;
-//         write(1, outBuf, (u64)avail);
-//         sent += avail;
-//     }
-// }
+// vaprint — printf DIRECTIVE syntax (%d %i %u %x %X %o %f %e %g %s %c
+// %p %% with flags/width/precision/length modifiers) on the print
+// function's own buffered machinery — not a thin libc forwarder. The
+// format is walked here; each directive is rebuilt into a one-value
+// format (integers forced to "ll") and rendered with snprintf, %s/%c/%p
+// handled directly; everything appends to the shared 1024-byte stack
+// buffer, so output length is unbounded (flush per full buffer) and the
+// arguments are compile-time variadic — any count, any types (builtin
+// switch or `any toStr`). A directive/argument class mismatch degrades to
+// the argument's default rendering instead of reaching libc as UB; extra
+// arguments past the end of the format print via their default rendering;
+// a dangling '%' is copied through raw. The format must be a comptime
+// literal (same @isFormatLiteral rule as print).
+pub void vaprint(const cchar* fmt, ...)
+{
+    u8 outBuf[1024];
+    _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
+    comptime { _vaprintEmit(&out, fmt, ...); }
+    _pflush(&out);
+}
+
+static void _vaprintEmit(_Buf* out, const cchar* fmt, ... args)
+{
+    comptime
+    {
+        if (!@isFormatLiteral(fmt)) { @compileError("vaprint: format string must be a comptime literal"); }
+
+        usize i = 0;
+        bool fmtDone = false;
+        for (var arg : args)
+        {
+            if (fmtDone) { _fprintOne(out, arg); continue; }
+
+            // Literal run and %% (which takes no argument) up to the
+            // next real directive — or the end of the format.
+            usize lit = i;
+            while (fmt[i] != 0)
+            {
+                if (fmt[i] != '%') { i++; continue; }
+                if (fmt[i + 1] == '%')
+                {
+                    _pbytes(out, fmt + lit, i - lit);
+                    _pbyte(out, '%');
+                    i += 2;
+                    lit = i;
+                    continue;
+                }
+                break;
+            }
+            _pbytes(out, fmt + lit, i - lit);
+            if (fmt[i] == 0) { fmtDone = true; _fprintOne(out, arg); continue; }
+
+            // Directive: % [flags] [width] [. precision] [length] conv
+            usize ds = i;
+            i++;
+            while (fmt[i] == '-' || fmt[i] == '0' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#') i++;
+            while (fmt[i] >= '0' && fmt[i] <= '9') i++;
+            if (fmt[i] == '.') { i++; while (fmt[i] >= '0' && fmt[i] <= '9') i++; }
+            while (fmt[i] == 'h' || fmt[i] == 'l' || fmt[i] == 'z' || fmt[i] == 'j' || fmt[i] == 't') i++;
+            if (fmt[i] == 0)
+            {
+                // Dangling directive tail: copy through raw.
+                _pbytes(out, fmt + ds, i - ds);
+                fmtDone = true;
+                _fprintOne(out, arg);
+                continue;
+            }
+            u8 conv = (u8)fmt[i];
+            i++;
+            _vaprintArg(out, fmt, ds, i, conv, arg);
+        }
+
+        // Whatever is left of the format (extra directives after the
+        // last argument) is copied through raw.
+        while (fmt[i] != 0) { _pbyte(out, (u8)fmt[i]); i++; }
+    }
+}
+
+// One directive (fmt[ds..de), conversion `conv`) + one argument.
+static void _vaprintArg<T>(_Buf* out, const cchar* fmt, usize ds, usize de, u8 conv, T val)
+{
+    comptime
+    {
+        switch (conv)
+        {
+            'd' => { _vaprintSigned(out, fmt, ds, de, val); },
+            'i' => { _vaprintSigned(out, fmt, ds, de, val); },
+            'u' => { _vaprintUnsigned(out, fmt, ds, de, val); },
+            'x' => { _vaprintUnsigned(out, fmt, ds, de, val); },
+            'X' => { _vaprintUnsigned(out, fmt, ds, de, val); },
+            'o' => { _vaprintUnsigned(out, fmt, ds, de, val); },
+            'f' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'F' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'e' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'E' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'g' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'G' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'a' => { _vaprintFloat(out, fmt, ds, de, val); },
+            'A' => { _vaprintFloat(out, fmt, ds, de, val); },
+            's' => { _vaprintStr(out, fmt, ds, de, val); },
+            'c' => { _vaprintChar(out, fmt, ds, de, val); },
+            'p' => { _vaprintPtr(out, val); },
+            else => { @compileError("vaprint: unsupported conversion"); }
+        }
+    }
+}
+
+// Rebuilds fmt[ds..de) into dst (NUL-terminated): '%' + flags/width/
+// precision with the length modifiers dropped, "ll" forced when forceLL,
+// then the conversion char. Returns 0 when it does not fit dst[64].
+static usize _vaprintRebuild(u8* dst, const cchar* fmt, usize ds, usize de, bool forceLL)
+{
+    usize n = 0;
+    dst[n] = '%'; n++;
+    for (usize i = ds + 1; i + 1 < de; i++) // everything before the conversion char
+    {
+        u8 c = (u8)fmt[i];
+        if (c == 'h' || c == 'l' || c == 'z' || c == 'j' || c == 't') continue;
+        if (n >= 58u) return 0;
+        dst[n] = c; n++;
+    }
+    if (forceLL)
+    {
+        if (n + 2u >= 60u) return 0;
+        dst[n] = 'l'; dst[n + 1] = 'l'; n += 2u;
+    }
+    if (n + 2u >= 62u) return 0;
+    dst[n] = (u8)fmt[de - 1]; n++;
+    dst[n] = 0; n++;
+    return n;
+}
+
+static void _vaprintI64(_Buf* out, const cchar* fmt, usize ds, usize de, i64 v)
+{
+    u8 dfmt[64];
+    if (_vaprintRebuild(dfmt, fmt, ds, de, true) == 0) { _pbytes(out, fmt + ds, de - ds); return; }
+    u8 tmp[256];
+    i32 w = snprintf(tmp, 256u, dfmt, v);
+    if (w > 0) _pbytes(out, tmp, (usize)w < 256u ? (usize)w : 255u);
+}
+
+static void _vaprintU64(_Buf* out, const cchar* fmt, usize ds, usize de, u64 v)
+{
+    u8 dfmt[64];
+    if (_vaprintRebuild(dfmt, fmt, ds, de, true) == 0) { _pbytes(out, fmt + ds, de - ds); return; }
+    u8 tmp[256];
+    i32 w = snprintf(tmp, 256u, dfmt, v);
+    if (w > 0) _pbytes(out, tmp, (usize)w < 256u ? (usize)w : 255u);
+}
+
+static void _vaprintF64(_Buf* out, const cchar* fmt, usize ds, usize de, f64 v)
+{
+    u8 dfmt[64];
+    if (_vaprintRebuild(dfmt, fmt, ds, de, false) == 0) { _pbytes(out, fmt + ds, de - ds); return; }
+    u8 tmp[256];
+    i32 w = snprintf(tmp, 256u, dfmt, v);
+    if (w > 0) _pbytes(out, tmp, (usize)w < 256u ? (usize)w : 255u);
+}
+
+// %d/%i with integer arguments (u64 reinterprets bit-for-bit — same
+// leniency C shows); anything else falls back to default rendering.
+static void _vaprintSigned<T>(_Buf* out, const cchar* fmt, usize ds, usize de, T val)
+{
+    comptime
+    {
+        switch (T)
+        {
+            i8 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            i16 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            i32 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            i64 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            u8 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            u16 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            u32 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            u64 => { _vaprintI64(out, fmt, ds, de, (i64)val); },
+            else => { _fprintOne(out, val); }
+        }
+    }
+}
+
+// %u/%x/%X/%o with integer arguments (negatives print as their two's
+// complement, as C does); anything else falls back to default rendering.
+static void _vaprintUnsigned<T>(_Buf* out, const cchar* fmt, usize ds, usize de, T val)
+{
+    comptime
+    {
+        switch (T)
+        {
+            i8 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            i16 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            i32 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            i64 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            u8 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            u16 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            u32 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            u64 => { _vaprintU64(out, fmt, ds, de, (u64)val); },
+            else => { _fprintOne(out, val); }
+        }
+    }
+}
+
+// Float conversions with floats (integers promote, as in C); anything
+// else falls back to default rendering.
+static void _vaprintFloat<T>(_Buf* out, const cchar* fmt, usize ds, usize de, T val)
+{
+    comptime
+    {
+        switch (T)
+        {
+            f32 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            f64 => { _vaprintF64(out, fmt, ds, de, val); },
+            i8 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            i16 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            i32 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            i64 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            u8 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            u16 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            u32 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            u64 => { _vaprintF64(out, fmt, ds, de, (f64)val); },
+            else => { _fprintOne(out, val); }
+        }
+    }
+}
+
+// Parses [-][flags][width][.precision] out of the directive.
+static void _vaprintParts(const cchar* fmt, usize ds, usize de, bool* left, i64* width, i64* prec)
+{
+    *left = false;
+    *width = -1;
+    *prec = -1;
+    usize i = ds + 1;
+    if (i + 1 < de && fmt[i] == '-') { *left = true; i++; }
+    while (i + 1 < de && (fmt[i] == '0' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#')) i++;
+    i64 w = 0;
+    bool saw = false;
+    while (i + 1 < de && fmt[i] >= '0' && fmt[i] <= '9') { w = w * 10 + (fmt[i] - '0'); i++; saw = true; }
+    if (saw) *width = w;
+    if (i + 1 < de && fmt[i] == '.')
+    {
+        i++;
+        i64 p = 0;
+        bool sawp = false;
+        while (i + 1 < de && fmt[i] >= '0' && fmt[i] <= '9') { p = p * 10 + (fmt[i] - '0'); i++; sawp = true; }
+        *prec = sawp ? p : 0;
+    }
+}
+
+// %s: str/String/cstr printed directly (str need not be NUL-terminated),
+// honoring precision (truncation), width and '-'. Other arguments fall
+// back to default rendering.
+static void _vaprintStr<T>(_Buf* out, const cchar* fmt, usize ds, usize de, T val)
+{
+    comptime
+    {
+        switch (T)
+        {
+            str => { _vaprintStrBytes(out, fmt, ds, de, (const u8*)val.ptr, val.len); },
+            String => { _vaprintStrBytes(out, fmt, ds, de, (const u8*)val.ptr, val.len); },
+            const cchar* => { _vaprintStrBytes(out, fmt, ds, de, (const u8*)val, strlen(val)); },
+            cchar* => { _vaprintStrBytes(out, fmt, ds, de, (const u8*)val, strlen(val)); },
+            else => { _fprintOne(out, val); }
+        }
+    }
+}
+
+static void _vaprintStrBytes(_Buf* out, const cchar* fmt, usize ds, usize de, const u8* p, usize n)
+{
+    bool left;
+    i64 width;
+    i64 prec;
+    _vaprintParts(fmt, ds, de, &left, &width, &prec);
+    if (prec >= 0 && (i64)n > prec) n = (usize)prec;
+    i64 pad = 0;
+    if (width > 0 && (i64)n < width) pad = width - (i64)n;
+    if (!left) { for (i64 k = 0; k < pad; k++) _pbyte(out, ' '); }
+    _pbytes(out, (const cchar*)p, n);
+    if (left) { for (i64 k = 0; k < pad; k++) _pbyte(out, ' '); }
+}
+
+// %c: one byte, width honored (spaces, '-' left-align). Non-character
+// arguments fall back to default rendering.
+static void _vaprintChar<T>(_Buf* out, const cchar* fmt, usize ds, usize de, T val)
+{
+    comptime
+    {
+        u8 ch = 0;
+        bool isCh = false;
+        switch (T)
+        {
+            u8 => { ch = val; isCh = true; },
+            i8 => { ch = (u8)val; isCh = true; },
+            cchar => { ch = (u8)val; isCh = true; },
+            u16 => { ch = (u8)val; isCh = true; },
+            i16 => { ch = (u8)val; isCh = true; },
+            u32 => { ch = (u8)val; isCh = true; },
+            i32 => { ch = (u8)val; isCh = true; },
+            u64 => { ch = (u8)val; isCh = true; },
+            i64 => { ch = (u8)val; isCh = true; },
+            else => { }
+        }
+        if (!isCh) { _fprintOne(out, val); return; }
+
+        bool left;
+        i64 width;
+        i64 prec;
+        _vaprintParts(fmt, ds, de, &left, &width, &prec);
+        i64 pad = 0;
+        if (width > 0 && width > 1) pad = width - 1;
+        if (!left) { for (i64 k = 0; k < pad; k++) _pbyte(out, ' '); }
+        _pbyte(out, ch);
+        if (left) { for (i64 k = 0; k < pad; k++) _pbyte(out, ' '); }
+    }
+}
+
+// %p: pointer types only (add prongs for further pointer types as they
+// show up); other arguments fall back to default rendering.
+static void _vaprintPtr<T>(_Buf* out, T val)
+{
+    comptime
+    {
+        switch (T)
+        {
+            rawptr => { _fprintPtr(out, (const rawptr)val); },
+            const cchar* => { _fprintPtr(out, (const rawptr)val); },
+            cchar* => { _fprintPtr(out, (const rawptr)val); },
+            else => { _fprintOne(out, val); }
+        }
+    }
+}
 
 // Print manipulator types
 pub struct Spaces { u64 count; }
