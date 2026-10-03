@@ -1891,7 +1891,16 @@ Slice cgLvalue(Codegen* cg, NodeId id)
     switch (e.kind.tag)
     {
         ExprKind::Ident => {
-            stPS(&cg.ebuf, cgIdent(cg, e.kind.payload.Ident.name));
+            Str iname = e.kind.payload.Ident.name;
+            /* self is a pointer parameter — an lvalue assignment to it
+             * writes through the pointer */
+            if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern((u8*)"self", 4)) {
+                stP(&cg.ebuf, "*(");
+                stPS(&cg.ebuf, cgIdent(cg, iname));
+                stCh(&cg.ebuf, ')');
+                return stTail(&cg.ebuf, es);
+            }
+            stPS(&cg.ebuf, cgIdent(cg, iname));
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Deref => {
@@ -1991,6 +2000,20 @@ Slice cgValBody(Codegen* cg, NodeId id)
 
 /* ── switch lowering: compare chains + labels ────────────────── */
 
+bool cgTyIsPtr(Codegen* cg, Ty t)
+{
+    if (t == 0) return false;
+    TypeEntry* e = cg.ctx->types + t;
+    while (e->kind.tag == TypeKind::Const || e->kind.tag == TypeKind::Comptime)
+    {
+        if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+        else t = e->kind.payload.Comptime.base;
+        if (t == 0) return false;
+        e = cg.ctx->types + t;
+    }
+    return e->kind.tag == TypeKind::Pointer;
+}
+
 extern("C") Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWildcard);
 
 Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWildcard)
@@ -2015,7 +2038,8 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 usize s = cg.ebuf.len;
                 stCh(&cg.ebuf, '(');
                 stPS(&cg.ebuf, scrut);
-                stP(&cg.ebuf, ".tag == ");
+                if (cgTyIsPtr(cg, scrutTy)) stP(&cg.ebuf, "->tag == ");
+                else stP(&cg.ebuf, ".tag == ");
                 stU64(&cg.ebuf, (u64)vidx);
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, s);
@@ -2265,7 +2289,8 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
                                 stPS(&cg.body, cgIntern(cg, fname));
                                 stP(&cg.body, " = ");
                                 stPS(&cg.body, scrut);
-                                stP(&cg.body, ".u.v");
+                                if (cgTyIsPtr(cg, scrutTy)) stP(&cg.body, "->u.v");
+                                else stP(&cg.body, ".u.v");
                                 stU64(&cg.body, (u64)vidx);
                                 stCh(&cg.body, '.');
                                 stPS(&cg.body, cgIntern(cg, fname));
