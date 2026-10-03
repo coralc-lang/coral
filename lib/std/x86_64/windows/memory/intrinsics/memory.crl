@@ -1,5 +1,14 @@
 // memmove, memcpy, memcmp, mmep, memset... provided here
 
+import(lib) platform::win32 { VirtualAlloc, VirtualFree };
+
+// Win32 memory constants (porting guide §9 — defined locally, not in
+// the win32 surface).
+const u32 MEM_COMMIT = 0x1000;
+const u32 MEM_RESERVE = 0x2000;
+const u32 MEM_RELEASE = 0x8000;
+const u32 PAGE_READWRITE = 4;
+
 pub void memmove(rawptr dst, const rawptr src, usize n)
 {
     if (n == 0) return;
@@ -37,40 +46,29 @@ pub void memcpy(rawptr dst, const rawptr src, usize n)
     }
 }
 
+// mmap: Win32 equivalent is VirtualAlloc — reserve and commit RW pages.
+// The 6-arg POSIX signature is kept exactly so every call site (mman,
+// mimalloc) stays untouched: prot/flags/fd/offset are ignored, addr is
+// a placement hint (all call sites pass null). Returns null on failure.
 pub rawptr mmap(rawptr addr, usize length,
                 i32 prot, i32 flags,
                 i32 fd, i64 offset)
 {
-    usize ret;
-    asm volatile {
-        "movq %2, %%rdi\n\t"
-        "movq %3, %%rsi\n\t"
-        "movq %4, %%rdx\n\t"
-        "movq %5, %%r10\n\t"
-        "movq %6, %%r8\n\t"
-        "movq %7, %%r9\n\t"
-        "syscall\n\t"
-        "movq %%rax, %0"
-        : "=a"(ret)
-        : "0"(9u), "D"((usize)addr), "S"(length), "d"((usize)prot),
-          "r"((usize)flags), "r"((usize)fd), "r"((usize)offset)
-        : "rcx", "r8", "r9", "r10", "r11", "memory"
-    }
-    if ((i64)ret < 0 && (i64)ret >= -4095) return null;
-    return (rawptr)ret;
+    (void)prot;
+    (void)flags;
+    (void)fd;
+    (void)offset;
+    return VirtualAlloc(addr, (u64)length, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
 
+// munmap: release the whole region back to the OS. The length argument
+// is ignored — VirtualFree(MEM_RELEASE) requires a zero size and the
+// base address returned by VirtualAlloc.
 pub void munmap(rawptr addr, usize length)
 {
-    usize ret;
-    asm volatile {
-        "syscall\n\t"
-        "movq %%rax, %0"
-        : "=a"(ret)
-        : "0"(11u), "D"((usize)addr), "S"(length)
-        : "rcx", "r11", "memory"
-    }
+    (void)length;
+    VirtualFree(addr, 0, MEM_RELEASE);
 }
 
 

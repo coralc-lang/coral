@@ -1,32 +1,19 @@
-import(lib) platform::libc { open, read };
 import(lib) std::mman { copy };
 
-const i32 O_RDONLY = 0;
+// Windows entropy source (replaces the /dev/urandom open/read):
+// BCryptGenRandom with the system-preferred RNG.
+// FLAG: local extern — not in the win32 surface; link against
+// bcrypt.dll (e.g. -lbcrypt).
+pub extern i32 BCryptGenRandom(rawptr pbBuffer, u32 cbBuffer, u32 dwFlags);
 
-i32 _urandomFd = -1;
-bool _urandomReady = false;
-
-void _ensureUrandom()
-{
-    if (!_urandomReady)
-    {
-        _urandomFd = open("/dev/urandom", O_RDONLY, 0);
-        _urandomReady = true;
-    }
-}
+const u32 BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2;
 
 pub u64 nextU64()
 {
-    _ensureUrandom();
-    if (_urandomFd < 0) return 0;
     u64 val = 0;
-    u64 got = 0;
-    while (got < 8)
-    {
-        i64 n = read(_urandomFd, (u8*)&val + got, 8u - got);
-        if (n <= 0) return 0;
-        got += (u64)n;
-    }
+    // One call fills all 8 bytes; non-zero NTSTATUS = failure → 0,
+    // matching the old /dev/urandom read-failure result.
+    if (BCryptGenRandom((rawptr)&val, 8u, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return 0;
     return val;
 }
 

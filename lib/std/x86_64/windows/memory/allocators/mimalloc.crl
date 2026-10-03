@@ -1,8 +1,11 @@
 import allocator { Allocator };
 import(lib) std::intrinsics { mmap, munmap, memcpy };
-import(lib) platform::libc { printf, pthread_self };
+import(lib) platform::libc { printf };
 
-extern i32 sched_yield();
+// Win32 thread/scheduler primitives (kernel32.dll) — local externs,
+// absent from the win32 surface (porting guide §9.2).
+extern u32 GetCurrentThreadId();
+extern bool SwitchToThread();
 
 // mimalloc - High-performance memory allocator
 // Architecture: Arena → Segment → Page → Block
@@ -186,7 +189,7 @@ static u64 _miRandomU64()
     return state;
 }
 
-// Atomics (linux x86_64 only). Local copies of the concurrent::thread
+// Atomics (x86_64 only). Local copies of the concurrent::thread
 // AtomicU64 primitives; replace with std::concurrent when it is ported.
 
 #[[inline]]
@@ -233,7 +236,7 @@ static void _miLockAcquire(u64* p)
     {
         u64 expected = 0;
         if (_miAtomicCAS(p, &expected, 1)) return;
-        sched_yield();
+        SwitchToThread();
     }
     printf((const cchar*)"mimalloc: internal error: lock cannot be acquired\n");
 }
@@ -779,7 +782,7 @@ static void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
     MiBlock* block = (MiBlock*)ptr;
 
     // Cross-thread when the segment was created by another thread (thread
-    // identity from pthread_self via libc). The owning heap drains the
+    // identity from GetCurrentThreadId via Win32). The owning heap drains the
     // notification lists; this heap must not touch the page's counters.
     MiHeap* owner = heap;
     if (page->segment != null && page->segment->threadId != heap->threadId)
@@ -897,7 +900,7 @@ pub struct MiAlloc
         self.heap.mapped = 0;
         self.heap.arenas = null;
         self.heap.segments = null;
-        self.heap.threadId = (u64)pthread_self();
+        self.heap.threadId = (u64)GetCurrentThreadId();
         self.heap.delayedFree = null;
         self.heap.fullPages = null;
         self.heap.hugePages = null;

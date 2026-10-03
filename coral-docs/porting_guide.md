@@ -370,3 +370,88 @@ Faithful ports under §7 rules — every function survives. Notes:
    surface).
 5. Local `extern("C")` symbols (`vsnprintf`, `getchar`, sockets) link
    against libc without being in the surface.
+
+## 9. The windows port (windows tree is a copy of linux — convert in place)
+
+Target: `lib/std/x86_64/windows/**` (already copied 1:1 from the linux
+tree). Surgically replace platform-dependent libc usage with Win32.
+NEVER touch `lib/std/x86_64/linux/`, `lib/std/lib.crl`,
+`lib/platform/libc.crl`, or the manifests. Do not compile (rule 9).
+
+### 9.1 Convert vs keep
+
+CONVERT (POSIX/OS-specific → Win32, externs in `lib/platform/win32.crl`):
+
+- file syscalls `open/close/read/write/lseek/access/stat/mkdir/rmdir/
+  unlink/rename/opendir/readdir/closedir` → `CreateFileA, ReadFile,
+  WriteFile, CloseHandle, SetFilePointerA, GetFileAttributesA,
+  CreateDirectoryA, RemoveDirectoryA, DeleteFileA, MoveFileA,
+  FindFirstFileA/FindNextFileA/FindClose`
+- `isatty` → `GetConsoleMode`; stdout/stderr `write` → `WriteFile` on
+  `GetStdHandle(STD_OUTPUT_HANDLE/-12, STD_ERROR_HANDLE/-11)`
+- `mkstemp/mkdtemp` → `GetTempPathA/GetTempFileNameA/CreateDirectoryA`
+- `getenv/setenv/unsetenv/environ` → `GetEnvironmentVariableA/
+  SetEnvironmentVariableA/GetEnvironmentStringsA/FreeEnvironmentStringsA`
+- `pipe/fork/dup2/execvp/waitpid/poll/_exit` → `CreatePipe,
+  CreateProcessA, WaitForSingleObject, GetExitCodeProcess,
+  TerminateProcess, PeekNamedPipe, CloseHandle`
+- `pthread_*` → `CreateThread/WaitForSingleObject/GetExitCodeThread`;
+  `pthread_mutex_*` → `CRITICAL_SECTION` (Init/Enter/Leave/TryEnter/
+  DeleteCriticalSection); rwlock → `SRWLOCK` (Acquire/ReleaseSRWLock
+  Shared/Exclusive); `sem_*` → `CreateSemaphoreA/ReleaseSemaphore/
+  WaitForSingleObject`; cond → `CONDITION_VARIABLE`
+  (`SleepConditionVariableCS`, `Wake/AllConditionVariable`)
+- sockets → win32 winsock externs (`closesocket`, not `close`); flag
+  where the one-time `WSAStartup` call belongs
+- `mmap/munmap` syscall asm in `memory/intrinsics/memory.crl` →
+  `VirtualAlloc/VirtualFree` — KEEP the exact 6-arg signature so every
+  call site in mman/mimalloc stays untouched (ignore prot/flags/fd/
+  offset; `MEM_RESERVE|MEM_COMMIT` + `PAGE_READWRITE`; free =
+  `VirtualFree(addr, 0, MEM_RELEASE)`)
+- `/dev/urandom` open/read → `BCryptGenRandom` (extern to add) or
+  msvcrt `rand_s` — pick one and flag it
+- `regcomp/regexec/regfree`: no Win32 or CRT equivalent → implement a
+  small pure-coral backtracking engine behind the same API
+  (`| . * + ? ^ $ [classes]`), flag it as an approximation
+- `kill`: no direct equivalent → `OpenProcess/TerminateProcess` or
+  flag; `signal/raise` may stay on msvcrt — flag the choice
+
+KEEP (ISO C CRT — msvcrt provides them; leave the file's
+`import(lib) platform::libc { ... }` line and call sites alone):
+
+`printf, fprintf, snprintf, vsnprintf, putchar, getchar, strtod,
+strtof, fopen, fclose, fread, fwrite, feof, ferror, fflush, strlen,
+memcpy, memmove, memset, memcmp` (last four are coral impls anyway),
+`htonl, ntohl, ntohs`.
+
+Mixed files keep their libc import for the CRT subset and gain
+`import(lib) platform::win32 { ... };` for converted symbols.
+
+### 9.2 Mechanics
+
+- Win32 signatures: `BOOL`→`bool`, `DWORD`→`u32`, `HANDLE`→`rawptr`;
+  A-suffixed APIs take `cchar*` paths — cast coral `str` like existing
+  code does (`sv.ptr`).
+- Struct layouts (FLAG every size assumption): mirror small structs you
+  READ field-by-field (`PROCESS_INFORMATION`: rawptr, rawptr, u32, u32
+  = 24 bytes; `SECURITY_ATTRIBUTES`: u32, rawptr, bool, u32 = 24);
+  for large opaque ones (`STARTUPINFOA`, `WSADATA`, `WIN32_FIND_DATAA`)
+  use an over-sized `u8 buf[N]` + cast, only relying on documented
+  offsets you spell out in a comment (`STARTUPINFOA.cb` = field 0;
+  `WIN32_FIND_DATAA.cFileName` offset 44, 260 bytes).
+- Constants to define locally where needed: `GENERIC_READ 0x80000000,
+  GENERIC_WRITE 0x40000000, OPEN_EXISTING 3, CREATE_ALWAYS 2,
+  FILE_ATTRIBUTE_NORMAL 0x80, INVALID_HANDLE_VALUE ((rawptr)-1),
+  INFINITE 0xFFFFFFFF, WAIT_OBJECT_0 0, MEM_COMMIT 0x1000,
+  MEM_RESERVE 0x2000, MEM_RELEASE 0x8000, PAGE_READWRITE 4,
+  STD_OUTPUT_HANDLE ((u32)-11), STD_ERROR_HANDLE ((u32)-12`.
+- If a needed extern is absent from `win32.crl`, declare it LOCALLY in
+  your file (§2/8.1 rule) and list it in your report — do NOT edit
+  `lib/platform/win32.crl`.
+- All §7 rules apply: no `flag (ARCH)`, `loop {}` for indefinite
+  loops, no `do..while`, no `as`, comments allowed, structural balance
+  verified with the state-machine checker (line comments, char
+  literals like `'"'`, strings — strip in order: comments, chars,
+  strings).
+- Report per file: converted symbols, kept symbols, local externs
+  added, FLAGs (sizes, WSAStartup site, regex approximation, rand).
