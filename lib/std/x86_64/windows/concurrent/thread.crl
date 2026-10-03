@@ -7,32 +7,27 @@ pub distinct Thread = rawptr;
 
 pub struct ConditionVar
 {
-    // CONDITION_VARIABLE is pointer-sized: 8 bytes on x64 — FLAGGED size
-    // assumption (RTL_CONDITION_VARIABLE is a single PVOID). impl[1] keeps
-    // `self.impl` passing the ADDRESS of the variable to the externs.
+        // CONDITION_VARIABLE is 8B on x64 (a single PVOID) — FLAGGED;
+        // impl[1] keeps the address.
     rawptr impl[1];
 
     void init() { InitializeConditionVariable(self.impl); }
     void destroy()
     {
-        // FLAG: Win32 CONDITION_VARIABLE needs no destruction —
-        // pthread_cond_destroy has no equivalent, so this is a no-op.
+        // no-op: CONDITION_VARIABLE needs no destruction.
     }
     void wait(Mutex* mutex)
     {
-        // SleepConditionVariableCS atomically releases the caller's
-        // critical section and blocks, like pthread_cond_wait. The caller
-        // must own the mutex (EnterCriticalSection) on this thread — same
-        // requirement as POSIX, but Win32 enforces ownership strictly.
+        // Releases self's critical section while blocked, like
+        // pthread_cond_wait — Win32 enforces CS ownership strictly.
         SleepConditionVariableCS(self.impl, mutex->_cs, INFINITE);
     }
     void signal() { WakeConditionVariable(self.impl); }
     void broadcast() { WakeAllConditionVariable(self.impl); }
 }
 
-// Win32 start routines take exactly one rawptr parameter, so the (fn, arg)
-// pair handed to threadCreate is bundled into a small heap context that the
-// trampoline unpacks on the new thread.
+// Win32 start routines take one parameter, so (fn, arg) goes on the
+// heap as a context the trampoline unpacks.
 struct ThreadCtx
 {
     rawptr(rawptr) fn;
@@ -44,8 +39,7 @@ static u32 _threadEntry(rawptr p)
     ThreadCtx* ctx = (ThreadCtx*)p;
     rawptr result = ctx->fn(ctx->arg);
     HeapFree(GetProcessHeap(), 0, ctx);
-    // FLAG: the 64-bit pthread-style return value is truncated to the u32
-    // Win32 thread exit code (see also threadExit/threadJoin).
+        // FLAG: 64-bit return value -> u32 Win32 exit code.
     return (u32)(usize)result;
 }
 

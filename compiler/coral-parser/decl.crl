@@ -879,7 +879,13 @@ pub extend Parser
                 self.addError();
                 break;
             }
+            ParserMark m = self.save();
             if (!self.match(TokenKind::ColonColon)) break;
+            if (self.current.kind == TokenKind::LBrace)
+            {
+                self.restore(m);
+                break;
+            }
         }
         return self.strListJoin(&parts);
     }
@@ -923,6 +929,20 @@ pub extend Parser
                     self.ctx.strListAppend(&parts, name);
                     name = self.strListJoin(&parts);
                 }
+                if (self.current.kind == TokenKind::ColonColon)
+                {
+                    ParserMark m = self.save();
+                    self.advance();
+                    if (self.current.kind == TokenKind::LBrace)
+                    {
+                        self.advance();
+                        if (!self.parseSymbolList(name, list)) return false;
+                        self.expect(TokenKind::RBrace);
+                        if (!self.match(TokenKind::Comma)) break;
+                        continue;
+                    }
+                    self.restore(m);
+                }
                 if (self.current.kind == TokenKind::LBrace)
                 {
                     self.advance();
@@ -960,16 +980,23 @@ pub extend Parser
         return true;
     }
 
-    void parseImportSymbols(rawptr* outSymbols, u32* outLen)
+    void parseImportSymbols(rawptr* outSymbols, u32* outLen, Str path)
     {
         *outSymbols = null;
         *outLen = 0;
-        if (!self.match(TokenKind::LBrace)) return;
+        Str prefix = 0;
+        if (self.current.kind == TokenKind::ColonColon)
+        {
+            self.advance();
+            prefix = path;
+            self.expect(TokenKind::LBrace);
+        }
+        else if (!self.match(TokenKind::LBrace)) return;
         ImportSymList list;
         list.items = null;
         list.len = 0;
         list.cap = 0;
-        self.parseSymbolList(0, &list);
+        self.parseSymbolList(prefix, &list);
         self.expect(TokenKind::RBrace);
         if (list.items != null && !self.ctx.track((rawptr)list.items)) self.addError();
         *outSymbols = (rawptr)list.items;
@@ -995,7 +1022,7 @@ pub extend Parser
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;
         u32 symbolsLen = 0;
-        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen);
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen, path);
         self.expect(TokenKind::Semicolon);
         return self.storeDecl(DeclKind::Import{ .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
@@ -1023,7 +1050,7 @@ pub extend Parser
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;
         u32 symbolsLen = 0;
-        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen);
+        self.parseImportSymbols((rawptr*)&symbols, &symbolsLen, path);
         self.expect(TokenKind::Semicolon);
         if (isPub) flags = flags | 2;
         return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
