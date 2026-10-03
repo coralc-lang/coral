@@ -1,24 +1,34 @@
-import(lib) platform::libc { pthread_mutex_init, pthread_mutexattr_init, pthread_mutexattr_settype, pthread_mutexattr_destroy, pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_unlock, pthread_mutex_trylock };
+// Win32 port: pthread_mutex_* -> CRITICAL_SECTION.
+// Local externs below are not in lib/platform/win32.crl (do NOT edit it).
+pub extern void InitCriticalSection(rawptr lpCriticalSection);
+pub extern void DeleteCriticalSection(rawptr lpCriticalSection);
+pub extern void EnterCriticalSection(rawptr lpCriticalSection);
+pub extern void LeaveCriticalSection(rawptr lpCriticalSection);
+pub extern bool TryEnterCriticalSection(rawptr lpCriticalSection);
 
 pub struct Mutex
 {
-    rawptr impl[6];
+    // CRITICAL_SECTION is 40 bytes on x64 — FLAGGED size assumption
+    // (RTL_CRITICAL_SECTION: ptr 8 + LONG 4 + LONG 4 + HANDLE 8 +
+    //  HANDLE 8 + ULONG_PTR 8 = 40). The array form keeps `self._cs`
+    //  passing the ADDRESS of the section to the externs, matching how
+    //  the old code passed its rawptr impl[6] buffer to pthread.
+    u8 _cs[40];
 
     void init() {
-        pthread_mutex_init(self.impl, null);
+        InitCriticalSection(self._cs);
     }
 
     void initRecursive()
     {
-        u8 attr[8];
-        pthread_mutexattr_init(attr);
-        pthread_mutexattr_settype(attr, 1);
-        pthread_mutex_init(self.impl, attr);
-        pthread_mutexattr_destroy(attr);
+        // FLAG: Win32 CRITICAL_SECTION is always recursive (owned per
+        // thread with a recursion count), so PTHREAD_MUTEX_RECURSIVE
+        // (type 1) needs no equivalent — plain init is the same thing.
+        InitCriticalSection(self._cs);
     }
 
-    void destroy() { pthread_mutex_destroy(self.impl); }
-    void lock() { pthread_mutex_lock(self.impl); }
-    void unlock() { pthread_mutex_unlock(self.impl); }
-    bool tryLock() { return pthread_mutex_trylock(self.impl) == 0; }
+    void destroy() { DeleteCriticalSection(self._cs); }
+    void lock() { EnterCriticalSection(self._cs); }
+    void unlock() { LeaveCriticalSection(self._cs); }
+    bool tryLock() { return TryEnterCriticalSection(self._cs); }
 }

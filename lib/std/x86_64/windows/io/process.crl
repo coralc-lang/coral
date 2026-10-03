@@ -1,13 +1,85 @@
 import(lib) std::vec { Vec };
-import(lib) std::mman { alloc, copy };
-import(lib) platform::libc { pipe, fork, dup2, execvp, waitpid, poll, read, write, close, _exit };
+import(lib) std::mman { alloc, dealloc, zero };
+import(lib) platform::win32 { ReadFile, WriteFile, CloseHandle, ExitProcess, WaitForSingleObject };
+
+// pipe/fork/dup2/execvp/waitpid/poll/_exit are POSIX — replaced by the
+// Win32 process model below.  These Win32 entry points are missing from
+// lib/platform/win32.crl, so they are declared locally (§2/8.1 rule).
+pub extern bool CreatePipe(rawptr* hReadPipe, rawptr* hWritePipe, rawptr lpPipeAttributes, u32 nSize);
+pub extern bool CreateProcessA(const cchar* lpApplicationName, cchar* lpCommandLine, rawptr lpProcessAttributes, rawptr lpThreadAttributes, bool bInheritHandles, u32 dwCreationFlags, rawptr lpEnvironment, const cchar* lpCurrentDirectory, rawptr lpStartupInfo, rawptr lpProcessInformation);
+pub extern bool SetHandleInformation(rawptr hObject, u32 dwMask, u32 dwFlags);
+pub extern bool GetExitCodeProcess(rawptr hProcess, u32* lpExitCode);
+pub extern bool PeekNamedPipe(rawptr hNamedPipe, rawptr lpBuffer, u32 nBufferSize, u32* lpBytesRead, u32* lpTotalBytesAvail, u32* lpBytesLeftThisMessage);
+
+const u32 INFINITE = 0xFFFFFFFF;         // winbase.h — wait forever (was waitpid's blocking wait)
+const u32 WAIT_OBJECT_0 = 0;             // winbase.h — handle became signaled
+const u32 STARTF_USESTDHANDLES = 0x100;  // winbase.h — honour hStdInput/Output/Error
+const u32 HANDLE_FLAG_INHERIT = 1;       // winbase.h — make a handle inheritable
+
+// SECURITY_ATTRIBUTES mirror (FLAG size): x64 C layout
+//   u32 nLength (0..4), implicit pad (4..8), rawptr lpSecurityDescriptor
+//   (8..16), bool bInheritHandle (16..17), implicit pad (17..20),
+//   u32 pad (20..24)  ->  24 bytes, matching winbase.h.
+//   FLAG: assumes natural (C) struct alignment, the same assumption §9.2
+//   makes when it writes "u32, rawptr, bool, u32 = 24".
+struct SECURITY_ATTRIBUTES
+{
+    u32 nLength;
+    rawptr lpSecurityDescriptor;
+    bool bInheritHandle;
+    u32 pad;
+}
+
+// STARTUPINFOA mirror (FLAG offsets): x64 layout, total 104 bytes —
+//   cb 0 (u32), pad 4, lpReserved 8, lpDesktop 16, lpTitle 24 (rawptr),
+//   dwX 32, dwY 36, dwXSize 40, dwYSize 44, dwXCountChars 48,
+//   dwYCountChars 52, dwFillAttribute 56, dwFlags 60 (u32),
+//   wShowWindow 64, cbReserved2 66 (u16), pad 68, lpReserved2 72,
+//   hStdInput 80, hStdOutput 88, hStdError 96 (rawptr)  ->  sizeof 104.
+//   FLAG: the brief lists cbReserved2 at 68; the real SDK puts it at 66
+//   with the pad at 68 (2+2+4 = 8 keeps lpReserved2 8-aligned at 72).
+//   Only cb, dwFlags and the three std-handle fields are ever written.
+struct STARTUPINFOA
+{
+    u32 cb;              // 0
+    u32 pad0;            // 4
+    rawptr lpReserved;   // 8
+    rawptr lpDesktop;    // 16
+    rawptr lpTitle;      // 24
+    u32 dwX;             // 32
+    u32 dwY;             // 36
+    u32 dwXSize;         // 40
+    u32 dwYSize;         // 44
+    u32 dwXCountChars;   // 48
+    u32 dwYCountChars;   // 52
+    u32 dwFillAttribute; // 56
+    u32 dwFlags;         // 60
+    u16 wShowWindow;     // 64
+    u16 cbReserved2;     // 66
+    u32 pad1;            // 68
+    rawptr lpReserved2;  // 72
+    rawptr hStdInput;    // 80
+    rawptr hStdOutput;   // 88
+    rawptr hStdError;    // 96
+}                        // 104
+
+// PROCESS_INFORMATION mirror (FLAG size): rawptr hProcess (0), rawptr
+// hThread (8), u32 dwProcessId (16), u32 dwThreadId (20)  ->  24 bytes.
+struct PROCESS_INFORMATION
+{
+    rawptr hProcess;
+    rawptr hThread;
+    u32 dwProcessId;
+    u32 dwThreadId;
+}
 
 pub struct Process
 {
-    i32 pid;
-    i32 stdinFd;
-    i32 stdoutFd;
-    i32 stderrFd;
+    i32 pid;          // FLAG: now dwProcessId (kept i32 so `pid < 0` failure checks still read the same)
+    rawptr hProcess;  // FLAG: new field — the process HANDLE waitFor waits on
+    rawptr stdinFd;   // FLAG: i32 POSIX fd -> Win32 HANDLE (null = closed)
+    rawptr stdoutFd;
+    rawptr stderrFd;
 }
 
 pub struct ProcessResult
@@ -17,6 +89,9 @@ pub struct ProcessResult
     i32 termSignal;
 }
 
+// Retained from the POSIX port for API compatibility; unused on Windows —
+// there is no poll() here, child waiting uses PeekNamedPipe +
+// WaitForSingleObject (see run/waitFor).
 pub struct pollfd
 {
     i32 fd;
@@ -24,116 +99,246 @@ pub struct pollfd
     i16 revents;
 }
 
-static void _closeIoFd(i32* fd)
+static void _closeIoFd(rawptr* h)
 {
-    if (*fd >= 0) { close(*fd); *fd = -1; }
+    if (*h != null) { CloseHandle(*h); *h = null; }
 }
 
+// Quote an argument only when it would otherwise change tokenisation:
+// empty, or containing a space/tab/quote.
+static bool _needsQuote(str s)
+{
+    if (s.len == 0) return true;
+    for (usize i = 0; i < s.len; i++)
+    {
+        u8 c = (u8)s.ptr[i];
+        if (c == ' ' || c == '\t' || c == '"') return true;
+    }
+    return false;
+}
+
+// Append one argument to the command line at `off`, return the new offset.
+// Unquoted args pass through verbatim.  Quoted args are wrapped in double
+// quotes; embedded quotes are backslash-escaped, and every backslash run
+// is doubled when it sits immediately before a quote (or before the
+// closing quote) — i.e. the CommandLineToArgvW parsing rules, which is how
+// the child's CRT will split the line back into argv.  Worst case this
+// emits 2 bytes per input byte plus the two wrapper quotes (the caller's
+// capacity bound).
+static usize _appendArg(u8* buf, usize off, str a)
+{
+    if (!_needsQuote(a)) {
+        for (usize i = 0; i < a.len; i++) buf[off + i] = (u8)a.ptr[i];
+        return off + a.len;
+    }
+    buf[off] = '\"';
+    off++;
+    usize bs = 0;
+    for (usize i = 0; i < a.len; i++)
+    {
+        u8 c = (u8)a.ptr[i];
+        if (c == '\\') { bs++; continue; }
+        if (c == '"') {
+            for (usize j = 0; j < bs * 2 + 1; j++) buf[off++] = '\\';
+            buf[off++] = '\"';
+            bs = 0;
+            continue;
+        }
+        for (usize j = 0; j < bs; j++) buf[off++] = '\\';
+        bs = 0;
+        buf[off++] = c;
+    }
+    for (usize j = 0; j < bs * 2; j++) buf[off++] = '\\';
+    buf[off] = '\"';
+    off++;
+    return off;
+}
+
+// One non-blocking drain step, standing in for poll(..., -1) on a single
+// pipe:  1 = read some bytes, 0 = nothing ready yet, -1 = pipe broken
+// (child side gone) or read error.
+static i32 _drainPipe(rawptr h, u8* buf, usize cap)
+{
+    u32 avail = 0;
+    if (!PeekNamedPipe(h, null, 0, null, &avail, null)) return -1;
+    if (avail == 0) return 0;
+    u32 want = avail < (u32)cap ? avail : (u32)cap;
+    u32 n = 0;
+    if (!ReadFile(h, (cchar*)buf, want, &n, null)) return -1;
+    if (n == 0) return -1;
+    return 1;
+}
+
+// fork + dup2 + execvp in one CreateProcessA call: three anonymous pipes
+// for stdin/stdout/stderr, the child ends inheritable and wired into the
+// std-handle fields of STARTUPINFOA.
 pub Process spawn(str cmd, Vec<str>* args)
 {
-    i32 stdinPipe[2];
-    i32 stdoutPipe[2];
-    i32 stderrPipe[2];
-    pipe(stdinPipe);
-    pipe(stdoutPipe);
-    pipe(stderrPipe);
-    if (stdinPipe[0] < 0 || stdinPipe[1] < 0 || stdoutPipe[0] < 0 || stdoutPipe[1] < 0 || stderrPipe[0] < 0 || stderrPipe[1] < 0)
+    rawptr stdinRead = null;
+    rawptr stdinWrite = null;
+    rawptr stdoutRead = null;
+    rawptr stdoutWrite = null;
+    rawptr stderrRead = null;
+    rawptr stderrWrite = null;
+
+    SECURITY_ATTRIBUTES sa = SECURITY_ATTRIBUTES
     {
-        _closeIoFd(&stdinPipe[0]); _closeIoFd(&stdinPipe[1]);
-        _closeIoFd(&stdoutPipe[0]); _closeIoFd(&stdoutPipe[1]);
-        _closeIoFd(&stderrPipe[0]); _closeIoFd(&stderrPipe[1]);
-        return Process { .pid = -1, .stdinFd = -1, .stdoutFd = -1, .stderrFd = -1 };
+        .nLength = (u32)sizeof(SECURITY_ATTRIBUTES), // 24 (FLAG)
+        .lpSecurityDescriptor = null,
+        .bInheritHandle = true,
+        .pad = 0
+    };
+
+    if (!CreatePipe(&stdinRead, &stdinWrite, (rawptr)&sa, 0) ||
+        !CreatePipe(&stdoutRead, &stdoutWrite, (rawptr)&sa, 0) ||
+        !CreatePipe(&stderrRead, &stderrWrite, (rawptr)&sa, 0))
+    {
+        if (stdinRead != null) CloseHandle(stdinRead);
+        if (stdinWrite != null) CloseHandle(stdinWrite);
+        if (stdoutRead != null) CloseHandle(stdoutRead);
+        if (stdoutWrite != null) CloseHandle(stdoutWrite);
+        if (stderrRead != null) CloseHandle(stderrRead);
+        if (stderrWrite != null) CloseHandle(stderrWrite);
+        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
     }
 
-    i32 pid = fork();
-    if (pid < 0)
+    // The parent keeps these three ends.  CreatePipe marks BOTH ends
+    // inheritable (SECURITY_ATTRIBUTES above), so clear HANDLE_FLAG_INHERIT
+    // on the parent ends — otherwise bInheritHandles hands the child the
+    // parent's copies too and reads on stdout/stderr would never see EOF.
+    if (!SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stdoutRead, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stderrRead, HANDLE_FLAG_INHERIT, 0))
     {
-        close(stdinPipe[0]); close(stdinPipe[1]);
-        close(stdoutPipe[0]); close(stdoutPipe[1]);
-        close(stderrPipe[0]); close(stderrPipe[1]);
-        // source left the other three fields uninitialized here; -1 matches
-        // the pipe-failure path above
-        return Process { .pid = -1, .stdinFd = -1, .stdoutFd = -1, .stderrFd = -1 };
+        CloseHandle(stdinRead); CloseHandle(stdinWrite);
+        CloseHandle(stdoutRead); CloseHandle(stdoutWrite);
+        CloseHandle(stderrRead); CloseHandle(stderrWrite);
+        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
     }
 
-    if (pid == 0)
+    // Build the child's command line.  execvp took (program, argv)
+    // separately; CreateProcessA gets the program in lpApplicationName and
+    // the argv it will see as the command line, so the caller's args reach
+    // the child exactly as execvp passed them (argv[0] stays whatever the
+    // caller put in args[0]).  Each argument is quoted per _appendArg;
+    // capacity: 2 output bytes per input byte + quotes + separator, +1 for
+    // the NUL.  (The POSIX port's 4095-byte per-argument cap is dropped;
+    // CreateProcessA allows a 32767-byte line.)
+    usize n = args != null ? args->count() : 0;
+    usize cap = 1;
+    for (usize i = 0; i < n; i++) cap += args->at(i).len * 2 + 3;
+    u8* line = alloc<u8>(cap);
+    usize off = 0;
+    for (usize i = 0; i < n; i++)
     {
-        close(stdinPipe[1]);
-        close(stdoutPipe[0]);
-        close(stderrPipe[0]);
-        dup2(stdinPipe[0], 0);
-        dup2(stdoutPipe[1], 1);
-        dup2(stderrPipe[1], 2);
+        if (i > 0) { line[off] = ' '; off++; }
+        off = _appendArg(line, off, args->at(i));
+    }
+    line[off] = 0;
 
-        usize n = args != null ? args->count() : 0;
-        usize totalLen = 0;
-        for (usize i = 0; i < n; i++)
-        {
-            str a = args->at(i);
-            totalLen += (a.len < 4095u ? a.len : 4095u) + 1;
-        }
-        cchar** argv = alloc<cchar*>(n + 1);
-        cchar* buf = alloc<cchar>(totalLen);
-        usize offset = 0;
-        for (usize i = 0; i < n; i++)
-        {
-            str a = args->at(i);
-            usize len = a.len < 4095u ? a.len : 4095u;
-            copy<u8>((u8*)buf + offset, (u8*)a.ptr, len);
-            buf[offset + len] = 0;
-            argv[i] = buf + offset;
-            offset += len + 1;
-        }
-        argv[n] = null;
-        execvp(cmd.ptr, (const cchar**)argv);
-        _exit(127);
+    // STARTUPINFOA through an opaque 104-byte buffer + cast (§9.2): the
+    // buffer is oversized for safety and only the documented fields above
+    // are written.
+    u8 siBuf[104];
+    zero<u8>(siBuf, 104);
+    STARTUPINFOA* si = (STARTUPINFOA*)siBuf;
+    si->cb = (u32)sizeof(STARTUPINFOA);          // 104 (FLAG offsets)
+    si->dwFlags = STARTF_USESTDHANDLES;          // 0x100 — honour hStd* below
+    si->hStdInput = stdinRead;                   // child's stdin  <- pipe read end
+    si->hStdOutput = stdoutWrite;                // child's stdout -> pipe write end
+    si->hStdError = stderrWrite;                 // child's stderr -> pipe write end
+
+    PROCESS_INFORMATION pi = PROCESS_INFORMATION {
+        .hProcess = null,
+        .hThread = null,
+        .dwProcessId = 0,
+        .dwThreadId = 0
+    };
+
+    // cmd.ptr must be NUL-terminated — the same assumption the old
+    // execvp(cmd.ptr, ...) call made.  With no args the command line is
+    // null and CreateProcessA derives it from lpApplicationName.
+    bool ok = CreateProcessA((const cchar*)cmd.ptr, n > 0 ? (cchar*)line : null,
+        null, null, true, 0, null, null, (rawptr)si, (rawptr)&pi);
+    dealloc<u8>(line);
+
+    if (!ok)
+    {
+        CloseHandle(stdinRead); CloseHandle(stdinWrite);
+        CloseHandle(stdoutRead); CloseHandle(stdoutWrite);
+        CloseHandle(stderrRead); CloseHandle(stderrWrite);
+        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
     }
 
-    close(stdinPipe[0]);
-    close(stdoutPipe[1]);
-    close(stderrPipe[1]);
+    // The child holds its own inherited copies of the child ends, and only
+    // hProcess is needed to wait — close everything else.  (The old code
+    // closed the same ends after fork returned in the parent.)
+    CloseHandle(stdinRead);
+    CloseHandle(stdoutWrite);
+    CloseHandle(stderrWrite);
+    CloseHandle(pi.hThread);
 
-    return Process
-    {
-        .pid = pid,
-        .stdinFd = stdinPipe[1],
-        .stdoutFd = stdoutPipe[0],
-        .stderrFd = stderrPipe[0]
+    return Process {
+        .pid = (i32)pi.dwProcessId,
+        .hProcess = pi.hProcess,
+        .stdinFd = stdinWrite,
+        .stdoutFd = stdoutRead,
+        .stderrFd = stderrRead
     };
 }
 
 pub ProcessResult waitFor(Process* p)
 {
-    i32 status;
-    i32 rc = waitpid(p->pid, &status, 0);
-    if (rc < 0)
-    {
+    if (p->hProcess == null) {
         return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
     }
+    // waitpid -> WaitForSingleObject(INFINITE) + GetExitCodeProcess.
+    u32 wr = WaitForSingleObject(p->hProcess, INFINITE);
+    if (wr != WAIT_OBJECT_0) {
+        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
+    }
+    u32 code = 0;
+    bool got = GetExitCodeProcess(p->hProcess, &code);
     _closeIoFd(&p->stdinFd);
     _closeIoFd(&p->stdoutFd);
     _closeIoFd(&p->stderrFd);
-
-    if (status & 0x7F)
+    // The process handle is done being waited on; close it so a second
+    // waitFor sees the null handle and returns -1 (like a reaped pid).
+    CloseHandle(p->hProcess);
+    p->hProcess = null;
+    if (!got)
     {
-        return ProcessResult { .exitCode = -1, .signaled = true, .termSignal = status & 0x7F };
+        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
     }
-    return ProcessResult { .exitCode = (status >> 8) & 0xFF, .signaled = false, .termSignal = 0 };
+    // FLAG: Win32 has no wait-status signal word.  A child that died from
+    // a signal on POSIX was reported as signaled/termSignal; Windows only
+    // hands back the exit code (an NTSTATUS-style value when killed), so
+    // the two signal fields stay 0 and the raw code is surfaced instead.
+    return ProcessResult { .exitCode = (i32)code, .signaled = false, .termSignal = 0 };
 }
 
 pub isize writeStdin(Process* p, const cchar* data, usize len)
 {
-    return write(p->stdinFd, data, len);
+    if (p->stdinFd == null) return -1;
+    u32 written = 0;
+    if (!WriteFile(p->stdinFd, data, (u32)len, &written, null)) return -1;
+    return (isize)written;
 }
 
 pub isize readStdout(Process* p, u8* buf, usize maxLen)
 {
-    return read(p->stdoutFd, buf, maxLen);
+    if (p->stdoutFd == null) return -1;
+    u32 n = 0;
+    if (!ReadFile(p->stdoutFd, (cchar*)buf, (u32)maxLen, &n, null)) return -1;
+    return (isize)n;
 }
 
 pub isize readStderr(Process* p, u8* buf, usize maxLen)
 {
-    return read(p->stderrFd, buf, maxLen);
+    if (p->stderrFd == null) return -1;
+    u32 n = 0;
+    if (!ReadFile(p->stderrFd, (cchar*)buf, (u32)maxLen, &n, null)) return -1;
+    return (isize)n;
 }
 
 pub i32 run(str cmd, Vec<str>* args)
@@ -141,28 +346,32 @@ pub i32 run(str cmd, Vec<str>* args)
     Process p = spawn(cmd, args);
     if (p.pid < 0) return -1;
     _closeIoFd(&p.stdinFd);
-    // poll both pipes so the child never blocks writing while the parent
-    // waits for the other pipe
+    // Drain stdout and stderr exactly like the old poll() loop: neither
+    // pipe is ever waited on while the other fills.  PeekNamedPipe plays
+    // poll's part (ready / broken), WaitForSingleObject(0) detects child
+    // exit, and once the child is gone the buffered remainder is read
+    // until the pipe breaks; an idle iteration sleeps 1ms on the process
+    // handle instead of spinning.
     u8 buf[4096];
-    while (true)
+    while (p.stdoutFd != null || p.stderrFd != null)
     {
-        pollfd fds[2];
-        usize nfds = 0;
-        if (p.stdoutFd >= 0) { fds[nfds].fd = p.stdoutFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
-        if (p.stderrFd >= 0) { fds[nfds].fd = p.stderrFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
-        if (nfds == 0) break;
-        i32 rc = poll((rawptr)fds, nfds, -1);
-        if (rc <= 0) break;
-        for (usize i = 0; i < nfds; i++)
+        bool exited = WaitForSingleObject(p.hProcess, 0) == WAIT_OBJECT_0;
+        bool gotData = false;
+        if (p.stdoutFd != null)
         {
-            if ((fds[i].revents & 17) == 0) continue;
-            i64 n = read(fds[i].fd, buf, 4096);
-            if (n <= 0)
-            {
-                if (fds[i].fd == p.stdoutFd) _closeIoFd(&p.stdoutFd);
-                else _closeIoFd(&p.stderrFd);
-            }
+            i32 r = _drainPipe(p.stdoutFd, buf, 4096);
+            // (r == 0 && exited): child gone and nothing buffered — close
+            // rather than wait forever on a pipe nobody will write again.
+            if (r < 0 || (r == 0 && exited)) _closeIoFd(&p.stdoutFd);
+            else if (r > 0) gotData = true;
         }
+        if (p.stderrFd != null)
+        {
+            i32 r = _drainPipe(p.stderrFd, buf, 4096);
+            if (r < 0 || (r == 0 && exited)) _closeIoFd(&p.stderrFd);
+            else if (r > 0) gotData = true;
+        }
+        if (!gotData && !exited) WaitForSingleObject(p.hProcess, 1);
     }
     ProcessResult r = waitFor(&p);
     return r.exitCode;
@@ -170,5 +379,8 @@ pub i32 run(str cmd, Vec<str>* args)
 
 pub void exit(i32 code)
 {
-    _exit(code);
+    // _exit -> ExitProcess (available on the win32 surface).
+    // TerminateProcess(GetCurrentProcess(), code) is the harsher variant
+    // but needs two extra externs for the same effect.
+    ExitProcess((u32)code);
 }

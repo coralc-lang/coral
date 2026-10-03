@@ -1,39 +1,115 @@
 import mutex { Mutex };
-import(lib) platform::libc { pthread_cond_init, pthread_cond_destroy, pthread_cond_wait, pthread_cond_signal, pthread_cond_broadcast, pthread_create, pthread_join, pthread_exit, pthread_self };
+import(lib) platform::win32 { CreateThread, WaitForSingleObject, GetExitCodeThread, CloseHandle, GetProcessHeap, HeapAlloc, HeapFree };
+
+// Local externs below are not in lib/platform/win32.crl (do NOT edit it).
+pub extern u32 GetCurrentThreadId();
+pub extern void ExitThread(u32 dwExitCode);
+pub extern void InitializeConditionVariable(rawptr cond);
+pub extern bool SleepConditionVariableCS(rawptr cond, rawptr critsec, u32 dwMilliseconds);
+pub extern void WakeConditionVariable(rawptr cond);
+pub extern void WakeAllConditionVariable(rawptr cond);
+
+const u32 INFINITE = 0xFFFFFFFF;
 
 pub distinct Thread = rawptr;
 
 pub struct ConditionVar
 {
-    rawptr impl[6];
+    // CONDITION_VARIABLE is pointer-sized: 8 bytes on x64 — FLAGGED size
+    // assumption (RTL_CONDITION_VARIABLE is a single PVOID). impl[1] keeps
+    // `self.impl` passing the ADDRESS of the variable to the externs.
+    rawptr impl[1];
 
-    void init() { pthread_cond_init(self.impl, null); }
-    void destroy() { pthread_cond_destroy(self.impl); }
-    void wait(Mutex* mutex) { pthread_cond_wait(self.impl, mutex->impl); }
-    void signal() { pthread_cond_signal(self.impl); }
-    void broadcast() { pthread_cond_broadcast(self.impl); }
+    void init() { InitializeConditionVariable(self.impl); }
+    void destroy()
+    {
+        // FLAG: Win32 CONDITION_VARIABLE needs no destruction —
+        // pthread_cond_destroy has no equivalent, so this is a no-op.
+    }
+    void wait(Mutex* mutex)
+    {
+        // SleepConditionVariableCS atomically releases the caller's
+        // critical section and blocks, like pthread_cond_wait. The caller
+        // must own the mutex (EnterCriticalSection) on this thread — same
+        // requirement as POSIX, but Win32 enforces ownership strictly.
+        SleepConditionVariableCS(self.impl, mutex->_cs, INFINITE);
+    }
+    void signal() { WakeConditionVariable(self.impl); }
+    void broadcast() { WakeAllConditionVariable(self.impl); }
+}
+
+// Win32 start routines take exactly one rawptr parameter, so the (fn, arg)
+// pair handed to threadCreate is bundled into a small heap context that the
+// trampoline unpacks on the new thread.
+struct ThreadCtx
+{
+    rawptr(rawptr) fn;
+    rawptr arg;
+}
+
+static u32 _threadEntry(rawptr p)
+{
+    ThreadCtx* ctx = (ThreadCtx*)p;
+    rawptr result = ctx->fn(ctx->arg);
+    HeapFree(GetProcessHeap(), 0, ctx);
+    // FLAG: the 64-bit pthread-style return value is truncated to the u32
+    // Win32 thread exit code (see also threadExit/threadJoin).
+    return (u32)(usize)result;
 }
 
 pub Thread threadCreate(rawptr(rawptr) fn, rawptr arg)
 {
-    rawptr t;
-    if (pthread_create(&t, null, fn, arg) != 0) return (Thread)0;
-    return (Thread)t;
+    // Two rawptrs (fn + arg) = 16 bytes on x64.
+    ThreadCtx* ctx = (ThreadCtx*)HeapAlloc(GetProcessHeap(), 0, 16);
+    if (ctx == null) return (Thread)0;
+    ctx->fn = fn;
+    ctx->arg = arg;
+    u32 tid;
+    rawptr h = CreateThread(null, 0, _threadEntry, ctx, 0, &tid);
+    if (h == null)
+    {
+        HeapFree(GetProcessHeap(), 0, ctx);
+        return (Thread)0;
+    }
+    return (Thread)h;
 }
 
 pub bool threadJoin(Thread t, rawptr* retval)
 {
-    return pthread_join((rawptr)t, retval) == 0;
+    rawptr h = (rawptr)t;
+    if (WaitForSingleObject(h, INFINITE) != 0) return false;
+    if (retval != null)
+    {
+        u32 code;
+        if (!GetExitCodeThread(h, &code))
+        {
+            CloseHandle(h);
+            return false;
+        }
+        // FLAG: u32 exit code -> rawptr, truncated on x64.
+        *retval = (rawptr)(usize)code;
+    }
+    // Win32 handles must be closed by the joiner; pthread_join had no such
+    // step. After this, the Thread value is invalid (do not join twice).
+    CloseHandle(h);
+    return true;
 }
 
 pub void threadExit(rawptr retval)
 {
-    pthread_exit(retval);
+    // FLAG: truncation to u32, and if this is called from inside a
+    // threadCreate entry, the 16-byte ThreadCtx heap block leaks (the
+    // trampoline never regains control).
+    ExitThread((u32)(usize)retval);
 }
 
 pub Thread threadCurrent()
 {
-    return (Thread)pthread_self();
+    // FLAG: pthread_self() is an opaque per-thread identity meant for
+    // comparison; GetCurrentThreadId() returns a reusable u32 thread ID
+    // that is NOT the HANDLE returned by threadCreate — so values from
+    // threadCurrent() must never be passed to threadJoin.
+    return (Thread)(rawptr)(usize)GetCurrentThreadId();
 }
 
 pub struct AtomicU64

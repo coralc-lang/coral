@@ -1,4 +1,14 @@
-import(lib) platform::libc { signal, kill, raise };
+// FLAG: signal and raise stay on the CRT (msvcrt) per §9 — the libc
+// surface provides them and msvcrt exports POSIX-like signal/raise, so
+// this file keeps its platform::libc import for that subset only.
+import(lib) platform::libc { signal, raise };
+import(lib) platform::win32 { CloseHandle };
+
+// kill has no Win32 equivalent — local externs (not in win32.crl).
+pub extern rawptr OpenProcess(u32 dwDesiredAccess, bool bInheritHandle, u32 dwProcessId);
+pub extern bool TerminateProcess(rawptr hProcess, u32 uExitCode);
+
+const u32 PROCESS_TERMINATE = 1;
 
 pub const i32 SIGABRT = 6;
 pub const i32 SIGALRM = 14;
@@ -27,8 +37,9 @@ pub const i32 SIGXCPU = 24;
 pub const i32 SIGXFSZ = 25;
 
 // SIG_DFL/SIG_IGN are special pointer values, not integers.
-// On posix, SIG_DFL = (void (*)(int))0, SIG_IGN = (void (*)(int))1.
-// these are passed as raw usize and cast to function pointer.
+// msvcrt uses the same values as POSIX: SIG_DFL = (void (*)(int))0,
+// SIG_IGN = (void (*)(int))1. These are passed as raw usize and cast to
+// function pointer.
 
 pub const u8 SIG_DFL = 0;
 pub const usize SIG_IGN = 1;
@@ -50,9 +61,19 @@ pub void defaultHandler(i32 sig)
     signal(sig, (SigHandler*)(usize)SIG_DFL);
 }
 
+// FLAG: no POSIX kill() on Win32 — best-effort strategy chosen:
+// OpenProcess(PROCESS_TERMINATE) + TerminateProcess + CloseHandle.
+// Differences from POSIX kill: no signal delivery (the target's handlers
+// never run, this is a hard termination), sig is used only as the exit
+// code (sig == 0, the POSIX existence probe, would terminate!), and
+// termination is asynchronous. Returns 0 on success, -1 on failure.
 pub i32 send(i32 pid, i32 sig)
 {
-    return kill(pid, sig);
+    rawptr h = OpenProcess(PROCESS_TERMINATE, false, (u32)pid);
+    if (h == null) return -1;
+    bool ok = TerminateProcess(h, (u32)sig);
+    CloseHandle(h);
+    return ok ? 0 : -1;
 }
 
 pub i32 raiseSig(i32 sig)

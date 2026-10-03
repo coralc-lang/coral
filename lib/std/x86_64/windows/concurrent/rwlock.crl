@@ -1,14 +1,70 @@
-import(lib) platform::libc { pthread_rwlock_init, pthread_rwlock_destroy, pthread_rwlock_rdlock, pthread_rwlock_wrlock, pthread_rwlock_tryrdlock, pthread_rwlock_trywrlock, pthread_rwlock_unlock };
+// Win32 port: pthread_rwlock_* -> SRWLOCK.
+// Local externs below are not in lib/platform/win32.crl (do NOT edit it).
+pub extern void InitializeSRWLock(rawptr srwlock);
+pub extern void AcquireSRWLockExclusive(rawptr srwlock);
+pub extern void ReleaseSRWLockExclusive(rawptr srwlock);
+pub extern void AcquireSRWLockShared(rawptr srwlock);
+pub extern void ReleaseSRWLockShared(rawptr srwlock);
+// FLAG: TryAcquireSRWLock* exists only on Windows 7+ (Kernel32). It gives
+// pthread tryrdlock/trywrlock exact semantics (bool, never blocks, never
+// "always succeeds"). If a pre-Win7 target is ever required, try* must be
+// replaced with a flagged best-effort approximation — do NOT make them
+// always return true.
+pub extern bool TryAcquireSRWLockExclusive(rawptr srwlock);
+pub extern bool TryAcquireSRWLockShared(rawptr srwlock);
 
 pub struct RwLock
 {
-    rawptr impl[8];
+    // SRWLOCK is pointer-sized: 8 bytes on x64 — FLAGGED size assumption
+    // (RTL_SRWLOCK is a single PVOID). rawptr impl[1] keeps `self.impl`
+    // passing the ADDRESS of the lock, as the old rawptr impl[8] did.
+    rawptr impl[1];
+    // FLAG (added state): pthread_rwlock_unlock does not distinguish
+    // reader/writer, but Win32 requires the matching Release*. The holder
+    // records which mode it acquired; every concurrent holder of one era
+    // shares the same mode (writers only enter once all readers left), and
+    // unlock reads back what the same thread wrote between acquire/release.
+    bool _exclusive;
 
-    void init() { pthread_rwlock_init(self.impl, null); }
-    void destroy() { pthread_rwlock_destroy(self.impl); }
-    void readLock() { pthread_rwlock_rdlock(self.impl); }
-    void writeLock() { pthread_rwlock_wrlock(self.impl); }
-    bool tryReadLock() { return pthread_rwlock_tryrdlock(self.impl) == 0; }
-    bool tryWriteLock() { return pthread_rwlock_trywrlock(self.impl) == 0; }
-    void unlock() { pthread_rwlock_unlock(self.impl); }
+    void init()
+    {
+        InitializeSRWLock(self.impl);
+        self._exclusive = false;
+    }
+    void destroy()
+    {
+        // FLAG: SRWLOCK needs no destruction — pthread_rwlock_destroy has
+        // no Win32 equivalent, so this is a no-op.
+    }
+    void readLock()
+    {
+        AcquireSRWLockShared(self.impl);
+        self._exclusive = false;
+    }
+   
+    void writeLock()
+    {
+        AcquireSRWLockExclusive(self.impl);
+        self._exclusive = true;
+    }
+   
+    bool tryReadLock()
+    {
+        if (!TryAcquireSRWLockShared(self.impl)) return false;
+        self._exclusive = false;
+        return true;
+    }
+   
+    bool tryWriteLock()
+    {
+        if (!TryAcquireSRWLockExclusive(self.impl)) return false;
+        self._exclusive = true;
+        return true;
+    }
+   
+    void unlock()
+    {
+        if (self._exclusive) ReleaseSRWLockExclusive(self.impl);
+        else ReleaseSRWLockShared(self.impl);
+    }
 }
