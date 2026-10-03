@@ -5,7 +5,9 @@ import(lib) core::limits { INT64_MAX, INT64_MIN };
 
 // Missing from the libc surface: declared locally, linked against libc
 // as-is. Never edit lib/platform/libc.crl.
-
+extern("C") i32 getchar();
+extern("C") f64 strtod(const cchar* nptr, cchar** endptr);
+extern("C") i32 vsnprintf(cchar* buf, u64 size, const cchar* fmt, ...);
 
 // One stack-buffered output context per print call: every helper appends
 // here and the call issues a single write(2) when it flushes.
@@ -57,7 +59,8 @@ static void _pbytes(_Buf* out, const cchar* s, usize n)
 // has no std::fmt dependency and no String alloc/free per number.
 // Digits are produced back-to-front into tmp, then copied forward.
 // tmp holds 72 bytes: 64 binary digits + sign (+ prefix lives outside).
-#[[inline]] static usize _itoa(u8* dst, u64 val, u32 base, bool neg)
+#[[inline]]
+static usize _itoa(u8* dst, u64 val, u32 base, bool neg)
 {
     u8 tmp[72];
     usize n = 0;
@@ -83,7 +86,8 @@ static void _pbytes(_Buf* out, const cchar* s, usize n)
 
 // Signed integer into the buffer (decimal by default; base comes from
 // {:d}/{:x}/{:b}). 72 bytes covers i64's 21 decimal / 65 binary digits.
-#[[inline]] static i32 _fprintSigned(_Buf* out, i64 v, u32 base)
+#[[inline]]
+static i32 _fprintSigned(_Buf* out, i64 v, u32 base)
 {
     u8 numBuf[72];
     bool neg = v < 0;
@@ -95,7 +99,8 @@ static void _pbytes(_Buf* out, const cchar* s, usize n)
 
 // Unsigned integer into the buffer; `prefix` adds the 0x/0b the old
 // formatHex/formatBin produced for the hex/bin manipulators and {:p}.
-#[[inline]] static i32 _fprintUnsigned(_Buf* out, u64 v, u32 base, bool prefix)
+#[[inline]]
+static i32 _fprintUnsigned(_Buf* out, u64 v, u32 base, bool prefix)
 {
     u8 numBuf[72];
     usize n = 0;
@@ -154,40 +159,33 @@ static i32 _fprintF64(_Buf* out, f64 v)
     return 1;
 }
 
-#[[inline]] static i32 _fprintPtr(_Buf* out, const rawptr v)
+#[[inline]]
+static i32 _fprintPtr(_Buf* out, const rawptr v)
 {
     return _fprintUnsigned(out, (u64)v, 16, true);
 }
 
-#[[inline]] static i32 _fprintCstr(_Buf* out, const cchar* s)
+#[[inline]]
+static i32 _fprintCstr(_Buf* out, const cchar* s)
 {
     usize len = strlen(s);
     if (len > 0) _pbytes(out, s, len);
     return (i32)len;
 }
 
-#[[inline]] static i32 _fprintBytes(_Buf* out, const cchar* ptr, usize len)
-{
+#[[inline]]
+static i32 _fprintBytes(_Buf* out, const cchar* ptr, usize len) {
     if (ptr && len > 0) _pbytes(out, ptr, len);
     return (i32)len;
 }
 
-#[[inline]] static void _fprintNewline(_Buf* out)
-{
-    _pbyte(out, '\n');
-}
+#[[inline]] static void _fprintNewline(_Buf* out) { _pbyte(out, '\n'); }
 
 // Nothing is retained between calls — each print call flushes its own
 // stack buffer — so flush is a no-op, as it was in the old file.
-#[[inline]] static void _fprintFlush(i32 fd)
-{
-    (void)fd;
-}
+#[[inline]] static void _fprintFlush(i32 fd) { (void)fd; }
 
-#[[inline]] static i32 _fprintHex(_Buf* out, u64 v)
-{
-    return _fprintUnsigned(out, v, 16, true);
-}
+#[[inline]] static i32 _fprintHex(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 16, true); }
 
 #[[inline]] static i32 _fprintBin(_Buf* out, u64 v)
 {
@@ -516,27 +514,27 @@ pub void eprintln<comptime T>(T fmt, ...)
     _pflush(&out);
 }
 
+// i did not ask for printf equivalent, but the equivalent of tthe print function in 
 // The printf-like equivalent: runtime C variadic with full vsnprintf
 // semantics (%d %i %u %x %X %s %c %f %p %%, widths, precisions, -/0
 // flags — whatever vsnprintf supports). Formatted into a 1024-byte stack
 // buffer, written, cursor advanced, looped until done: unbounded argument
 // count and output length, no heap allocation.
-pub void vaprint(const cchar* fmt, ...)
-{
-    u8 outBuf[1024];
-    usize sent = 0;
-    for (;;)
-    {
-        i32 n = vsnprintf(outBuf, 1024u, fmt, ...);
-        if (n <= 0) return;
-        usize total = (usize)n;
-        if (sent >= total) return;
-        usize avail = total - sent;
-        if (avail > 1023u) avail = 1023u;
-        write(1, outBuf, (u64)avail);
-        sent += avail;
-    }
-}
+// pub void vaprint(const cchar* fmt, ...)
+// {
+//     u8 outBuf[1024];
+//     usize sent = 0;
+//     loop {
+//         i32 n = vsnprintf(outBuf, 1024u, fmt, ...);
+//         if (n <= 0) return;
+//         usize total = (usize)n;
+//         if (sent >= total) return;
+//         usize avail = total - sent;
+//         if (avail > 1023u) avail = 1023u;
+//         write(1, outBuf, (u64)avail);
+//         sent += avail;
+//     }
+// }
 
 // Print manipulator types
 pub struct Spaces { u64 count; }
@@ -545,35 +543,12 @@ pub struct Hex { u64 value; }
 pub struct Bin { u64 value; }
 pub struct Fixed { f64 value; u64 precision; }
 
-pub Spaces spaces(u64 count)
-{
-    return Spaces { .count = count };
-}
-
-pub Repeat repeat(u8 ch, u64 count)
-{
-    return Repeat { .ch = ch, .count = count };
-}
-
-pub Hex hex(u64 value)
-{
-    return Hex { .value = value };
-}
-
-pub Bin bin(u64 value)
-{
-    return Bin { .value = value };
-}
-
-pub Fixed fixed(f64 value, u64 precision)
-{
-    return Fixed { .value = value, .precision = precision };
-}
-
-pub void flush()
-{
-    _fprintFlush(1);
-}
+pub Spaces spaces(u64 count) { return Spaces { .count = count }; }
+pub Repeat repeat(u8 ch, u64 count) { return Repeat { .ch = ch, .count = count }; }
+pub Hex hex(u64 value) { return Hex { .value = value }; }
+pub Bin bin(u64 value) { return Bin { .value = value }; }
+pub Fixed fixed(f64 value, u64 precision) { return Fixed { .value = value, .precision = precision }; }
+pub void flush() { _fprintFlush(1); }
 
 static i64 _readI64()
 {
