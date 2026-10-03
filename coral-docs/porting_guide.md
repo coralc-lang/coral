@@ -68,7 +68,8 @@ sources collide, keep one qualified via the module import form.
 pub void push(T val) { ... }          // no `fn` keyword; return type first
 static Vec<T> new() { ... }           // associated fn (no receiver) / file-local helper
 usize count() { return self.len; }    // method inside struct body
-extern("C") rawptr calloc(usize count, usize size);   // FFI
+extern rawptr calloc(usize count, usize size);   // FFI — plain `extern`;
+    // an `("C")` suffix is allowed but optional (the user omits it)
 pub typedef cchar = u8;               // type alias
 pub Allocator* defaultAllocator;      // global
 const u32 FLI_COUNT = 32;             // const
@@ -213,6 +214,11 @@ file: `pub extend str { ... }`.
 9. Never attempt to compile, build or test anything — the compiler is
    incomplete. Verify by reading: every function ported, imports
    resolved to real files, braces balanced.
+10. `flag (ARCH) { ... }` is OLD syntax and has no place in the new tree
+    — this tree IS x86_64/linux. Port ONLY the x86_64 branch's body,
+    with no flag construct at all. (`lib/core`'s type-level
+    `flag (ARCH) { x86_64 => {...}, else => {...} }` expression is the
+    user's own — never touch it.)
 
 ## 8. The io port — 12 files, print family redesign
 
