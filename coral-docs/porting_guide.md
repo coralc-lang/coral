@@ -76,7 +76,7 @@ static const u8 Table[16] = { ... };  // static const table
 ```
 
 Params are `type name` (C-style), never `name: type`. Variadic: `...`.
-File-private helpers get `static`.
+File-private helpers get `static`. must not be, because if it is not pub, then automatically it is private
 
 ### struct
 
@@ -207,6 +207,12 @@ file: `pub extend str { ... }`.
 6. If a construct has no clean equivalent, port it as faithfully as
    possible and flag the judgment call in your report.
 7. Do not modify files outside your assigned destinations.
+8. `loop { ... }` is valid new-dialect coral (indefinite loop, exits via
+   `break`/`return` inside) — leave `loop` loops exactly as they are;
+   never rewrite them as `while (true)`.
+9. Never attempt to compile, build or test anything — the compiler is
+   incomplete. Verify by reading: every function ported, imports
+   resolved to real files, braces balanced.
 
 ## 8. The io port — 12 files, print family redesign
 
