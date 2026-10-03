@@ -1,21 +1,15 @@
-// Winsock — `ws2_32 must be linked`.  close() from platform::libc is gone:
-// sockets are closed with closesocket().
+// Winsock — ws2_32 must be linked; close() is gone, sockets use
+// closesocket(). recvfrom/sendto take a rawptr SOCKET in win32.crl.
 import(lib) platform::win32 { socket, bind, listen, accept, connect, send, recv, closesocket, setsockopt, htonl, WSAStartup, sendto, recvfrom };
 
-// recvfrom/sendto take a Win64 SOCKET (rawptr) first parameter in
-// win32.crl — no i32 truncation.
-
-// htons is missing from win32.crl (ntohs/htonl/ntohl are there; htons is
-// not).  x86_64 is little-endian and network order is big-endian, so swap
-// the bytes in coral instead of adding an extern.
+// htons isn't on the surface — byte swap in coral (x86 is little endian).
 pub u16 htons(u16 v)
 {
     return (u16)((v << 8) | (v >> 8));
 }
 
-// AF_INET / SOCK_STREAM / SOCK_DGRAM / IPPROTO_TCP / IPPROTO_UDP have the
-// same numeric values on Windows as on POSIX — kept as-is.  SOL_SOCKET and
-// SO_REUSEADDR do NOT (winsock2.h): converted (FLAG).
+// AF_INET/SOCK_*/IPPROTO_* match POSIX on Windows; SOL_SOCKET (0xFFFF)
+// and SO_REUSEADDR (4) do not — converted.
 const i32 AF_INET = 2;
 const i32 SOCK_STREAM = 1;
 const i32 SOCK_DGRAM = 2;
@@ -24,25 +18,20 @@ const i32 IPPROTO_UDP = 17;
 const i32 SOL_SOCKET = 0xFFFF; // POSIX is 1; winsock uses 0xFFFF
 const i32 SO_REUSEADDR = 4;    // POSIX is 2; winsock uses 4
 
-// One-time winsock initialization (FLAG: file-private guard in net.crl,
-// called from the socket-creating paths tcpConnect/tcpListen/udpSocket).
-// ws2_32 must be linked.
+// One-time WSAStartup guard, called from the socket-creating paths
+// (tcpConnect/tcpListen/udpSocket). ws2_32 must be linked.
 static bool _wsaStarted = false;
 
 static void _ensureWsa()
 {
     if (_wsaStarted) return;
-    // WSADATA is a large opaque struct (~408 bytes on x64); only the
-    // version handshake matters here, so an opaque 512-byte buffer stands
-    // in for it per §9 (FLAG size) — WSAStartup fills it and we never read
-    // it back.
+    // WSADATA is ~408B; only the version handshake matters, so an opaque
+    // 512B buffer stands in (FLAG size) and is never read back.
     u8 wsa[512];
     if (WSAStartup(0x0202, (rawptr)wsa) == 0) _wsaStarted = true;
 }
 
-// INVALID_SOCKET = (SOCKET)(~0): winsock's failure value (FLAG: relies on
-// the int->pointer cast (rawptr)(-1), the spelling §9.2 itself uses for
-// INVALID_HANDLE_VALUE).
+// INVALID_SOCKET = (rawptr)(-1), winsock's failure value.
 static bool _badSock(rawptr s)
 {
     return s == (rawptr)(-1);
@@ -85,8 +74,7 @@ static bool _parseIp(str ip, u32* out)
         }
     }
     if (octets != 4) return false;
-    // FLAG: win32.crl types htonl as returning u64 (the Win32 DWORD return
-    // is really 32 bits) — cast the result back to u32 at every use.
+    // FLAG: win32.crl types htonl as u64 — cast back to u32.
     *out = (u32)htonl(addrVal);
     return true;
 }
@@ -96,9 +84,8 @@ static void _zeroSockaddr(sockaddr_in* a)
     for (usize i = 0; i < 8; i++) a->sinZero[i] = 0;
 }
 
-// FLAG: was `distinct TcpSocket = i32` — a Win64 SOCKET is 64-bit, so the
-// distinct base type is now rawptr (invalid value = (rawptr)(-1), i.e.
-// INVALID_SOCKET, where the i32 version used -1).
+// FLAG: was distinct TcpSocket = i32; a Win64 SOCKET is 64-bit, so the
+// base is rawptr (invalid (rawptr)(-1), was -1).
 pub distinct TcpSocket = rawptr;
 
 pub TcpSocket tcpConnect(str ip, u16 port)
@@ -130,8 +117,8 @@ pub TcpSocket tcpListen(u16 port)
     rawptr s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (_badSock(s)) return (TcpSocket)(rawptr)(-1);
 
-    // source bug: this was a 5-argument call to sendto (which takes 6);
-    // the shape is setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...) — fixed.
+    // source bug: was a 5-arg sendto (6 params) — the shape is
+    // setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...).
     i32 optval = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const cchar*)&optval, 4);
 
@@ -149,9 +136,7 @@ pub TcpSocket tcpAccept(TcpSocket server)
 {
     sockaddr_in addr;
     i32 addrLen = 16;
-    // accept returns INVALID_SOCKET on failure, which casts straight to
-    // the (TcpSocket)(rawptr)(-1) error value — same as the old
-    // (TcpSocket)(-1) for a failed accept.
+    // INVALID_SOCKET casts straight to the (TcpSocket)(rawptr)(-1) error.
     rawptr s = accept((rawptr)server, (rawptr)&addr, &addrLen);
     return (TcpSocket)s;
 }
@@ -161,8 +146,6 @@ pub isize tcpSend(TcpSocket sock, const u8* buf, usize len)
     usize sent = 0;
     while (sent < len)
     {
-        // winsock's send takes an i32 length and returns i32
-        // (SOCKET_ERROR = -1 on failure).
         i32 n = send((rawptr)sock, (const cchar*)(buf + sent), (i32)(len - sent), 0);
         if (n <= 0) return n < 0 ? (isize)n : (isize)sent;
         sent += (usize)n;
@@ -187,7 +170,7 @@ pub void tcpClose(TcpSocket sock)
     closesocket((rawptr)sock);
 }
 
-// FLAG: `fd` was i32, now a rawptr Win64 SOCKET (invalid = (rawptr)(-1)).
+// FLAG: was i32 fd; rawptr Win64 SOCKET now (invalid (rawptr)(-1)).
 pub struct UdpSocket
 {
     rawptr fd;

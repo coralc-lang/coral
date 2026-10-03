@@ -3,7 +3,6 @@ import(lib) std::mman { alloc, dealloc, copy };
 import(lib) std::text::string { String };
 import fios;
 
-// Win32 constants (section 9.2), defined where they are used.
 pub const u32 GENERIC_READ = 0x80000000u;
 pub const u32 GENERIC_WRITE = 0x40000000u;
 pub const u32 FILE_APPEND_DATA = 0x4u;
@@ -37,16 +36,15 @@ pub const i32 R_OK = 4;
 pub const i32 W_OK = 2;
 pub const i32 X_OK = 1;
 
-// File is now a Win32 HANDLE (opaque pointer) - the POSIX i32 fd cannot
-// hold one. Failure is INVALID_HANDLE_VALUE, mirroring open()'s -1.
+// HANDLE now (an i32 fd can't hold one); failure INVALID_HANDLE_VALUE,
+// like open()'s -1.
 pub distinct File = rawptr;
-// Iteration state pointer: a heap DirIter holding the find handle plus
-// the WIN32_FIND_DATAA block (the old DIR* carried the same state).
+// heap DirIter: find handle + WIN32_FIND_DATAA block (the old DIR*
+// carried the same state).
 pub distinct Dir = rawptr;
 
-// Kept as the public POSIX-shaped stat record; statPath() now fills its
-// fields from Win32 metadata (st_dev/st_ino have no Win32 equivalent
-// here and stay 0 - see statPath).
+// POSIX-shaped stat record, filled from Win32 metadata (st_dev/st_ino
+// have no equivalent here and stay 0).
 pub struct Stat
 {
     u64 st_dev;
@@ -95,9 +93,9 @@ pub File fileOpen(str path, str mode)
         if (mode.ptr[0] == 'r') access = GENERIC_READ;
         else if (mode.ptr[0] == 'w') { access = GENERIC_WRITE; disp = CREATE_ALWAYS; }
         else if (mode.ptr[0] == 'a') {
-            // O_APPEND: FILE_APPEND_DATA *without* FILE_WRITE_DATA makes
-            // every WriteFile go to EOF atomically; GENERIC_WRITE would
-            // grant FILE_WRITE_DATA too and defeat that.
+            // O_APPEND: FILE_APPEND_DATA without FILE_WRITE_DATA = every
+            // WriteFile at EOF; GENERIC_WRITE would grant FILE_WRITE_DATA
+            // and defeat it.
             access = FILE_APPEND_DATA;
             disp = OPEN_ALWAYS;
         }
@@ -107,8 +105,8 @@ pub File fileOpen(str path, str mode)
         // '+' widens to O_RDWR on the same handle.
         if (mode.ptr[i] == '+') access |= GENERIC_READ | GENERIC_WRITE;
     }
-    // POSIX lets any number of processes share a file; request all three
-    // share bits so an open file can still be renamed/deleted here.
+    // request all three share bits: POSIX lets processes share, and an
+    // open file must stay renamable/deletable here.
     rawptr h = CreateFileA((const cchar*)pbuf, access,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            null, disp, FILE_ATTRIBUTE_NORMAL, null);
@@ -122,7 +120,7 @@ pub void fileClose(File f)
 
 pub isize fileRead(File f, u8* buf, usize count)
 {
-    // One ReadFile per call, like read(2): 0 at EOF, (isize)-1 on error.
+    // one ReadFile per call, like read(2): 0 at EOF, (isize)-1 on error.
     u64 remain = (u64)count;
     u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
     u32 got = 0;
@@ -141,9 +139,8 @@ pub isize fileWrite(File f, const u8* buf, usize count)
 
 pub isize fileSeek(File f, isize offset, i32 whence)
 {
-    // POSIX SEEK_SET/CUR/END (0/1/2) have the same values as Win32
-    // FILE_BEGIN/CURRENT/END, so `whence` passes straight through.
-    // Full 64-bit: high half in/out through lpDistanceToMoveHigh.
+    // SEEK_*/FILE_* share the same values - whence passes through;
+    // full 64-bit via lpDistanceToMoveHigh.
     i32 high = (i32)(((i64)offset) >> 32);
     u32 low = SetFilePointerA((rawptr)f, (i32)(((u64)offset) & 0xFFFFFFFFu), &high, (u32)whence);
     if (low == 0xFFFFFFFFu && GetLastError() != 0u) return (isize)-1;
@@ -160,12 +157,9 @@ pub bool fileExists(str path)
     return GetFileAttributesA((const cchar*)pbuf) != 0xFFFFFFFFu;
 }
 
-// Read a WIN32_FILE_ATTRIBUTE_DATA field out of the opaque buffer.
-// Documented offsets (FLAG size: the real struct is 36 bytes, the
-// buffer is oversized per section 9.2): dwFileAttributes 0,
-// ftCreationTime 4, ftLastAccessTime 12, ftLastWriteTime 20,
-// nFileSizeHigh 28, nFileSizeLow 32. All reads below are 4-byte
-// aligned, so no unaligned 8-byte load is needed.
+// WIN32_FILE_ATTRIBUTE_DATA out of the opaque buffer (FLAG: real struct
+// is 36B, buffer oversized): attributes@0, created@4, accessed@12,
+// written@20, sizeHigh@28, sizeLow@32. Reads are 4-byte aligned.
 static u32 _u32At(const u8* b, usize off) { return *(const u32*)(b + off); }
 
 static u64 _u64At(const u8* b, usize off)
@@ -175,8 +169,8 @@ static u64 _u64At(const u8* b, usize off)
     return (u64)lo | ((u64)hi << 32);
 }
 
-// FILETIME: 100ns ticks since 1601-01-01; the Unix epoch is
-// 116444736000000000 of those ticks. Pre-epoch values clamp to 0.
+// FILETIME: 100ns ticks since 1601; Unix epoch = 116444736000000000
+// ticks. Pre-epoch clamps to 0.
 static i64 _ftSec(u64 ft)
 {
     if (ft < 116444736000000000u) return 0;
@@ -196,8 +190,7 @@ pub bool statPath(str path, Stat* out)
     copy<u8>(pbuf, (u8*)path.ptr, plen);
     pbuf[plen] = 0;
 
-    // stat() replacement: GetFileAttributesExA with fInfoLevelId 0
-    // (GetFileExInfoStandard) fills a WIN32_FILE_ATTRIBUTE_DATA block.
+    // stat(): GetFileAttributesExA level 0 (GetFileExInfoStandard).
     u8 info[64];
     if (!GetFileAttributesExA((const cchar*)pbuf, 0u, (rawptr)info)) return false;
 
@@ -208,13 +201,11 @@ pub bool statPath(str path, Stat* out)
     u64 size = ((u64)_u32At(info, 28) << 32) | (u64)_u32At(info, 32);
     bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-    // Synthesized POSIX st_mode: getFileType() only switches on the
-    // 0xF000 file-type nibble (S_IFDIR 0x4000 / S_IFREG 0x8000), so
-    // fill that plus conventional rwx bits (0755 dirs, 0644 files).
+    // synthesized st_mode: getFileType() only switches on the 0xF000
+    // nibble (S_IFDIR/S_IFREG) - fill that + rwx (0755 dirs, 0644 files).
     u32 mode = isDir ? (0x4000u | 493u) : (0x8000u | 420u);
 
-    // Field-by-field fill covers every member (incl. the reserved tail)
-    // so callers get a fully determined record.
+    // fill every member incl. the reserved tail - fully determined.
     out->st_dev = 0;
     out->st_ino = 0;
     out->st_nlink = 1;
@@ -257,8 +248,8 @@ pub bool createDir(str path, i32 mode)
     usize plen = path.len < 4095 ? path.len : 4095;
     copy<u8>(pbuf, (u8*)path.ptr, plen);
     pbuf[plen] = 0;
-    // `mode` is POSIX permission bits; Win32 derives permissions from
-    // the inherited ACL instead, so it is not applicable.
+    // mode is POSIX bits; Win32 permissions come from the inherited ACL
+    // - not applicable.
     return CreateDirectoryA((const cchar*)pbuf, null);
 }
 
@@ -303,8 +294,8 @@ pub bool canAccess(str path, i32 mode)
     if (attrs == 0xFFFFFFFFu) return false;
     if (mode == F_OK) return true;
 
-    // R_OK/W_OK have no direct query: probe by opening the path.
-    // FILE_FLAG_BACKUP_SEMANTICS lets the same probe cover directories.
+    // R_OK/W_OK: no direct query - probe by opening (the flag lets the
+    // probe cover directories too).
     if ((mode & R_OK) != 0 || (mode & W_OK) != 0)
     {
         u32 access = 0;
@@ -317,16 +308,13 @@ pub bool canAccess(str path, i32 mode)
         if (h == INVALID_HANDLE_VALUE) return false;
         CloseHandle(h);
     }
-    // X_OK: Windows has no execute permission for ordinary files (an
-    // .exe is "executable" by extension), so existence checked above is
-    // the closest equivalent.
+    // X_OK: no execute permission for ordinary files (.exe is
+    // "executable" by extension) - existence is the closest equivalent.
     return true;
 }
 
-// Dirent keeps the glibc x86-64 field layout for source compatibility
-// (d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name cchar[256]);
-// on Windows readDir() synthesizes the contents from WIN32_FIND_DATAA
-// rather than copying a kernel dirent.
+// Dirent keeps the glibc x86-64 layout for source compat; readDir()
+// synthesizes it from WIN32_FIND_DATAA instead of a kernel dirent.
 pub struct Dirent
 {
     u64 d_ino;
@@ -336,11 +324,8 @@ pub struct Dirent
     u8 d_name[256];
 }
 
-// Opaque iterator behind Dir: the FindFirst/FindNext handle plus the
-// find-data block whose cFileName entry readDir() surfaces.
-// FLAG sizes: WIN32_FIND_DATAA is 318 bytes on Win32 (padded to 320);
-// 1024 gives ample headroom. Documented offsets used below:
-// dwFileAttributes 0, cFileName at 44 (260 bytes, MAX_PATH).
+// opaque iterator: find handle + find-data block (cFileName@44, 260B).
+// FLAG sizes: WIN32_FIND_DATAA is 318B (padded 320); buffer is 1024.
 struct DirIter
 {
     rawptr findHandle;
@@ -353,7 +338,7 @@ struct DirIter
 
 pub Dir openDir(str path)
 {
-    // opendir() -> FindFirstFileA("<path>\*") in one buffer.
+    // opendir() -> FindFirstFileA("<path>\*").
     u8 pbuf[4096];
     usize plen = path.len < 4094 ? path.len : 4094;
     copy<u8>(pbuf, (u8*)path.ptr, plen);
@@ -384,9 +369,8 @@ pub Dir openDir(str path)
     return (Dir)((rawptr)it);
 }
 
-// readdir(): returns a pointer to the iterator's synthesized Dirent
-// (valid until the next readDir/closeDir on this Dir), or null at the
-// end of the stream - same contract as the glibc readdir.
+// pointer into the iterator's Dirent (valid until next read/close),
+// null at end of stream - same contract as glibc readdir.
 pub rawptr readDir(Dir dir)
 {
     rawptr raw = (rawptr)dir;
@@ -403,10 +387,8 @@ pub rawptr readDir(Dir dir)
     }
     it->first = false;
 
-    // Fill the glibc-shaped Dirent from the find-data entry: d_ino has
-    // no Win32 counterpart (0), d_off is our step counter, d_type uses
-    // the DT_* values (DT_DIR 4, DT_REG 8), d_name is cFileName
-    // (offset 44, NUL-terminated within its 260 bytes).
+    // fill the glibc-shaped Dirent: d_ino 0 (no Win32 counterpart),
+    // d_off our step, d_type DT_* (4/8), d_name cFileName@44.
     const u8* fname = it->findData + 44;
     u32 attrs = _u32At(it->findData, 0);
     it->entry.d_ino = 0;
@@ -426,7 +408,7 @@ pub rawptr readDir(Dir dir)
 
 pub void closeDir(Dir dir)
 {
-    // closedir() -> FindClose + free the iterator.
+    // closedir() -> FindClose + free.
     rawptr raw = (rawptr)dir;
     DirIter* it = (DirIter*)raw;
     if (it == null) return;
@@ -451,10 +433,6 @@ pub String readFileToString(str path)
     return out;
 }
 
-// Dirent keeps the glibc x86-64 field layout for source compatibility
-// (d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name cchar[256]);
-// on Windows readDir() synthesizes the contents from WIN32_FIND_DATAA
-// rather than copying a kernel dirent.
 pub struct Dirent
 {
     u64 d_ino;
@@ -464,7 +442,7 @@ pub struct Dirent
     u8 d_name[256];
 }
 
-// Read the next directory entry; false at end of stream.
+// next directory entry; false at end of stream.
 pub bool readDirEntry(Dir dir, Dirent* out)
 {
     rawptr raw = readDir(dir);
@@ -473,8 +451,7 @@ pub bool readDirEntry(Dir dir, Dirent* out)
     return true;
 }
 
-// mkdir -p behavior: create every missing component of `path`.
-// mode 0755 by convention here (pass 493u).
+// mkdir -p: create every missing component (mode 0755 -> 493u).
 pub bool createDirRecursive(str path, i32 mode)
 {
     if (path.len == 0) return false;
@@ -490,7 +467,7 @@ pub bool createDirRecursive(str path, i32 mode)
     return createDir(path, mode);
 }
 
-// Write an entire String to `path` (truncates). Returns success.
+// write an entire String to path (truncates); returns success.
 pub bool writeFileFromString(str path, const String* data)
 {
     fios::FileHandle fh = fios::fileOpen(path, str::fromCstr("w"));

@@ -13,8 +13,8 @@ struct _Buf
     usize len;
 }
 
-// stdout/stderr (section 9.1): STD_OUTPUT_HANDLE = (u32)-11,
-// STD_ERROR_HANDLE = (u32)-12, resolved through GetStdHandle.
+// stdout/stderr: STD_OUTPUT_HANDLE = (u32)-11, STD_ERROR_HANDLE =
+// (u32)-12, via GetStdHandle.
 const u32 STD_OUTPUT_HANDLE = (u32)-11;
 const u32 STD_ERROR_HANDLE = (u32)-12;
 
@@ -24,9 +24,8 @@ static rawptr _stdHandle(i32 fd)
     return GetStdHandle(fd == 2 ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
 }
 
-// The one place the buffered output touches the OS: GetStdHandle +
-// WriteFile on the standard handle (libc write(2) replacement). Works
-// for both console and redirected stdout/stderr.
+// the one place buffered output touches the OS: GetStdHandle +
+// WriteFile (write(2) replacement); console and redirected both.
 static void _sysWrite(i32 fd, const cchar* p, usize n)
 {
     if (n == 0) return;
@@ -71,10 +70,8 @@ static void _pbytes(_Buf* out, const cchar* s, usize n)
     out->len += n;
 }
 
-// Hand-rolled itoa — replaces fmt::formatInt/formatUint so the print path
-// has no std::fmt dependency and no String alloc/free per number.
-// Digits are produced back-to-front into tmp, then copied forward.
-// tmp holds 72 bytes: 64 binary digits + sign (+ prefix lives outside).
+// hand-rolled itoa - no std::fmt dep, no String alloc per number.
+// digits back-to-front into tmp (72B: 64 binary + sign), copied fwd.
 #[[inline]]
 static usize _itoa(u8* dst, u64 val, u32 base, bool neg)
 {
@@ -97,8 +94,7 @@ static usize _itoa(u8* dst, u64 val, u32 base, bool neg)
     return n;
 }
 
-// Signed integer into the buffer (decimal by default; base comes from
-// {:d}/{:x}/{:b}). 72 bytes covers i64's 21 decimal / 65 binary digits.
+// signed int into the buffer; 72B covers i64's 21 decimal / 65 binary.
 #[[inline]]
 static i32 _fprintSigned(_Buf* out, i64 v, u32 base)
 {
@@ -110,8 +106,7 @@ static i32 _fprintSigned(_Buf* out, i64 v, u32 base)
     return (i32)n;
 }
 
-// Unsigned integer into the buffer; `prefix` adds the 0x/0b the old
-// formatHex/formatBin produced for the hex/bin manipulators and {:p}.
+// unsigned int; `prefix` adds 0x/0b for the hex/bin manipulators, {:p}.
 #[[inline]]
 static i32 _fprintUnsigned(_Buf* out, u64 v, u32 base, bool prefix)
 {
@@ -194,8 +189,7 @@ static i32 _fprintBytes(_Buf* out, const cchar* ptr, usize len) {
 
 #[[inline]] static void _fprintNewline(_Buf* out) { _pbyte(out, '\n'); }
 
-// Nothing is retained between calls — each print call flushes its own
-// stack buffer — so flush is a no-op, as it was in the old file.
+// nothing retained between calls - flush is a no-op, as before.
 #[[inline]] static void _fprintFlush(i32 fd) { (void)fd; }
 
 #[[inline]] static i32 _fprintHex(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 16, true); }
@@ -205,9 +199,8 @@ static i32 _fprintBytes(_Buf* out, const cchar* ptr, usize len) {
     return _fprintUnsigned(out, v, 2, true);
 }
 
-// The Fixed manipulator: %.*f with the same precision clamp the old
-// fmt::formatFloat applied. The stack buffer covers ±1.8e308 (309 digits)
-// + '.' + 1000 decimals + sign + NUL.
+// Fixed: %.*f with the old precision clamp; the stack buffer covers
+// ±1.8e308 (309 digits) + '.' + 1000 decimals + sign + NUL.
 static i32 _fprintFixed(_Buf* out, f64 value, u64 precision)
 {
     if (precision > 1000u) precision = 1000u;
@@ -246,11 +239,6 @@ static usize _sysReadLine(u8* buf, usize maxBytes)
     return i;
 }
 
-// The built-in comptime switch — zero runtime type dispatch. These types
-// count as covered by the type-not-specified rule; every other type is
-// matched by the `any toStr` prong (the inbuilt toStr trait) and the
-// compiler resolves and inserts that call itself — no dispatch code is
-// written here.
 static void _fprintOne<T>(_Buf* out, T val)
 {
     comptime {
@@ -312,10 +300,9 @@ static void _fprintOne<T>(_Buf* out, T val)
                 return;
             },
 
-            // Any type implementing the inbuilt toStr trait (same class
-            // as @drop): the compiler resolves the toStr call itself —
-            // no dispatch code here. A type matching no prong above and
-            // no `any toStr` falls through to the error below.
+            // inbuilt toStr trait (same class as @drop): the compiler
+            // resolves the call, no dispatch code here. No prong above
+            // and no toStr -> the error below.
             any toStr => {
                 str s = val.toStr();
                 _fprintBytes(out, s.ptr, s.len);
@@ -343,10 +330,9 @@ static void _eprintOne<T>(T val)
     _pflush(&out);
 }
 
-// Renders one {} placeholder: spec 0 is the default dispatch (so the
-// manipulators work as {} arguments); {:d} {:x} {:b} re-render an integer
-// in that base; {:p} prints a pointer; {..} spreads an iterable
-// collection. Anything else is a compile error.
+// one placeholder: spec 0 = default dispatch (manipulators work as {}
+// args); {:d}/{:x}/{:b} re-render an int in that base; {:p} pointer;
+// {..} spread. Anything else is a compile error.
 static void _fprintSpec<T>(_Buf* out, T val, u8 spec)
 {
     comptime
@@ -364,10 +350,8 @@ static void _fprintSpec<T>(_Buf* out, T val, u8 spec)
     }
 }
 
-// {..}: an iterable collection, every element through the default {}
-// dispatch, elements separated by ", ". Relies on range-for over the
-// collection (old `iterable` trait class) — a non-iterable argument is
-// a compile error.
+// {..}: iterable, default dispatch per element, ", " between - relies
+// on range-for. A non-iterable argument is a compile error.
 static void _fprintIter<T>(_Buf* out, T val)
 {
     comptime
@@ -417,12 +401,11 @@ static i32 _fprintPtrVal<T>(_Buf* out, T val)
     }
 }
 
-// Emits one print call. When the first argument is a comptime string
-// literal it is the format string: literal chunks (and the {{ }} escapes)
-// are written directly — no runtime scanning of {} — and each
-// placeholder consumes the next argument. Otherwise this is the
-// type-not-specified path: fmt is just the first value and every
-// argument renders through the comptime switch above or its own toStr.
+// one print call. First argument a comptime string literal = the format
+// string: chunks (and {{ }} escapes) written directly, no runtime {}
+// scan, each placeholder takes the next argument. Otherwise fmt is just
+// the first value and everything renders through the comptime switch or
+// its own toStr.
 static void _printEmit<T>(_Buf* out, T fmt, ... args)
 {
     comptime
@@ -487,8 +470,8 @@ static void _printEmit<T>(_Buf* out, T fmt, ... args)
                 _fprintSpec(out, arg, spec);
             }
 
-            // Remainder: an unclosed placeholder left here means too few
-            // arguments (this also covers "{}" passed with no arguments at all).
+            // remainder: an unclosed placeholder here = too few arguments
+            // (also covers "{}" with no arguments at all).
             while (i < f.len)
             {
                 u8 c = f.ptr[i];
@@ -517,22 +500,17 @@ static void _printEmit<T>(_Buf* out, T fmt, ... args)
     }
 }
 
-// toStr is an INBUILT trait (same class as @drop) — nothing is declared
-// here. User types provide impls (extend ... : @toStr, spelling FLAGGED)
-// and the `any toStr` prong above is where the compiler auto-wires the
-// call. A type matching no prong (no builtin, no toStr) is a compile
-// error. Built-in comptime-switch types don't need an impl.
+// toStr is inbuilt (same class as @drop) - nothing declared here. User
+// types impl it (extend ... : @toStr, spelling FLAGGED); the `any toStr`
+// prong is where the compiler auto-wires the call. No prong = compile
+// error. Comptime-switch types don't need an impl.
 
-// Final rules: print/println/eprint/eprintln take the format string FIRST
-// as `comptime T` — the compiler parses the literal ({} one placeholder
-// per following argument, {{ }} escapes, {:d} {:x} {:b} {:p} specifiers,
-// {..} spreads an iterable collection with ", " separators);
-// placeholder/argument mismatch, an unknown specifier, or {} with no
-// argument is a compile error. Without a comptime format literal
-// (print(x), print(a, b)) every argument must render through the built-in
-// comptime switch or its `any toStr` case. One 1024-byte stack buffer per
-// call: a single WriteFile per call, hand-rolled itoa for integers,
-// snprintf for floats.
+// final rules: print family takes a comptime format string first ({} per
+// following argument, {{ }} escapes, {:d}/{:x}/{:b}/{:p}, {..} spread
+// with ", "); mismatch/unknown specifier/empty {} = compile error.
+// Without a comptime literal every argument renders through the comptime
+// switch or `any toStr`. One 1024B stack buffer per call: one WriteFile,
+// hand-rolled itoa, snprintf for floats.
 pub void print<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
@@ -567,13 +545,11 @@ pub void eprintln<comptime T>(T fmt, ...)
     _pflush(&out);
 }
 
-// vaprint — lib_old print!'s equivalent: a compile-time variadic of
-// VALUES. No format string first — the first argument is never treated
-// as text — and no format specifiers at all: there is no order to
-// encode, so arguments print in sequence, each inferred through the
-// built-in comptime switch or the `any toStr` case. Unbounded argument
-// count and output length (the 1024-byte stack buffer flushes per full
-// buffer). No trailing newline (see println).
+// vaprint - lib_old print!'s equivalent: a comptime variadic of VALUES.
+// No format string first (the first argument is never text), no
+// specifiers - arguments print in sequence, each via the comptime switch
+// or `any toStr`. Unbounded count/length (the stack buffer flushes per
+// full buffer). No trailing newline (see println).
 pub void vaprint(... args)
 {
     u8 outBuf[1024];
