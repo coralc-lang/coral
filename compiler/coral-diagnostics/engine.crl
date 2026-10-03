@@ -1,30 +1,17 @@
-/* diagnostics/engine.crl — multi-span diagnostic engine
+/* diagnostics/engine.crl — diagnostic engine
  *
- * Diagnostic: code, severity, message, detail, labels, why, fix, learn.
- * Label: span + text + primary/secondary.
- * Renderer: groups by file, gutter, underlines (^ or ──┬──), connectors (╰─).
+ * Owns the file table (file id -> path + buffer) and the error counters.
+ * Every diagnostic funnels through error.crl, which owns the formatting.
+ * Call sites report a stable ErrorCode + SourceLoc + message + optional
+ * help line; the engine resolves the location against the right file.
  */
 
-mod code = import "code" { ErrorCode };
-mod msg = import "msg" { Severity };
-mod span = import "span" { Span, Label, SourceMap };
-mod id = import "../coral-ast/id" { Str };
+mod code = import "code" { ErrorCode, codeStr };
+mod error = import "error" { render };
+mod id = import "../coral-ast/id" { SourceLoc, locFile, locLine, locCol };
 
 extern("C") i32 printf(u8* fmt, ...);
 extern("C") i32 write(i32 fd, u8* buf, usize len);
-
-pub struct Diagnostic
-{
-    u32 code;
-    u32 severity;
-    u8* message;
-    u8* detail;
-    Label* labels;
-    u32 labelsLen;
-    u8* why;
-    u8* fix;
-    u8* learn;
-}
 
 pub struct DiagnosticEngine
 {
@@ -35,7 +22,12 @@ pub struct DiagnosticEngine
     usize parserErrors;
     u8* bufStart;
     u8* bufEnd;
-    SourceMap* sourceMap;
+    u8** filePaths;
+    usize* filePathLens;
+    u8** fileBufs;
+    u8** fileBufEnds;
+    u32 fileCount;
+    u32 fileCap;
 
     void init(u8* bufStart, u8* bufEnd)
     {
@@ -47,7 +39,12 @@ pub struct DiagnosticEngine
             .parserErrors = 0,
             .bufStart = bufStart,
             .bufEnd = bufEnd,
-            .sourceMap = null
+            .filePaths = null,
+            .filePathLens = null,
+            .fileBufs = null,
+            .fileBufEnds = null,
+            .fileCount = 0,
+            .fileCap = 0,
         };
     }
 
@@ -58,220 +55,138 @@ pub struct DiagnosticEngine
     bool hasErrors() { return self.errors > 0; }
     bool tooManyErrors() { return self.errorLimit == 0 || self.errors >= self.errorLimit; }
 
-    void setBuffer(u8* bufStart, u8* bufEnd)
+    /* register a source file; returns its file id */
+    u32 addFile(u8* path, usize pathLen, u8* bufStart, u8* bufEnd)
     {
-        if (bufStart != null) self.bufStart = bufStart;
-        if (bufEnd != null) self.bufEnd = bufEnd;
+        if (self.fileCount >= self.fileCap)
+        {
+            u32 newCap = self.fileCap == 0 ? 8 : self.fileCap * 2;
+            u8** np = (u8**)malloc((usize)newCap * sizeof(u8*));
+            usize* nl = (usize*)malloc((usize)newCap * sizeof(usize));
+            u8** nb = (u8**)malloc((usize)newCap * sizeof(u8*));
+            u8** ne = (u8**)malloc((usize)newCap * sizeof(u8*));
+            if (np == null || nl == null || nb == null || ne == null)
+            {
+                if (np != null) free((rawptr)np);
+                if (nl != null) free((rawptr)nl);
+                if (nb != null) free((rawptr)nb);
+                if (ne != null) free((rawptr)ne);
+                return 0;
+            }
+            u32 i = 0;
+            while (i < self.fileCount)
+            {
+                np[i] = self.filePaths[i];
+                nl[i] = self.filePathLens[i];
+                nb[i] = self.fileBufs[i];
+                ne[i] = self.fileBufEnds[i];
+                i = i + 1;
+            }
+            if (self.filePaths != null) free((rawptr)self.filePaths);
+            if (self.filePathLens != null) free((rawptr)self.filePathLens);
+            if (self.fileBufs != null) free((rawptr)self.fileBufs);
+            if (self.fileBufEnds != null) free((rawptr)self.fileBufEnds);
+            self.filePaths = np;
+            self.filePathLens = nl;
+            self.fileBufs = nb;
+            self.fileBufEnds = ne;
+            self.fileCap = newCap;
+        }
+        u32 id = self.fileCount;
+        self.filePaths[id] = path;
+        self.filePathLens[id] = pathLen;
+        self.fileBufs[id] = bufStart;
+        self.fileBufEnds[id] = bufEnd;
+        self.fileCount = self.fileCount + 1;
+        return id;
     }
 
-    void emitErrorAt(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
+    /* resolve a SourceLoc to a pointer into the owning file's buffer */
+    u8* locPtr(SourceLoc loc)
     {
-        bool shouldRender = !self.tooManyErrors();
+        u32 file = locFile(loc);
+        u32 line = locLine(loc);
+        u32 col = locCol(loc);
+        if (file >= self.fileCount) return self.bufStart;
+        u8* buf = self.fileBufs[file];
+        u8* end = self.fileBufEnds[file];
+        if (buf == null) return null;
+        if (line == 0) return buf;
+        u32 curLine = 1;
+        u8* p = buf;
+        while (p < end && curLine < line)
+        {
+            if (p[0] == 10) curLine = curLine + 1;
+            p = p + 1;
+        }
+        if (col == 0) col = 1;
+        u32 c = 1;
+        while (p < end && c < col && p[0] != 10 && p[0] != 13)
+        {
+            p = p + 1;
+            c = c + 1;
+        }
+        return p;
+    }
+
+    void emitError(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    {
         self.errors = self.errors + 1;
-        self.setBuffer(bufStart, bufEnd);
-        if (errPtr == null) errPtr = self.bufStart;
-        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
+        if (self.tooManyErrors()) return;
+        self.renderAt(code, "error", loc, msg, help);
     }
 
-    void emitLexerError(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
-    {
-        bool shouldRender = !self.tooManyErrors();
-        self.errors = self.errors + 1;
-        self.lexerErrors = self.lexerErrors + 1;
-        self.setBuffer(bufStart, bufEnd);
-        if (errPtr == null) errPtr = self.bufStart;
-        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
-    }
-
-    void emitParserError(ErrorCode code, u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg)
-    {
-        bool shouldRender = !self.tooManyErrors();
-        self.errors = self.errors + 1;
-        self.parserErrors = self.parserErrors + 1;
-        self.setBuffer(bufStart, bufEnd);
-        if (errPtr == null) errPtr = self.bufStart;
-        if (shouldRender) self.renderSimple(code, errPtr, msg, "error");
-    }
-
-    void reportError(u8* bufStart, u8* bufEnd, u8* errPtr, u8* msg) { self.emitLexerError(ErrorCode::LexInvalidChar, bufStart, bufEnd, errPtr, msg); }
-    void emitError(ErrorCode code, u8* errPtr, u8* msg) { self.emitErrorAt(code, self.bufStart, self.bufEnd, errPtr, msg); }
-
-    void emitWarning(ErrorCode code, u8* errPtr, u8* msg)
+    void emitWarning(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
     {
         self.warnings = self.warnings + 1;
-        if (errPtr == null) errPtr = self.bufStart;
-        self.renderSimple(code, errPtr, msg, "warning");
+        if (self.tooManyErrors()) return;
+        self.renderAt(code, "warning", loc, msg, help);
     }
 
-    void emitNote(ErrorCode code, u8* errPtr, u8* msg)
+    void emitNote(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
     {
-        if (errPtr == null) errPtr = self.bufStart;
-        self.renderSimple(code, errPtr, msg, "note");
+        self.renderAt(code, "note", loc, msg, help);
     }
 
-    void emitFatal(ErrorCode code, u8* errPtr, u8* msg)
+    void emitFatal(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
     {
         self.errors = self.errors + 1;
-        if (errPtr == null) errPtr = self.bufStart;
-        self.renderSimple(code, errPtr, msg, "fatal error");
+        self.renderAt(code, "fatal error", loc, msg, help);
     }
 
-    void renderSimple(ErrorCode code, u8* errPtr, u8* msg, u8* level)
+    void renderAt(ErrorCode code, u8* level, SourceLoc loc, u8* msg, u8* help)
     {
-        if (self.bufStart == null || self.bufEnd == null)
+        u8* ptr = self.locPtr(loc);
+        if (ptr == null)
         {
-            u8* safeLevel = level != null ? level : (u8*)"error";
-            u8* safeMsg = msg != null ? msg : (u8*)"diagnostic";
-            printf("%s: %s\n", safeLevel, safeMsg);
+            printf("%s[%s]: %s\n", level, codeStr(code), msg != null ? msg : (u8*)"diagnostic");
             return;
         }
-        if (errPtr == null || errPtr < self.bufStart) errPtr = self.bufStart;
-        if (errPtr > self.bufEnd) errPtr = self.bufEnd;
+        u32 file = locFile(loc);
+        u32 line = locLine(loc);
+        u32 col = locCol(loc);
+        u8* fileBuf = self.fileBufs[file];
+        u8* fileEnd = self.fileBufEnds[file];
 
-        u8* lineStart = errPtr;
-        while (lineStart > self.bufStart)
+        u8* lineStart = ptr;
+        while (lineStart > fileBuf)
         {
             u8* prev = lineStart - 1;
             if (prev[0] == '\n') break;
             lineStart = prev;
         }
 
-        u8* lineEnd = errPtr;
-        while (lineEnd < self.bufEnd)
+        u8* lineEnd = ptr;
+        while (lineEnd < fileEnd)
         {
             if (lineEnd[0] == '\n') break;
             if (lineEnd[0] == '\r') break;
             lineEnd = lineEnd + 1;
         }
 
-        usize lineNum = 1;
-        u8* scan = self.bufStart;
-        while (scan < lineStart)
-        {
-            if (scan[0] == '\n') lineNum = lineNum + 1;
-            scan = scan + 1;
-        }
-
-        usize colNum = (usize)(errPtr - lineStart) + 1;
-        u8* safeLevel = level != null ? level : (u8*)"error";
-        u8* safeMsg = msg != null ? msg : (u8*)"diagnostic";
-
-        printf("%llu:%llu: %s: %s\n", lineNum, colNum, safeLevel, safeMsg);
-
         usize lineLen = (usize)(lineEnd - lineStart);
-        printf("%.*s\n", (i32)lineLen, lineStart);
-        printf("%*s^\n", (i32)colNum - 1, "");
-    }
-
-    void renderDiagnostic(Diagnostic* diag)
-    {
-        if (diag == null) return;
-        u8* sevStr = "error";
-        if (diag.severity == 2) sevStr = "warning";
-        if (diag.severity == 1) sevStr = "note";
-        if (diag.severity == 4) sevStr = "fatal error";
-
-        printf("%s: %s\n", sevStr, diag.message != null ? diag.message : (u8*)"diagnostic");
-        if (diag.detail != null) printf("  %s\n", diag.detail);
-
-        u32 i = 0;
-        while (i < diag.labelsLen)
-        {
-            Label* lbl = diag.labels + i;
-            if (lbl != null) self.renderLabel(lbl);
-            i = i + 1;
-        }
-
-        if (diag.why != null) printf("  why    %s\n", diag.why);
-        if (diag.fix != null) printf("  fix    %s\n", diag.fix);
-        if (diag.learn != null) printf("  learn  %s\n", diag.learn);
-    }
-
-    void renderLabel(Label* lbl)
-    {
-        if (lbl == null || self.bufStart == null || self.bufEnd == null) return;
-        u32 start = lbl.span.start;
-        u32 end = lbl.span.end;
-        if (start > (usize)(self.bufEnd - self.bufStart)) start = (usize)(self.bufEnd - self.bufStart);
-        if (end < start) end = start;
-        if (end > (usize)(self.bufEnd - self.bufStart)) end = (usize)(self.bufEnd - self.bufStart);
-
-        u8* errPtr = self.bufStart + start;
-        u8* lineStart = errPtr;
-        while (lineStart > self.bufStart)
-        {
-            u8* prev = lineStart - 1;
-            if (prev[0] == '\n') break;
-            lineStart = prev;
-        }
-
-        u8* lineEnd = errPtr;
-        while (lineEnd < self.bufEnd)
-        {
-            if (lineEnd[0] == '\n') break;
-            if (lineEnd[0] == '\r') break;
-            lineEnd = lineEnd + 1;
-        }
-
-        usize lineNum = 1;
-        u8* scan = self.bufStart;
-        while (scan < lineStart)
-        {
-            if (scan[0] == '\n') lineNum = lineNum + 1;
-            scan = scan + 1;
-        }
-
-        usize startCol = (usize)(errPtr - lineStart);
-        u32 spanLen = end - start;
-        usize lineLen = (usize)(lineEnd - lineStart);
-        printf("  %llu | ", lineNum);
-        write(1, lineStart, lineLen);
-        write(1, "\n", 1);
-        printf("       | ");
-
-        usize j = 0;
-        while (j < startCol)
-        {
-            write(1, " ", 1);
-            j = j + 1;
-        }
-
-        if (spanLen <= 1)
-        {
-            write(1, "^", 1);
-        }
-        else
-        {
-            u32 k = 0;
-            u32 mid = spanLen / 2;
-            while (k < spanLen)
-            {
-                if (k == mid) write(1, "+", 1);
-                else write(1, "-", 1);
-                k = k + 1;
-            }
-        }
-        write(1, "\n", 1);
-
-        printf("       | ");
-        j = 0;
-        if (spanLen > 1)
-        {
-            u32 mid2 = spanLen / 2;
-            while (j < startCol + mid2)
-            {
-                write(1, " ", 1);
-                j = j + 1;
-            }
-        }
-        else
-        {
-            while (j < startCol)
-            {
-                write(1, " ", 1);
-                j = j + 1;
-            }
-        }
-        printf("`- %s\n", lbl.text != null ? lbl.text : (u8*)"label");
+        render(codeStr(code), level, msg,
+               self.filePaths[file], line, col,
+               lineStart, lineLen, help);
     }
 }
