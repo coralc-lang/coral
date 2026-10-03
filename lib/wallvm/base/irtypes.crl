@@ -20,6 +20,7 @@ pub enum IrValueKind
     Inst,
     ConstInt,
     ConstFloat,
+    ConstArray,
     Block,
     Func,
     Global,
@@ -75,6 +76,13 @@ pub struct IrStringConst
     IrValue base;
     const cchar* str;
     u32 length;
+}
+
+pub struct IrArrayConst
+{
+    IrValue base;
+    IrValue** elems;
+    u32 nelems;
 }
 
 pub struct IrStructType
@@ -265,6 +273,9 @@ pub struct IrValue
 
     IrValueKind valueKind() { return self.kind; }
     IrType* valueType() { return self.type; }
+    IrOpcode instOpcode() { return self.opcode; }
+    u32 numOps() { return self.nops; }
+    IrValue* operand(u32 i) { if (i < self.nops) return self.ops[i]; return null; }
 }
 
 pub struct IrBlock
@@ -574,6 +585,9 @@ pub struct IrContext
     IrValue** constFloats;
     u32 nconstFloats;
     u32 capConstFloats;
+    IrArrayConst** arrayConsts;
+    u32 narrayConsts;
+    u32 capArrayConsts;
     FunctionAnalysisCache** analysisCaches;
     u32 nCaches;
     u32 capCaches;
@@ -769,6 +783,28 @@ pub struct IrContext
         return t;
     }
 
+    IrValue* constInt(IrType* ty, u64 val)
+    {
+        for (u32 i = 0; i < self.nconstInts; i++)
+            if (self.constInts[i]->type == ty && self.constInts[i]->valData == val)
+                return self.constInts[i];
+
+        IrValue* v = alloc<IrValue>(1);
+        *v = (IrValue) { IrValueKind::ConstInt, ty, self.nextValueId(), val, null, null, 0, 0 };
+        u32 idx = self.nconstInts;
+        if (idx >= self.capConstInts)
+        {
+            u32 newCap = self.capConstInts ? self.capConstInts * 2 : 16;
+            IrValue** newC = alloc<IrValue*>(newCap);
+            if (self.constInts)
+                { copy<IrValue*>(newC, self.constInts, self.nconstInts); dealloc<IrValue*>(self.constInts); }
+            self.constInts = newC; self.capConstInts = newCap;
+        }
+        self.constInts[idx] = v;
+        self.nconstInts = idx + 1;
+        return v;
+    }
+
     IrValue* constFloat(IrType* ty, f64 val)
     {
         u64 raw;
@@ -790,6 +826,31 @@ pub struct IrContext
         self.constFloats[idx] = v;
         self.nconstFloats = idx + 1;
         return v;
+    }
+
+    // ir_strings builds element constants then folds them here; there was no
+    // aggregate const in the value table before this, so it just gets one
+    IrValue* constArray(IrType* ty, IrValue** elems, u32 nelems)
+    {
+        IrArrayConst* ac = alloc<IrArrayConst>(1);
+        IrValue** els = alloc<IrValue*>(nelems > 0 ? nelems : 1);
+        for (u32 i = 0; i < nelems; i++) els[i] = elems ? elems[i] : null;
+        *ac = (IrArrayConst) {
+            { IrValueKind::ConstArray, ty, self.nextValueId(), 0, null, null, 0, 0 },
+            els, nelems
+        };
+        u32 idx = self.narrayConsts;
+        if (idx >= self.capArrayConsts)
+        {
+            u32 newCap = self.capArrayConsts ? self.capArrayConsts * 2 : 8;
+            IrArrayConst** newC = alloc<IrArrayConst*>(newCap);
+            if (self.arrayConsts)
+                { copy<IrArrayConst*>(newC, self.arrayConsts, self.narrayConsts); dealloc<IrArrayConst*>(self.arrayConsts); }
+            self.arrayConsts = newC; self.capArrayConsts = newCap;
+        }
+        self.arrayConsts[idx] = ac;
+        self.narrayConsts = idx + 1;
+        return &ac->base;
     }
 
     IrInst* createInst(IrOpcode op, IrType* ty, IrValue** ops, u32 nops, u64 icmpP, u64 fcmpP)
@@ -861,6 +922,7 @@ pub void irCtxDestroy(IrContext* ctx)
     if (!ctx) return;
     if (ctx->constInts) dealloc<IrValue*>(ctx->constInts);
     if (ctx->constFloats) dealloc<IrValue*>(ctx->constFloats);
+    if (ctx->arrayConsts) dealloc<IrArrayConst*>(ctx->arrayConsts);
     if (ctx->types) dealloc<IrType*>(ctx->types);
     dealloc<IrContext>(ctx);
 }
@@ -877,6 +939,13 @@ pub void irStringConstDestroy(IrStringConst* sc)
     if (!sc) return;
     if (sc->str) dealloc<cchar>((cchar*)sc->str);
     dealloc<IrStringConst>(sc);
+}
+
+pub void irArrayConstDestroy(IrArrayConst* ac)
+{
+    if (!ac) return;
+    if (ac->elems) dealloc<IrValue*>(ac->elems);
+    dealloc<IrArrayConst>(ac);
 }
 
 pub void irStructTypeDestroy(IrStructType* st)

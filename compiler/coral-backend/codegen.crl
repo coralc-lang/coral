@@ -6,6 +6,7 @@
  */
 
 mod id = import "../coral-ast/id";
+import id { SourceLoc };
 import id { Str, NodeId };
 mod types_mod = import "../coral-ast/types";
 import types_mod { Ty, TypeEntry, TypeKind };
@@ -16,7 +17,9 @@ import expr_mod { Expr, ExprKind };
 mod stmt_mod = import "../coral-ast/stmt";
 import stmt_mod { Stmt, StmtKind, SwitchCase };
 mod decl_mod = import "../coral-ast/decl";
+mod diag_code = import "../coral-diagnostics/code";
 import decl_mod { Decl, DeclKind, File, Param, Field, EnumVariant, VariantVariant };
+import diag_code { ErrorCode };
 mod pat_mod = import "../coral-ast/pat";
 import pat_mod { Pat, PatKind };
 mod context_mod = import "../coral-context/context";
@@ -174,6 +177,17 @@ pub struct Codegen
     u32 ind;
 }
 
+void cgError(Codegen* cg, u8* msg)
+{
+    cg.errors = cg.errors + 1;
+    if (cg.sema != null)
+    {
+        SourceLoc loc;
+        loc.data = 0;
+        cg.sema.semaError(ErrorCode::CodegenInternal, loc, msg);
+    }
+}
+
 u32 cgLabel(Codegen* cg)
 {
     cg.labelSeq = cg.labelSeq + 1;
@@ -183,7 +197,7 @@ u32 cgLabel(Codegen* cg)
 u32 cgNewTemp(Codegen* cg, Slice ty, u32 arrLen)
 {
     if (cg.tempsLen >= cg.tempsCap) {
-        cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"temp capacity exceeded");
         return 0;
     }
     u32 t = cg.tempsLen;
@@ -203,7 +217,7 @@ Slice cgTempName(Codegen* cg, u32 t)
 
 void cgPushBreak(Codegen* cg, u32 lab)
 {
-    if (cg.loopDepth >= cg.loopCap) { cg.errors = cg.errors + 1; return; }
+    cgError(cg, (u8*)"loop-depth capacity exceeded");
     cg.breakStack[cg.loopDepth] = lab;
     cg.loopDepth = cg.loopDepth + 1;
 }
@@ -442,7 +456,7 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     if (matches == 0) {
         /* no argument match: fall back to the first instance (sema already
            accepted the call) and surface the mismatch */
-        if (total > 1) cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"no unique mono instance for call");
         pick = firstMatch;
     }
     MonoInstance* p = cg.mono.instances + pick;
@@ -542,7 +556,7 @@ Slice tyStr(Codegen* cg, Ty t)
         TypeKind::TypeParam => {
             Ty sub = cgSubstTy(cg, t);
             if (sub != t) return tyStr(cg, sub);
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"unresolved type param in codegen");
             return tyStrPut(cg, Slice::from((u8*)"void*", 5), start);
         },
         TypeKind::Slice => { return cgRegName(cg, t); },
@@ -1384,7 +1398,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                     i = i + 1;
                 }
-                if (argsLen > 16) cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, retTy, 0);
@@ -1456,7 +1470,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen + (recvKind != 0 ? 1 : 0) > 16) cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
@@ -1492,7 +1506,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen > 16) cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
@@ -1593,7 +1607,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i = i + 1;
             }
-            if (fvLen > 16) cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"too many struct fields (cap 16)");
             Slice lty = tyStr(cg, e.kind.payload.StructLiteral.typeNode);
             u32 t = cgNewTemp(cg, lty, 0);
             Slice tn = cgTempName(cg, t);
@@ -1608,7 +1622,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 /* variant construction: tag + payload union member */
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, e.kind.payload.StructLiteral.typeNode, vname, &vidx);
-                if (vd.index == 0) cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"variant case not found");
                 stP(&cg.body, " .tag = ");
                 stU64(&cg.body, (u64)vidx);
                 if (fvLen > 0)
@@ -1639,7 +1653,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.ArrayLiteral.elems[i]));
                 i = i + 1;
             }
-            if (alen > 16) cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"too many array elements (cap 16)");
             Slice aty = cgResultTy(cg, id, e);
             u32 t = cgNewTemp(cg, aty, 0);
             Slice tn = cgTempName(cg, t);
@@ -1664,7 +1678,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.TupleExpr.elems[i]));
                 i = i + 1;
             }
-            if (elen > 16) cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"too many tuple elements (cap 16)");
             Slice tty = cgResultTy(cg, id, e);
             u32 t = cgNewTemp(cg, tty, 0);
             Slice tn = cgTempName(cg, t);
@@ -1836,7 +1850,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stP(&cg.ebuf, "0");
                 return stTail(&cg.ebuf, rs);
             }
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"unsupported builtin call");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -1855,18 +1869,18 @@ Slice cgExpr(Codegen* cg, NodeId id)
         },
 
         ExprKind::TypeRef => {
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"unresolved TypeRef");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Typeof => {
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"typeof not supported");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
 
         else => {
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"unsupported expression kind");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -1882,7 +1896,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
     }
     Node* n = cgNode(cg, id);
     if (n.kind.tag != NodeKind::Expr) {
-        cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"expected expression node");
         stP(&cg.ebuf, "0");
         return stTail(&cg.ebuf, cg.ebuf.len - 1);
     }
@@ -1972,7 +1986,7 @@ Slice cgValBody(Codegen* cg, NodeId id)
     Node* n = cgNode(cg, id);
     if (n.kind.tag == NodeKind::Expr) return cgExpr(cg, id);
     if (n.kind.tag != NodeKind::Stmt) {
-        cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"expected lvalue node");
         return Slice::from((u8*)"0", 1);
     }
     Stmt* s = &n.kind.payload.Stmt.value;
@@ -1994,7 +2008,7 @@ Slice cgValBody(Codegen* cg, NodeId id)
         cgStmt(cg, last);
         return Slice::from((u8*)"0", 1);
     }
-    cg.errors = cg.errors + 1;
+    cgError(cg, (u8*)"expected statement node");
     return Slice::from((u8*)"0", 1);
 }
 
@@ -2031,7 +2045,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, scrutTy, p.kind.payload.Variant.variantName, &vidx);
                 if (vd.index == 0) {
-                    cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"pattern lowering failed");
                     *isWildcard = true;
                     return Slice::from(null, 0);
                 }
@@ -2088,7 +2102,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 return stTail(&cg.ebuf, s);
             },
             else => {
-                cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"pattern lowering failed");
                 *isWildcard = true;
                 return Slice::from(null, 0);
             },
@@ -2106,7 +2120,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
         stCh(&cg.ebuf, ')');
         return stTail(&cg.ebuf, s);
     }
-    cg.errors = cg.errors + 1;
+    cgError(cg, (u8*)"pattern lowering failed");
     *isWildcard = true;
     return Slice::from(null, 0);
 }
@@ -2118,7 +2132,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
     u32* chkL = (u32*)cg.arena.alloc(64 * 4, 4);
     u32* bodyL = (u32*)cg.arena.alloc(64 * 4, 4);
     if (chkL == null || bodyL == null || casesLen > 64) {
-        cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"too many switch cases (cap 64)");
         return;
     }
 
@@ -2381,7 +2395,7 @@ void cgStmt(Codegen* cg, NodeId id)
             stCh(&cg.body, ';');
             return;
         }
-        cg.errors = cg.errors + 1;
+        cgError(cg, (u8*)"expected statement node");
         return;
     }
     Stmt* s = &n.kind.payload.Stmt.value;
@@ -2455,7 +2469,7 @@ void cgStmt(Codegen* cg, NodeId id)
                     }
                     stCh(&cg.body, '}');
                 } else if (init.index != 0) {
-                    cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"array local needs array-literal init");
                     stP(&cg.body, " = {0}");
                 } else {
                     stP(&cg.body, " = {0}");
@@ -2506,7 +2520,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Break => {
-            if (cg.loopDepth == 0) { cg.errors = cg.errors + 1; return; }
+            cgError(cg, (u8*)"break outside of loop");
             cgEmitGoto(cg, cg.breakStack[cg.loopDepth - 1]);
             return;
         },
@@ -2514,7 +2528,7 @@ void cgStmt(Codegen* cg, NodeId id)
         StmtKind::Continue => {
             /* continue targets the innermost loop's continue label: stored in
                contStack parallel to breakStack but loops push both */
-            if (cg.loopDepth == 0) { cg.errors = cg.errors + 1; return; }
+            cgError(cg, (u8*)"continue outside of loop");
             cgEmitGoto(cg, cg.contStack[cg.loopDepth - 1]);
             return;
         },
@@ -2625,7 +2639,7 @@ void cgStmt(Codegen* cg, NodeId id)
             TypeEntry* te = null;
             if (iterTy != 0) te = cg.ctx->types + iterTy;
             if (te == null || (te.kind.tag != TypeKind::Slice && te.kind.tag != TypeKind::Array)) {
-                cg.errors = cg.errors + 1;
+                cgError(cg, (u8*)"for-in over non-slice/array");
                 return;
             }
             Slice elemTy = tyStr(cg, te.kind.payload.Slice.base);
@@ -2703,7 +2717,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Defer => {
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"defer is not supported");
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "/* unsupported: defer */");
             return;
@@ -2741,7 +2755,7 @@ void cgStmt(Codegen* cg, NodeId id)
                         blen = blen + piece.len;
                     }
                 } else {
-                    cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"asm template pieces must be string literals");
                 }
                 i = i + 1;
             }
@@ -2752,7 +2766,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         else => {
-            cg.errors = cg.errors + 1;
+            cgError(cg, (u8*)"unsupported statement kind");
             return;
         },
     }
@@ -2837,7 +2851,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
             if ((p.flags & 1) != 0)
             {
                 if (owner.len == 0) {
-                    cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"explicit self with unknown owner");
                     stP(s, "rawptr* self");
                 } else {
                     stPS(s, owner);
@@ -3066,7 +3080,7 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
                 }
                 else
                 {
-                    cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"enum variant is not a literal");
                 }
             }
             else
@@ -3272,7 +3286,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 }
                 else
                 {
-                    if (cval.index != 0 && !cgConstAtom(cg, cval)) cg.errors = cg.errors + 1;
+                    cgError(cg, (u8*)"constant must be a constant atom");
                     stP(&cg.defs, "static ");
                     stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
                     stCh(&cg.defs, ' ');
