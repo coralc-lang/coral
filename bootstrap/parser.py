@@ -589,8 +589,10 @@ class Parser:
                 TokenKind.MinusEqual: "-=", TokenKind.StarEqual: "*=",
                 TokenKind.SlashEqual: "/=", TokenKind.PipeEqual: "|=",
                 TokenKind.CaretEqual: "^=", TokenKind.AmpEqual: "&=",
-                TokenKind.NegEqual: "~=",
             }
+            if op.kind == TokenKind.NegEqual:
+                # `x ~= y` means `x = ~y` (assign bit-not of the RHS)
+                return Assign(left, UnaryExpr("~", right), "=")
             return Assign(left, right, op_map.get(op.kind, "="))
         return left
 

@@ -99,7 +99,7 @@ pub extend Sema
         u32 i = 0;
         while (i < argsLen)
         {
-            if (!self.compatible(self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
+            if (!self.assignCompatible(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
             i = i + 1;
         }
@@ -152,7 +152,7 @@ pub extend Sema
                     Param* param = &paramNode->kind.payload.Param.value;
                     if (!self.genericArgParam(decl, param))
                     {
-                        if (!self.compatible(self.exprType(args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+                        if (!self.assignCompatible(args[i], self.exprType(args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
                     }
                 }
             }
@@ -227,6 +227,45 @@ pub extend Sema
             }
         }
         return true;
+    }
+
+    bool assignCompatible(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (self.compatible(fromTy, targetTy)) return true;
+        /* integer/float literal initializers convert when the value fits */
+        if (value.index != 0)
+        {
+            Node* vn = self.ctx.nodes + value.index;
+            if (vn->kind.tag == NodeKind::Expr)
+            {
+                Expr* ev = &vn->kind.payload.Expr.value;
+                if (ev->kind.tag == ExprKind::IntLit)
+                {
+                    u64 v = ev->kind.payload.IntLit.value;
+                    TypeEntry* te = targetTy != 0 ? self.ctx.types + targetTy : null;
+                    if (te != null)
+                    {
+                        switch (te->kind.tag)
+                        {
+                            TypeKind::U8 => { return v <= 255; },
+                            TypeKind::I8 => { return v <= 127; },
+                            TypeKind::Char => { return true; },
+                            TypeKind::U16 => { return v <= 65535; },
+                            TypeKind::I16 => { return v <= 32767; },
+                            TypeKind::U32 => { return v <= 4294967295; },
+                            TypeKind::I32 => { return v <= 2147483647; },
+                            else => { return true; },
+                        }
+                    }
+                }
+                if (ev->kind.tag == ExprKind::FloatLit)
+                {
+                    TypeEntry* te = targetTy != 0 ? self.ctx.types + targetTy : null;
+                    if (te != null && (te->kind.tag == TypeKind::F32 || te->kind.tag == TypeKind::F64)) return true;
+                }
+            }
+        }
+        return false;
     }
 
     Ty assignTargetType(NodeId target)
@@ -504,19 +543,19 @@ pub extend Sema
             ExprKind::Assign => {
                 if (!self.assignExpr(expr->kind.payload.Assign.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.Assign.value)) return false;
-                if (!self.compatible(self.exprType(expr->kind.payload.Assign.value), self.assignTargetType(expr->kind.payload.Assign.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                if (!self.assignCompatible(expr->kind.payload.Assign.value, self.exprType(expr->kind.payload.Assign.value), self.assignTargetType(expr->kind.payload.Assign.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignAdd => {
                 if (!self.assignExpr(expr->kind.payload.AssignAdd.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignAdd.value)) return false;
-                if (!self.compatible(self.exprType(expr->kind.payload.AssignAdd.value), self.assignTargetType(expr->kind.payload.AssignAdd.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                if (!self.assignCompatible(expr->kind.payload.AssignAdd.value, self.exprType(expr->kind.payload.AssignAdd.value), self.assignTargetType(expr->kind.payload.AssignAdd.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignSub => {
                 if (!self.assignExpr(expr->kind.payload.AssignSub.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignSub.value)) return false;
-                if (!self.compatible(self.exprType(expr->kind.payload.AssignSub.value), self.assignTargetType(expr->kind.payload.AssignSub.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                if (!self.assignCompatible(expr->kind.payload.AssignSub.value, self.exprType(expr->kind.payload.AssignSub.value), self.assignTargetType(expr->kind.payload.AssignSub.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignMul => {
