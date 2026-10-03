@@ -1,6 +1,8 @@
 import allocator { Allocator };
 import(lib) std::intrinsics { mmap, munmap, memcpy };
-import(lib) platform::libc { printf };
+import(lib) platform::libc { printf, pthread_self };
+
+extern i32 sched_yield();
 
 // mimalloc - High-performance memory allocator
 // Architecture: Arena → Segment → Page → Block
@@ -59,8 +61,9 @@ struct MiPage
     u8* base;
     MiBlock* free;           // thread-local free list (fast path)
     MiBlock* localFree;      // freed by owning thread while page active
-    MiBlock* xthreadFree;    // freed by other threads (atomic)
-    u32 xthreadFreeCount;
+    MiBlock* xthreadFree;    // cross-thread list head (raw block ptr | low-bit delayed flag)
+    u64 xthreadFreeCount;
+    bool inFull;             // currently linked into heap->fullPages
     MiSegment* segment;
     u32 pageIdx;
     bool retired;
@@ -80,6 +83,8 @@ struct MiSegment
     u32 usedCount;
     MiPage* pages;
     MiArena* arena;
+    u64 threadId;            // owning thread; foreign frees compare against this
+    MiHeap* owner;           // owning heap; cross-thread frees queue to owner->delayedFree
 }
 
 // Arena: large OS region, shared across threads
@@ -106,12 +111,10 @@ struct MiHeap
     usize totalFreed;
     usize mapped;
     u32 pageSize[MI_SIZE_CLASS_COUNT];
-    u32 threadId;
-    MiSpinLock lock;         // protects cross-thread operations
-    MiBlock* delayedFree;    // delayed free list for cross-thread frees
+    u64 threadId;
+    MiBlock* delayedFree;    // cross-thread delayed frees, atomic head (owner drains)
     MiPage* fullPages;       // pages with no free blocks
     MiPage* hugePages;       // huge allocation pages
-    MiSegmentMap segmentMap; // O(1) page lookup
 }
 
 // Size class tables
@@ -185,20 +188,100 @@ static u64 _miRandomU64()
     return state;
 }
 
-// Encode a free list pointer using per-page keys
-static void _miFreeBlockEncode(MiBlock* block, MiBlock* next, u64 key1, u64 key2)
+// Atomics (linux x86_64 only). Local copies of the concurrent::thread
+// AtomicU64 primitives; replace with std::concurrent when it is ported.
+
+#[[inline]]
+static u64 _miAtomicLoad(u64* p)
 {
-    u64 raw = (u64)next;
-    u64 encoded = ((raw ^ key2) << key1) | ((raw ^ key2) >> (64 - key1));
-    block->next = (MiBlock*)encoded;
+    u64 v;
+    asm volatile { "movq %1, %0" : "=r"(v) : "m"(*p) : "memory" }
+    return v;
 }
 
-// Decode a free list pointer using per-page keys
-static MiBlock* _miFreeBlockDecode(MiBlock* block, u64 key1, u64 key2)
+#[[inline]]
+static void _miAtomicStore(u64* p, u64 v)
+{
+    asm volatile { "movq %1, %0" : "=m"(*p) : "r"(v) : "memory" }
+}
+
+static bool _miAtomicCAS(u64* p, u64* expected, u64 desired)
+{
+    u8 ok;
+    asm volatile { "lock cmpxchgq %3, %1\n\tsete %0" : "=q"(ok), "+m"(*p), "+a"(*expected) : "r"(desired) : "cc", "memory" }
+    return ok != 0;
+}
+
+static u64 _miAtomicExchange(u64* p, u64 v)
+{
+    u64 old = v;
+    asm volatile { "xchgq %0, %1" : "+r"(old), "+m"(*p) :: "memory" }
+    return old;
+}
+
+static u64 _miAtomicFetchAdd(u64* p, u64 delta)
+{
+    u64 result;
+    asm volatile { "lock xaddq %0, %1" : "=r"(result), "=m"(*p) : "0"(delta), "m"(*p) : "memory" }
+    return result;
+}
+
+// mimalloc lock: CAS try-acquire with bounded retry and yield.
+// Only arena reservation and the segment map use locks; the
+// allocation fast path never takes one.
+static void _miLockAcquire(u64* p)
+{
+    for (u32 i = 0; i < 10000; i++)
+    {
+        u64 expected = 0;
+        if (_miAtomicCAS(p, &expected, 1)) return;
+        sched_yield();
+    }
+    printf((const cchar*)"mimalloc: internal error: lock cannot be acquired\n");
+}
+
+#[[inline]]
+static void _miLockRelease(u64* p)
+{
+    _miAtomicStore(p, 0);
+}
+
+// Global page map: pages of every heap live here so a foreign thread
+// can resolve any pointer in free(). Insert/remove take the lock;
+// lookups are lock-free.
+static MiSegmentMap _miGlobalPages;
+static u64 _miMapLockWord = 0;
+
+// Encode a free list pointer using per-page keys:
+//   set:   rotl(next ^ key2, key1) + key1
+//   get:   rotr(encoded - key1, key1) ^ key2
+// key1 is the rotation amount (0..63), key2 the xor mask; the additive
+// key1 term defeats the xor/rotate linearity of plain p^k encodings.
+// A null next encodes to the fixed sentinel below and decodes back to
+// null (the sentinel branch keeps a distinct value out of real chains).
+static void _miFreeBlockEncode(MiBlock* block, MiBlock* next, MiPage* page)
+{
+    u64 raw = (u64)next;
+    u64 rot = ((raw ^ page->key2) << page->key1) | ((raw ^ page->key2) >> (64 - page->key1));
+    block->next = (MiBlock*)(rot + page->key1);
+}
+
+// Decode and validate: the result must be null or live inside this
+// page at a block boundary, otherwise the list is corrupted.
+static MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
 {
     u64 encoded = (u64)block->next;
-    u64 decoded = ((encoded >> key1) | (encoded << (64 - key1))) ^ key2;
-    return (MiBlock*)decoded;
+    u64 raw = ((encoded - page->key1) >> page->key1) | ((encoded - page->key1) << (64 - page->key1));
+    raw = raw ^ page->key2;
+    if (raw == 0) return null;
+    u8* p = (u8*)raw;
+    u8* end = page->base + (u64)page->capacity * page->blockSize;
+    if (p < page->base || p >= end || (u64)(p - page->base) % page->blockSize != 0)
+    {
+        printf((const cchar*)"mimalloc: corrupted free list entry\n");
+        return null;
+    }
+    return (MiBlock*)raw;
 }
 
 // Hash function for segment map
@@ -209,37 +292,23 @@ static u32 _miSegmentMapHash(u8* addr)
     return (u32)(val % MI_SEGMENT_MAP_SIZE);
 }
 
-// Simple spinlock for cross-thread operations
-struct MiSpinLock
-{
-    u32 locked;
-
-    void acquire()
-    {
-        while (self.locked == 1) { /* spin */ }
-        self.locked = 1;
-    }
-
-    void release()
-    {
-        self.locked = 0;
-    }
-}
-
 // Segment map operations
 static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
 {
+    _miLockAcquire(&_miMapLockWord);
     u32 idx = _miSegmentMapHash(pageBase);
     MiSegmentMapEntry* entry = (MiSegmentMapEntry*)mmap(null, sizeof(MiSegmentMapEntry), 3, 0x22, -1, 0);
-    if (entry == null) return;
+    if (entry == null) { _miLockRelease(&_miMapLockWord); return; }
     entry->pageBase = pageBase;
     entry->page = page;
     entry->next = map->buckets[idx];
     map->buckets[idx] = entry;
+    _miLockRelease(&_miMapLockWord);
 }
 
 static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase)
 {
+    _miLockAcquire(&_miMapLockWord);
     u32 idx = _miSegmentMapHash(pageBase);
     MiSegmentMapEntry* prev = null;
     MiSegmentMapEntry* entry = map->buckets[idx];
@@ -250,11 +319,12 @@ static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase)
             if (prev != null) prev->next = entry->next;
             else map->buckets[idx] = entry->next;
             munmap((rawptr)entry, sizeof(MiSegmentMapEntry));
-            return;
+            break;
         }
         prev = entry;
         entry = entry->next;
     }
+    _miLockRelease(&_miMapLockWord);
 }
 
 static MiPage* _miSegmentMapLookup(MiSegmentMap* map, u8* addr)
@@ -359,6 +429,8 @@ static MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
             seg->pageCount = pageCount;
             seg->usedCount = 0;
             seg->arena = arena;
+            seg->threadId = heap->threadId;
+            seg->owner = heap;
             seg->pages = null;
             seg->next = heap->segments;
             seg->prev = null;
@@ -379,6 +451,8 @@ static MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
     seg->pageCount = pageCount;
     seg->usedCount = 0;
     seg->arena = null;
+    seg->threadId = heap->threadId;
+    seg->owner = heap;
     seg->pages = null;
     seg->next = heap->segments;
     seg->prev = null;
@@ -436,6 +510,7 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     page->localFree = null;
     page->xthreadFree = null;
     page->xthreadFreeCount = 0;
+    page->inFull = false;
     page->segment = seg;
     page->pageIdx = 0;
     page->retired = false;
@@ -448,7 +523,7 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     for (u32 i = 0; i < MI_INITIAL_CAPACITY; i++)
     {
         MiBlock* block = (MiBlock*)(page->base + (u64)i * blockSize);
-        _miFreeBlockEncode(block, head, page->key1, page->key2);
+        _miFreeBlockEncode(block, head, page);
         head = block;
     }
     page->free = head;
@@ -462,8 +537,8 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     heap->pages[sc] = page;
     heap->pageCounts[sc]++;
 
-    // Add to segment map
-    _miSegmentMapInsert(&heap->segmentMap, page->base, page);
+    // Add to global page map (foreign frees resolve here)
+    _miSegmentMapInsert(&_miGlobalPages, page->base, page);
 
     return page;
 }
