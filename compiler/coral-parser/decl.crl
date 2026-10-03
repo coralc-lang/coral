@@ -54,38 +54,36 @@ pub extend Parser
 
     NodeId parseDecl()
     {
+        bool isConst = false;
         while (self.match(TokenKind::Hash))
         {
             self.expect(TokenKind::LBracket);
             self.expect(TokenKind::LBracket);
-            self.expect(TokenKind::Ident);
+            /* attribute name — an identifier or keyword (e.g. `const`) */
+            if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+            {
+                if (self.current.kind == TokenKind::Const) isConst = true;
+                self.advance();
+            }
             if (self.current.kind == TokenKind::LParen)
             {
                 self.advance();
                 while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                {
-                    if (self.current.kind == TokenKind::Ident || self.current.kind == TokenKind::String || self.current.kind == TokenKind::Dec)
-                        self.advance();
-                    else
-                        self.advance();
-                    if (!self.match(TokenKind::Comma)) break;
-                }
+                    self.advance();
                 self.expect(TokenKind::RParen);
             }
             while (self.match(TokenKind::Comma))
             {
-                self.expect(TokenKind::Ident);
+                if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+                {
+                    if (self.current.kind == TokenKind::Const) isConst = true;
+                    self.advance();
+                }
                 if (self.current.kind == TokenKind::LParen)
                 {
                     self.advance();
                     while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                    {
-                        if (self.current.kind == TokenKind::Ident || self.current.kind == TokenKind::String || self.current.kind == TokenKind::Dec)
-                            self.advance();
-                        else
-                            self.advance();
-                        if (!self.match(TokenKind::Comma)) break;
-                    }
+                        self.advance();
                     self.expect(TokenKind::RParen);
                 }
             }
@@ -121,7 +119,7 @@ pub extend Parser
         }
 
         if (isExtern || isStatic || self.isTypeStart())
-            return self.parseFuncOrVarDecl(isPub, isExtern, isStatic);
+            return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, isConst);
 
         self.addError();
         if (!self.atEnd()) self.advance();
@@ -229,7 +227,7 @@ pub extend Parser
         }
     }
 
-    NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic)
+    NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic, bool isConst)
     {
         Ty retType = self.parseType();
         Token nameTok = self.expectName();
@@ -248,6 +246,7 @@ pub extend Parser
         if (isPub) flags = flags | 1;
         if (isExtern) flags = flags | 2;
         if (isStatic) flags = flags | 4;
+        if (isConst) flags = flags | 16;
         if (self.current.kind == TokenKind::LParen) {
             self.advance();
             NodeListBuilder params;
@@ -263,6 +262,8 @@ pub extend Parser
                 }
             }
             self.expect(TokenKind::RParen);
+            /* `const` qualifier after the parameter list — const method */
+            if (self.match(TokenKind::Const)) flags = flags | 16;
             u32 paramCount = params.len;
             NodeId* paramValues = self.ctx.nodeListFinish(&params);
             u32 pi = 0;
@@ -316,7 +317,45 @@ pub extend Parser
         if (!self.consumeGreater()) self.addError();
     }
 
-    NodeId parseFuncDecl() { return self.parseFuncOrVarDecl(false, false, false); }
+    NodeId parseFuncDecl()
+    {
+        bool isConst = false;
+        while (self.match(TokenKind::Hash))
+        {
+            self.expect(TokenKind::LBracket);
+            self.expect(TokenKind::LBracket);
+            if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+            {
+                if (self.current.kind == TokenKind::Const) isConst = true;
+                self.advance();
+            }
+            if (self.current.kind == TokenKind::LParen)
+            {
+                self.advance();
+                while (self.current.kind != TokenKind::RParen && !self.atEnd())
+                    self.advance();
+                self.expect(TokenKind::RParen);
+            }
+            while (self.match(TokenKind::Comma))
+            {
+                if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+                {
+                    if (self.current.kind == TokenKind::Const) isConst = true;
+                    self.advance();
+                }
+                if (self.current.kind == TokenKind::LParen)
+                {
+                    self.advance();
+                    while (self.current.kind != TokenKind::RParen && !self.atEnd())
+                        self.advance();
+                    self.expect(TokenKind::RParen);
+                }
+            }
+            self.expect(TokenKind::RBracket);
+            self.expect(TokenKind::RBracket);
+        }
+        return self.parseFuncOrVarDecl(false, false, false, isConst);
+    }
 
     NodeId parseParam()
     {
