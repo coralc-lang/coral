@@ -6,13 +6,17 @@ mod token = import "../coral-common/token";
 mod types = import "../coral-ast/types";
 mod id = import "../coral-ast/id";
 mod context = import "../coral-context/context";
+mod node = import "../coral-ast/node";
+mod expr_ast = import "../coral-ast/expr";
 
 import base { Parser, ParserMark };
 import parser { Parser };
 import token { Token, TokenKind };
 import types { Ty, TypeKind, TypeEntry };
-import id { Str };
+import id { Str, NodeId };
 import context { AstContext, TyListBuilder };
+import node { Node, NodeKind };
+import expr_ast { ExprKind };
 
 extern("C") void free(rawptr ptr);
 
@@ -73,6 +77,26 @@ pub extend Parser
             return self.makeComptime(inner);
         }
         return self.parseTypeSuffix(self.parseBaseType());
+    }
+
+    /* `name[N]` / `name[]` Array suffix attached to a declarator.
+     * N must be an integer literal for now. */
+    Ty parseDeclaratorArray(Ty base)
+    {
+        if (self.current.kind != TokenKind::LBracket) return base;
+        self.advance();
+        if (self.match(TokenKind::RBracket)) return self.makeSlice(base);
+        NodeId sizeExpr = self.parseExpr();
+        self.expect(TokenKind::RBracket);
+        Node* sn = self.ctx.nodes + sizeExpr.index;
+        if (sn.kind.tag == NodeKind::Expr &&
+            sn.kind.payload.Expr.value.kind.tag == ExprKind::IntLit)
+        {
+            u64 v = sn.kind.payload.Expr.value.kind.payload.IntLit.value;
+            return self.makeArray(base, (u32)v);
+        }
+        self.addError();
+        return base;
     }
 
     Ty makeVoid()

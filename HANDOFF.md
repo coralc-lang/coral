@@ -31,7 +31,7 @@
 ### High
 - **text.txt three-pass sema**: pass 1 declare-all symbols; pass 2 evaluate with dependency tracking (`x` depends on `y`, resume when `y` evaluated); leftover waiters → cyclic-import error (`let a = b; let b = a;`). Include a cyclic lib-import test.
 ### Switch / trait features (user-blocking for lib)
-- **Switch `|` same-body cases** — decide done; implement parser (`PatKind::Or` exists — route `|` into it) + codegen (already renders `||` for Or, so mostly parser wiring).
+- ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
 - `compatible()` is unsound (any pointer ↔ any pointer; int/float freely interconvert; `from==0` always true).
@@ -40,7 +40,7 @@
 ### Codegen
 - 33 silent `cg.errors++` sites — route through the diag engine.
 - `cgFindDecl` linear scan per call; `cgResolveCall` linear mono-instance scan; 16-element caps; dead `tempArrs`/`tempSeq`; `cgEmitStructFields` unused `indent`; asm template O(n²) string rebuild; dead conditionals.
-- Parser: `~=` mapped to `!=`; ternary precedence; double-parsing in speculation (`parseExprOrDecl`, struct/union fields, const untyped detection, param name extraction from type); `pendingGreater` `>>` split; stub `parseFlagDecl`/`parseComptimeDecl` returning Invalid node.
+- Parser: `~=` mapped to `!=`; ~~ternary precedence~~ DONE 2026-10-03 (`a = b ? c : d` parses as `a = (b ? c : d)`; sema now resolves Ternary/IfExpr branch types); double-parsing in speculation (`parseExprOrDecl`, struct/union fields, const untyped detection, param name extraction from type); `pendingGreater` `>>` split; stub `parseFlagDecl`/`parseComptimeDecl` returning Invalid node.
 ### Lexer
 - No `f`/`F` float suffix; no `l`/`L` int suffix; single-bit `numFlags`; fixed 256-entry ident table (never resizes); `decodeUtf8` accepts invalid UTF-8/overlong/surrogates; `\u`/`\U` accept surrogates; `parseInteger` returns partial on overflow; no hex floats; exponent allows `_`.
 ### Builder (`compiler/coral-build/`)
@@ -66,7 +66,7 @@
 ## Std library (lib/) — constructs that do NOT parse / are not implemented
 Verified by running `/tmp/opencode/coralc <file>` on samples:
 
-- **Local array declarations in fn bodies** (`u8 tmp[72];`) → parse error `expected ';'`. Blocks most `io/*.crl`, `hashmap.crl`, etc.
+- ~~Local array declarations in fn bodies~~ DONE 2026-10-03: `u8 tmp[72];` parses in stmt+const+struct-field positions; `= { a, b }` array-literal initializers parse as `ExprKind::ArrayLiteral`. Verified: `/tmp/opencode/arr` compiles+runs; sha256.crl now parse-clean (next failure there is sema Deref/Index of slices, not parse). Array sizes must be integer literals; named const sizes (e.g. `MI_SEGMENT_MAP_SIZE`) still rejected.
 - **Fn-pointer params with names** (`usize(K) hf, bool(K, K) ef`) → parse error `expected ')'`. Blocks `hashmap.crl:20`.
 - **Struct/array fields or local arrays with const-size** (`MiSegmentMapEntry* buckets[MI_SEGMENT_MAP_SIZE]`) → parse/`identifier` errors at `mimalloc.crl:47`.
 - **`#[[inline]]`, `#[[noinline]]`, `#[[threadlocal]]`, etc.** — now *parsed* (robust attr consumer over idents/keywords/args) but **not honored** (no codegen inline hint, no threadlocal, etc.).
@@ -76,7 +76,7 @@ Verified by running `/tmp/opencode/coralc <file>` on samples:
 - **`pub trait …` + `extend S : Trait`** — parses as `DeclKind::Trait`/`DeclKind::ExtendTrait`, but codegen skips traits; sema has no real trait-method resolution (`findMethod` doesn't consult the trait), so `trait`-typed dispatch does not work.
 - **`distinct` / `flag(Arch){…}`** (e.g. `pub distinct cchar = flag(Arch){x86=>{i8}else=>{u8}}`) — parse errors; not a real feature yet.
 - **`any TraitName` trait-object types** — syntax decided (`any Widget`), not implemented.
-- **Switch `|` multi-pattern cases** — syntax decided (`pat1 | pat2 => body`), not implemented (Or-patterns already exist inside patterns/codegen renders `||`).
+- ~~Switch `|` multi-pattern cases~~ DONE 2026-10-03 (see line 34 note).
 - Lib files importing (`import(..)`) mostly fail to resolve because of the above plus the neutral-path/library manifest gaps (`E1004` for `std::x::y` when the folder/manifest chain `memory`, `data`, `collections`, etc. doesn't chain cleanly).
 
 ## Sema — pointer.crl is unused
@@ -176,7 +176,7 @@ Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang 
 - An assignment target must be an lvalue (`ident`, `field`, `deref *p`, `slice index` usable as lvalue); assigning to a literal/`const`/`comptime` is not allowed.
 - `++`/`--` operands must be an lvalue of an integer/arithmetic-ish type.
 - Member access `a.b`: `a` must have non-null `b` member; `a->b` requires `a` to be a pointer.
-- Indexing `a[i]`: first operand integer/slice/pointer/array, second integer; no bounds run-time error required at compile time but OOB semantics defined.
+- Indexing `a[i]`: first operand integer/slice/pointer/array, second integer; the index operand's type must be checked as integer (sema gap — today unchecked). **Out-of-bounds indexing is PROHIBITED**: for fixed-size arrays (`T[N]`) with a statically known index (literal/comptime), sema must reject `i < 0`-style unsigned wraparound and `i >= N` at compile time; for dynamic indices, a conforming implementation guarantees a defined trap/panic rather than silent UB (runtime bounds check retained; not yet implemented).
 - Call on a value of fn-pointer/FnPtr type only; calling an `i32`/`rawptr` is a type error.
 - Return statements must match the function's declared return type; missing return on a non-void path is invalid (Wasm/void ok).
 - The block must definitely produce the return value on all paths (unlike C).
@@ -325,7 +325,7 @@ These must be declared in the definition of the `trait` keyword's language and h
 - Semantic rule: every function with a `comptime T` generic param MUST contain a `comptime { … }` block. Add to sema (and produce a proper compile error when absent).
 - Not yet implemented: parser acceptance of `comptime T` in the generic-param list, comptime evaluation, `@compileError` / `@isFormatLiteral` handling.
 
-### Nested path-listed import (decided, NOT implemented)
+### Nested path-listed import (decided, IMPLEMENTED 2026-10-03: `module::{ a, b }` parses; `nested_import.crl` parse-clean, sema TC for unresolved lib symbols still applies)
 ```crl
 import(lib) std::text {
     string::{ String },
