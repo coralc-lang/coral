@@ -108,7 +108,6 @@ struct LibLoader
 {
     AstContext* ctx;
     IdentifierTable* idents;
-    DiagnosticEngine* diag;
     u8* inputPath;
     u8** loaded;
     u32 loadedLen;
@@ -116,9 +115,6 @@ struct LibLoader
     File** files;
     u32 filesLen;
     u32 filesCap;
-    u8** bufs;
-    u32 bufsLen;
-    u32 bufsCap;
     u32 errors;
 }
 
@@ -220,17 +216,18 @@ u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
     return count;
 }
 
-File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* diag, u32 fileId)
+File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath)
 {
+    DiagnosticEngine engine;
+    engine.init(buf, buf + len);
     Lexer lexer = Lexer {
         .bufStart = buf,
         .cur = buf,
         .bufEnd = buf + len,
         .line = 1,
         .lineStart = buf,
-        .diag = diag,
+        .diag = &engine,
         .idents = L->idents,
-        .fileId = fileId,
     };
     Parser parser = Parser {
         .lexer = &lexer,
@@ -238,7 +235,6 @@ File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* di
         .panicMode = 0,
         .pendingGreater = false,
         .current = lexer.nextToken(),
-        .fileId = fileId,
     };
     parser.previous = parser.current;
     AstContext* c = L->ctx;
@@ -290,10 +286,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         u8* mbuf = libRead(mpath, &mlen);
         if (mbuf != null)
         {
-            u32 mfid = 0;
-            DiagnosticEngine* dg = L->diag;
-            if (dg != null) mfid = dg.addFile(mpath, libLen(mpath), mbuf, mbuf + mlen);
-            File* mf = libParse(L, mbuf, mlen, mpath, dg, mfid);
+            File* mf = libParse(L, mbuf, mlen, mpath);
             if (mf != null)
             {
                 u32 d = 0;
@@ -457,22 +450,7 @@ void libLoadImports(LibLoader* L, File* f)
                         usize len = 0;
                         u8* buf = libRead(resolved, &len);
                         File* lf = null;
-                        if (buf != null)
-                        {
-                            u32 fid = 0;
-                            DiagnosticEngine* dg = L->diag;
-                            if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
-                            if (L->bufsLen >= L->bufsCap)
-                            {
-                                u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
-                                rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * sizeof(u8*));
-                                if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
-                            }
-                            if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
-                            else free(buf);
-                            L->bufsLen = L->bufsLen + 1;
-                            lf = libParse(L, buf, len, resolved, dg, fid);
-                        }
+                        if (buf != null) lf = libParse(L, buf, len, resolved);
                         if (lf == null)
                         {
                             write(2, "coral: cannot read import(lib) file ", 36);
@@ -570,16 +548,6 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
     DiagnosticEngine engine;
     engine.init(src, src + len);
 
-    u8* mainPath = (u8*)"main";
-    usize mainPathLen = 4;
-    if (path != null)
-    {
-        usize plen = 0;
-        while (path[plen] != 0) plen = plen + 1;
-        if (plen > 0) { mainPath = path; mainPathLen = plen; }
-    }
-    engine.addFile(mainPath, mainPathLen, src, src + len);
-
     Lexer lexer = Lexer {
         .bufStart = src,
         .cur = src,
@@ -588,7 +556,6 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
         .lineStart = src,
         .diag = &engine,
         .idents = &idents,
-        .fileId = 0,
     };
 
     Parser parser = Parser {
@@ -597,7 +564,6 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
         .panicMode = 0,
         .pendingGreater = false,
         .current = lexer.nextToken(),
-        .fileId = 0,
     };
     parser.previous = parser.current;
 
@@ -615,26 +581,11 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
 
     /* import(lib): resolve + parse + merge library decls, deps first */
     bool loadOk = true;
-    LibLoader loader;
-    loader.ctx = null;
-    loader.idents = null;
-    loader.diag = null;
-    loader.inputPath = null;
-    loader.loaded = null;
-    loader.loadedLen = 0;
-    loader.loadedCap = 0;
-    loader.files = null;
-    loader.filesLen = 0;
-    loader.filesCap = 0;
-    loader.bufs = null;
-    loader.bufsLen = 0;
-    loader.bufsCap = 0;
-    loader.errors = 0;
     if (file != null)
     {
+        LibLoader loader;
         loader.ctx = ctx;
         loader.idents = &idents;
-        loader.diag = &engine;
         loader.inputPath = path;
         loader.loaded = (u8**)malloc(8 * sizeof(u8*));
         loader.loadedLen = 0;
@@ -687,17 +638,6 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
             unit.sema = sema;
             unit.mono = mono;
         }
-    }
-
-    if (loader.bufs != null)
-    {
-        u32 bi = 0;
-        while (bi < loader.bufsLen)
-        {
-            free(loader.bufs[bi]);
-            bi = bi + 1;
-        }
-        free(loader.bufs);
     }
 
     free(entries);
