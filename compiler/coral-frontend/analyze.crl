@@ -224,13 +224,15 @@ u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
 
 File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* diag, u32 fileId)
 {
+    DiagnosticEngine localEngine;
+    localEngine.init(buf, buf + len);
     Lexer lexer = Lexer {
         .bufStart = buf,
         .cur = buf,
         .bufEnd = buf + len,
         .line = 1,
         .lineStart = buf,
-        .diag = diag,
+        .diag = &localEngine,
         .idents = L->idents,
         .fileId = fileId,
     };
@@ -253,13 +255,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
 {
     if (L == null || segs == null || dir == null || n == 0) return null;
     if (depth > 16) return null;
-    write(2, "DBG n=", 6);
-    if (n == 1) write(2, "1", 1);
-    else if (n == 2) write(2, "2", 1);
-    else write(2, "3", 1);
-    write(2, " d=", 3);
-    write(2, dir, dirLen);
-    write(2, " ; ", 3);
+
     if (n == 1)
     {
         /* existence probe only — the file is re-read by the loader later,
@@ -303,7 +299,6 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
             DiagnosticEngine* dg = L->diag;
             if (dg != null) mfid = dg.addFile(mpath, libLen(mpath), mbuf, mbuf + mlen);
             File* mf = libParse(L, mbuf, mlen, mpath, dg, mfid);
-            write(2, "DBG manifest parsed decls=", 26);
             if (mf != null)
             {
                 u32 d = 0;
@@ -331,34 +326,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                                         got = got + 1;
                                         j = j + 1;
                                     }
-                                    u8* r = null;
-                                    if (L->platformRootSegsLen > 0)
-                                    {
-                                        /* platform-first: <module_root>/<platform_root>/<target>
-                                         * — a platform may override any portable file
-                                         * (see coral-docs/builder_incomplete.md) */
-                                        LibSeg* pnext = (LibSeg*)malloc(((usize)L->platformRootSegsLen + got) * sizeof(LibSeg));
-                                        if (pnext != null)
-                                        {
-                                            u32 k = 0;
-                                            while (k < L->platformRootSegsLen)
-                                            {
-                                                pnext[k] = L->platformRootSegs[k];
-                                                k = k + 1;
-                                            }
-                                            u32 m = 0;
-                                            while (m < got)
-                                            {
-                                                pnext[k] = next[m];
-                                                k = k + 1;
-                                                m = m + 1;
-                                            }
-                                            r = libResolveSegs(L, pnext, k, sub, subLen, depth + 1);
-                                            free(pnext);
-                                        }
-                                    }
-                                    if (r == null)
-                                        r = libResolveSegs(L, next, got, sub, subLen, depth + 1);
+                                    u8* r = libResolveSegs(L, next, got, sub, subLen, depth + 1);
                                     free(next);
                                     if (r != null)
                                     {
@@ -371,7 +339,6 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                     }
                     d = d + 1;
                 }
-                write(2, "DBG manifest-ok ; ", 20);
             }
         }
         free(mpath);
@@ -413,6 +380,36 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     }
     if (result == null)
         result = libResolveSegs(L, segs, n, (u8*)"lib", 3, 0);
+    if (result == null && L->platformRootSegsLen > 0 && n > 1)
+    {
+        /* platform-first: <module>/<platform_root>/<rest> — neutral paths
+         * resolve under the platform root before the base tree
+         * (see coral-docs/builder_incomplete.md) */
+        LibSeg* psegs = (LibSeg*)malloc(((usize)1 + L->platformRootSegsLen + (n - 1)) * sizeof(LibSeg));
+        if (psegs != null)
+        {
+            psegs[0] = segs[0];
+            u32 k = 1;
+            u32 m = 0;
+            while (m < L->platformRootSegsLen)
+            {
+                psegs[k] = L->platformRootSegs[m];
+                k = k + 1;
+                m = m + 1;
+            }
+            m = 1;
+            while (m < n)
+            {
+                psegs[k] = segs[m];
+                k = k + 1;
+                m = m + 1;
+            }
+            result = libResolveSegs(L, psegs, k, (u8*)"lib", 3, 0);
+            if (result == null && base != null)
+                result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
+            free(psegs);
+        }
+    }
     free(segs);
     return result;
 }
