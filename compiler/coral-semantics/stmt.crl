@@ -169,6 +169,31 @@ pub extend Sema
         }
     }
 
+    /* replace the `self` placeholder with the actual type */
+    Ty resolveSelfTy(Ty t, Ty selfType)
+    {
+        if (t == 0) return 0;
+        TypeEntry* e = self.ctx.types + t;
+        switch (e->kind.tag)
+        {
+            TypeKind::Named => {
+                if (e->kind.payload.Named.name == self.ctx.intern((u8*)"self", 4)) return selfType;
+                return t;
+            },
+            TypeKind::Pointer => {
+                Ty base = self.resolveSelfTy(e->kind.payload.Pointer.base, selfType);
+                if (base == e->kind.payload.Pointer.base) return t;
+                return self.allocType(TypeKind::Pointer{ .base = base });
+            },
+            TypeKind::Const => {
+                Ty base = self.resolveSelfTy(e->kind.payload.Const.base, selfType);
+                if (base == e->kind.payload.Const.base) return t;
+                return self.allocType(TypeKind::Const{ .base = base });
+            },
+            else => { return t; }
+        }
+    }
+
     bool checkFunction(Decl* decl, Ty selfType)
     {
         self.scopes.enter();
@@ -215,8 +240,11 @@ pub extend Sema
                     if ((param->flags & 8) != 0) {
                         Ty typeNode = self.typeParamType(param->name, i);
                         if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0)) ok = false;
-                    } else if ((param->flags & 1) != 0 && selfType != 0) {
-                        if (!self.scopes.declare(param->name, 1, selfType, paramId, 0)) ok = false;
+                    } else if ((param->flags & 1) != 0) {
+                        Ty selfTy = param->typeNode;
+                        if (selfTy == 0) selfTy = selfType;
+                        else selfTy = self.resolveSelfTy(selfTy, selfType);
+                        if (!self.scopes.declare(param->name, 1, selfTy, paramId, 0)) ok = false;
                     } else {
                         if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0)) ok = false;
                     }
