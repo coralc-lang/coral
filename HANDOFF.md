@@ -34,6 +34,7 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
+- 2026-10-03 two-pass decl handling (agent): `sema.declareAll` binds every top-level symbol before any body is type-checked; `checkBodies` re-declares (same decl node = idempotent) and checks bodies. Forward references between same-file fns/methods now work (verified with fwd.crl: helper()->g() exit 0). Full dependency-graph/cyclic-import error (text.txt) is NOT implemented yet.
 - 2026-10-03 enforced: If/While/For/Ternary/IfExpr conditions must be `bool`; Index's index operand must be an integer type; `Deref` of non-pointer is an error; `++`/`--` exprs now resolve their type (fixes void* temp in for-post).
 - ~~`compatible()` unsound~~ PARTIALLY DONE 2026-10-03: int/float no longer interconvert; `Str`⇄pointer removed; pointer↔pointer now requires same element type (adding `const` on the target is allowed; `T*`→`rawptr` ok, reverse needs cast). `from==0/to==0` still passes through; exactly-one-dependent-side still permissive (documented: mono boundary is the enforcement point). Also: method receiver self is typed `Pointer(selfType)` in sema and `self = x` now checks against the pointee (C backend writes through it); Struct/Union/Trait/Variant methodself args built via `selfNamedType` so fields/methods see generic args; `T*` vs `const T*` returns allowed. VERIFIED: option.crl is sema/codegen-clean again.
 - Silent errors: assignment failures, redeclaration errors, `Deref` of non-pointer, calling a non-function value.
@@ -268,18 +269,18 @@ module @std::x86_64::linux    // fully qualified path
 
 ### 3) Item body — A-normal-ish typed local form
 ```crl
-  fn @checkedPow :: (base: f64, exponent: f64) -> Option<f64> {
-  locals:
-    tmp0 : Option<f64>;
-    tmp1 : f64;
-  entry:
-    tmp0 = copy _limits$checkedPow(base, exponent);  // cross-module fully-qualified call
-    br label %then_%return;
-  then:
-    tmp1 = load %x;  // every use is typed
-    store %tmp1 into %r;
-    ret { kind: Some, payload: tmp1 } into $slot;
-  }
+  // fn @checkedPow :: (base: f64, exponent: f64) -> Option<f64> {
+  // locals:
+  //   tmp0 : Option<f64>;
+  //   tmp1 : f64;
+  // entry:
+  //   tmp0 = copy _limits$checkedPow(base, exponent);  // cross-module fully-qualified call
+  //   br label %then_%return;
+  // then:
+  //   tmp1 = load %x;  // every use is typed
+  //   store %tmp1 into %r;
+  //   ret { kind: Some, payload: tmp1 } into $slot;
+  // } // rejected, it should be more high level than this
 ```
 - Every local/temp has a name and a type. Every expression yields a typed slot; no unparsed sugar.
 - Control flow is explicit blocks ending in `ret`/`br`/`switch`/`unreachable`.
