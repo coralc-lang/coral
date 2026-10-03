@@ -23,7 +23,7 @@ import(lib) core;                           // whole surface, no item list
 import(lib) std::allocator { Allocator, mimalloc { MiAlloc }, tlsf { Tlsf } };  // nested items
 ```
 
-Nested item braces are supported: `mimalloc { MiAlloc }` inside an item
+Nested item braces are supported: `mimalloc::{ MiAlloc }` inside an item
 list is equivalent to the flat path `mimalloc::MiAlloc`. Use whichever;
 both are correct.
 
@@ -36,7 +36,7 @@ Inside the `allocators/` folder itself, use sibling imports
 `std::allocator` surface from a file that the surface itself re-exports.
 
 **FLAGGED — assumed working, not verified:** (a) nested item lists
-(`mimalloc { MiAlloc }`) and flat paths (`mimalloc::MiAlloc`) both
+(`mimalloc::{ MiAlloc }`) and flat paths (`mimalloc::MiAlloc`) both
 resolve; (b) a flat `Allocator` item resolves through the
 `std::allocator` surface even though `lib.crl` re-exports it as a
 sub-module; (c) the `std` surface picks up the platform surface's
