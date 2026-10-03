@@ -299,3 +299,22 @@ module @std::x86_64::linux    // fully qualified path
 - The text is a single grammar from `module`/`imports`/`struct`/`extend`/`fn`/`mono`/`locals`/`entry` down to `load/store/call/ret/br/switch/drop`; one pass, every symbol and type already resolved — no imports, comptime, or type inference needed when reading it.
 
 (We will finalize the exact punctuation/keywords when we stabilize the IR; above is the minimal shape that satisfies "everything resolved + single-parseable + backend-neutral".)
+
+## Built-in traits the language should have (not yet implemented)
+- `drop` — `void drop()` glue; called when the value goes out of scope (like Rust `Drop`). Mentioned in `threadpool.crl` comments; NOT enforced/resolved anywhere.
+- `toStr` — string representation; sema doesn't resolve which impl applies to a concrete type.
+- `iterable` — `for (T x : it)` means `it` must satisfy `iterable` (supplied by `Iterator`/`Stream` extensions); currently `ForIn` has NO sema check and codegen just assumes slice/array.
+- `eq` / `ne` / `ord` — equality & ordering used by switch/enum compare and `==`.
+- `clone` / `default` / `debug` (fmt/debug printing).
+- `copy` / `send` / `sync` marker analogues.
+These must be declared in the definition of the `trait` keyword's language and have sema impl-resolution + a const/drop elaboration pass before they can be used; today their constructs don't parse or don't resolve (see gaps section).
+
+## Error rendering gaps
+- Most diagnostics emit only the bare line `error[PAR-0001]: <msg>` with no location, or a one-line `expected ';'` with no source line/caret/help.
+- `why`, `fix`, and `learn` fields exist on `Diagnostic`/`renderDiagnostic` but are not populated/rendered on the common path; `call sites report stable CODE + location + help` is still aspirational on many sites.
+- Several sema/parser reports go through `addError()`/`semaErrorNode(…, code, msg)` but the `why`/`fix` are always `null`; no label spans, no secondary notes.
+- Consequently many real errors produce empty/positionless output (`expected ';'` with no line, `expected identifier` at offset) making diagnosis hard — treat improving the renderer as part of closing the diagnostics todo.
+
+## Where compilation checks stand
+- Running `/tmp/opencode/coralc <file>` on lib/test files is how we flag what coralc cannot do; each failure is being written into this file (unsupported syntax, unenforced rules, missing sema/codegen). Yes — this is a deliberate gap sweep, not compilation steps toward shipping.
+- Blocking right now: option.crl (test) reports 6 parse errors with no established position; investigating whether the offending construct is in a lib-only path with mismatched file id, or a lib file using syntax the parser rejects (e.g. `@assertOut(...)` in `result.crl`, local arrays, fn-ptr-params).
