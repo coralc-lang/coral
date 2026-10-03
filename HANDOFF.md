@@ -68,7 +68,7 @@
 Verified by running `/tmp/opencode/coralc <file>` on samples:
 
 - ~~Local array declarations in fn bodies~~ DONE 2026-10-03: `u8 tmp[72];` parses in stmt+const+struct-field positions; `= { a, b }` array-literal initializers parse as `ExprKind::ArrayLiteral`. Verified: `/tmp/opencode/arr` compiles+runs; sha256.crl now parse-clean (next failure there is sema Deref/Index of slices, not parse). Array sizes must be integer literals; named const sizes (e.g. `MI_SEGMENT_MAP_SIZE`) still rejected.
-- ~~Fn-pointer params with names~~ PARSE-DONE 2026-10-03: struct-body `static`/`extern` methods were mis-routed through `parseFuncDecl` (dropped flags, never consumed `static`); now routed through `parseFuncOrVarDecl` with correct flags. Remaining: sema `TC-0002` struct-literal mismatch on fn-field assignment (sema generic/FnPtr gap, already tracked).
+- ~~Fn-pointer params with names~~ PARSE-DONE 2026-10-03: struct-body `static`/`extern` methods were mis-routed through `parseFuncDecl` (dropped flags, never consumed `static`); now routed through `parseFuncOrVarDecl` with correct flags. RESOLVED 2026-10-03 via the sameType TypeParam~Named bridge + stricter compatible(): fp4.crl (HashMap static new with fn-ptr params) now compiles and runs.
 - **Struct/array fields or local arrays with const-size** (`MiSegmentMapEntry* buckets[MI_SEGMENT_MAP_SIZE]`) → parse/`identifier` errors at `mimalloc.crl:47`.
 - **`#[[inline]]`, `#[[noinline]]`, `#[[threadlocal]]`, etc.** — now *parsed* (robust attr consumer over idents/keywords/args) but **not honored** (no codegen inline hint, no threadlocal, etc.).
 - **`comptime {}` blocks** (`io/ios.crl`) — `parseComptimeDecl` returns an Invalid node → parsed then discarded; no comptime evaluation.
