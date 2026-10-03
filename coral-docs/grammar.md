@@ -121,6 +121,21 @@ Tuple, `TypeParam`, `Distinct`, plus `Str` used as a `u8*` interned-id in AST.
   `Else` guard (`else`) — a `,` separator between cases today; the
   **decided** form is `pat1 | pat2 => body` (not implemented).
 
+
+## comptime semantics (observed in lib/std/x86_64/linux/io/ios.crl)
+- `comptime { … }` is a general compile-time block; it may contain switches,
+  ifs, loops, and arbitrary logic that SELECTS/emits code — it is NOT limited
+  to showing switches/ifs. Types in it are resolved at compile time.
+- A generic parameter may be marked `comptime`, i.e. `print<comptime T>(T fmt,
+  ...)`. A `comptime T` parameter means the caller does NOT specify T:
+  T is auto-deduced by the logic inside the function's `comptime { … }` block.
+- Semantic rule (to be enforced): any function whose generic list uses a
+  `comptime T` parameter MUST contain a `comptime { … }` block in its body
+  (otherwise there is nowhere to derive T). This is part of the type-erasure
+  / tmp inference that replaces a dispatch argument at each call site.
+- `@compileError(...)`, `@isFormatLiteral`, `@assert(cond)`, `@assertOut(...)`
+  are compile-time attributes used inside comptime blocks.
+
 ## 8. Expressions (parser/expr.crl)
 
 - Precedence (low→high) via binary levels: `=, +=, -=, *=, /=, %=` are separate

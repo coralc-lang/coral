@@ -318,3 +318,9 @@ These must be declared in the definition of the `trait` keyword's language and h
 ## Where compilation checks stand
 - Running `/tmp/opencode/coralc <file>` on lib/test files is how we flag what coralc cannot do; each failure is being written into this file (unsupported syntax, unenforced rules, missing sema/codegen). Yes — this is a deliberate gap sweep, not compilation steps toward shipping.
 - Blocking right now: option.crl (test) reports 6 parse errors with no established position; investigating whether the offending construct is in a lib-only path with mismatched file id, or a lib file using syntax the parser rejects (e.g. `@assertOut(...)` in `result.crl`, local arrays, fn-ptr-params).
+
+### comptime semantics (to encode in sema; parser doesn't yet emit `comptime T` gen-params)
+- `comptime { … }` is a general compile-time block (switches, if/else, for, arbitrary logic) that selects/emits code; not just switches/ifs.
+- A generic param may be `comptime T` (`print<comptime T>(T fmt, …)`): the caller does NOT supply T — it is auto-deduced by the function's `comptime { … }` block.
+- Semantic rule: every function with a `comptime T` generic param MUST contain a `comptime { … }` block. Add to sema (and produce a proper compile error when absent).
+- Not yet implemented: parser acceptance of `comptime T` in the generic-param list, comptime evaluation, `@compileError` / `@isFormatLiteral` handling.
