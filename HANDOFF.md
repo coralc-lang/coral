@@ -148,3 +148,74 @@ Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang 
 - `compatible()` unsound; silent assignment/redecl errors; no condition-bool checks; variadic args unchecked; `StaticCall` untyped.
 - Codegen silent `cg.errors++` at ~33 sites; `cgResolveCall`/`cgMethodRecvKind` do per-call linear scans; 16-arg cap; dead `tempArrs`/`tempSeq`.
 - Lexer: fixed 256-slot ident table; no `f`/`F`/`l`/`L` suffixes; `u` suffix exists; `decodeUtf8`/`\u` accept invalid; `parseInteger` returns partial on overflow; no hex float.
+
+## Semantic rules (C/C++-style + coral-specific, enforced or to-be-enforced)
+
+### Declarations & scopes
+- No duplicate declaration of the same name in one scope.
+- `use-before-declaration` / forward refs: file-scope fn names are resolvable out of order only after a declare-all pass; `var` is not usable before its declaration.
+- Visibility: `pub` carries; imports resolve the same names only if public; alias/symbol ambiguity is an error.
+- Const symbols cannot be reassigned; `pub const` is usable across modules.
+
+### Initialization / inference
+- A local `var x = expr;` may omit an annotation only when the initializer has a concrete type; otherwise error. `var x: T = expr;` checks `expr` against `T`.
+- `const X = …;` requires the initializer to be a constant expression (literal fold) when untyped.
+- Constants: enum values and literal-sized fields may not use non-constexpr exprs.
+
+### Expressions & lvalues
+- An assignment target must be an lvalue (`ident`, `field`, `deref *p`, `slice index` usable as lvalue); assigning to a literal/`const`/`comptime` is not allowed.
+- `++`/`--` operands must be an lvalue of an integer/arithmetic-ish type.
+- Member access `a.b`: `a` must have non-null `b` member; `a->b` requires `a` to be a pointer.
+- Indexing `a[i]`: first operand integer/slice/pointer/array, second integer; no bounds run-time error required at compile time but OOB semantics defined.
+- Call on a value of fn-pointer/FnPtr type only; calling an `i32`/`rawptr` is a type error.
+- Return statements must match the function's declared return type; missing return on a non-void path is invalid (Wasm/void ok).
+- The block must definitely produce the return value on all paths (unlike C).
+
+### Conversions (C/C++-strict)
+- No implicit integer↔float, float→int, or different-width integer assignment; explicit conversion via `(T)x`.
+- No pointer↔int conversions; `rawptr` may receive object pointers (and be cast); typed `T*` requires matching element type.
+- No `T**` from `T*` without explicit cast. Struct/`enum`/`fn` types are not assignable to unrelated struct/enum/fn types.
+- Identical shape is not enough for `distinct` types: explicit conversion required; distinct new/coercion rules must be checked.
+- Generic named types match exactly (after instantiation) with no covariance; `str` ≠ slice.
+
+### Operators
+- Arithmetic `+ - * / %` require integer-or-float operands of the same type after int promotion; result type preserved.
+- `%`/`~`/shift only on `usize`/`i*`/`u*`.
+- Logical `&& || !` require `bool` operands and produce `bool`.
+- Bitwise `& | ^ ~` require integer/`bool`(? — decide) operands.
+- Comparisons `== != < <= > >=`: operands must share an integer/float/bool/pointer/str (== only for pointer) relation and produce `bool`; no enum↔int implicit compare.
+- Shifts require right operand to be within-width unsigned integer (decide rule); oversized shift is an error/undefined-behavior choice — decide and note.
+
+### Types / aggregates
+- A struct/variant/union value must have every non-defaulted member initialized exactly once.
+- Struct literal: field names valid, types compatible, no duplicate member, all required members present.
+- Variant: match subject must be the right type; every case arm produces the type; fields bound have the declared type; literals/flags consistent.
+- Enum: used value must be a declared member / valid discriminant; exhaustive match over member set.
+- Array literal: element count == declared size; homogeneous conversion only.
+- Pointer arithmetic: byte math only via provided helpers; addition/subtraction on `T*` yields `T*` and index must be integer-compatible.
+- `comptime` wrapper forces constant-evaluable inner type.
+
+### Control flow
+- `if`/`while`/`for`/`match` conditions must be `bool` (C requires nonzero-truthy; decide — coral currently requires tests).
+- `for (T x in it)`: `it` must be iterable for `T`.
+- `break`/`continue` only inside loops; `return` only inside a function; no label jumps into blocks.
+- Switch: patterns exhaustive (or `else`), duplicate patterns rejected, scrutinee type must match arms, different payload widths must be handled; implicit subgroup via `|` treated as one case shared-body.
+- No case fall-through like C (each arm scoped with empty or explicit); decide define.
+
+### Functions / methods
+- A function call must supply the exact number of arguments or be a valid variadic call; variadic args are untyped extras.
+- Method call receiver type has a visible member by that name (`findMethod` over impl blocks); arity match.
+- `const` methods may not mutate `self`/params; `comptime` fn calls in const context must be comptime-evaluable.
+- Static methods (flags bit 2) take no `self`; calling a static method requires `Type::name()` path, not instance.
+- A method cannot be defined on a built-in/alien type from another module unless `pub` re-exported rules allow.
+- Extern fns share C linkage: params/return must be C-ABI-expressible; calls validate against the system prototype page (cchar vs char issue lives here).
+
+### Imports / modules
+- Importing an unknown symbol/module/slot is an error (`E1004`/`E1005`).
+- No direct circular import reliance: declarations collected first, evaluation waits on dependencies, leftover waits → `E1006`.
+- `pub` items in `lib.crl`/lib surface resolve neutral paths under the platform root first then base tree; both must produce the same *semantic type shape* (today only the file must be found).
+
+### Lexer / literal rules
+- Numeric: grammar-allowed literals only; overflow must be a diagnostic (`parseInteger out of range`); float literal invalid tokens diagnosed; `_` separators; valid integer suffixes (`u`,`ul`,`ull`) map to distinct types; invalid suffix is an error.
+- String/char literal must terminate before EOF/newline (unless triple quote design say otherwise); unknown escape is an error.
+- Identifiers follow XID-Start/XID-Continue; C++-similar keywords/literals reserved; emitted C is keyworded-escaped (cgIdent).
