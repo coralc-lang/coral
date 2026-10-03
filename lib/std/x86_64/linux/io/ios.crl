@@ -545,111 +545,19 @@ pub void eprintln<comptime T>(T fmt, ...)
     _pflush(&out);
 }
 
-// vaprint — printf DIRECTIVE syntax (%d %i %u %x %X %o %f %e %g %s %c
-// %p %% with flags/width/precision/length modifiers) on the print
-// function's own buffered machinery — not a thin libc forwarder. The
-// format is walked here; each directive is rebuilt into a one-value
-// format (integers forced to "ll") and rendered with snprintf, %s/%c/%p
-// handled directly; everything appends to the shared 1024-byte stack
-// buffer, so output length is unbounded (flush per full buffer) and the
-// arguments are compile-time variadic — any count, any types (builtin
-// switch or `any toStr`). A directive/argument class mismatch degrades to
-// the argument's default rendering instead of reaching libc as UB; extra
-// arguments past the end of the format print via their default rendering;
-// a dangling '%' is copied through raw. The format must be a comptime
-// literal (same @isFormatLiteral rule as print).
-pub void vaprint(const cchar* fmt, ...)
+// vaprint — lib_old print!'s equivalent: a compile-time variadic of
+// VALUES. No format string first — the first argument is never treated
+// as text — and no format specifiers at all: there is no order to
+// encode, so arguments print in sequence, each inferred through the
+// built-in comptime switch or the `any toStr` case. Unbounded argument
+// count and output length (the 1024-byte stack buffer flushes per full
+// buffer). No trailing newline (see println).
+pub void vaprint(... args)
 {
     u8 outBuf[1024];
     _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
-    comptime { _vaprintEmit(&out, fmt, ...); }
+    comptime { for (var arg : args) _fprintOne(&out, arg); }
     _pflush(&out);
-}
-
-static void _vaprintEmit(_Buf* out, const cchar* fmt, ... args)
-{
-    comptime
-    {
-        if (!@isFormatLiteral(fmt)) { @compileError("vaprint: format string must be a comptime literal"); }
-
-        usize i = 0;
-        bool fmtDone = false;
-        for (var arg : args)
-        {
-            if (fmtDone) { _fprintOne(out, arg); continue; }
-
-            // Literal run and %% (which takes no argument) up to the
-            // next real directive — or the end of the format.
-            usize lit = i;
-            while (fmt[i] != 0)
-            {
-                if (fmt[i] != '%') { i++; continue; }
-                if (fmt[i + 1] == '%')
-                {
-                    _pbytes(out, fmt + lit, i - lit);
-                    _pbyte(out, '%');
-                    i += 2;
-                    lit = i;
-                    continue;
-                }
-                break;
-            }
-            _pbytes(out, fmt + lit, i - lit);
-            if (fmt[i] == 0) { fmtDone = true; _fprintOne(out, arg); continue; }
-
-            // Directive: % [flags] [width] [. precision] [length] conv
-            usize ds = i;
-            i++;
-            while (fmt[i] == '-' || fmt[i] == '0' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#') i++;
-            while (fmt[i] >= '0' && fmt[i] <= '9') i++;
-            if (fmt[i] == '.') { i++; while (fmt[i] >= '0' && fmt[i] <= '9') i++; }
-            while (fmt[i] == 'h' || fmt[i] == 'l' || fmt[i] == 'z' || fmt[i] == 'j' || fmt[i] == 't') i++;
-            if (fmt[i] == 0)
-            {
-                // Dangling directive tail: copy through raw.
-                _pbytes(out, fmt + ds, i - ds);
-                fmtDone = true;
-                _fprintOne(out, arg);
-                continue;
-            }
-            u8 conv = (u8)fmt[i];
-            i++;
-            _vaprintArg(out, fmt, ds, i, conv, arg);
-        }
-
-        // Whatever is left of the format (extra directives after the
-        // last argument) is copied through raw.
-        while (fmt[i] != 0) { _pbyte(out, (u8)fmt[i]); i++; }
-    }
-}
-
-// One directive (fmt[ds..de), conversion `conv`) + one argument.
-static void _vaprintArg<T>(_Buf* out, const cchar* fmt, usize ds, usize de, u8 conv, T val)
-{
-    comptime
-    {
-        switch (conv)
-        {
-            'd' => { _vaprintSigned(out, fmt, ds, de, val); },
-            'i' => { _vaprintSigned(out, fmt, ds, de, val); },
-            'u' => { _vaprintUnsigned(out, fmt, ds, de, val); },
-            'x' => { _vaprintUnsigned(out, fmt, ds, de, val); },
-            'X' => { _vaprintUnsigned(out, fmt, ds, de, val); },
-            'o' => { _vaprintUnsigned(out, fmt, ds, de, val); },
-            'f' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'F' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'e' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'E' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'g' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'G' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'a' => { _vaprintFloat(out, fmt, ds, de, val); },
-            'A' => { _vaprintFloat(out, fmt, ds, de, val); },
-            's' => { _vaprintStr(out, fmt, ds, de, val); },
-            'c' => { _vaprintChar(out, fmt, ds, de, val); },
-            'p' => { _vaprintPtr(out, val); },
-            else => { @compileError("vaprint: unsupported conversion"); }
-        }
-    }
 }
 
 // Rebuilds fmt[ds..de) into dst (NUL-terminated): '%' + flags/width/
