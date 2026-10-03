@@ -1,52 +1,128 @@
-import(lib) platform::libc { mkstemp, close, unlink, mkdtemp, rmdir };
-import(lib) std::mman { alloc, dealloc, copy };
+import(lib) platform::libc { snprintf };
+import(lib) platform::win32 { CreateFileA, CloseHandle, DeleteFileA, MoveFileA, RemoveDirectoryA, GetTickCount };
 import(lib) std::text::string { String };
+
+// Local externs - absent from lib/platform/win32.crl (kernel32).
+pub extern u32 GetTempPathA(u32 nBufferLength, cchar* lpBuffer);
+pub extern u32 GetTempFileNameA(const cchar* lpPathName, const cchar* lpPrefixString, u32 uUnique, cchar* lpTempFileName);
+
+// Win32 constants (section 9.2) used here.
+const u32 GENERIC_READ = 0x80000000u;
+const u32 GENERIC_WRITE = 0x40000000u;
+const u32 FILE_SHARE_READ = 0x1u;
+const u32 FILE_SHARE_WRITE = 0x2u;
+const u32 FILE_SHARE_DELETE = 0x4u;
+const u32 OPEN_EXISTING = 3u;
+const u32 FILE_ATTRIBUTE_NORMAL = 0x80u;
+// CreateFileA failure handle ((rawptr)-1) - mirrors mkstemp's -1.
+const rawptr INVALID_HANDLE_VALUE = (rawptr)-1;
+
+// GetTempPathA/GetTempFileNameA output buffers are MAX_PATH (FLAG size:
+// 260 bytes including the NUL; paths longer than that are not handled).
+const usize _TMP_PATH_MAX = 260;
+
+// True for [0-9A-Fa-f].
+static bool _hexByte(u8 c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// GetTempFileNameA writes "<dir>tmp<hex digits>.tmp" for our "tmp"
+// prefix. "tmp" contains no hex digits, so the hex run is exactly what
+// follows the 3-char prefix - extracted so the caller's prefix+suffix
+// can be rebuilt around it (mkstemp filled XXXXXX at the END of the
+// template, i.e. prefix+suffix came BEFORE the random part).
+static str _uniqHex(const u8* genPath)
+{
+    usize sep = 0;
+    bool found = false;
+    for (usize i = 0; genPath[i] != 0; i++)
+        if (genPath[i] == '\\' || genPath[i] == '/') { sep = i + 1; found = true; }
+    if (!found) return "";
+    usize i = sep + 3; // skip the "tmp" prefix
+    usize start = i;
+    while (_hexByte(genPath[i])) i++;
+    if (i == start) return "";
+    return str::fromParts(genPath + start, i - start);
+}
+
+// 8 fixed-width uppercase hex digits - the uniquifier appended to a
+// generated temp name (mkstemp's XXXXXX slot).
+static void _appendHex(String* out, u32 v)
+{
+    u8 buf[9];
+    snprintf((cchar*)buf, 9u, "%08X", v);
+    out->pushCstr((const cchar*)buf);
+}
 
 pub struct TempFile
 {
-    i32 fd;
+    // Win32 HANDLE (was i32 fd from mkstemp) - FLAG signature change;
+    // failure is INVALID_HANDLE_VALUE, mirroring mkstemp's -1.
+    rawptr fd;
     String path;
     bool autoDelete;
 
     static TempFile create(str prefix, str suffix)
     {
-        String tmpl = String::new();
-        tmpl.appendView(str::fromCstr("/tmp/"));
-        tmpl.appendView(prefix);
-        tmpl.appendView(suffix);
-        tmpl.appendView(str::fromCstr("XXXXXX"));
+        // mkstemp -> GetTempPathA (locate %TEMP%) + GetTempFileNameA
+        // (atomically create a uniquely named zero-byte file), then
+        // MoveFileA it to the shape the old template produced:
+        // "<tempdir><prefix><suffix><hex>".
+        u8 tmpDir[_TMP_PATH_MAX];
+        u32 dirLen = GetTempPathA((u32)_TMP_PATH_MAX, (cchar*)tmpDir);
+        if (dirLen == 0u || dirLen >= (u32)_TMP_PATH_MAX)
+            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
 
-        u8* buf = alloc<u8>(tmpl.len + 1);
-        if (buf == null)
+        String wanted = String::new();
+        u8 gen[_TMP_PATH_MAX];
+        bool havePath = false;
+        for (u32 attempt = 0; attempt < 8u && !havePath; attempt++)
         {
-            tmpl.free();
-            return TempFile { .fd = -1, .path = String::new(), .autoDelete = false };
+            // uUnique 0: the API picks a free name and creates the file.
+            if (GetTempFileNameA((const cchar*)tmpDir, "tmp", 0u, (cchar*)gen) == 0u) break;
+            str hex = _uniqHex(gen);
+            if (hex.len == 0) { DeleteFileA((const cchar*)gen); break; }
+            wanted.clear();
+            wanted.appendView(str::fromParts(tmpDir, (usize)dirLen));
+            wanted.appendView(prefix);
+            wanted.appendView(suffix);
+            wanted.appendView(hex);
+            if (MoveFileA((const cchar*)gen, (const cchar*)wanted.asCstr()))
+                havePath = true;
+            else
+                DeleteFileA((const cchar*)gen); // target exists; retry with a fresh hex
         }
-        copy<u8>(buf, (u8*)tmpl.asView().ptr, tmpl.len);
-        buf[tmpl.len] = 0;
+        if (!havePath)
+        {
+            wanted.free();
+            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
+        }
 
-        i32 fd = mkstemp(buf);
-        String actualPath;
-        if (fd >= 0)
-            actualPath = String::fromView(str::fromParts(buf, tmpl.len));
-        else
-            actualPath = String::new();
-        dealloc<u8>(buf);
-        tmpl.free();
-
-        return TempFile { .fd = fd, .path = actualPath, .autoDelete = true };
+        // mkstemp's returned descriptor was O_RDWR; open the file back.
+        rawptr h = CreateFileA((const cchar*)wanted.asCstr(),
+                               GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            DeleteFileA((const cchar*)wanted.asCstr());
+            wanted.free();
+            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
+        }
+        return TempFile { .fd = h, .path = wanted, .autoDelete = true };
     }
 
     void dispose()
     {
-        if (self.fd >= 0) close(self.fd);
+        if (self.fd != null && self.fd != INVALID_HANDLE_VALUE) CloseHandle(self.fd);
         if (self.autoDelete && !self.path.isEmpty())
-            unlink((const u8*)self.path.asView().ptr);
+            DeleteFileA((const cchar*)self.path.asCstr());
         self.path.free();
-        self.fd = -1;
+        self.fd = INVALID_HANDLE_VALUE;
     }
 
-    i32 fd() { return self.fd; }
+    rawptr fd() { return self.fd; }
     str pathStr() { return self.path.asView(); }
 
     void setAutoDelete(bool ad) { self.autoDelete = ad; }
@@ -59,36 +135,33 @@ pub struct TempDir
 
     static TempDir create(str prefix)
     {
-        String tmpl = String::new();
-        tmpl.appendView(str::fromCstr("/tmp/"));
-        tmpl.appendView(prefix);
-        tmpl.appendView(str::fromCstr("XXXXXX"));
-
-        u8* buf = alloc<u8>(tmpl.len + 1);
-        if (buf == null)
-        {
-            tmpl.free();
+        // mkdtemp -> GetTempPathA + a generated "<prefix><hex>" name +
+        // CreateDirectoryA, retried while the name is taken (mkdir's
+        // EEXIST is exactly "CreateDirectoryA returned false").
+        u8 tmpDir[_TMP_PATH_MAX];
+        u32 dirLen = GetTempPathA((u32)_TMP_PATH_MAX, (cchar*)tmpDir);
+        if (dirLen == 0u || dirLen >= (u32)_TMP_PATH_MAX)
             return TempDir { .path = String::new(), .autoDelete = false };
+
+        String out = String::new();
+        u32 salt = GetTickCount();
+        for (u32 attempt = 0; attempt < 100u; attempt++)
+        {
+            out.clear();
+            out.appendView(str::fromParts(tmpDir, (usize)dirLen));
+            out.appendView(prefix);
+            _appendHex(&out, salt + attempt);
+            if (CreateDirectoryA((const cchar*)out.asCstr(), null))
+                return TempDir { .path = out, .autoDelete = true };
         }
-        copy<u8>(buf, (u8*)tmpl.asView().ptr, tmpl.len);
-        buf[tmpl.len] = 0;
-
-        u8* result = mkdtemp(buf);
-        String actualPath;
-        if (result != null)
-            actualPath = String::fromView(str::fromParts(buf, tmpl.len));
-        else
-            actualPath = String::new();
-        dealloc<u8>(buf);
-        tmpl.free();
-
-        return TempDir { .path = actualPath, .autoDelete = true };
+        out.free();
+        return TempDir { .path = String::new(), .autoDelete = false };
     }
 
     void dispose()
     {
         if (self.autoDelete && !self.path.isEmpty())
-            rmdir((const u8*)self.path.asView().ptr);
+            RemoveDirectoryA((const cchar*)self.path.asCstr());
         self.path.free();
     }
 

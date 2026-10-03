@@ -1,4 +1,8 @@
-import(lib) platform::libc { write, snprintf, isatty };
+import(lib) platform::libc { snprintf };
+import(lib) platform::win32 { GetStdHandle, WriteFile };
+
+// stdout (section 9.1): STD_OUTPUT_HANDLE = (u32)-11.
+const u32 STD_OUTPUT_HANDLE = (u32)-11;
 
 // file-local CSI prefix; the cast keeps it correct whether literals are
 // str or cchar* (cf. mimalloc's printf((const cchar*)"...") calls)
@@ -6,18 +10,32 @@ str CSI = str::fromCstr((const cchar*)"\x1B[");
 
 static bool _isTty()
 {
-    return isatty(1) != 0;
+    // isatty(1): GetConsoleMode succeeds only on a console handle, so a
+    // redirected stdout answers false just like isatty did.
+    u32 mode = 0;
+    return GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode);
+}
+
+// Single write path for every CSI sequence below: WriteFile on the std
+// handle (works for console AND redirected output; WriteConsoleA would
+// fail when stdout is a pipe/file). The escape bytes pass through
+// unchanged - the Windows console renders them where VT processing is on.
+static void _writeOut(str s)
+{
+    if (s.len == 0) return;
+    u32 written = 0;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), (const cchar*)s.ptr, (u32)s.len, &written, null);
 }
 
 static void _writeCSI(str code)
 {
-    write(1, CSI.ptr, CSI.len);
-    write(1, code.ptr, code.len);
+    _writeOut(CSI);
+    _writeOut(code);
 }
 
 static void _writeStr(str s)
 {
-    write(1, s.ptr, s.len);
+    _writeOut(s);
 }
 
 pub void reset()
@@ -67,10 +85,10 @@ static u64 _clampN(u64 n)
     return n;
 }
 
-pub void cursorUp(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluA", n); if (l > 0) { write(1, CSI.ptr, CSI.len); write(1, buf, (u64)l); } }
-pub void cursorDown(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluB", n); if (l > 0) { write(1, CSI.ptr, CSI.len); write(1, buf, (u64)l); } }
-pub void cursorRight(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluC", n); if (l > 0) { write(1, CSI.ptr, CSI.len); write(1, buf, (u64)l); } }
-pub void cursorLeft(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluD", n); if (l > 0) { write(1, CSI.ptr, CSI.len); write(1, buf, (u64)l); } }
+pub void cursorUp(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluA", n); if (l > 0) { _writeOut(CSI); _writeOut(str::fromParts(buf, (usize)l)); } }
+pub void cursorDown(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluB", n); if (l > 0) { _writeOut(CSI); _writeOut(str::fromParts(buf, (usize)l)); } }
+pub void cursorRight(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluC", n); if (l > 0) { _writeOut(CSI); _writeOut(str::fromParts(buf, (usize)l)); } }
+pub void cursorLeft(u64 n) { u8 buf[24]; n = _clampN(n); i32 l = snprintf(buf, 24u, (const cchar*)"%lluD", n); if (l > 0) { _writeOut(CSI); _writeOut(str::fromParts(buf, (usize)l)); } }
 
 pub void cursorPos(u64 row, u64 col)
 {
@@ -79,8 +97,8 @@ pub void cursorPos(u64 row, u64 col)
     col = _clampN(col);
     i32 l = snprintf(buf, 40u, (const cchar*)"%llu;%lluH", row, col);
     if (l > 0) {
-        write(1, CSI.ptr, CSI.len);
-        write(1, buf, (u64)l);
+        _writeOut(CSI);
+        _writeOut(str::fromParts(buf, (usize)l));
     }
 }
 

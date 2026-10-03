@@ -1,13 +1,19 @@
-import(lib) platform::libc { read, write, lseek };
+import(lib) platform::win32 { ReadFile, WriteFile };
 
+// Local extern - absent from lib/platform/win32.crl (kernel32).
+pub extern u32 SetFilePointerA(rawptr hFile, i32 lDistanceToMove, i32* lpDistanceToMoveHigh, u32 dwMoveMethod);
+
+// POSIX whence values double as Win32 FILE_BEGIN/CURRENT (same numbers).
 const i32 SEEK_SET = 0;
 const i32 SEEK_CUR = 1;
 
+// FLAG: fd is a Win32 HANDLE (rawptr), matching what fs.crl's fileOpen
+// now returns - the old i32 POSIX descriptor cannot hold a HANDLE.
 pub struct FileReader
 {
-    i32 fd;
+    rawptr fd;
 
-    static FileReader fromFd(i32 fd)
+    static FileReader fromFd(rawptr fd)
     {
         return FileReader { .fd = fd };
     }
@@ -17,9 +23,12 @@ pub struct FileReader
         u64 total = 0;
         while (total < n)
         {
-            i64 r = read(self.fd, dst + total, n - total);
-            if (r <= 0) return false;
-            total += (u64)r;
+            u64 remain = n - total;
+            u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
+            u32 got = 0;
+            if (!ReadFile(self.fd, (cchar*)(dst + total), want, &got, null)) return false;
+            if (got == 0) return false; // EOF before n bytes
+            total += (u64)got;
         }
         return true;
     }
@@ -89,14 +98,23 @@ pub struct FileReader
     f64 readF64Be() { u64 v = self.readU64Be(); return *(f64*)&v; }
 
     #[[inline]]
-    void skip(u64 n) { if (n <= 0x7FFFFFFFFFFFFFFFu) lseek(self.fd, (i64)n, SEEK_CUR); }
+    void skip(u64 n)
+    {
+        // lseek(fd, n, SEEK_CUR) -> SetFilePointerA on the handle; the
+        // result was ignored before and still is.
+        if (n <= 0x7FFFFFFFFFFFFFFFu)
+        {
+            i32 high = (i32)(n >> 32);
+            SetFilePointerA(self.fd, (i32)(n & 0xFFFFFFFFu), &high, (u32)SEEK_CUR);
+        }
+    }
 }
 
 pub struct FileWriter
 {
-    i32 fd;
+    rawptr fd;
 
-    static FileWriter fromFd(i32 fd) { return FileWriter { .fd = fd }; }
+    static FileWriter fromFd(rawptr fd) { return FileWriter { .fd = fd }; }
 
     #[[inline]]
     void writeU8(u8 v) { self.writeBytes(&v, 1); }
@@ -106,9 +124,12 @@ pub struct FileWriter
         u64 total = 0;
         while (total < n)
         {
-            i64 r = write(self.fd, src + total, n - total);
-            if (r <= 0) return false;
-            total += (u64)r;
+            u64 remain = n - total;
+            u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
+            u32 put = 0;
+            if (!WriteFile(self.fd, (const cchar*)(src + total), want, &put, null)) return false;
+            if (put == 0) return false;
+            total += (u64)put;
         }
         return true;
     }
