@@ -31,8 +31,10 @@
 ### High
 - **text.txt three-pass sema**: pass 1 declare-all symbols; pass 2 evaluate with dependency tracking (`x` depends on `y`, resume when `y` evaluated); leftover waiters → cyclic-import error (`let a = b; let b = a;`). Include a cyclic lib-import test.
 ### Switch / trait features (user-blocking for lib)
-- ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
+- ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is also repaired — nested alternatives render correctly).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
+### Error messages must be complete — NEW TODO (2026-10-03)
+- Every diagnostic in the compiler — sema, parser, lexer, mono, codegen, driver — must emit the full error record: stable code/level + location (file:line:col gutter/caret) + the human-readable message + the actionable fix/help text via the shared erranics renderer. Sites to sweep: sema bare `addError()`/`addError()` with no message (assignment failures, redeclaration, Deref of non-pointer — now partially closed; `TupleField`/`ArrayLiteral` fallback; `Switch` non-checked patterns; integer/literal overflow partials; checkPath segments beyond two; `parseFlagDecl`/`parseComptimeDecl` stubs; import E1004/E1005; builder's `printf`-style errors (E1000…) should funnel through the same engine where practical.
 ### Sema soundness / diagnostics
 - 2026-10-03: Small inline cache in Codegen for cgFindDecl (32-entry (name,tag)->nodeId index) — backend'sheaviest per-call scan. Object is a true struct until the self-host struct-array emission is fixed; for now pointer fields off an arena*.
 - 2026-10-03: StaticCall + Call-on-Path (`Type::method(args)`) now type-checked in sema (struct static call, arity + param compat; StaticCall emits owner_method). cg_resolve static bodies no longer mis-prefix `static` on the definition (kept extern prototypes consistent); test `/tmp/opencode/stcall.crl` compiles+runs with S::new(5). Mono/dependent path sets Call exprType via static-method check (findMethod over decls+extends).
@@ -46,14 +48,14 @@
 - Silent errors: assignment failures, redeclaration errors, `Deref` of non-pointer, calling a non-function value.
 - `StaticCall` not type-checked in sema; `checkCallee`/`cgResolveCall`/cgMethodRecvKind do linear single-file searches — attach resolved decls to AST nodes (clang-style).
 ### Codegen
-- 33 silent `cg.errors++` sites — route through the diag engine.
+- ~~33 silent `cg.errors++` sites~~ DONE 2026-10-03: all replaced by `cgError(cg, msg)` which funnels through the diag engine as `error[CG-0002]` with a per-site message; the 'if (cap)' conditions that were lost during that replace were restored (struct-literal fields / argsLen / loop-depth); Codegen now carries a heap-allocated `DiagnosticEngine*` persisted via `CompileUnit::engineObj` so CG-stage messages survive `analyzeForCompile` returning.
 - `cgFindDecl` linear scan per call; `cgResolveCall` linear mono-instance scan; 16-element caps; dead `tempArrs`/`tempSeq`; `cgEmitStructFields` unused `indent`; asm template O(n²) string rebuild; dead conditionals.
 - Parser: ~~`~=` mapped to `!=`~~ DONE 2026-10-03: `x ~= y` now means `x = ~y` (self-host AST lowers to Assign(target, BitNot(value)); bootstrap lowers to `= ~y` too). ~~ternary precedence~~ DONE 2026-10-03 (`a = b ? c : d` parses as `a = (b ? c : d)`; sema now resolves Ternary/IfExpr branch types); double-parsing in speculation (`parseExprOrDecl`, struct/union fields, const untyped detection, param name extraction from type); `pendingGreater` `>>` split; stub `parseFlagDecl`/`parseComptimeDecl` returning Invalid node.
 ### Lexer
 - No `f`/`F` float suffix; no `l`/`L` int suffix; single-bit `numFlags`; fixed 256-entry ident table (never resizes); `decodeUtf8` accepts invalid UTF-8/overlong/surrogates; `\u`/`\U` accept surrogates; `parseInteger` returns partial on overflow; no hex floats; exponent allows `_`.
 ### Builder (`compiler/coral-build/`)
-- `include "…"` never expanded.
-- `extends "…"` never merged.
+- ~~`include "…"` never expanded~~ DONE 2026-10-03: coralc.crl expands include nodes (up to 8-deep nesting), paths relative to the including file's directory.
+- ~~`extends "…"` never merged~~ PARTIALLY DONE 2026-10-03: a Build node's extends target is now merged (base fields fill gaps from `base.crl`, child's own keys win) so manifest.linux.crlb pulls root/modules from manifest.base.crlb. The `map` command still requires an explicit modules= array in the file's own text.
 - `target` consulted for nothing — no neutral→platform tree routing (needs `platform_root`).
 - Manifest selection from target flags (linux/windows); profiles/workspace/override/tasks/tests/hooks/phases/link/artifact/features/env/log/metrics/lint/format/lsp/ci/remote/deps parsed but unused.
 ### Language / features
@@ -100,7 +102,7 @@ Give this a roadmap slot before relying on inference for lib code.
 ## Language rules NOT yet enforced by sema
 (Language rules exist in docs/`coral-docs/reason.crl`, `imports.md`, but the sema doesn't enforce them)
 - `compatible()` is not sound: any pointer ↔ any pointer, int/float interconvert, `from==0/to==0` pass-through, generic params match everything (`dependentType→true`). 
-- No return-type check on assignments failures silently; no redeclaration diagnostic; `While`/`If` conditions not required to be `bool`; `ForIn` not validated as iterable; `Switch` patterns not type-checked; `Cast` accepts any→any; `Index` index casts/inc/dec not int-checked; `Not`/`BitNot` operand unchecked; variadic args unchecked; generic args skipped in checks; `checkPath` only validates first two segments; many Expr kinds untyped (`TupleField`, `ArrayLiteral`, `Ternary`, `IfExpr`, `BlockExpr`, `Sizeof`/`Alignof`/`Typeof`, `BuiltinCall`); `StaticCall` not sema'd (always `addError`); single-pass order-dependent (mutual recursion / forward refs broken); extends collected during same pass as method resolution.
+- Remaining unenforced sema rules (2026-10-03 view; ticked DONE items removed): no return-type check on assignments failures silently; no redeclaration diagnostic; `Switch` patterns not type-checked; `Cast` accepts any→any; casts/inc/dec not int-checked; `Not`/`BitNot` operand unchecked; variadic args unchecked; generic args skipped in checks; `checkPath` only validates first two segments; many Expr kinds untyped (`TupleField`, `ArrayLiteral`, `Sizeof`/`Alignof`/`Typeof`, `BuiltinCall`); single-pass order-dependent for import resolution (mutual recursion across files / cyclic imports undetected — declared-all now covers same-file fwd-refs); extends collected as part of method-resolution passes.
 - Many diagnostics missing the error *message* payload (`addError()` counts but prints nothing) — several codegen silent-`errors++` too.
 
 ## Grammar reference
@@ -348,3 +350,6 @@ import(lib) std::text {
 - Demo: `compiler/coral-test/nested_import.crl` (expected to fail to parse until implemented).
 
 - struct enum and variant definition in functions
+- there should also be a prelude flg, for prelude imports, like core::str, to provide str methods. 
+- this should be on by default but can be turnned off in the build file and via flags.
+- also, make sure agents review this whole system extensively for naivety, hacks, ans redndant operation, improper logic, bad actions, and expencsive behaviour(perf)
