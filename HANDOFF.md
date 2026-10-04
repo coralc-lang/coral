@@ -34,6 +34,7 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
+- 2026-10-03: Small inline cache in Codegen for cgFindDecl (32-entry (name,tag)->nodeId index) — backend'sheaviest per-call scan. Object is a true struct until the self-host struct-array emission is fixed; for now pointer fields off an arena*.
 - 2026-10-03: StaticCall + Call-on-Path (`Type::method(args)`) now type-checked in sema (struct static call, arity + param compat; StaticCall emits owner_method). cg_resolve static bodies no longer mis-prefix `static` on the definition (kept extern prototypes consistent); test `/tmp/opencode/stcall.crl` compiles+runs with S::new(5). Mono/dependent path sets Call exprType via static-method check (findMethod over decls+extends).
 - 2026-10-03 integer conversion rule tightened: equal-width changing signedness is rejected (u8→i8 needs a cast); unsigned→signed requires strictly wider target (u8→i32 ok, u32→i32 rejected).
 - 2026-10-03: BlockExpr now propagates its trailing-expression type (fixes void* switch-expr temps); BlockExpr case also verifies+typechecks result. Switch-as-expression case bodies type via checkExpr on the block; a block inside a case is a BlockExpr.

@@ -170,6 +170,12 @@ pub struct Codegen
     u32 loopDepth;
     u32 loopCap;
 
+    /* small inline cache for cgFindDecl — the heaviest per-call scan */
+    Str* declCacheNames;
+    u32* declCacheIds;
+    u32* declCacheTags;
+    u32 declCacheLen;
+
     Slice* regNames;
     u32 regLen;
     u32 regCap;
@@ -318,6 +324,17 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
     NodeId none;
     none.index = 0;
     if (cg.file == null || name == 0) return none;
+    u32 c = 0;
+    while (c < cg.declCacheLen)
+    {
+        if (cg.declCacheNames[c] == name && cg.declCacheTags[c] == tag)
+        {
+            NodeId hit;
+            hit.index = cg.declCacheIds[c];
+            return hit;
+        }
+        c = c + 1;
+    }
     u32 i = 0;
     while (i < cg.file.declsLen)
     {
@@ -337,7 +354,18 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
                 DeclKind::Constant => { dn = dd.kind.payload.Constant.name; },
                 else => {},
             }
-            if (dn == name) return cg.file.decls[i];
+            if (dn == name)
+            {
+                NodeId found = cg.file.decls[i];
+                if (cg.declCacheLen < 32)
+                {
+                    cg.declCacheNames[cg.declCacheLen] = name;
+                    cg.declCacheIds[cg.declCacheLen] = found.index;
+                    cg.declCacheTags[cg.declCacheLen] = tag;
+                    cg.declCacheLen = cg.declCacheLen + 1;
+                }
+                return found;
+            }
         }
         i = i + 1;
     }
@@ -3139,10 +3167,29 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
         {
             Field* fd = &fn.kind.payload.Field.value;
             stP(&cg.defs, "\n    ");
-            stPS(&cg.defs, tyStr(cg, fd.typeNode));
-            stCh(&cg.defs, ' ');
-            stPS(&cg.defs, cgIdent(cg, fd.name));
-            stCh(&cg.defs, ';');
+            if (fd.typeNode != 0 &&
+                (cg.ctx->types + fd.typeNode)->kind.tag == TypeKind::Array)
+            {
+                TypeEntry* ae = cg.ctx->types + fd.typeNode;
+                stPS(&cg.defs, tyStr(cg, ae->kind.payload.Array.base));
+                stCh(&cg.defs, ' ');
+                stPS(&cg.defs, cgIdent(cg, fd.name));
+                u32 alen = (u32)ae->kind.payload.Array.len;
+                u8 tens = 1;
+                while (alen / tens >= 10) tens = tens * 10;
+                stCh(&cg.defs, '[');
+                u32 tmpA = alen;
+                while (tens > 0) { stCh(&cg.defs, (u8)('0' + (tmpA / tens) % 10)); tens = tens / 10; }
+                stCh(&cg.defs, ']');
+                stCh(&cg.defs, ';');
+            }
+            else
+            {
+                stPS(&cg.defs, tyStr(cg, fd.typeNode));
+                stCh(&cg.defs, ' ');
+                stPS(&cg.defs, cgIdent(cg, fd.name));
+                stCh(&cg.defs, ';');
+            }
             any = true;
         }
         f = f + 1;
@@ -3687,6 +3734,15 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.subs = null;
     cg.subsLen = 0;
     cg.errors = 0;
+    cg.declCacheLen = 0;
+    cg.declCacheNames = (Str*)cg.arena.alloc(32 * sizeof(Str), 4);
+    cg.declCacheIds = (u32*)cg.arena.alloc(32 * sizeof(u32), 4);
+    cg.declCacheTags = (u32*)cg.arena.alloc(32 * sizeof(u32), 4);
+    if (cg.declCacheNames != null)
+    {
+        u32 dci = 0;
+        while (dci < 32) { cg.declCacheNames[dci] = 0; cg.declCacheIds[dci] = 0; cg.declCacheTags[dci] = 0; dci = dci + 1; }
+    }
     cg.labelSeq = 0;
     cg.tempSeq = 0;
     cg.tempsCap = 4096;
