@@ -7,7 +7,7 @@
 mod arena_mod = import "../coral-build/arena" { Arena };
 mod slice_mod = import "../coral-common/slice" { Slice };
 mod crlb_mod = import "../coral-build/parser" { CrlbParser };
-mod cfg_ast = import "../coral-build/ast" { CrlbNode };
+mod cfg_ast = import "../coral-build/ast" { CrlbNode, CrlbNodeKind, CrlbField };
 mod builder_mod = import "../coral-build/builder" { builderRun, Builder };
 mod args_mod = import "args" { Options, Command, parseArgs, usage };
 mod io_mod = import "io" { readFile, sliceCStr };
@@ -60,6 +60,143 @@ pub i32 main()
     if (root == null || p.errors > 0) {
         printf("coral: parse failed, errors=%d\n", (i32)p.errors);
         return 2;
+    }
+
+    /* expand include "other.crlb" decls (relative to the including file) */
+    {
+        u32 idepth = 0;
+        while (idepth < 8)
+        {
+            bool anyInc = false;
+            u32 i = 0;
+            while (i < root.children.len)
+            {
+                CrlbNode* c = root.children.data + i;
+                if (c.kind != CrlbNodeKind::Include || !c.hasPayload) { i = i + 1; continue; }
+                anyInc = true;
+                u8* base = fileC;
+                u32 sep = 0;
+                u32 k = 0;
+                while (fileC[k] != 0)
+                {
+                    if (fileC[k] == '/') sep = k + 1;
+                    k = k + 1;
+                }
+                u32 blen = sep > 0 ? sep : 0;
+                u32 plen = (u32)c.payload.len;
+                u8* joined = (u8*)malloc(blen + plen + 1);
+                k = 0;
+                while (k < blen) { joined[k] = base[k]; k = k + 1; }
+                u32 j = 0;
+                while (j < plen) { joined[blen + j] = c.payload.ptr[j]; j = j + 1; }
+                joined[blen + plen] = 0;
+                usize ilen = 0;
+                Slice isrc = readFile(joined, &ilen);
+                if (isrc.ptr == null)
+                {
+                    printf("coral: cannot read include \"%s\"\n", joined);
+                    return 2;
+                }
+                CrlbParser ip;
+                ip.init(&a, isrc);
+                CrlbNode* iroot = ip.parseFile();
+                free(joined);
+                if (iroot == null || ip.errors > 0) { printf("coral: include parse failed\n"); return 2; }
+                u32 nl = (u32)(root.children.len - i - 1);
+                CrlbNode* grown = (CrlbNode*)a.alloc((usize)(root.children.len + iroot.children.len) * sizeof(CrlbNode), 8);
+                k = 0;
+                while (k < i) { grown[k] = root.children.data[k]; k = k + 1; }
+                k = 0;
+                while (k < iroot.children.len) { grown[i + k] = iroot.children.data[k]; k = k + 1; }
+                k = 0;
+                while (k < nl) { grown[i + iroot.children.len + k] = root.children.data[i + 1 + k]; k = k + 1; }
+                root.children.data = grown;
+                root.children.cap = root.children.len + iroot.children.len;
+                root.children.len = root.children.len + iroot.children.len - 1;
+                i = i + iroot.children.len;
+            }
+            if (!anyInc) break;
+            idepth = idepth + 1;
+        }
+    }
+
+    /* merge extends "base.crlb" into build blocks: base fields fill gaps,
+     * the child's own fields always win */
+    {
+        u32 edepth = 0;
+        while (edepth < 8)
+        {
+            bool anyExt = false;
+            u32 i = 0;
+            while (i < root.children.len)
+            {
+                CrlbNode* c = root.children.data + i;
+                i = i + 1;
+                if (!c.hasExtends) continue;
+                anyExt = true;
+                Slice target = c.extendsTarget;
+                u32 k = 0;
+                u32 nl = 0;
+                while (target.ptr[k] != 0 && k < target.len) { nl = nl + 1; k = k + 1; }
+                u32 sep = 0;
+                k = 0;
+                while (fileC[k] != 0) { if (fileC[k] == '/') sep = k + 1; k = k + 1; }
+                u8* joined = (u8*)malloc(sep + nl + 1);
+                k = 0;
+                while (k < sep) { joined[k] = fileC[k]; k = k + 1; }
+                u32 j = 0;
+                while (j < nl) { joined[sep + j] = target.ptr[j]; j = j + 1; }
+                joined[sep + nl] = 0;
+                usize elen = 0;
+                Slice esrc = readFile(joined, &elen);
+                free(joined);
+                if (esrc.ptr == null) { printf("coral: cannot read extends target\n"); return 2; }
+                CrlbParser ep;
+                ep.init(&a, esrc);
+                CrlbNode* eroot = ep.parseFile();
+                if (eroot == null || ep.errors > 0) { printf("coral: extends target parse failed\n"); return 2; }
+                CrlbNode* ebuild = null;
+                u32 q = 0;
+                while (q < eroot.children.len)
+                {
+                    if (eroot.children.data[q].kind == CrlbNodeKind::Build) { ebuild = eroot.children.data + q; break; }
+                    q = q + 1;
+                }
+                if (ebuild == null) { continue; }
+                u32 newcap = (u32)(c.fields.len + ebuild.fields.len);
+                CrlbField* merged = (CrlbField*)a.alloc((usize)newcap * sizeof(CrlbField), 8);
+                k = 0;
+                while (k < c.fields.len) { merged[k] = c.fields.data[k]; k = k + 1; }
+                u32 w = c.fields.len;
+                u32 m = 0;
+                while (m < ebuild.fields.len)
+                {
+                    CrlbField* bf = ebuild.fields.data + m;
+                    bool found = false;
+                    u32 f = 0;
+                    while (f < c.fields.len)
+                    {
+                        CrlbField* cf = c.fields.data + f;
+                        if (cf.name.len == bf.name.len)
+                        {
+                            u32 eq = 0;
+                            bool same = true;
+                            while (eq < cf.name.len) { if (cf.name.ptr[eq] != bf.name.ptr[eq]) { same = false; break; } eq = eq + 1; }
+                            if (same) { found = true; break; }
+                        }
+                        f = f + 1;
+                    }
+                    if (!found) { merged[w] = bf[0]; w = w + 1; }
+                    m = m + 1;
+                }
+                c.fields.data = merged;
+                c.fields.cap = newcap;
+                c.fields.len = w;
+                c.hasExtends = false;
+            }
+            if (!anyExt) break;
+            edepth = edepth + 1;
+        }
     }
 
     switch (opts.cmd)
