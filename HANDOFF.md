@@ -330,3 +330,4 @@ import(lib) std::text {
 - also, make sure agents review this whole system extensively for naivety, hacks, ans redndant operation, improper logic, bad actions, and expencsive behaviour(perf)
 - `self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "allocTypeSlot failed (type table full)");` type table being ull is a result of bad management and naivety. dooes it ever happpen in cpp or c?
 - the addition of an @default() function, to set the default vals for a type.
+- implementation od #[[generator(debug, cmp, ..)]] 
