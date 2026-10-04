@@ -328,3 +328,5 @@ import(lib) std::text {
 - there should also be a prelude flg, for prelude imports, like core::str, to provide str methods. 
 - this should be on by default but can be turnned off in the build file and via flags.
 - also, make sure agents review this whole system extensively for naivety, hacks, ans redndant operation, improper logic, bad actions, and expencsive behaviour(perf)
+- `self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "allocTypeSlot failed (type table full)");` type table being ull is a result of bad management and naivety. dooes it ever happpen in cpp or c?
+- the addition of an @default() function, to set the default vals for a type.

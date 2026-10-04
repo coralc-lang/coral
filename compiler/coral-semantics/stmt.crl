@@ -283,6 +283,43 @@ pub extend Sema
             }
             i = i + 1;
         }
+        /* a comptime generic parameter must have a matching comptime
+         * block somewhere in this function's body (the compiler is
+         * expected to auto-deduce the parameter's value from it) */
+        bool needsComptimeBlock = false;
+        u32 ci = 0;
+        while (ci < decl->kind.payload.Func.genericParamsLen)
+        {
+            NodeId gId = decl->kind.payload.Func.genericParams[ci];
+            Node* gNode = self.ctx.nodes + gId.index;
+            if (gNode->kind.tag == NodeKind::GenericParam && (gNode->kind.payload.GenericParam.value.flags & 1) != 0)
+                needsComptimeBlock = true;
+            ci = ci + 1;
+        }
+        if (needsComptimeBlock && decl->kind.payload.Func.body.index != 0)
+        {
+            Node* bNode = self.ctx.nodes + decl->kind.payload.Func.body.index;
+            bool found = false;
+            if (bNode->kind.tag == NodeKind::Stmt &&
+                bNode->kind.payload.Stmt.value.kind.tag == StmtKind::Block)
+            {
+                Stmt* blk = &bNode->kind.payload.Stmt.value;
+                u32 bi = 0;
+                while (bi < blk->kind.payload.Block.stmtsLen)
+                {
+                    Node* inner = self.ctx.nodes + blk->kind.payload.Block.stmts[bi].index;
+                    if (inner->kind.tag == NodeKind::Stmt &&
+                        inner->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                        found = true;
+                    bi = bi + 1;
+                }
+            }
+            else if (bNode->kind.tag == NodeKind::Stmt &&
+                     bNode->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                found = true;
+            if (!found)
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, decl->kind.payload.Func.body, "function with a comptime generic parameter needs a comptime {} block in its body");
+        }
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
         self.currentReturnType = decl->kind.payload.Func.returnType;
         if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
