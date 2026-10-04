@@ -19,6 +19,7 @@ All verified cumulative; code committed in sequence 27dcaa1..7acd59f.
 - Builder command dispatch: `include "x.crlb"` expanded (8-deep cap, relative to including dir) and `build "X" extends "base.crlb"` merges base fields under child's (child wins).
 - 2026-10-03: `@compileError(msg)` aborts sema with its message as TC-0002; `@isFormatLiteral(expr)` types as bool and emits 1/0 at compile time (true only for string literal args). `comptime T` parses (flags bit0) and fns with such params require a comptime{} block in their body.
 - 2026-10-03: in-memory HIR groundwork (compiler/coral-hir): `HirModule` struct holds the resolved items + mono instances as interned rows; `build(ctx,file,mono,name)` constructs it; text is rendered (only on the `--emit-hir` flag) by `printHir`.
+- 2026-10-03: distinct decls now emit typedef in C; `flag (ARCH) {...}` evaluated at parse time to the arm matching `ctx->targetArch` (default x86_64) else `else` arm; cchar.crl compiles through CG.
 
 1. **Platform-aware resolver** (`analyze.crl`): neutral lib paths try `<platform_root>/` first, then the base tree. Default host platform = `x86_64/linux` (from `L->platformRootSegs`).
 2. **Error format** (`compiler/coral-diagnostics/error.crl`): every diagnostic funnels through `diag.emitError(code, SourceLoc loc, msg, help)` → stable codes (`LEX-`, `PAR-`, `TC-`, `CG-`, `DRV-`) + exact gutter/caret/help rendering.
