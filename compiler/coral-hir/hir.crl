@@ -1,0 +1,106 @@
+/* coral-hir/hir.crl — in-memory HIR produced after sema/mono; `print` renders.
+ *
+ * Design (HANDOFF § "HIR text format"): a single, self-contained form
+ * produced after sema + import resolution + monomorphization — everything
+ * the backend needs already resolved/named. `build` constructs it; text
+ * is emitted only when `print` is called.
+ */
+
+mod id = import "../coral-ast/id";
+mod types_mod = import "../coral-ast/types";
+mod node_mod = import "../coral-ast/node";
+mod decl_mod = import "../coral-ast/decl";
+mod context_mod = import "../coral-context/context";
+mod context2 = import "../coral-context/context";
+mod mono_mod = import "../coral-mono/mono";
+
+import id { Str, NodeId };
+import types_mod { Ty, TypeEntry, TypeKind };
+import node_mod { Node, NodeKind };
+import decl_mod { Decl, DeclKind, File, Param };
+import context_mod { AstContext };
+import mono_mod { MonoContext, MonoInstance, MonoInstanceKind };
+
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") i32 printf(u8* fmt, ...);
+
+pub struct HirModule
+{
+    Str name;         /* module path or file name */
+    Str* items;       /* item names (fn/struct/variant/enum/union) — later: Styles */
+    u32 itemsLen;
+    u32 itemsCap;
+    Str* monos;       /* instance names for mono fns/types */
+    u32 monosLen;
+    u32 monosCap;
+}
+
+pub HirModule* build(AstContext* ctx, File* file, MonoContext* mono, Str name)
+{
+    HirModule* m = (HirModule*)malloc(sizeof(HirModule));
+    m->name = name;
+    m->items = (Str*)malloc(256 * sizeof(Str));
+    m->itemsLen = 0;
+    m->itemsCap = 256;
+    m->monos = (Str*)malloc(256 * sizeof(Str));
+    m->monosLen = 0;
+    m->monosCap = 256;
+
+    u32 i = 0;
+    while (i < file->declsLen)
+    {
+        Node* dn = ctx->nodes + file->decls[i].index;
+        i = i + 1;
+        if (dn.kind.tag != NodeKind::Decl) continue;
+        Decl* dd = &dn.kind.payload.Decl.value;
+        if (dd.kind.tag == DeclKind::Func) {
+            m->items[m->itemsLen++] = dd.kind.payload.Func.name;
+        }
+        else if (dd.kind.tag == DeclKind::Struct) {
+            m->items[m->itemsLen++] = dd.kind.payload.Struct.name;
+        }
+        else if (dd.kind.tag == DeclKind::Variant) {
+            m->items[m->itemsLen++] = dd.kind.payload.Variant.name;
+        }
+        else if (dd.kind.tag == DeclKind::Enum) {
+            m->items[m->itemsLen++] = dd.kind.payload.Enum.name;
+        }
+        else if (dd.kind.tag == DeclKind::Union) {
+            m->items[m->itemsLen++] = dd.kind.payload.Union.name;
+        }
+    }
+
+    if (mono != null)
+    {
+        u32 k = 0;
+        while (k < mono->instancesLen)
+        {
+            MonoInstance* inst = mono->instances + k;
+            m->monos[m->monosLen++] = inst.name;
+            k = k + 1;
+        }
+    }
+    return m;
+}
+
+pub void printHir(AstContext* ctx, HirModule* m)
+{
+    if (m->name != 0 && m->name < ctx->internsLen) printf("module @%.*s\n", (i32)ctx->interns[m->name].len, ctx->interns[m->name].ptr);
+
+    printf("  items:\n");
+    u32 i = 0;
+    while (i < m->itemsLen)
+    {
+        if (m->items[i] != 0 && m->items[i] < ctx->internsLen) printf("    %.*s\n", (i32)ctx->interns[m->items[i]].len, ctx->interns[m->items[i]].ptr);
+        i = i + 1;
+    }
+    printf("  mono:\n");
+    i = 0;
+    while (i < m->monosLen)
+    {
+        printf("    #%d ", i);
+        if (m->monos[i] != 0 && m->monos[i] < ctx->internsLen) printf("%.*s\n", (i32)ctx->interns[m->monos[i]].len, ctx->interns[m->monos[i]].ptr);
+        i = i + 1;
+    }
+}
