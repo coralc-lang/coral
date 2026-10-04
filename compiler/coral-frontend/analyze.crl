@@ -64,6 +64,7 @@ pub struct CompileUnit
     MonoContext* mono;
     u8** bufs;
     u32 bufsLen;
+    DiagnosticEngine* engineObj;
     u32 parseErrors;
     u32 semanticErrors;
     u32 monoErrors;
@@ -82,6 +83,7 @@ pub void freeUnit(CompileUnit* unit)
         free(unit.bufs);
         unit.bufs = null;
     }
+    if (unit.engineObj != null) { free(unit.engineObj); unit.engineObj = null; }
     if (unit.mono != null) {
         unit.mono.deinit();
         free(unit.mono);
@@ -619,8 +621,10 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
     idents.init(entries, 256);
     idents.addKeywords();
 
-    DiagnosticEngine engine;
-    engine.init(src, src + len);
+    DiagnosticEngine* engine = (DiagnosticEngine*)malloc(sizeof(DiagnosticEngine));
+    unit.engineObj = engine;
+    DiagnosticEngine __tmpEngine;
+    __tmpEngine.init(src, src + len);
 
     u8* mainPath = (u8*)"main";
     usize mainPathLen = 4;
@@ -630,7 +634,8 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
         while (path[plen] != 0) plen = plen + 1;
         if (plen > 0) { mainPath = path; mainPathLen = plen; }
     }
-    engine.addFile(mainPath, mainPathLen, src, src + len);
+    __tmpEngine.addFile(mainPath, mainPathLen, src, src + len);
+    *engine = __tmpEngine;
 
     Lexer lexer = Lexer {
         .bufStart = src,
@@ -638,7 +643,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
         .bufEnd = src + len,
         .line = 1,
         .lineStart = src,
-        .diag = &engine,
+        .diag = engine,
         .idents = &idents,
         .fileId = 0,
     };
@@ -691,7 +696,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
         loader.ctx = ctx;
         loader.idents = &idents;
         loader.inputPath = path;
-        loader.diag = &engine;
+        loader.diag = engine;
         /* default host platform — neutral lib paths resolve under
          * <platform_root>/ first, then the base tree (see
          * coral-docs/builder_incomplete.md). target flags from the build
@@ -743,7 +748,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path)
             if (sema != null) free(sema);
             if (mono != null) free(mono);
         } else {
-            sema.init(ctx, &engine);
+            sema.init(ctx, engine);
             sema.scopes.enter();
             sema.declareAll(file);
             sema.checkBodies(file);
@@ -806,6 +811,8 @@ AnalyzeResult analyze(u8* src, usize len)
     idents.init(entries, 256);
     idents.addKeywords();
 
+    CompileUnit unit;
+    unit.engineObj = null;
     DiagnosticEngine engine;
     engine.init(src, src + len);
 

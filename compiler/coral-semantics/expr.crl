@@ -362,6 +362,55 @@ pub extend Sema
                     i = i + 1;
                 }
                 Node* calleeNode = self.ctx.nodes + expr->kind.payload.Call.callee.index;
+                if (calleeNode->kind.tag == NodeKind::Expr &&
+                    calleeNode->kind.payload.Expr.value.kind.tag == ExprKind::Path &&
+                    calleeNode->kind.payload.Expr.value.kind.payload.Path.segmentsLen >= 2)
+                {
+                    NodeId* segs = calleeNode->kind.payload.Expr.value.kind.payload.Path.segments;
+                    Node* s0n = self.ctx.nodes + segs[0].index;
+                    Node* s1n = self.ctx.nodes + segs[1].index;
+                    if (s0n->kind.tag == NodeKind::Expr && s0n->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+                        s1n->kind.tag == NodeKind::Expr && s1n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    {
+                        Str tn = s0n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        Str mn = s1n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        Ty ownerTy = self.namedType(tn);
+                        MemberInfo m = self.findMethod(ownerTy, mn);
+                        if (m.declaration.index == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                            return false;
+                        }
+                        Node* methodNode = self.ctx.nodes + m.declaration.index;
+                        Decl* md = &methodNode->kind.payload.Decl.value;
+                        if ((md->kind.payload.Func.flags & 4) == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static");
+                            return false;
+                        }
+                        u32 pLen = md->kind.payload.Func.paramsLen;
+                        if (pLen != expr->kind.payload.Call.argsLen)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                            return false;
+                        }
+                        u32 jj = 0;
+                        while (jj < pLen)
+                        {
+                            NodeId ppid = md->kind.payload.Func.params[jj];
+                            Node* pn = self.ctx.nodes + ppid.index;
+                            if (pn->kind.tag == NodeKind::Param)
+                            {
+                                Param* pp = &pn->kind.payload.Param.value;
+                                if (!self.assignCompatible(expr->kind.payload.Call.args[jj], self.exprType(expr->kind.payload.Call.args[jj]), pp->typeNode))
+                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
+                            }
+                            jj = jj + 1;
+                        }
+                        self.setExprType(id, md->kind.payload.Func.returnType);
+                        return true;
+                    }
+                }
                 if (calleeNode->kind.tag == NodeKind::Expr)
                 {
                     Expr* callee = &calleeNode->kind.payload.Expr.value;
@@ -700,6 +749,49 @@ pub extend Sema
                     if (!self.checkExpr(expr->kind.payload.ArrayLiteral.elems[i])) return false;
                     i = i + 1;
                 }
+                return true;
+            },
+            ExprKind::StaticCall => {
+                u32 i = 0;
+                while (i < expr->kind.payload.StaticCall.argsLen)
+                {
+                    if (!self.checkExpr(expr->kind.payload.StaticCall.args[i])) return false;
+                    i = i + 1;
+                }
+                Ty ownerTy = self.namedType(expr->kind.payload.StaticCall.typeName);
+                MemberInfo methodInfo = self.findMethod(ownerTy, expr->kind.payload.StaticCall.method);
+                if (methodInfo.declaration.index == 0)
+                {
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                    return false;
+                }
+                Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
+                Decl* methodDecl = &methodNode->kind.payload.Decl.value;
+                if ((methodDecl->kind.payload.Func.flags & 4) == 0)
+                {
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static; called on the type");
+                    return false;
+                }
+                u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
+                if (paramsLen != expr->kind.payload.StaticCall.argsLen)
+                {
+                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                    return false;
+                }
+                i = 0;
+                while (i < expr->kind.payload.StaticCall.argsLen)
+                {
+                    NodeId paramId = methodDecl->kind.payload.Func.params[i];
+                    Node* paramNode = self.ctx.nodes + paramId.index;
+                    if (paramNode->kind.tag == NodeKind::Param)
+                    {
+                        Param* param = &paramNode->kind.payload.Param.value;
+                        if (!self.assignCompatible(expr->kind.payload.StaticCall.args[i], self.exprType(expr->kind.payload.StaticCall.args[i]), param->typeNode))
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static method argument type does not match parameter type");
+                    }
+                    i = i + 1;
+                }
+                self.setExprType(id, methodDecl->kind.payload.Func.returnType);
                 return true;
             },
             ExprKind::BuiltinCall => {

@@ -217,7 +217,7 @@ Slice cgTempName(Codegen* cg, u32 t)
 
 void cgPushBreak(Codegen* cg, u32 lab)
 {
-    cgError(cg, (u8*)"loop-depth capacity exceeded");
+    if (cg.loopDepth >= cg.loopCap) { cgError(cg, (u8*)"loop-depth capacity exceeded"); return; }
     cg.breakStack[cg.loopDepth] = lab;
     cg.loopDepth = cg.loopDepth + 1;
 }
@@ -1350,7 +1350,27 @@ Slice cgExpr(Codegen* cg, NodeId id)
             bool resolved = false;
             NodeId fdecl;
             fdecl.index = 0;
-            if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
+            if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Path &&
+                cn.kind.payload.Expr.value.kind.payload.Path.segmentsLen >= 2)
+            {
+                NodeId* segs = cn.kind.payload.Expr.value.kind.payload.Path.segments;
+                u32 sn = cn.kind.payload.Expr.value.kind.payload.Path.segmentsLen;
+                Node* s0 = cgNode(cg, segs[0]);
+                Node* s1 = cgNode(cg, segs[sn - 1]);
+                if (s0->kind.tag == NodeKind::Expr && s0->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
+                    s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, cgIntern(cg, s0->kind.payload.Expr.value.kind.payload.Ident.name));
+                    stCh(&cg.ebuf, '_');
+                    stPS(&cg.ebuf, cgIntern(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name));
+                    calleeText = stTail(&cg.ebuf, cs);
+                    retTy = cgResultTy(cg, id, e);
+                    fdecl = cgFindDecl(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name, (u32)DeclKind::Func);
+                    resolved = true;
+                }
+            }
+            else if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                 Str fname = cn.kind.payload.Expr.value.kind.payload.Ident.name;
                 fdecl = cgFindDecl(cg, fname, (u32)DeclKind::Func);
                 calleeText = cgResolveCall(cg, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
@@ -1398,7 +1418,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                     i = i + 1;
                 }
-                cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, retTy, 0);
@@ -1470,7 +1490,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen + (recvKind != 0 ? 1 : 0) > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
@@ -1506,7 +1526,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
@@ -1607,7 +1627,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i = i + 1;
             }
-            cgError(cg, (u8*)"too many struct fields (cap 16)");
+            if (fvLen > 16) cgError(cg, (u8*)"too many struct fields (cap 16)");
             Slice lty = tyStr(cg, e.kind.payload.StructLiteral.typeNode);
             u32 t = cgNewTemp(cg, lty, 0);
             Slice tn = cgTempName(cg, t);
@@ -1622,7 +1642,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 /* variant construction: tag + payload union member */
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, e.kind.payload.StructLiteral.typeNode, vname, &vidx);
-                cgError(cg, (u8*)"variant case not found");
+                if (vd.index == 0) cgError(cg, (u8*)"variant case not found");
                 stP(&cg.body, " .tag = ");
                 stU64(&cg.body, (u64)vidx);
                 if (fvLen > 0)
@@ -1653,7 +1673,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.ArrayLiteral.elems[i]));
                 i = i + 1;
             }
-            cgError(cg, (u8*)"too many array elements (cap 16)");
+            if (alen > 16) cgError(cg, (u8*)"too many array elements (cap 16)");
             Slice aty = cgResultTy(cg, id, e);
             u32 t = cgNewTemp(cg, aty, 0);
             Slice tn = cgTempName(cg, t);
@@ -1678,7 +1698,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.TupleExpr.elems[i]));
                 i = i + 1;
             }
-            cgError(cg, (u8*)"too many tuple elements (cap 16)");
+            if (elen > 16) cgError(cg, (u8*)"too many tuple elements (cap 16)");
             Slice tty = cgResultTy(cg, id, e);
             u32 t = cgNewTemp(cg, tty, 0);
             Slice tn = cgTempName(cg, t);
@@ -2142,7 +2162,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
     u32* chkL = (u32*)cg.arena.alloc(64 * 4, 4);
     u32* bodyL = (u32*)cg.arena.alloc(64 * 4, 4);
     if (chkL == null || bodyL == null || casesLen > 64) {
-        cgError(cg, (u8*)"too many switch cases (cap 64)");
+        if (casesLen > 64) cgError(cg, (u8*)"too many switch cases (cap 64)");
         return;
     }
 
@@ -2479,7 +2499,7 @@ void cgStmt(Codegen* cg, NodeId id)
                     }
                     stCh(&cg.body, '}');
                 } else if (init.index != 0) {
-                    cgError(cg, (u8*)"array local needs array-literal init");
+                    if (!initIsArrayLit) cgError(cg, (u8*)"array local needs array-literal init");
                     stP(&cg.body, " = {0}");
                 } else {
                     stP(&cg.body, " = {0}");
@@ -2530,7 +2550,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Break => {
-            cgError(cg, (u8*)"break outside of loop");
+            if (cg.loopDepth == 0) { cgError(cg, (u8*)"break outside of loop"); return; }
             cgEmitGoto(cg, cg.breakStack[cg.loopDepth - 1]);
             return;
         },
@@ -2538,7 +2558,7 @@ void cgStmt(Codegen* cg, NodeId id)
         StmtKind::Continue => {
             /* continue targets the innermost loop's continue label: stored in
                contStack parallel to breakStack but loops push both */
-            cgError(cg, (u8*)"continue outside of loop");
+            if (cg.loopDepth == 0) { cgError(cg, (u8*)"continue outside of loop"); return; }
             cgEmitGoto(cg, cg.contStack[cg.loopDepth - 1]);
             return;
         },
@@ -2951,7 +2971,6 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
 
     /* header */
     stNL(&cg.bodies, 0);
-    if (isStatic) stP(&cg.bodies, "static ");
     stPS(&cg.bodies, tyStr(cg, retTy));
     stCh(&cg.bodies, ' ');
     stPS(&cg.bodies, cname);
