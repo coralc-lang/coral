@@ -34,36 +34,12 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is also repaired — nested alternatives render correctly).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Error messages must be complete — NEW TODO (2026-10-03)
-- Every diagnostic in the compiler — sema, parser, lexer, mono, codegen, driver — must emit the full error record: stable code/level + location (file:line:col gutter/caret) + the human-readable message + the actionable fix/help text via the shared erranics renderer. Sites to sweep: sema bare `addError()`/`addError()` with no message (assignment failures, redeclaration, Deref of non-pointer — now partially closed; `TupleField`/`ArrayLiteral` fallback; `Switch` non-checked patterns; integer/literal overflow partials; checkPath segments beyond two; `parseFlagDecl`/`parseComptimeDecl` stubs; import E1004/E1005; builder's `printf`-style errors (E1000…) should funnel through the same engine where practical.
-### Sema soundness / diagnostics
-- 2026-10-03: Small inline cache in Codegen for cgFindDecl (32-entry (name,tag)->nodeId index) — backend'sheaviest per-call scan. Object is a true struct until the self-host struct-array emission is fixed; for now pointer fields off an arena*.
-- 2026-10-03: StaticCall + Call-on-Path (`Type::method(args)`) now type-checked in sema (struct static call, arity + param compat; StaticCall emits owner_method). cg_resolve static bodies no longer mis-prefix `static` on the definition (kept extern prototypes consistent); test `/tmp/opencode/stcall.crl` compiles+runs with S::new(5). Mono/dependent path sets Call exprType via static-method check (findMethod over decls+extends).
-- 2026-10-03 integer conversion rule tightened: equal-width changing signedness is rejected (u8→i8 needs a cast); unsigned→signed requires strictly wider target (u8→i32 ok, u32→i32 rejected).
-- 2026-10-03: BlockExpr now propagates its trailing-expression type (fixes void* switch-expr temps); BlockExpr case also verifies+typechecks result. Switch-as-expression case bodies type via checkExpr on the block; a block inside a case is a BlockExpr.
-- 2026-10-03: `PatKind::Or` codegen rewritten — part slices are collected in a temp Stream and assembled from scratch (was duplicating every alternative's text into cg.ebuf because Lit-style nested slices share that stream).
-- 2026-10-03: new `assignCompatible` — integer/float literal initializers convert into fitting targets (replaces the over-strict blanket reject; C-literal constant narrowing rule, per literal-fit check).
-- 2026-10-03 two-pass decl handling (agent): `sema.declareAll` binds every top-level symbol before any body is type-checked; `checkBodies` re-declares (same decl node = idempotent) and checks bodies. Forward references between same-file fns/methods now work (verified with fwd.crl: helper()->g() exit 0). Full dependency-graph/cyclic-import error (text.txt) is NOT implemented yet.
-- 2026-10-03 enforced: If/While/For/Ternary/IfExpr conditions must be `bool`; Index's index operand must be an integer type; `Deref` of non-pointer is an error; `++`/`--` exprs now resolve their type (fixes void* temp in for-post).
-- ~~`compatible()` unsound~~ PARTIALLY DONE 2026-10-03: int/float no longer interconvert; `Str`⇄pointer removed; pointer↔pointer now requires same element type (adding `const` on the target is allowed; `T*`→`rawptr` ok, reverse needs cast). `from==0/to==0` still passes through; exactly-one-dependent-side still permissive (documented: mono boundary is the enforcement point). Also: method receiver self is typed `Pointer(selfType)` in sema and `self = x` now checks against the pointee (C backend writes through it); Struct/Union/Trait/Variant methodself args built via `selfNamedType` so fields/methods see generic args; `T*` vs `const T*` returns allowed. VERIFIED: option.crl is sema/codegen-clean again.
-- Silent errors: assignment failures, redeclaration errors, `Deref` of non-pointer, calling a non-function value.
-- `StaticCall` not type-checked in sema; `checkCallee`/`cgResolveCall`/cgMethodRecvKind do linear single-file searches — attach resolved decls to AST nodes (clang-style).
-### Codegen
-- ~~33 silent `cg.errors++` sites~~ DONE 2026-10-03: all replaced by `cgError(cg, msg)` which funnels through the diag engine as `error[CG-0002]` with a per-site message; the 'if (cap)' conditions that were lost during that replace were restored (struct-literal fields / argsLen / loop-depth); Codegen now carries a heap-allocated `DiagnosticEngine*` persisted via `CompileUnit::engineObj` so CG-stage messages survive `analyzeForCompile` returning.
-- `cgFindDecl` linear scan per call; `cgResolveCall` linear mono-instance scan; 16-element caps; dead `tempArrs`/`tempSeq`; `cgEmitStructFields` unused `indent`; asm template O(n²) string rebuild; dead conditionals.
-- Parser: ~~`~=` mapped to `!=`~~ DONE 2026-10-03: `x ~= y` now means `x = ~y` (self-host AST lowers to Assign(target, BitNot(value)); bootstrap lowers to `= ~y` too). ~~ternary precedence~~ DONE 2026-10-03 (`a = b ? c : d` parses as `a = (b ? c : d)`; sema now resolves Ternary/IfExpr branch types); double-parsing in speculation (`parseExprOrDecl`, struct/union fields, const untyped detection, param name extraction from type); `pendingGreater` `>>` split; stub `parseFlagDecl`/`parseComptimeDecl` returning Invalid node.
-### Lexer
-- No `f`/`F` float suffix; no `l`/`L` int suffix; single-bit `numFlags`; fixed 256-entry ident table (never resizes); `decodeUtf8` accepts invalid UTF-8/overlong/surrogates; `\u`/`\U` accept surrogates; `parseInteger` returns partial on overflow; no hex floats; exponent allows `_`.
-### Builder (`compiler/coral-build/`)
-- ~~`include "…"` never expanded~~ DONE 2026-10-03: coralc.crl expands include nodes (up to 8-deep nesting), paths relative to the including file's directory.
-- ~~`extends "…"` never merged~~ PARTIALLY DONE 2026-10-03: a Build node's extends target is now merged (base fields fill gaps from `base.crl`, child's own keys win) so manifest.linux.crlb pulls root/modules from manifest.base.crlb. The `map` command still requires an explicit modules= array in the file's own text.
-- `target` consulted for nothing — no neutral→platform tree routing (needs `platform_root`).
-- Manifest selection from target flags (linux/windows); profiles/workspace/override/tasks/tests/hooks/phases/link/artifact/features/env/log/metrics/lint/format/lsp/ci/remote/deps parsed but unused.
-### Language / features
-- Lexer/parser/sema for `any TraitName`; comptime type-pattern matching; mono `ceval` (also enables file-scope Ident→const folding in `cgConstAtom`); pub-mod reexport; mangling (`mangle_asm.md`); embed modules; Defer unsupported; `Trait` decls skipped in codegen.
-### Lib porting (lib_old → lib per `coral-docs/porting_guide.md`)
-- Full port of remaining crates; requires switch `|` and `any TraitName` to be implemented first.
-### Repo hygiene
-- `PH:` markers cleanup (analyze.crl, compile.crl) and consistent commits.
+- Every diagnostic in the compiler — sema, parser, lexer, mono, codegen, driver — must emit the full error record: stable code/level + location (file:line:col gutter/caret) + the human-readable message + the actionable fix/help text. Sites still lacking full messages:
+  - Parser: `addError()` bare counters without text at ~40+ sites (`recovery.crl`, `nodeListAppend` failures, etc.) — no `code`/`msg`/`loc` wiring yet. `parseFlagDecl`/`parseComptimeDecl` silently return Invalid nodes; their discarded bodies need an explicit 'not implemented' diagnostic.
+  - Sema: tupleField/ArrayLiteral fallback messages missing type (`expr.crl` else/fallbacks); assignment failures from `assignExpr`/`DerefType` incompatible operands→ now properly via Non-Pointer-Deref error added 2026-10-03; redeclaration of fields/imports not diagnosed; `While`/`If` conditions ✓; `ForIn` iterable ✓; Deref non-pointer ✓; index-int-operand ✓.
+  - Codegen: ~33 `cgError` sites now have distinct messages ✓ (2026-10-03); labels without help text still common (e.g. forward decls + location-less when node.index == 0).
+  - Diagnostics' `why`/`fix`/`learn` fields on `Diagnostic`/`renderDiagnostic` are still unpopulated. Engine path passes `help=null` everywhere; only some sites include help (`#[[condassign]]` help exists — PAR-0010).
+
 
 ## Key differentiators / design rules (from docs + user)
 - No `impl`/`dyn` in coral; dyn trait spelled `any Trait`.
@@ -154,7 +130,6 @@ Coral's grammar intentionally mirrors C/C++ and is built/followed against Clang 
 
 ### Methods & self semantics
 - Methods may omit `self` → sema declares an implicit `self`; in C the receiver is a **pointer** (`Option_doubledouble* self`), member access emits `self->field`, assignment writes through (`*self = …`).
-- Explicit `self` param supported (`self`, `self*`, `const self*`) → detected via param flags bit 0.
 - `#[[const]]` attribute OR `const` after `(params)` → const method (cannot mutate self/params) — flag bit 16.
 - Method resolution: linear first-match over methods + `extend` blocks; no trait impl dispatch yet.
 
