@@ -811,9 +811,70 @@ pub extend Parser
         Token nameTok = self.expect(TokenKind::Ident);
         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
         self.expect(TokenKind::Equal);
-        Ty base = self.parseType();
+        Ty base = 0;
+        if (self.current.kind == TokenKind::Flag) base = self.parseFlagType();
+        else base = self.parseType();
         self.expect(TokenKind::Semicolon);
         return self.storeDecl(DeclKind::Distinct{ .name = name, .baseType = base, .flags = 0 });
+    }
+
+    /* `flag (NAME) { <key> => { T }, ..., else => { T } }` — a type that
+     * is selected by matching NAME's value against the host. Picked branch
+     * is the distinct alias' base type. For tidiness we use the compiler's
+     * uniform host default "x86_64"; non-matching arms use the else arm. */
+    Ty parseFlagType()
+    {
+        self.advance(); /* flag */
+        self.expect(TokenKind::LParen);
+        self.expect(TokenKind::Ident);
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        Ty selected = 0;
+        Ty selectedArmElse = 0;
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            bool isHost = false;
+            if (self.match(TokenKind::Else))
+            {
+                isElse = true;
+            }
+            else
+            {
+                Token keyTok = self.expect(TokenKind::Ident);
+                /* ARM selection uses ctx->targetArch — the name the driver
+                 * supplies from its source-build configuration */
+                if (self.ctx->targetArch != null)
+                {
+                    u8* tap = self.ctx->targetArch;
+                    u32 kl = 0;
+                    while (tap[kl] != 0) kl = kl + 1;
+                    bool eq = true;
+                    if (kl != (u32)keyTok.data.len) eq = false;
+                    else
+                    {
+                        u32 kk = 0;
+                        while (kk < kl) { if (tap[kk] != keyTok.data.ptr[kk]) { eq = false; break; } kk = kk + 1; }
+                    }
+                    if (eq) isHost = true;
+                }
+            }
+            self.expect(TokenKind::FatArrow);
+            Ty armTy = 0;
+            if (self.match(TokenKind::LBrace))
+            {
+                armTy = self.parseType();
+                self.expect(TokenKind::RBrace);
+            }
+            else armTy = self.parseType();
+            if (isHost) selected = armTy;
+            else if (isElse) selectedArmElse = armTy;
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        Ty r = selected != 0 ? selected : selectedArmElse;
+        return r;
     }
 
     NodeId parseFlagDecl()
