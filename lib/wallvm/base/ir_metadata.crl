@@ -1,4 +1,4 @@
-import irtypes { IrValue, IrType, IrFunc, IrInst };
+import irtypes { IrValue, IrType, IrFunc, IrInst, IrGlobal, IrStringConst };
 import(lib) std::mman { alloc, dealloc };
 
 pub enum MetadataKind
@@ -27,6 +27,7 @@ pub struct MetadataValue
     usize intVal;
     str strVal;
     IrValue* irVal;
+    f64 floatVal;
 }
 
 pub struct MetadataEntry
@@ -70,6 +71,7 @@ pub void addInt(MetadataSet* self, str key, usize val)
     e->value.intVal = val;
     e->value.strVal = str::empty();
     e->value.irVal = null;
+    e->value.floatVal = 0;
 }
 
 pub void addString(MetadataSet* self, str key, str val)
@@ -91,6 +93,7 @@ pub void addString(MetadataSet* self, str key, str val)
     e->value.intVal = 0;
     e->value.strVal = val;
     e->value.irVal = null;
+    e->value.floatVal = 0;
 }
 
 pub void addIRValue(MetadataSet* self, str key, IrValue* val)
@@ -112,6 +115,29 @@ pub void addIRValue(MetadataSet* self, str key, IrValue* val)
     e->value.intVal = 0;
     e->value.strVal = str::empty();
     e->value.irVal = val;
+    e->value.floatVal = 0;
+}
+
+pub void addFloat(MetadataSet* self, str key, f64 val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e->key = key;
+    e->value.kind = MetadataKind::Custom;
+    e->value.intVal = 0;
+    e->value.strVal = str::empty();
+    e->value.irVal = null;
+    e->value.floatVal = val;
 }
 
 pub MetadataEntry* find(MetadataSet* self, str key)
@@ -205,43 +231,55 @@ pub void metadataShutdown()
     if (s.varDebugInfo) dealloc<DebugVarInfo>(s.varDebugInfo);
 }
 
-// Attach metadata to a function
+// Attach metadata to a function — the set rides on the function itself so
+// printers and passes can find it again (the old global side table was
+// write-only: nothing could ever map a set back to its owner)
 pub MetadataSet* attachFuncMetadata(IrFunc* func)
 {
-    MetadataStore* s = &gMetadataStore;
-    if (s.numFuncs >= s.capFuncs)
+    if (!func) return null;
+    if (!func->metadata)
     {
-        u32 newCap = s.capFuncs ? s.capFuncs * 2 : 16;
-        MetadataSet* newSets = alloc<MetadataSet>(newCap);
-        for (u32 i = 0; i < s.numFuncs; i++)
-            newSets[i] = s.funcMetadata[i];
-        if (s.funcMetadata) dealloc<MetadataSet>(s.funcMetadata);
-        s->funcMetadata = newSets;
-        s->capFuncs = newCap;
+        MetadataSet* md = alloc<MetadataSet>(1);
+        *md = newMetadataSet();
+        func->metadata = md;
     }
-
-    MetadataSet* set = &s.funcMetadata[s.numFuncs++];
-    *set = newMetadataSet();
-    return set;
+    return (MetadataSet*)func->metadata;
 }
 
 pub MetadataSet* attachInstMetadata(IrInst* inst)
 {
-    MetadataStore* s = &gMetadataStore;
-    if (s.numInsts >= s.capInsts)
+    if (!inst) return null;
+    if (!inst->metadata)
     {
-        u32 newCap = s.capInsts ? s.capInsts * 2 : 64;
-        MetadataSet* newSets = alloc<MetadataSet>(newCap);
-        for (u32 i = 0; i < s.numInsts; i++)
-            newSets[i] = s.instMetadata[i];
-        if (s.instMetadata) dealloc<MetadataSet>(s.instMetadata);
-        s->instMetadata = newSets;
-        s->capInsts = newCap;
+        MetadataSet* md = alloc<MetadataSet>(1);
+        *md = newMetadataSet();
+        inst->metadata = md;
     }
+    return (MetadataSet*)inst->metadata;
+}
 
-    MetadataSet* set = &s.instMetadata[s.numInsts++];
-    *set = newMetadataSet();
-    return set;
+pub MetadataSet* attachGlobalMetadata(IrGlobal* g)
+{
+    if (!g) return null;
+    if (!g->metadata)
+    {
+        MetadataSet* md = alloc<MetadataSet>(1);
+        *md = newMetadataSet();
+        g->metadata = md;
+    }
+    return (MetadataSet*)g->metadata;
+}
+
+pub MetadataSet* attachStringMetadata(IrStringConst* sc)
+{
+    if (!sc) return null;
+    if (!sc->metadata)
+    {
+        MetadataSet* md = alloc<MetadataSet>(1);
+        *md = newMetadataSet();
+        sc->metadata = md;
+    }
+    return (MetadataSet*)sc->metadata;
 }
 
 pub void setDebugLocation(IrInst* inst, str file, u32 line, u32 col)
@@ -298,7 +336,6 @@ pub void setRange(IrInst* inst, isize min, isize max)
 
 pub MetadataSet* getInstMetadata(IrInst* inst)
 {
-    // Would need to map inst pointer to metadata index
-    // Simplified: return null
-    return null;
+    if (!inst) return null;
+    return (MetadataSet*)inst->metadata;
 }

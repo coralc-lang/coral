@@ -34,6 +34,7 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
+- 2026-10-03 integer conversion rule tightened: equal-width changing signedness is rejected (u8→i8 needs a cast); unsigned→signed requires strictly wider target (u8→i32 ok, u32→i32 rejected).
 - 2026-10-03: BlockExpr now propagates its trailing-expression type (fixes void* switch-expr temps); BlockExpr case also verifies+typechecks result. Switch-as-expression case bodies type via checkExpr on the block; a block inside a case is a BlockExpr.
 - 2026-10-03: `PatKind::Or` codegen rewritten — part slices are collected in a temp Stream and assembled from scratch (was duplicating every alternative's text into cg.ebuf because Lit-style nested slices share that stream).
 - 2026-10-03: new `assignCompatible` — integer/float literal initializers convert into fitting targets (replaces the over-strict blanket reject; C-literal constant narrowing rule, per literal-fit check).
@@ -97,7 +98,7 @@ Give this a roadmap slot before relying on inference for lib code.
 ## Language rules NOT yet enforced by sema
 (Language rules exist in docs/`coral-docs/reason.crl`, `imports.md`, but the sema doesn't enforce them)
 - `compatible()` is not sound: any pointer ↔ any pointer, int/float interconvert, `from==0/to==0` pass-through, generic params match everything (`dependentType→true`). 
-- No return-type check on assignments failures silently; no redeclaration diagnostic; `While`/`If` conditions not required to be `bool`; `ForIn` not validated as iterable; `Switch` patterns not type-checked; `Cast` accepts any→any; `Index` index not checked as int; casts/inc/dec not int-checked; `Not`/`BitNot` operand unchecked; variadic args unchecked; generic args skipped in checks; `checkPath` only validates first two segments; many Expr kinds untyped (`TupleField`, `ArrayLiteral`, `Ternary`, `IfExpr`, `BlockExpr`, `Sizeof`/`Alignof`/`Typeof`, `BuiltinCall`); `StaticCall` not sema'd (always `addError`); single-pass order-dependent (mutual recursion / forward refs broken); extends collected during same pass as method resolution.
+- No return-type check on assignments failures silently; no redeclaration diagnostic; `While`/`If` conditions not required to be `bool`; `ForIn` not validated as iterable; `Switch` patterns not type-checked; `Cast` accepts any→any; `Index` index casts/inc/dec not int-checked; `Not`/`BitNot` operand unchecked; variadic args unchecked; generic args skipped in checks; `checkPath` only validates first two segments; many Expr kinds untyped (`TupleField`, `ArrayLiteral`, `Ternary`, `IfExpr`, `BlockExpr`, `Sizeof`/`Alignof`/`Typeof`, `BuiltinCall`); `StaticCall` not sema'd (always `addError`); single-pass order-dependent (mutual recursion / forward refs broken); extends collected during same pass as method resolution.
 - Many diagnostics missing the error *message* payload (`addError()` counts but prints nothing) — several codegen silent-`errors++` too.
 
 ## Grammar reference

@@ -69,6 +69,7 @@ pub struct IrGlobal
     bool isExtern;
     IrValue* initVal;
     u32 alignment;
+    rawptr metadata; // generic metadata pointer
 }
 
 pub struct IrStringConst
@@ -76,6 +77,7 @@ pub struct IrStringConst
     IrValue base;
     const cchar* str;
     u32 length;
+    rawptr metadata; // generic metadata pointer
 }
 
 pub struct IrArrayConst
@@ -417,6 +419,9 @@ pub struct IrFunc
     str externLib;
     str externSym;
     rawptr metadata; // generic metadata pointer
+    IrValue** args;
+    u32 nargs;
+    u32 capArgs;
 
     void addBlock(IrBlock* bb)
     {
@@ -434,6 +439,23 @@ pub struct IrFunc
         }
         bb->parent = self;
         self.blocks[self.nblocks++] = bb;
+    }
+
+    void addArg(IrValue* a)
+    {
+        if (self.nargs >= self.capArgs)
+        {
+            u32 newCap = self.capArgs ? self.capArgs * 2 : 4;
+            IrValue** newArgs = alloc<IrValue*>(newCap);
+            if (self.args)
+            {
+                copy<IrValue*>(newArgs, self.args, self.nargs);
+                dealloc<IrValue*>(self.args);
+            }
+            self.args = newArgs;
+            self.capArgs = newCap;
+        }
+        self.args[self.nargs++] = a;
     }
 
     void removeBlock(IrBlock* bb)
@@ -656,7 +678,7 @@ pub struct IrContext
         nc[nl] = 0;
         *g = (IrGlobal) {
             { IrValueKind::Global, ty, self.nextValueId(), 0, nc, null, 0, 0 },
-            null, isConst, isExtern, init, alignment
+            null, isConst, isExtern, init, alignment, null
         };
         return g;
     }
@@ -671,7 +693,7 @@ pub struct IrContext
         ((cchar*)copy)[length] = 0;
         *sc = (IrStringConst) {
             { IrValueKind::StringConst, arrTy, self.nextValueId(), 0, null, null, 0, 0 },
-            copy, length
+            copy, length, null
         };
         return sc;
     }
@@ -866,8 +888,13 @@ pub struct IrContext
             0, null
         };
         
-        if (op == IrOpcode::ICmp) inst->icmpPred = (IrICmpPred)icmpP;
-        if (op == IrOpcode::FCmp) inst->fcmpPred = (IrFCmpPred)fcmpP;
+        // atomics smuggle their ordering (and rmw op) through the same slots
+        // the builder already passes them in, so they survive the round trip
+        if (op == IrOpcode::ICmp || op == IrOpcode::AtomicLoad || op == IrOpcode::AtomicStore ||
+            op == IrOpcode::AtomicRmw || op == IrOpcode::AtomicCmpXchg || op == IrOpcode::Fence)
+            inst->icmpPred = (IrICmpPred)icmpP;
+        if (op == IrOpcode::FCmp || op == IrOpcode::AtomicRmw || op == IrOpcode::AtomicCmpXchg)
+            inst->fcmpPred = (IrFCmpPred)fcmpP;
         return inst;
     }
 
@@ -897,7 +924,7 @@ pub struct IrContext
         *f = (IrFunc) {
             { IrValueKind::Func, self.tyFunc(ret, params, nparams, false), self.nextValueId(), 0, nameCopy, null, 0, 0 },
             null, null, 0, 0, ret, params, nparams,
-            false, "", "", null
+            false, "", "", null, null, 0, 0
         };
         return f;
     }
