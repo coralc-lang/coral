@@ -2069,18 +2069,28 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 return stTail(&cg.ebuf, s);
             },
             PatKind::Or => {
+                /* Render each alternative, collect the parts, then build the
+                 * wrapping text from scratch — appending each part slice
+                 * directly into cg.ebuf duplicates it (inner expr artifacts
+                 * + the real text land in the same stream). */
+                Slice altsText = Slice::from(null, 0);
+                {
+                    Stream abuf = stNew(cg.arena, 64);
+                    u32 i = 0;
+                    while (i < p.kind.payload.Or.alternativesLen)
+                    {
+                        bool w = false;
+                        Slice t = cgPatTest(cg, p.kind.payload.Or.alternatives[i], scrut, scrutTy, &w);
+                        if (i > 0) stP(&abuf, " || ");
+                        if (w) stP(&abuf, "1");
+                        else stPS(&abuf, t);
+                        i = i + 1;
+                    }
+                    altsText = stTail(&abuf, 0);
+                }
                 usize s = cg.ebuf.len;
                 stCh(&cg.ebuf, '(');
-                u32 i = 0;
-                while (i < p.kind.payload.Or.alternativesLen)
-                {
-                    bool w = false;
-                    if (i > 0) stP(&cg.ebuf, " || ");
-                    Slice t = cgPatTest(cg, p.kind.payload.Or.alternatives[i], scrut, scrutTy, &w);
-                    if (w) stP(&cg.ebuf, "1");
-                    else stPS(&cg.ebuf, t);
-                    i = i + 1;
-                }
+                stPS(&cg.ebuf, altsText);
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, s);
             },

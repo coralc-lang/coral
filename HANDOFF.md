@@ -34,6 +34,8 @@
 - ~~Switch `|` same-body cases~~ DONE 2026-10-03: parser accepts `pat | pat => body` in switch stmt+expr (multiple patterns on one `SwitchCase`; `PatKind::Or` codegen path is broken — left unused).
 - **`any TraitName` dyn trait objects** — decide done; implement `TypeKind::Dyn`/`TraitObject` (parser, sema type check, codegen vtable/fat-pointer).
 ### Sema soundness / diagnostics
+- 2026-10-03: BlockExpr now propagates its trailing-expression type (fixes void* switch-expr temps); BlockExpr case also verifies+typechecks result. Switch-as-expression case bodies type via checkExpr on the block; a block inside a case is a BlockExpr.
+- 2026-10-03: `PatKind::Or` codegen rewritten — part slices are collected in a temp Stream and assembled from scratch (was duplicating every alternative's text into cg.ebuf because Lit-style nested slices share that stream).
 - 2026-10-03: new `assignCompatible` — integer/float literal initializers convert into fitting targets (replaces the over-strict blanket reject; C-literal constant narrowing rule, per literal-fit check).
 - 2026-10-03 two-pass decl handling (agent): `sema.declareAll` binds every top-level symbol before any body is type-checked; `checkBodies` re-declares (same decl node = idempotent) and checks bodies. Forward references between same-file fns/methods now work (verified with fwd.crl: helper()->g() exit 0). Full dependency-graph/cyclic-import error (text.txt) is NOT implemented yet.
 - 2026-10-03 enforced: If/While/For/Ternary/IfExpr conditions must be `bool`; Index's index operand must be an integer type; `Deref` of non-pointer is an error; `++`/`--` exprs now resolve their type (fixes void* temp in for-post).
@@ -281,7 +283,8 @@ module @std::x86_64::linux    // fully qualified path
   //   tmp1 = load %x;  // every use is typed
   //   store %tmp1 into %r;
   //   ret { kind: Some, payload: tmp1 } into $slot;
-  // } // rejected, it should be more high level than this
+  // } // rejected, it should be more high level than this, or at least, temp not 
+  // needed, the temp val c was a shitty decision. and this was mirroring it
 ```
 - Every local/temp has a name and a type. Every expression yields a typed slot; no unparsed sugar.
 - Control flow is explicit blocks ending in `ret`/`br`/`switch`/`unreachable`.
@@ -340,3 +343,5 @@ import(lib) std::text {
   recursing with a `::`-joined prefix, but the `module::{ … }` form is a parse
   error today. Needs implementation before the lib port can use it.
 - Demo: `compiler/coral-test/nested_import.crl` (expected to fail to parse until implemented).
+
+- struct enum and variant definition in functions

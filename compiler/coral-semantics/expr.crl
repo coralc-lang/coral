@@ -727,7 +727,10 @@ pub extend Sema
                     if (!self.checkStmt(expr->kind.payload.BlockExpr.stmts[i])) return false;
                     i = i + 1;
                 }
-                return self.checkExpr(expr->kind.payload.BlockExpr.result);
+                if (!self.checkExpr(expr->kind.payload.BlockExpr.result)) return false;
+                Ty bty = self.exprType(expr->kind.payload.BlockExpr.result);
+                if (bty != 0) self.setExprType(id, bty);
+                return true;
             },
             ExprKind::Ternary => {
                 if (!self.checkExpr(expr->kind.payload.Ternary.cond)) return false;
@@ -783,6 +786,35 @@ pub extend Sema
                     }
                     if (!self.checkExpr(switchCase->body)) ok = false;
                     Ty bodyTy = self.exprType(switchCase->body);
+                    /* a case body that is a block value yields the type of
+                       its trailing expression statement */
+                    if (bodyTy == 0 && switchCase->body.index != 0)
+                    {
+                        Node* bn = self.ctx.nodes + switchCase->body.index;
+                        if (bn->kind.tag == NodeKind::Stmt &&
+                            bn->kind.payload.Stmt.value.kind.tag == StmtKind::Block)
+                        {
+                            Stmt* blk = &bn->kind.payload.Stmt.value;
+                            u32 si = blk->kind.payload.Block.stmtsLen;
+                            while (si > 0)
+                            {
+                                si = si - 1;
+                                Node* inn = self.ctx.nodes + blk->kind.payload.Block.stmts[si].index;
+                                if (inn->kind.tag != NodeKind::Stmt) continue;
+                                if (inn->kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
+                                {
+                                    bodyTy = self.exprType(inn->kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
+                                    break;
+                                }
+                                if (inn->kind.payload.Stmt.value.kind.tag == StmtKind::Return &&
+                                    inn->kind.payload.Stmt.value.kind.payload.Return.value.index != 0)
+                                {
+                                    bodyTy = self.exprType(inn->kind.payload.Stmt.value.kind.payload.Return.value);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     if (bodyTy != 0)
                     {
                         if (resultTy == 0) resultTy = bodyTy;
