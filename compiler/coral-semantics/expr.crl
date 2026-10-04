@@ -20,6 +20,9 @@ import member { MemberInfo };
 import sema { Sema };
 import diagnostics { ErrorCode };
 
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+
 pub extend Sema
 {
     bool checkIdent(NodeId id, Str name)
@@ -800,6 +803,58 @@ pub extend Sema
                 {
                     if (!self.checkExpr(expr->kind.payload.BuiltinCall.args[i])) return false;
                     i = i + 1;
+                }
+                Str bname = expr->kind.payload.BuiltinCall.name;
+                /* @compileError("msg") — a hard compile-time error carrying
+                 * the user message (the call site was reached during type
+                 * checking instead of being folded away by comptime). */
+                if (bname == self.ctx.intern((u8*)"compileError", 12))
+                {
+                    u8* msgPtr = (u8*)"@compileError tripped";
+                    usize msgLen = 21;
+                    NodeId msgNodeId;
+                    msgNodeId.index = 0;
+                    if (expr->kind.payload.BuiltinCall.argsLen > 0)
+                        msgNodeId = expr->kind.payload.BuiltinCall.args[0];
+                    if (msgNodeId.index != 0)
+                    {
+                        Node* mn = self.ctx.nodes + msgNodeId.index;
+                        if (mn->kind.tag == NodeKind::Expr &&
+                            mn->kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        {
+                            Str litStr = mn->kind.payload.Expr.value.kind.payload.StringLit.value;
+                            if (litStr != 0 && litStr < self.ctx.internsLen)
+                            {
+                                msgPtr = self.ctx.interns[litStr].ptr;
+                                msgLen = self.ctx.interns[litStr].len;
+                            }
+                        }
+                    }
+                    u8* msgBuf = (u8*)malloc(msgLen + 1);
+                    u32 cpI = 0;
+                    while (cpI < msgLen) { msgBuf[cpI] = msgPtr[cpI]; cpI = cpI + 1; }
+                    msgBuf[msgLen] = 0;
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msgBuf);
+                    return false;
+                }
+                /* @isFormatLiteral(expr) — true only when the given
+                 * argument is a string literal (comptime path gate). */
+                if (bname == self.ctx.intern((u8*)"isFormatLiteral", 15))
+                {
+                    bool lit = false;
+                    if (expr->kind.payload.BuiltinCall.argsLen == 1)
+                    {
+                        NodeId nid = expr->kind.payload.BuiltinCall.args[0];
+                        if (nid.index != 0)
+                        {
+                            Node* nn = self.ctx.nodes + nid.index;
+                            if (nn->kind.tag == NodeKind::Expr &&
+                                nn->kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                                lit = true;
+                        }
+                    }
+                    self.setExprType(id, lit ? self.boolType() : self.boolType());
+                    return true;
                 }
                 return true;
             },

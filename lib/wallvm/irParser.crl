@@ -1,8 +1,34 @@
-import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType };
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind, IrGlobal, IrStringConst, IrStructType, IrArrayConst };
 import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, IrAtomicRmwOp };
-import(lib) wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat };
+import(lib) wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat, addBool, addType };
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) core::cchar { cchar };
+
+// what a deferred name patches when its scope closes
+enum FixupTarget
+{
+    InstOp,
+    MetaEntry,
+    GlobalInit,
+    ArrayElem
+}
+
+// %refs used before their def (phi bodies, metadata) and @refs used before
+// the decl, both patched when their scope closes; names are owned copies
+// because takeIdent slices the input buffer
+struct Fixup
+{
+    str name;
+    u8 kind;        // 1 = % value (function scope), 2 = @ symbol (module scope)
+    FixupTarget target;
+    IrInst* inst;
+    u32 opIdx;
+    MetadataSet* mdSet;
+    u32 mdIdx;
+    IrGlobal* global;
+    IrArrayConst* arr;
+    u32 arrIdx;
+}
 
 pub struct IrParser
 {
@@ -26,12 +52,7 @@ pub struct IrParser
     u32 numBlocks;
     u32 capBlocks;
 
-    // %refs used before their def (phi bodies) and @refs used before the
-    // decl, both patched when their scope closes
-    IrInst** fixInsts;
-    u32* fixOps;
-    str* fixNames;
-    u8* fixKinds; // 1 = value, 2 = symbol
+    Fixup* fixups;
     u32 numFixs;
     u32 capFixs;
 
@@ -68,12 +89,14 @@ struct OpList
 
 struct MetaAtom
 {
-    u32 kind;   // 0 int, 1 float, 2 string, 3 ir value, 4 type
+    u32 kind;   // 0 int, 1 float, 2 string, 3 ir value, 4 type, 5 bool
     i64 i;
     f64 f;
     str s;
     IrValue* v;
     IrType* ty;
+    str ref;        // deferred %/@ name (kind 3 with v == null)
+    bool refIsSym;
 }
 
 pub IrParser new(IrContext* ctx)
@@ -96,10 +119,7 @@ pub IrParser new(IrContext* ctx)
         .blocks = null,
         .numBlocks = 0,
         .capBlocks = 0,
-        .fixInsts = null,
-        .fixOps = null,
-        .fixNames = null,
-        .fixKinds = null,
+        .fixups = null,
         .numFixs = 0,
         .capFixs = 0,
         .currentFunc = null,
@@ -119,11 +139,8 @@ pub void destroy(IrParser* p)
     if (p->blockNames) dealloc<str>(p->blockNames);
     if (p->blocks) dealloc<IrBlock*>(p->blocks);
     for (u32 i = 0; i < p->numFixs; i++)
-        dealloc<cchar>((cchar*)p->fixNames[i].ptr);
-    if (p->fixInsts) dealloc<IrInst*>(p->fixInsts);
-    if (p->fixOps) dealloc<u32>(p->fixOps);
-    if (p->fixNames) dealloc<str>(p->fixNames);
-    if (p->fixKinds) dealloc<u8>(p->fixKinds);
+        dealloc<cchar>((cchar*)p->fixups[i].name.ptr);
+    if (p->fixups) dealloc<Fixup>(p->fixups);
     if (p->errMsg.len > 0) dealloc<cchar>((cchar*)p->errMsg.ptr);
 }
 
@@ -545,7 +562,29 @@ static IrType* parseTypeAfter(IrParser* p, str w)
             }
             if (!expectChar(p, '}', "expected '}' in struct type")) return null;
             IrStructType* st = p->ctx->createStructType(str::empty(), fts, null, n);
-            if (p->currentModule) p->currentModule->addStruct(st);
+            if (p->currentModule)
+            {
+                // struct types intern by structure, so a structurally equal
+                // twin in the side table already answers to this type —
+                // keep one entry instead of one per use site
+                IrStructType* twin = null;
+                for (u32 i = 0; i < p->currentModule->nstructs; i++)
+                {
+                    if (p->currentModule->structs[i]->irType == st->irType)
+                    {
+                        twin = p->currentModule->structs[i];
+                        break;
+                    }
+                }
+                if (twin)
+                {
+                    dealloc<u32>(st->offsets);
+                    dealloc<IrType*>(st->fieldTypes);
+                    dealloc<IrStructType>(st);
+                    return p->ctx->tyStruct(twin);
+                }
+                p->currentModule->addStruct(st);
+            }
             return p->ctx->tyStruct(st);
         }
         parseError(p, "expected struct body or @name");
@@ -630,52 +669,102 @@ static IrValue* findSymbol(IrParser* p, str name)
     for (u32 i = 0; i < m->nfuncs; i++)
     {
         cchar* fn = m->funcs[i]->base.name;
-        if (fn && str::fromCstr((const cchar::cchar*)fn).equals(name)) return m->funcs[i]->base;
+        if (fn && str::fromCstr((const cchar::cchar*)fn).equals(name)) return &m->funcs[i]->base;
     }
     for (u32 i = 0; i < m->nglobals; i++)
     {
         cchar* gn = m->globals[i]->base.name;
-        if (gn && str::fromCstr((const cchar::cchar*)gn).equals(name)) return m->globals[i]->base;
+        if (gn && str::fromCstr((const cchar::cchar*)gn).equals(name)) return &m->globals[i]->base;
     }
     for (u32 i = 0; i < m->nconstStrings; i++)
     {
         cchar* sn = m->constStrings[i]->base.name;
-        if (sn && str::fromCstr((const cchar::cchar*)sn).equals(name)) return m->constStrings[i]->base;
+        if (sn && str::fromCstr((const cchar::cchar*)sn).equals(name)) return &m->constStrings[i]->base;
     }
     return null;
 }
 
-static void addFixup(IrParser* p, IrInst* inst, u32 opIdx, str name, u8 kind)
+static Fixup* fixupGrow(IrParser* p)
 {
     if (p->numFixs >= p->capFixs)
     {
         u32 newCap = p->capFixs == 0 ? 16 : p->capFixs * 2;
-        IrInst** ni = alloc<IrInst*>(newCap);
-        u32* no = alloc<u32>(newCap);
-        str* nn = alloc<str>(newCap);
-        u8* nk = alloc<u8>(newCap);
-        if (p->fixInsts)
+        Fixup* nf = alloc<Fixup>(newCap);
+        if (p->fixups)
         {
-            copy<IrInst*>(ni, p->fixInsts, p->numFixs);
-            copy<u32>(no, p->fixOps, p->numFixs);
-            copy<str>(nn, p->fixNames, p->numFixs);
-            copy<u8>(nk, p->fixKinds, p->numFixs);
-            dealloc<IrInst*>(p->fixInsts);
-            dealloc<u32>(p->fixOps);
-            dealloc<str>(p->fixNames);
-            dealloc<u8>(p->fixKinds);
+            copy<Fixup>(nf, p->fixups, p->numFixs);
+            dealloc<Fixup>(p->fixups);
         }
-        p->fixInsts = ni;
-        p->fixOps = no;
-        p->fixNames = nn;
-        p->fixKinds = nk;
+        p->fixups = nf;
         p->capFixs = newCap;
     }
-    p->fixInsts[p->numFixs] = inst;
-    p->fixOps[p->numFixs] = opIdx;
-    p->fixNames[p->numFixs] = dupStr(name);
-    p->fixKinds[p->numFixs] = kind;
+    Fixup* f = &p->fixups[p->numFixs];
     p->numFixs = p->numFixs + 1;
+    return f;
+}
+
+static void addFixup(IrParser* p, IrInst* inst, u32 opIdx, str name, u8 kind)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = kind;
+    f->target = FixupTarget::InstOp;
+    f->inst = inst;
+    f->opIdx = opIdx;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = null;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+// a metadata value slot survives entry-array growth because the fixup
+// stores the index, never the pointer
+static void addMetaFixup(IrParser* p, MetadataSet* md, u32 mdIdx, str name, u8 kind)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = kind;
+    f->target = FixupTarget::MetaEntry;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = md;
+    f->mdIdx = mdIdx;
+    f->global = null;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+static void addGlobalFixup(IrParser* p, IrGlobal* g, str name)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = 2;
+    f->target = FixupTarget::GlobalInit;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = g;
+    f->arr = null;
+    f->arrIdx = 0;
+}
+
+// aggregate init elements fill slots in a freshly built constArray — fresh
+// because constArray does not unique, so no other value shares the slots
+static void addArrayFixup(IrParser* p, IrArrayConst* ac, u32 idx, str name)
+{
+    Fixup* f = fixupGrow(p);
+    f->name = dupStr(name);
+    f->kind = 2;
+    f->target = FixupTarget::ArrayElem;
+    f->inst = null;
+    f->opIdx = 0;
+    f->mdSet = null;
+    f->mdIdx = 0;
+    f->global = null;
+    f->arr = ac;
+    f->arrIdx = idx;
 }
 
 // phi operands may name a value the text defines later, everything else
@@ -966,25 +1055,17 @@ static IrFCmpPred parseFCmpPred(IrParser* p)
     return v;
 }
 
-static IrType* elementTypeAt(IrParser* p, IrType* agg, u32 idx, bool* ok)
+static IrType* elementTypeAt(IrType* agg, u32 idx, bool* ok)
 {
     *ok = true;
     if (!agg) { *ok = false; return null; }
     if (agg->kind == IrTypeKind::Array || agg->kind == IrTypeKind::Vector) return agg->elem;
+    // field types ride on the interned struct type itself now — the
+    // module side-table only carries names and offsets
     if (agg->kind == IrTypeKind::Struct)
     {
-        if (!p->currentModule) { *ok = false; return null; }
-        for (u32 i = 0; i < p->currentModule->nstructs; i++)
-        {
-            IrStructType* st = p->currentModule->structs[i];
-            if (st->irType == agg)
-            {
-                if (idx >= st->nfields) { *ok = false; return null; }
-                return st->fieldTypes[idx];
-            }
-        }
-        *ok = false;
-        return null;
+        if (idx >= agg->nparams) { *ok = false; return null; }
+        return agg->params[idx];
     }
     *ok = false;
     return null;
@@ -1096,6 +1177,128 @@ static IrOpcode castOpcode(str w)
     return IrOpcode::Bitcast;
 }
 
+// one `!key = atom, …` clause's value list — `!key` alone leaves hadEq
+// false and the commit side turns that into the conventional = 1
+static u32 parseMetaValues(IrParser* p, MetaAtom* vals, u32 max, bool* hadEq)
+{
+    *hadEq = false;
+    u32 n = 0;
+    skipSpaces(p);
+    if (p->cur != '=') return 0;
+    advance(p);
+    *hadEq = true;
+    while (!p->hadError)
+    {
+        if (n >= max) break;
+        skipWs(p);
+        MetaAtom a;
+        a.kind = 0;
+        a.i = 0;
+        a.f = 0;
+        a.s = str::empty();
+        a.v = null;
+        a.ty = null;
+        a.ref = str::empty();
+        a.refIsSym = false;
+        cchar c = p->cur;
+        if (c == '"')
+        {
+            a.s = parseStringLiteral(p);
+            a.kind = 2;
+        }
+        else if (c == '%' || c == '@')
+        {
+            bool isSym = c == '@';
+            advance(p);
+            str vn = takeIdent(p);
+            if (p->hadError) return n;
+            a.kind = 3;
+            if (isSym) a.v = findSymbol(p, vn);
+            else a.v = findValue(p, vn);
+            if (!a.v)
+            {
+                // forward ref: names point into the input buffer, the
+                // fixup dups whatever the commit side hands it
+                a.ref = vn;
+                a.refIsSym = isSym;
+            }
+        }
+        else if (c == '-' || (c >= '0' && c <= '9') ||
+                 (c == '.' && peekByte(p, 1) >= '0' && peekByte(p, 1) <= '9'))
+        {
+            NumToken t = parseNumber(p);
+            if (p->hadError) return n;
+            if (t.isFloat) { a.kind = 1; a.f = t.f; }
+            else { a.kind = 0; a.i = t.i; }
+        }
+        else if (isIdentStart(c))
+        {
+            str w = peekIdent(p);
+            if (w.equals("true") || w.equals("false"))
+            {
+                a.kind = 5;
+                a.i = w.equals("true") ? 1 : 0;
+                for (usize i = 0; i < w.len; i++) advance(p);
+            }
+            else if (isTypeWord(w))
+            {
+                a.ty = parseType(p);
+                if (p->hadError) return n;
+                a.kind = 4;
+            }
+            else {
+                parseError(p, "expected metadata value");
+                return n;
+            }
+        }
+        else {
+            parseError(p, "expected metadata value");
+            return n;
+        }
+        vals[n] = a;
+        n = n + 1;
+        skipSpaces(p);
+        if (p->cur == ',') { advance(p); continue; }
+        break;
+    }
+    return n;
+}
+
+static void commitMetaValue(IrParser* p, MetadataSet* md, str key, MetaAtom* a, bool inFunc)
+{
+    if (a->kind == 0) addInt(md, key, (usize)a->i);
+    else if (a->kind == 1) addFloat(md, key, a->f);
+    else if (a->kind == 2) addString(md, key, a->s);
+    else if (a->kind == 5) addBool(md, key, a->i != 0);
+    else if (a->kind == 4) addType(md, key, a->ty);
+    else
+    {
+        if (a->v) { addIRValue(md, key, a->v); return; }
+        if (!a->refIsSym && !inFunc)
+        {
+            parseError(p, "value reference in global metadata");
+            return;
+        }
+        addIRValue(md, key, null);
+        addMetaFixup(p, md, md->numEntries - 1, a->ref, a->refIsSym ? 2 : 1);
+    }
+}
+
+// clause dispatch shared by instruction, function, global and string meta
+static void commitMetaClause(IrParser* p, MetadataSet* md, str key, MetaAtom* vals, u32 n, bool hadEq, bool inFunc)
+{
+    if (!hadEq)
+    {
+        addInt(md, key, 1);
+        return;
+    }
+    for (u32 i = 0; i < n; i++)
+    {
+        commitMetaValue(p, md, key, &vals[i], inFunc);
+        if (p->hadError) return;
+    }
+}
+
 static void parseMetaInstr(IrParser* p, IrInst* inst)
 {
     while (!p->hadError)
@@ -1106,93 +1309,9 @@ static void parseMetaInstr(IrParser* p, IrInst* inst)
         str key = takeIdent(p);
         if (p->hadError) return;
         MetaAtom vals[8];
-        u32 n = 0;
-        for (u32 i = 0; i < 8; i++)
-        {
-            vals[i].kind = 0;
-            vals[i].i = 0;
-            vals[i].f = 0;
-            vals[i].s = str::empty();
-            vals[i].v = null;
-            vals[i].ty = null;
-        }
-        skipSpaces(p);
-        if (p->cur == '=')
-        {
-            advance(p);
-            while (!p->hadError)
-            {
-                if (n >= 8) break;
-                skipWs(p);
-                MetaAtom a;
-                a.kind = 0;
-                a.i = 0;
-                a.f = 0;
-                a.s = str::empty();
-                a.v = null;
-                a.ty = null;
-                cchar c = p->cur;
-                if (c == '"')
-                {
-                    a.s = parseStringLiteral(p);
-                    a.kind = 2;
-                }
-                else if (c == '%' || c == '@')
-                {
-                    if (c == '@') { parseError(p, "symbol metadata value must be in scope"); return; }
-                    advance(p);
-                    str vn = takeIdent(p);
-                    if (p->hadError) return;
-                    a.v = findValue(p, vn);
-                    if (!a.v) { parseError(p, "undefined value"); return; }
-                    a.kind = 3;
-                }
-                else if (c == '-' || (c >= '0' && c <= '9') ||
-                         (c == '.' && peekByte(p, 1) >= '0' && peekByte(p, 1) <= '9'))
-                {
-                    NumToken t = parseNumber(p);
-                    if (p->hadError) return;
-                    if (t.isFloat) { a.kind = 1; a.f = t.f; }
-                    else { a.kind = 0; a.i = t.i; }
-                }
-                else if (isIdentStart(c))
-                {
-                    str w = peekIdent(p);
-                    if (w.equals("true") || w.equals("false"))
-                    {
-                        a.kind = 0;
-                        a.i = w.equals("true") ? 1 : 0;
-                        for (usize i = 0; i < w.len; i++) advance(p);
-                    }
-                    else if (isTypeWord(w))
-                    {
-                        usize start = p->pos;
-                        a.ty = parseType(p);
-                        if (p->hadError) return;
-                        a.kind = 4;
-                        a.s = str::fromParts(p->input.ptr + start, p->pos - start);
-                    }
-                    else {
-                        parseError(p, "expected metadata value");
-                        return;
-                    }
-                }
-                else {
-                    parseError(p, "expected metadata value");
-                    return;
-                }
-                vals[n] = a;
-                n = n + 1;
-                skipSpaces(p);
-                if (p->cur == ',') { advance(p); continue; }
-                break;
-            }
-        }
-        else {
-            vals[0].kind = 0;
-            vals[0].i = 1;
-            n = 1;
-        }
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
         if (key.equals("var") && n >= 4 &&
             vals[0].kind == 2 && vals[1].kind == 4 &&
             vals[2].kind == 0 && vals[3].kind == 0)
@@ -1200,18 +1319,7 @@ static void parseMetaInstr(IrParser* p, IrInst* inst)
             u32 argIdx = (n >= 5 && vals[4].kind == 0) ? (u32)vals[4].i : 0xFFFFFFFF;
             inst->addVarDebug(vals[0].s, vals[1].ty, (u32)vals[2].i, (u32)vals[3].i, argIdx);
         }
-        else
-        {
-            MetadataSet* md = attachInstMetadata(inst);
-            for (u32 i = 0; i < n; i++)
-            {
-                if (vals[i].kind == 0) addInt(md, key, (usize)vals[i].i);
-                else if (vals[i].kind == 1) addFloat(md, key, vals[i].f);
-                else if (vals[i].kind == 2) addString(md, key, vals[i].s);
-                else if (vals[i].kind == 3) addIRValue(md, key, vals[i].v);
-                else addString(md, key, vals[i].s);
-            }
-        }
+        else commitMetaClause(p, attachInstMetadata(inst), key, vals, n, hadEq, true);
     }
 }
 
@@ -1461,7 +1569,7 @@ static void parseInstruction(IrParser* p)
                     return;
                 }
                 bool ok = false;
-                IrType* ft = elementTypeAt(p, rt, (u32)ixv->valData, &ok);
+                IrType* ft = elementTypeAt(rt, (u32)ixv->valData, &ok);
                 if (!ok)
                 {
                     parseError(p, "gep index out of range");
@@ -1590,7 +1698,7 @@ static void parseInstruction(IrParser* p)
             NumToken idx = parseNumber(p);
             if (p->hadError) { opsFree(&l); return; }
             bool ok = false;
-            IrType* ft = elementTypeAt(p, ty, (u32)idx.u, &ok);
+            IrType* ft = elementTypeAt(ty, (u32)idx.u, &ok);
             if (!ok) { parseError(p, "extractvalue index out of range"); opsFree(&l); return; }
             opsPushRef(&l, &agg);
             opsPush(&l, p->ctx->constInt(p->ctx->tyInt(32), idx.u), str::empty(), 0);
@@ -1941,27 +2049,26 @@ static void resolveFuncFixups(IrParser* p)
     u32 w = 0;
     for (u32 i = 0; i < p->numFixs; i++)
     {
-        if (p->fixKinds[i] == 1)
+        Fixup* f = &p->fixups[i];
+        if (f->kind == 1)
         {
-            IrValue* v = findValue(p, p->fixNames[i]);
+            IrValue* v = findValue(p, f->name);
             if (!v)
             {
-                parseError(p, "undefined value in phi");
+                parseError(p, "undefined value");
                 return;
             }
-            p->fixInsts[i]->ops[p->fixOps[i]] = v;
-            v->addUser(p->fixInsts[i]);
-            dealloc<cchar>((cchar*)p->fixNames[i].ptr);
+            if (f->target == FixupTarget::InstOp)
+            {
+                f->inst->ops[f->opIdx] = v;
+                v->addUser(f->inst);
+            }
+            else f->mdSet->entries[f->mdIdx].value.irVal = v;
+            dealloc<cchar>((cchar*)f->name.ptr);
         }
         else
         {
-            if (w != i)
-            {
-                p->fixInsts[w] = p->fixInsts[i];
-                p->fixOps[w] = p->fixOps[i];
-                p->fixNames[w] = p->fixNames[i];
-                p->fixKinds[w] = p->fixKinds[i];
-            }
+            if (w != i) p->fixups[w] = p->fixups[i];
             w = w + 1;
         }
     }
@@ -1977,53 +2084,11 @@ static void parseFuncMeta(IrParser* p, IrFunc* f)
         advance(p);
         str key = takeIdent(p);
         if (p->hadError) return;
-        skipSpaces(p);
-        if (p->cur == '=')
-        {
-            advance(p);
-            while (!p->hadError)
-            {
-                skipWs(p);
-                cchar c = p->cur;
-                if (c == '"')
-                {
-                    str v = parseStringLiteral(p);
-                    if (p->hadError) return;
-                    addString(attachFuncMetadata(f), key, v);
-                }
-                else if (c == '-' || (c >= '0' && c <= '9') ||
-                         (c == '.' && peekByte(p, 1) >= '0' && peekByte(p, 1) <= '9'))
-                {
-                    NumToken t = parseNumber(p);
-                    if (p->hadError) return;
-                    if (t.isFloat) addFloat(attachFuncMetadata(f), key, t.f);
-                    else addInt(attachFuncMetadata(f), key, (usize)t.i);
-                }
-                else if (isIdentStart(c))
-                {
-                    str w = peekIdent(p);
-                    if (w.equals("true") || w.equals("false"))
-                    {
-                        addInt(attachFuncMetadata(f), key, w.equals("true") ? 1 : 0);
-                        for (usize i = 0; i < w.len; i++) advance(p);
-                    }
-                    else
-                    {
-                        parseError(p, "expected metadata value");
-                        return;
-                    }
-                }
-                else
-                {
-                    parseError(p, "expected metadata value");
-                    return;
-                }
-                skipSpaces(p);
-                if (p->cur == ',') { advance(p); continue; }
-                break;
-            }
-        }
-        else addInt(attachFuncMetadata(f), key, 1);
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        commitMetaClause(p, attachFuncMetadata(f), key, vals, n, hadEq, true);
     }
 }
 
@@ -2148,6 +2213,9 @@ static void parseFuncDecl(IrParser* p)
     {
         if (p->cur != ';') { parseError(p, "expected ';' after extern function"); return; }
         advance(p);
+        // no body is coming — close the %refs (params) now so they cannot
+        // leak into the next function's scope
+        resolveFuncFixups(p);
         return;
     }
     if (p->cur != '{') { parseError(p, "expected '{' or 'extern' in function"); return; }
@@ -2214,6 +2282,102 @@ static void parseTypeDecl(IrParser* p)
     p->currentModule->addStruct(st);
 }
 
+// `= [ … ]` array/vector initializers: elements are atoms of the element
+// type or nested lists; a @sym element defers until the module closes
+static IrValue* parseAggregateInit(IrParser* p, IrType* ty)
+{
+    if (ty->kind != IrTypeKind::Array && ty->kind != IrTypeKind::Vector)
+    {
+        parseError(p, "aggregate initializer requires array or vector type");
+        return null;
+    }
+    IrType* elemTy = ty->elem;
+    u32 cap = ty->count > 0 ? ty->count : 1;
+    IrValue** elems = alloc<IrValue*>(cap);
+    str* pend = alloc<str>(cap);
+    u32 n = 0;
+    while (!p->hadError)
+    {
+        skipWs(p);
+        if (p->cur == ']') break;
+        if (p->cur == '[')
+        {
+            if (elemTy->kind != IrTypeKind::Array && elemTy->kind != IrTypeKind::Vector)
+            {
+                parseError(p, "nested list where scalar expected");
+                break;
+            }
+            IrValue* sub = parseAggregateInit(p, elemTy);
+            if (p->hadError) break;
+            if (n >= ty->count)
+            {
+                parseError(p, "too many aggregate elements");
+                break;
+            }
+            elems[n] = sub;
+            pend[n] = str::empty();
+            n = n + 1;
+        }
+        else
+        {
+            if (elemTy->kind == IrTypeKind::Array || elemTy->kind == IrTypeKind::Vector)
+            {
+                parseError(p, "expected nested list for aggregate element");
+                break;
+            }
+            if (elemTy->kind == IrTypeKind::Struct || elemTy->kind == IrTypeKind::Func)
+            {
+                parseError(p, "unsupported aggregate element type");
+                break;
+            }
+            if (n >= ty->count)
+            {
+                parseError(p, "too many aggregate elements");
+                break;
+            }
+            AtomRef r;
+            parseAtom(p, elemTy, false, true, &r);
+            if (p->hadError) break;
+            if (r.pending)
+            {
+                elems[n] = null;
+                pend[n] = r.name;
+            }
+            else
+            {
+                elems[n] = r.val;
+                pend[n] = str::empty();
+            }
+            n = n + 1;
+        }
+        skipWs(p);
+        if (p->cur == ',') { advance(p); continue; }
+        break;
+    }
+    if (p->hadError) { dealloc<IrValue*>(elems); dealloc<str>(pend); return null; }
+    if (p->cur != ']')
+    {
+        parseError(p, "expected ']' in aggregate initializer");
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    advance(p);
+    if (n != ty->count)
+    {
+        parseError(p, "aggregate initializer length does not match type");
+        dealloc<IrValue*>(elems);
+        dealloc<str>(pend);
+        return null;
+    }
+    IrArrayConst* ac = p->ctx->constArray(elemTy, elems, n);
+    for (u32 i = 0; i < n; i++)
+        if (pend[i].len > 0) addArrayFixup(p, ac, i, pend[i]);
+    dealloc<IrValue*>(elems);
+    dealloc<str>(pend);
+    return &ac->base;
+}
+
 static void parseGlobalDecl(IrParser* p)
 {
     skipSpaces(p);
@@ -2232,17 +2396,29 @@ static void parseGlobalDecl(IrParser* p)
     IrType* ty = parseType(p);
     if (p->hadError) return;
     IrValue* init = null;
+    str initRef = str::empty();
     skipSpaces(p);
     if (p->cur == '=')
     {
         advance(p);
-        AtomRef r;
-        parseAtom(p, ty, false, false, &r);
-        if (p->hadError) return;
-        init = r.val;
+        skipWs(p);
+        if (p->cur == '[')
+        {
+            init = parseAggregateInit(p, ty);
+            if (p->hadError) return;
+        }
+        else
+        {
+            AtomRef r;
+            parseAtom(p, ty, false, true, &r);
+            if (p->hadError) return;
+            init = r.val;
+            if (r.pending) initRef = r.name;
+        }
     }
     IrGlobal* g = p->ctx->createGlobal(name, ty, isConst, false, init, p->ctx->irTypeAlignOf(ty));
     p->currentModule->addGlobal(g);
+    if (initRef.len > 0) addGlobalFixup(p, g, initRef);
     while (!p->hadError)
     {
         skipSpaces(p);
@@ -2250,17 +2426,18 @@ static void parseGlobalDecl(IrParser* p)
         advance(p);
         str key = takeIdent(p);
         if (p->hadError) return;
-        skipSpaces(p);
-        if (p->cur == '=')
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        if (hadEq && n == 1 && vals[0].kind == 0 && key.equals("alignment"))
         {
-            advance(p);
-            skipWs(p);
-            NumToken t = parseNumber(p);
-            if (p->hadError) return;
-            if (key.equals("alignment") && !t.isFloat) g->alignment = (u32)t.i;
-            else addInt(attachGlobalMetadata(g), key, t.isFloat ? 0 : (usize)t.i);
+            // codegen reads the field, the printer round-trips the
+            // metadata — an explicit value lands in both
+            g->alignment = (u32)vals[0].i;
+            addInt(attachGlobalMetadata(g), key, (usize)vals[0].i);
         }
-        else addInt(attachGlobalMetadata(g), key, 1);
+        else commitMetaClause(p, attachGlobalMetadata(g), key, vals, n, hadEq, false);
     }
     if (p->hadError) return;
     if (!expectChar(p, ';', "expected ';' after global declaration")) return;
@@ -2288,16 +2465,11 @@ static void parseStringDecl(IrParser* p)
         advance(p);
         str key = takeIdent(p);
         if (p->hadError) return;
-        skipSpaces(p);
-        if (p->cur == '=')
-        {
-            advance(p);
-            skipWs(p);
-            str v = parseStringLiteral(p);
-            if (p->hadError) return;
-            addString(attachStringMetadata(sc), key, v);
-        }
-        else addInt(attachStringMetadata(sc), key, 1);
+        MetaAtom vals[8];
+        bool hadEq = false;
+        u32 n = parseMetaValues(p, vals, 8, &hadEq);
+        if (p->hadError) return;
+        commitMetaClause(p, attachStringMetadata(sc), key, vals, n, hadEq, false);
     }
     if (p->hadError) return;
     if (!expectChar(p, ';', "expected ';' after string declaration")) return;
@@ -2307,16 +2479,27 @@ static void resolveModuleFixups(IrParser* p)
 {
     for (u32 i = 0; i < p->numFixs; i++)
     {
-        if (p->fixKinds[i] != 2) continue;
-        IrValue* v = findSymbol(p, p->fixNames[i]);
+        Fixup* f = &p->fixups[i];
+        if (f->kind != 2) continue;
+        IrValue* v = findSymbol(p, f->name);
         if (!v)
         {
             parseError(p, "undefined symbol");
             return;
         }
-        p->fixInsts[i]->ops[p->fixOps[i]] = v;
-        v->addUser(p->fixInsts[i]);
-        dealloc<cchar>((cchar*)p->fixNames[i].ptr);
+        if (f->target == FixupTarget::InstOp)
+        {
+            f->inst->ops[f->opIdx] = v;
+            v->addUser(f->inst);
+        }
+        else if (f->target == FixupTarget::MetaEntry)
+        {
+            // metadata refs are not operands — no use-list entry
+            f->mdSet->entries[f->mdIdx].value.irVal = v;
+        }
+        else if (f->target == FixupTarget::GlobalInit) f->global->initVal = v;
+        else f->arr->elems[f->arrIdx] = v;
+        dealloc<cchar>((cchar*)f->name.ptr);
     }
     p->numFixs = 0;
 }

@@ -667,7 +667,10 @@ pub struct IrContext
     IrType* tyArray(IrType* elem, u32 count) { return self.tyGetOrCreate(IrTypeKind::Array, 0, elem, count, null, null, 0, false); }
     IrType* tyFunc(IrType* ret, IrType** params, u32 nparams, bool isVararg) { return self.tyGetOrCreate(IrTypeKind::Func, 0, null, 0, ret, params, nparams, isVararg); }
     IrType* tyVector(IrType* elem, u32 count) { return self.tyGetOrCreate(IrTypeKind::Vector, 0, elem, count, null, null, 0, false); }
-    IrType* tyStruct(IrStructType* st) { return self.tyGetOrCreate(IrTypeKind::Struct, st->size, null, 0, null, null, 0, false); }
+    // the intern key carries the field types: size alone would fold
+    // { i32, i32 } and { f32, f32 } into one type and the side-table
+    // lookup for gep could not tell them apart
+    IrType* tyStruct(IrStructType* st) { return self.tyGetOrCreate(IrTypeKind::Struct, st->size, null, 0, null, st->fieldTypes, st->nfields, false); }
 
     IrGlobal* createGlobal(str name, IrType* ty, bool isConst, bool isExtern, IrValue* init, u32 alignment)
     {
@@ -760,7 +763,7 @@ pub struct IrContext
             if (al > maxAlign) maxAlign = al;
         }
         u32 sz = alignUpTo(off, maxAlign);
-        IrType* irTy = self.tyGetOrCreate(IrTypeKind::Struct, sz, null, 0, null, null, 0, false);
+        IrType* irTy = self.tyGetOrCreate(IrTypeKind::Struct, sz, null, 0, null, fields, nfields, false);
 
         *st = (IrStructType) { irTy, name, fields, fieldNames, nfields, nfields, sz, offs };
         return st;
@@ -780,6 +783,12 @@ pub struct IrContext
                 { if (t->count == count && irTypeEqual(t->elem, elem)) return t; }
             else if (kind == IrTypeKind::Func) {
                 if (!irTypeEqual(t->ret, ret)) continue;
+                bool match = true;
+                for (u32 j = 0; j < nparams; j++)
+                    if (!irTypeEqual(t->params[j], params[j])) { match = false; break; }
+                if (match) return t;
+            }
+            else if (kind == IrTypeKind::Struct) {
                 bool match = true;
                 for (u32 j = 0; j < nparams; j++)
                     if (!irTypeEqual(t->params[j], params[j])) { match = false; break; }
@@ -994,7 +1003,12 @@ static bool irTypeEqual(IrType* a, IrType* b)
         IrTypeKind::Ptr => { return irTypeEqual(a->elem, b->elem); },
         IrTypeKind::Array => { return a->count == b->count && irTypeEqual(a->elem, b->elem); },
         IrTypeKind::Vector => { return a->count == b->count && irTypeEqual(a->elem, b->elem); },
-        IrTypeKind::Struct => { return a->width == b->width; },
+        IrTypeKind::Struct => {
+            if (a->width != b->width || a->nparams != b->nparams) return false;
+            for (u32 i = 0; i < a->nparams; i++)
+                if (!irTypeEqual(a->params[i], b->params[i])) return false;
+            return true;
+        }
         
         IrTypeKind::Func => {
             if (!irTypeEqual(a->ret, b->ret) || a->isVararg != b->isVararg || a->nparams != b->nparams) return false;

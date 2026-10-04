@@ -1,6 +1,14 @@
 import irtypes { IrValue, IrType, IrFunc, IrInst, IrGlobal, IrStringConst };
 import(lib) std::mman { alloc, dealloc };
 
+static str dupStr(str s)
+{
+    u8* b = alloc<u8>(s.len + 1);
+    for (usize i = 0; i < s.len; i++) b[i] = s.ptr[i];
+    b[s.len] = 0;
+    return str::fromParts((const u8*)b, s.len);
+}
+
 pub enum MetadataKind
 {
     DebugInfo,
@@ -21,6 +29,18 @@ pub enum MetadataKind
     Custom
 }
 
+// which payload fields are live — without this an empty string and a zero
+// int are indistinguishable, and the printer cannot round-trip either
+pub enum MetadataValueKind
+{
+    Int,
+    Float,
+    Bool,
+    String,
+    IRValue,
+    Type
+}
+
 pub struct MetadataValue
 {
     MetadataKind kind;
@@ -28,6 +48,8 @@ pub struct MetadataValue
     str strVal;
     IrValue* irVal;
     f64 floatVal;
+    MetadataValueKind vkind;
+    IrType* typeVal;
 }
 
 pub struct MetadataEntry
@@ -66,12 +88,14 @@ pub void addInt(MetadataSet* self, str key, usize val)
     }
 
     MetadataEntry* e = &self.entries[self.numEntries++];
-    e->key = key;
+    e->key = dupStr(key);
     e->value.kind = MetadataKind::Custom;
     e->value.intVal = val;
     e->value.strVal = str::empty();
     e->value.irVal = null;
     e->value.floatVal = 0;
+    e->value.vkind = MetadataValueKind::Int;
+    e->value.typeVal = null;
 }
 
 pub void addString(MetadataSet* self, str key, str val)
@@ -88,12 +112,15 @@ pub void addString(MetadataSet* self, str key, str val)
     }
 
     MetadataEntry* e = &self.entries[self.numEntries++];
-    e->key = key;
+    e->key = dupStr(key);
     e->value.kind = MetadataKind::Custom;
     e->value.intVal = 0;
+    // val's ownership transfers to the set — callers hand over heap buffers
     e->value.strVal = val;
     e->value.irVal = null;
     e->value.floatVal = 0;
+    e->value.vkind = MetadataValueKind::String;
+    e->value.typeVal = null;
 }
 
 pub void addIRValue(MetadataSet* self, str key, IrValue* val)
@@ -110,12 +137,14 @@ pub void addIRValue(MetadataSet* self, str key, IrValue* val)
     }
 
     MetadataEntry* e = &self.entries[self.numEntries++];
-    e->key = key;
+    e->key = dupStr(key);
     e->value.kind = MetadataKind::Custom;
     e->value.intVal = 0;
     e->value.strVal = str::empty();
     e->value.irVal = val;
     e->value.floatVal = 0;
+    e->value.vkind = MetadataValueKind::IRValue;
+    e->value.typeVal = null;
 }
 
 pub void addFloat(MetadataSet* self, str key, f64 val)
@@ -132,12 +161,62 @@ pub void addFloat(MetadataSet* self, str key, f64 val)
     }
 
     MetadataEntry* e = &self.entries[self.numEntries++];
-    e->key = key;
+    e->key = dupStr(key);
     e->value.kind = MetadataKind::Custom;
     e->value.intVal = 0;
     e->value.strVal = str::empty();
     e->value.irVal = null;
     e->value.floatVal = val;
+    e->value.vkind = MetadataValueKind::Float;
+    e->value.typeVal = null;
+}
+
+pub void addBool(MetadataSet* self, str key, bool val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e->key = dupStr(key);
+    e->value.kind = MetadataKind::Custom;
+    e->value.intVal = val ? 1 : 0;
+    e->value.strVal = str::empty();
+    e->value.irVal = null;
+    e->value.floatVal = 0;
+    e->value.vkind = MetadataValueKind::Bool;
+    e->value.typeVal = null;
+}
+
+pub void addType(MetadataSet* self, str key, IrType* val)
+{
+    if (self.numEntries >= self.capEntries)
+    {
+        u32 newCap = self.capEntries ? self.capEntries * 2 : 8;
+        MetadataEntry* newEntries = alloc<MetadataEntry>(newCap);
+        for (u32 i = 0; i < self.numEntries; i++)
+            newEntries[i] = self.entries[i];
+        if (self.entries) dealloc<MetadataEntry>(self.entries);
+        self.entries = newEntries;
+        self.capEntries = newCap;
+    }
+
+    MetadataEntry* e = &self.entries[self.numEntries++];
+    e->key = dupStr(key);
+    e->value.kind = MetadataKind::Custom;
+    e->value.intVal = 0;
+    e->value.strVal = str::empty();
+    e->value.irVal = null;
+    e->value.floatVal = 0;
+    e->value.vkind = MetadataValueKind::Type;
+    e->value.typeVal = val;
 }
 
 pub MetadataEntry* find(MetadataSet* self, str key)
@@ -152,6 +231,13 @@ pub MetadataEntry* find(MetadataSet* self, str key)
 
 pub void free(MetadataSet* self)
 {
+    for (u32 i = 0; i < self.numEntries; i++)
+    {
+        MetadataEntry* e = &self.entries[i];
+        if (e->key.ptr) dealloc<u8>((u8*)e->key.ptr);
+        if (e->value.vkind == MetadataValueKind::String && e->value.strVal.ptr)
+            dealloc<u8>((u8*)e->value.strVal.ptr);
+    }
     if (self.entries) dealloc<MetadataEntry>(self.entries);
     self.entries = null;
     self.numEntries = 0;

@@ -2,6 +2,14 @@ import irtypes;
 import irOps;
 import(lib) std;
 
+static str dupStr(str s)
+{
+    u8* b = std::mman::alloc<u8>(s.len + 1);
+    for (usize i = 0; i < s.len; i++) b[i] = s.ptr[i];
+    b[s.len] = 0;
+    return str::fromParts((const u8*)b, s.len);
+}
+
 pub struct IrBuilder
 {
     irtypes::IrContext* ctx;
@@ -374,15 +382,20 @@ pub struct IrBuilder
         return self.createInst(irOps::IrOpcode::InsertElement, v->type, ops, 3, 0, 0);
     }
 
-    irtypes::IrInst* inlineAsm(str asmStr, irtypes::IrValue** args, u32 nargs, irtypes::IrType* retTy)
+    // the three strings copy into the instruction (matching the parser's
+    // owned-buffer convention), and volatile lands in asmNumSideEffects —
+    // operands are the values the template may touch, nothing else
+    irtypes::IrInst* inlineAsm(str tmpl, str constraints, str clobbers, bool isVolatile,
+                              irtypes::IrValue** args, u32 nargs, irtypes::IrType* retTy)
     {
-        irtypes::IrValue** ops = self.allocOps(nargs + 1);
-        irtypes::IrType* asmType = self.ctx->tyPtr(self.ctx->tyInt(8));
-        irtypes::IrValue* asmStrVal = self.ctx->constInt(asmType, (u64)asmStr);
-        ops[0] = asmStrVal;
-        for (u32 i = 0; i < nargs; i++)
-            ops[i + 1] = args[i];
-        return self.createInst(irOps::IrOpcode::InlineAsm, retTy ? retTy : self.ctx->tyVoid(), ops, nargs + 1, 0, 0);
+        irtypes::IrValue** ops = self.allocOps(nargs);
+        for (u32 i = 0; i < nargs; i++) ops[i] = args[i];
+        irtypes::IrInst* inst = self.createInst(irOps::IrOpcode::InlineAsm, retTy ? retTy : self.ctx->tyVoid(), ops, nargs, 0, 0);
+        inst->asmString = dupStr(tmpl);
+        inst->asmConstraints = dupStr(constraints);
+        inst->asmClobbers = dupStr(clobbers);
+        inst->asmNumSideEffects = isVolatile ? 1 : 0;
+        return inst;
     }
 
     // atomics
