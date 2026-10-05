@@ -3,6 +3,7 @@ import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred, IrAtomicOrdering, 
 import(lib) wallvm::irMetadata { MetadataSet, attachInstMetadata, attachFuncMetadata, attachGlobalMetadata, attachStringMetadata, addInt, addString, addIRValue, addFloat, addBool, addType };
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) core::cchar { cchar };
+import(lib) platform::libc { strtod };
 
 // what a deferred name patches when its scope closes
 enum FixupTarget
@@ -361,6 +362,7 @@ static NumToken parseNumber(IrParser* p)
     t.u = 0;
     t.f = 0;
     bool neg = false;
+    usize tokStart = p->pos;
     if (p->cur == '-') { neg = true; advance(p); }
     if (p->cur == '0' && (peekByte(p, 1) == 'x' || peekByte(p, 1) == 'X'))
     {
@@ -387,19 +389,11 @@ static NumToken parseNumber(IrParser* p)
         dec = dec * 10 + (u64)(p->cur - '0');
         advance(p);
     }
-    f64 val = (f64)dec;
     if (p->cur == '.')
     {
         t.isFloat = true;
         advance(p);
-        f64 frac = 0;
-        f64 scale = 0.1;
-        while (p->cur >= '0' && p->cur <= '9') {
-            frac = frac + (f64)(p->cur - '0') * scale;
-            scale = scale * 0.1;
-            advance(p);
-        }
-        val = val + frac;
+        while (p->cur >= '0' && p->cur <= '9') advance(p);
     }
     if (p->cur == 'e' || p->cur == 'E')
     {
@@ -408,23 +402,21 @@ static NumToken parseNumber(IrParser* p)
         {
             t.isFloat = true;
             advance(p);
-            bool eneg = false;
-            if (p->cur == '+' || p->cur == '-') { eneg = p->cur == '-'; advance(p); }
-            u64 mag = 0;
-            while (p->cur >= '0' && p->cur <= '9') {
-                mag = mag * 10 + (u64)(p->cur - '0');
-                advance(p);
-            }
-            f64 r = 1;
-            if (mag > 1000) mag = 1000;
-            for (u64 k = 0; k < mag; k = k + 1) r = r * 10;
-            if (eneg) val = val / r;
-            else val = val * r;
+            if (p->cur == '+' || p->cur == '-') advance(p);
+            while (p->cur >= '0' && p->cur <= '9') advance(p);
         }
     }
-    if (t.isFloat) t.f = neg ? -val : val;
-    else t.i = neg ? -(i64)dec : (i64)dec;
-    t.u = (u64)t.i;
+    if (t.isFloat)
+    {
+        // strtod over the exact token span (the '-' included) so the value
+        // is the correctly rounded double, not accumulated-digit slop
+        t.f = strtod((const cchar*)(p->input.ptr + tokStart), null);
+    }
+    else
+    {
+        t.i = neg ? -(i64)dec : (i64)dec;
+        t.u = (u64)t.i;
+    }
     return t;
 }
 
