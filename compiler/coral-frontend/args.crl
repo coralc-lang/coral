@@ -6,7 +6,7 @@ mod io_mod = import "io" { readCmdline, sliceCStr };
 extern("C") i32 printf(u8* fmt, ...);
 
 pub enum Command { Build, Map, Init, Run, Compile }
-pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Out, Other, EmitHir }
+pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Out, Other, EmitHir, Set }
 
 pub struct Options
 {
@@ -21,6 +21,9 @@ pub struct Options
     bool mapOnly;
     bool strict;
     bool emitHir;
+    Slice* flagNames;
+    Slice* flagValues;
+    u32 flagsCount;
 }
 
 bool aEq(Slice a, u8* b, usize bl)
@@ -56,7 +59,7 @@ Flag classifyFlag(Slice a)
             if (aEq(a, "-f", 2)) return Flag::File;
             if (aEq(a, "-o", 2)) return Flag::Out;
         },
-        6 => { if (aEq(a, "--help", 6)) return Flag::Help; },
+        6 => { if (aEq(a, "--help", 6)) return Flag::Help; if (aEq(a, "--flag", 6)) return Flag::Set; },
         7 => { if (aEq(a, "--force", 7)) return Flag::Force; },
             8 => { if (aEq(a, "--strict", 8)) return Flag::Strict; },
         9 => { if (aEq(a, "--dry-run", 9)) return Flag::DryRun; },
@@ -98,6 +101,9 @@ pub bool parseArgs(Options* opts)
     opts->mapOnly = false;
     opts->strict = false;
     opts->emitHir = false;
+    opts->flagsCount = 0;
+    opts->flagNames = null;
+    opts->flagValues = null;
 
     Slice argv = readCmdline();
     if (argv.ptr == null) return false;
@@ -120,6 +126,40 @@ pub bool parseArgs(Options* opts)
             Flag::MapOnly => { opts->mapOnly = true; continue; },
             Flag::Strict => { opts->strict = true; continue; },
             Flag::EmitHir => { opts->emitHir = true; continue; },
+            Flag::Set => {
+                Slice val;
+                pos = nextArg(argv, pos, &val);
+                if (val.len == 0)
+                {
+                    printf("coral: --flag needs NAME=VALUE\n");
+                    return false;
+                }
+                usize eq = 0;
+                u32 k = 0;
+                while (k < val.len)
+                {
+                    if (val.ptr[k] == 61) { eq = 1; break; }
+                    k = k + 1;
+                }
+                if (eq)
+                {
+                    if (opts->flagsCount < 32)
+                    {
+                        if (opts->flagNames == null)
+                        {
+                            opts->flagNames = (Slice*)malloc(32 * sizeof(Slice));
+                            opts->flagValues = (Slice*)malloc(32 * sizeof(Slice));
+                        }
+                        if (opts->flagNames != null)
+                        {
+                            opts->flagNames[opts->flagsCount] = Slice::from(val.ptr, k);
+                            opts->flagValues[opts->flagsCount] = Slice::from(val.ptr + k + 1, val.len - k - 1);
+                            opts->flagsCount = opts->flagsCount + 1;
+                        }
+                    }
+                }
+                continue;
+            },
             Flag::File => {
                 Slice val;
                 pos = nextArg(argv, pos, &val);

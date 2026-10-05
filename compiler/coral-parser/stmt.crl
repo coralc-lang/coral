@@ -99,6 +99,8 @@ pub extend Parser
             return self.parseBlock();
         if (self.current.kind == TokenKind::Comptime)
             return self.parseComptimeStmt();
+        if (self.current.kind == TokenKind::Flag)
+            return self.parseFlagStmt();
         if (self.current.kind == TokenKind::Asm || self.current.kind == TokenKind::Volatile)
             return self.parseAsmStmt();
         return self.parseExprOrDecl();
@@ -351,6 +353,77 @@ pub extend Parser
         return self.storeStmt(StmtKind::Block{ .stmts = values, .stmtsLen = count });
     }
 
+
+    /* flag (NAME) { key => { stmts }, else => { stmts } } — statement form.
+
+     * The matching arm is selected at parse time by the compiler's flag
+     * table (CLI `--flag NAME=VALUE`); the other arms are dead code. No
+     * else-arm is an error if nothing matches. */
+    NodeId parseFlagStmt()
+    {
+        self.advance(); /* flag */
+        self.expect(TokenKind::LParen);
+        Token tknn = self.expect(TokenKind::Ident);
+        Str nameStr = self.ctx.intern(tknn.data.ptr, tknn.data.len);
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        NodeId chosenNodeId = self.noneNode();
+        NodeId elseNodeId = self.noneNode();
+
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            Str keyStr = 0;
+            if (self.match(TokenKind::Else)) isElse = true;
+            else
+            {
+                Token ky = self.expect(TokenKind::Ident);
+                keyStr = self.ctx.intern(ky.data.ptr, ky.data.len);
+            }
+            self.expect(TokenKind::FatArrow);
+            /* branch body: either a block `{ ... }` or a single statement */
+            NodeId bl = self.noneNode();
+            if (self.match(TokenKind::LBrace))
+            {
+                NodeListBuilder stl;
+                self.ctx.nodeListInit(&stl);
+                while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+                {
+                    NodeId st = self.parseStmt();
+                    if (!self.ctx.nodeListAppend(&stl, st)) self.addError();
+                }
+                self.expect(TokenKind::RBrace);
+                u32 countIdx = stl.len;
+                NodeId* vals = self.ctx.nodeListFinish(&stl);
+                bl = self.storeStmt(StmtKind::Block{ .stmts = vals, .stmtsLen = countIdx });
+            }
+            else
+            {
+                bl = self.parseStmt();
+            }
+
+            /* match logic */
+            if (isElse) elseNodeId = bl;
+            else
+            {
+                Str flagValStr = 0;
+                u32 ii = 0;
+                while (ii < self.ctx->flagsLen)
+                {
+                    if (self.ctx->flagNames[ii] == nameStr) { flagValStr = self.ctx->flagValues[ii]; break; }
+                    ii = ii + 1;
+                }
+                if (flagValStr != 0 && flagValStr == keyStr) chosenNodeId = bl;
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        if (chosenNodeId.index != 0) return chosenNodeId;
+        if (elseNodeId.index != 0) return elseNodeId;
+        self.addError();
+        return self.noneNode();
+    }
     NodeId parseComptimeStmt()
     {
         self.advance();

@@ -12,6 +12,10 @@ mod codegen_mod = import "../coral-backend/codegen";
 import codegen_mod { generateC, CodegenResult };
 mod hir_mod = import "../coral-hir/hir";
 import hir_mod { build, printHir, HirModule };
+mod crlb_mod = import "../coral-build/parser";
+import crlb_mod { CrlbParser };
+mod ast_mod = import "../coral-build/ast";
+import ast_mod { CrlbNode, CrlbNodeKind, Value, ValueArray };
 
 extern("C") i32 printf(u8* fmt, ...);
 extern("C") i32 system(const char* cmd);
@@ -60,7 +64,75 @@ pub i32 compileFile(Options* opts)
         return 1;
     }
 
-    CompileUnit unit = analyzeForCompile(src.ptr, len, inC);
+    /* also surfacing build-file flags: the manifest's `flags = [ "NAME=VALUE",
+     * ... ]` list merges into the compile-time flag table (see Options).  */
+    if (opts->buildFileSet)
+    {
+        usize fbuflen = 0;
+        Slice fsrc = readFile(sliceCStr(opts->buildFile), &fbuflen);
+        if (fsrc.ptr != null && fbuflen > 0)
+        {
+            Arena fa;
+            fa.init(1 << 18);
+            CrlbParser fp;
+            fp.init(&fa, fsrc);
+            CrlbNode* rootp = fp.parseFile();
+            if (rootp != null && fp.errors == 0)
+            {
+                u32 bi = 0;
+                while (bi < rootp.children.len)
+                {
+                    CrlbNode* c = rootp.children.data + bi;
+                    if (c.kind == CrlbNodeKind::Build)
+                    {
+                        /* find fields. */
+                        u32 fi = 0;
+                        while (fi < c.fields.len)
+                        {
+                            CrlbField* f = c.fields.data + fi;
+                            if (f.name.len == 5 && f.name.ptr[0] == 102 && f.name.ptr[1] == 108 && f.name.ptr[2] == 97 && f.name.ptr[3] == 103 && f.name.ptr[4] == 115)
+                            {
+                                /* Value::List */
+                                u32 vi = 0;
+                                ValueArray* va = f.value.payload.List.value;
+                                if (va != null) {
+                                while (vi < va.len)
+                                {
+                                    Value* v = va.data + vi;
+                                    if (v.tag == Value::String)
+                                    {
+                                        usize si = 0;
+                                        usize ev = v.payload.String.value.len;
+                                        while (si < ev)
+                                        {
+                                            if (v.payload.String.value.ptr[si] == 61) break;
+                                            si = si + 1;
+                                        }
+                                        if (si > 0 && si < ev && opts->flagsCount < 32)
+                                        {
+                                            if (opts->flagNames == null)
+                                            {
+                                                opts->flagNames = (Slice*)malloc(32 * sizeof(Slice));
+                                                opts->flagValues = (Slice*)malloc(32 * sizeof(Slice));
+                                            }
+                                            opts->flagNames[opts->flagsCount] = Slice::from(v.payload.String.value.ptr, (u32)si);
+                                            opts->flagValues[opts->flagsCount] = Slice::from(v.payload.String.value.ptr + si + 1, ev - si - 1);
+                                            opts->flagsCount = opts->flagsCount + 1;
+                                        }
+                                    }
+                                    vi = vi + 1;
+                                }
+                                }
+                            }
+                            fi = fi + 1;
+                        }
+                    }
+                    bi = bi + 1;
+                }
+            }
+        }
+    }
+    CompileUnit unit = analyzeForCompile(src.ptr, len, inC, opts->flagNames, opts->flagValues, opts->flagsCount);
     if (unit.ctx == null) {
         printf("coral: compile failed, errors=%d (parse=%d sema=%d mono=%d)\n",
                (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors),

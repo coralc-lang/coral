@@ -319,6 +319,63 @@ pub extend Parser
         return expr;
     }
 
+    /* flag (NAME) { key => expr, else => expr } — compile-time selection
+     * of a matching arm from the flag table set by `--flag`/manifest. */
+    NodeId parseFlagExpr()
+    {
+        self.advance(); /* flag */
+        self.expect(TokenKind::LParen);
+        Token tknn = self.expect(TokenKind::Ident);
+        Str nameStr = self.ctx.intern(tknn.data.ptr, tknn.data.len);
+        self.expect(TokenKind::RParen);
+        self.expect(TokenKind::LBrace);
+
+        NodeId chosenNodeId = self.noneNode();
+        NodeId elseNodeId = self.noneNode();
+
+        while (!self.atEnd() && self.current.kind != TokenKind::RBrace)
+        {
+            bool isElse = false;
+            Str keyStr = 0;
+            if (self.match(TokenKind::Else)) isElse = true;
+            else
+            {
+                Token ky = self.expect(TokenKind::Ident);
+                keyStr = self.ctx.intern(ky.data.ptr, ky.data.len);
+            }
+            self.expect(TokenKind::FatArrow);
+            NodeId bodyNodeId = self.noneNode();
+            if (self.current.kind == TokenKind::LBrace)
+            {
+                self.advance();
+                bodyNodeId = self.parseExpr();
+                self.expect(TokenKind::RBrace);
+            }
+            else
+            {
+                bodyNodeId = self.parseExpr();
+            }
+            if (isElse) elseNodeId = bodyNodeId;
+            else
+            {
+                Str flagValStr = 0;
+                u32 ii = 0;
+                while (ii < self.ctx->flagsLen)
+                {
+                    if (self.ctx->flagNames[ii] == nameStr) { flagValStr = self.ctx->flagValues[ii]; break; }
+                    ii = ii + 1;
+                }
+                if (flagValStr != 0 && flagValStr == keyStr) chosenNodeId = bodyNodeId;
+            }
+            if (!self.match(TokenKind::Comma)) break;
+        }
+        self.expect(TokenKind::RBrace);
+        if (chosenNodeId.index != 0) return chosenNodeId;
+        if (elseNodeId.index != 0) return elseNodeId;
+        self.addError();
+        return self.noneNode();
+    }
+
     NodeId parsePrimaryExpr()
     {
         TokenKind k = self.current.kind;
@@ -565,6 +622,8 @@ pub extend Parser
                 return self.storeExpr(ExprKind::BuiltinCall{ .name = self.ctx.intern("assert", 6), .args = bargValues, .argsLen = bargCount });
             },
             
+            TokenKind::Flag => { return self.parseFlagExpr(); },
+
             TokenKind::At => {
                 self.advance();
                 Str bname;
