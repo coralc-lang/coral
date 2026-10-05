@@ -1,0 +1,808 @@
+import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValue, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode, IrICmpPred, IrFCmpPred };
+import(lib) std::mman { alloc, dealloc, copy };
+import(lib) platform::libc { snprintf };
+import(lib) core::cchar { cchar };
+
+// bit punning for float literals — I keep the pair beside the imports it needs
+static f64 f64OfU64(u64 b)
+{
+    f64 d;
+    copy<cchar>((cchar*)&d, (cchar*)&b, 8);
+    return d;
+}
+
+static f32 f32OfU32(u32 b)
+{
+    f32 f;
+    copy<cchar>((cchar*)&f, (cchar*)&b, 4);
+    return f;
+}
+
+// WebAssembly code generator, WAT text format. The stack machine does
+// the job regalloc would otherwise do — values live on the operand
+// stack — which is exactly why this target can port before the register
+// allocator and asm rules exist for the native backends.
+
+pub struct WasmEmitter
+{
+    IrContext* ctx;
+    IrModule* modd;
+    cchar* output;
+    u32 outputLen;
+    u32 outputCap;
+    u32 indent;
+    u32 labelCounter;
+
+    void init(IrContext* ctx, IrModule* modd)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.output = null;
+        self.outputLen = 0;
+        self.outputCap = 0;
+        self.indent = 0;
+        self.labelCounter = 0;
+    }
+
+    u32 nextLabel()
+    {
+        return self.labelCounter++;
+    }
+
+    void emit(const cchar* s)
+    {
+        if (s == null) return;
+        u32 len = 0;
+        while (s[len] != 0) len = len + 1;
+        if (self.outputLen + len + 1 > self.outputCap)
+        {
+            u32 newCap = self.outputCap != 0 ? self.outputCap * 2 : 8192;
+            // one doubling does not guarantee room for a literal longer
+            // than the whole buffer, keep growing until it fits
+            while (self.outputLen + len + 1 > newCap) newCap = newCap * 2;
+            cchar* buf = alloc<cchar>(newCap);
+            if (self.output != null)
+            {
+                for (u32 i = 0; i < self.outputLen; i++)
+                    buf[i] = self.output[i];
+                dealloc<cchar>(self.output);
+            }
+            self.output = buf;
+            self.outputCap = newCap;
+        }
+        for (u32 i = 0; i < len; i++)
+            self.output[self.outputLen + i] = s[i];
+        self.outputLen = self.outputLen + len;
+        self.output[self.outputLen] = 0;
+    }
+
+    void emitChar(cchar c)
+    {
+        cchar tmp[2];
+        tmp[0] = c;
+        tmp[1] = 0;
+        self.emit(tmp);
+    }
+
+    void emitLine(const cchar* s)
+    {
+        for (u32 i = 0; i < self.indent; i++)
+            self.emit("  ");
+        self.emit(s);
+        self.emit("\n");
+    }
+
+    void emitU64(u64 val)
+    {
+        if (val == 0)
+        {
+            self.emit("0");
+            return;
+        }
+        u8 buf[24];
+        u32 n = 0;
+        u64 v = val;
+        while (v != 0)
+        {
+            buf[n] = (u8)('0' + (v % 10));
+            v = v / 10;
+            n = n + 1;
+        }
+        while (n > 0)
+        {
+            n = n - 1;
+            self.emitChar((cchar)buf[n]);
+        }
+    }
+
+    void emitU32(u32 val)
+    {
+        self.emitU64((u64)val);
+    }
+
+    void emitI64(i64 val)
+    {
+        if (val < 0)
+        {
+            self.emit("-");
+            // the plain -val overflows on the most negative i64, the
+            // +1/−1 dance walks around it without ever negating it
+            u64 mag = (u64)(-(val + 1)) + 1u;
+            self.emitU64(mag);
+        }
+        else self.emitU64((u64)val);
+    }
+
+    // WAT wants the number itself, the old hex dump wrote the raw bit
+    // pattern where a numeric literal belongs, so pi arrived as 0x400921fb...
+    void emitDoubleLiteral(f64 v)
+    {
+        u64 bits = 0;
+        copy<cchar>((cchar*)&bits, (cchar*)&v, 8);
+        u64 exp = (bits >> 52) & 0x7FF;
+        u64 man = bits & 0xFFFFFFFFFFFFF;
+        if (exp == 0x7FF)
+        {
+            if ((bits >> 63) != 0) self.emit("-");
+            if (man == 0) self.emit("inf");
+            else self.emit("nan");
+            return;
+        }
+        cchar buf[40];
+        snprintf(buf, 40, "%.17g", v);
+        self.emit(buf);
+    }
+
+    void emitType(IrType* ty)
+    {
+        if (ty == null) { self.emit("void"); return; }
+        switch (ty->kind)
+        {
+            IrTypeKind::Void => { self.emit("void"); },
+            IrTypeKind::Int =>
+            {
+                if (ty->width <= 32) self.emit("i32");
+                else self.emit("i64");
+            },
+            IrTypeKind::Float =>
+            {
+                if (ty->width <= 32) self.emit("f32");
+                else self.emit("f64");
+            },
+            IrTypeKind::Ptr => { self.emit("i32"); },
+            else => { self.emit("i32"); }
+        }
+    }
+
+    const cchar* getOutput() { return self.output; }
+}
+
+pub struct WasmCodeGen
+{
+    IrContext* ctx;
+    IrModule* modd;
+    WasmEmitter emitter;
+
+    void init(IrContext* ctx, IrModule* modd)
+    {
+        self.ctx = ctx;
+        self.modd = modd;
+        self.emitter.init(ctx, modd);
+    }
+
+    void emitModule()
+    {
+        self.emitter.emitLine("(module");
+        self.emitter.indent = self.emitter.indent + 1;
+
+        self.emitter.emitLine("(memory $0 1 256)");
+        self.emitter.emitLine("(global $__heap_base (mut i32) (i32.const 65536))");
+        self.emitter.emitLine("(global $__stack_pointer (mut i32) (i32.const 1048576))");
+
+        self.emitter.emit("(func $malloc (param $size i32) (result i32)");
+        self.emitter.indent = self.emitter.indent + 1;
+        self.emitter.emitLine("local $ptr i32");
+        self.emitter.emitLine("global.get $__heap_base");
+        self.emitter.emitLine("local.set $ptr");
+        self.emitter.emitLine("global.get $__heap_base");
+        self.emitter.emitLine("local.get $size");
+        self.emitter.emitLine("i32.add");
+        self.emitter.emitLine("global.set $__heap_base");
+        self.emitter.emitLine("local.get $ptr");
+        self.emitter.indent = self.emitter.indent - 1;
+        self.emitter.emitLine(")");
+
+        self.emitter.emit("(func $grow_memory (param $pages i32) (result i32)");
+        self.emitter.indent = self.emitter.indent + 1;
+        self.emitter.emitLine("local.get $pages");
+        self.emitter.emitLine("memory.grow");
+        self.emitter.indent = self.emitter.indent - 1;
+        self.emitter.emitLine(")");
+
+        // Table section for indirect calls
+        u32 nFuncs = 0;
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+            nFuncs = nFuncs + 1;
+        }
+        if (nFuncs > 0)
+        {
+            self.emitter.emit("(table ");
+            self.emitter.emitU32(nFuncs);
+            self.emitter.emitLine(" funcref)");
+        }
+
+        // Type section
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+
+            self.emitter.emit("(type $t");
+            self.emitter.emitU32(fi);
+            self.emitter.emit(" (func (param");
+            for (u32 pi = 0; pi < func->nparams; pi++)
+            {
+                self.emitter.emit(" ");
+                self.emitter.emitType(func->paramTypes[pi]);
+            }
+            bool hasRet = func->retType != null && func->retType->kind != IrTypeKind::Void;
+            if (hasRet) {
+                self.emitter.emit(") (result ");
+                self.emitter.emitType(func->retType);
+                self.emitter.emitLine(")))");
+            }
+            else {
+                self.emitter.emitLine(")))");
+            }
+        }
+
+        // Import section
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || !func->isExtern) continue;
+
+            self.emitter.emit("(import \"env\" \"");
+            self.emitter.emit(func->base.name);
+            self.emitter.emit("\" (func $");
+            self.emitter.emit(func->base.name);
+            self.emitter.emit(" (param");
+            for (u32 pi = 0; pi < func->nparams; pi++)
+            {
+                self.emitter.emit(" ");
+                self.emitter.emitType(func->paramTypes[pi]);
+            }
+            bool hasRet = func->retType != null && func->retType->kind != IrTypeKind::Void;
+            if (hasRet) {
+                self.emitter.emit(") (result ");
+                self.emitter.emitType(func->retType);
+                self.emitter.emitLine(")))");
+            }
+            else {
+                self.emitter.emitLine(")))");
+            }
+        }
+
+        // Function section
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+
+            self.emitter.emit("(func $");
+            self.emitter.emit(func->base.name);
+            self.emitter.emit(" (type $t");
+            self.emitter.emitU32(fi);
+            self.emitter.emitLine(")");
+            self.emitter.indent = self.emitter.indent + 1;
+            self.emitFunc(func);
+            self.emitter.indent = self.emitter.indent - 1;
+            self.emitter.emitLine(")");
+        }
+
+        // Elem section for indirect calls
+        self.emitter.emit("(elem (i32.const 0)");
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+            self.emitter.emit(" $");
+            self.emitter.emit(func->base.name);
+        }
+        self.emitter.emitLine(")");
+
+        // Export main
+        for (u32 fi = 0; fi < self.modd->nfuncs; fi++)
+        {
+            IrFunc* func = self.modd->funcs[fi];
+            if (func == null || func->isExtern) continue;
+            const cchar* nm = func->base.name;
+            if (nm != null && nm[0] == 'm' && nm[1] == 'a' && nm[2] == 'i' && nm[3] == 'n')
+            {
+                self.emitter.emit("(export \"main\" (func $");
+                self.emitter.emit(nm);
+                self.emitter.emitLine("))");
+            }
+        }
+
+        self.emitter.emitLine("(export \"malloc\" (func $malloc))");
+        self.emitter.emitLine("(export \"grow_memory\" (func $grow_memory))");
+        self.emitter.emitLine("(export \"memory\" (memory $0))");
+
+        self.emitter.indent = self.emitter.indent - 1;
+        self.emitter.emitLine(")");
+    }
+
+    // NOTE: Each basic block is emitted as block $name ... end.
+    // This is correct for straight-line code but incorrect for arbitrary CFGs
+    // with multiple predecessors/successors. The correct approach is to use
+    // the function body as one block with nested blocks for loops and
+    // conditional branches using br/br_if.
+    void emitFunc(IrFunc* func)
+    {
+        self.emitter.emitLine("(local $alloca_ptr i32)");
+        self.emitter.emitLine("(local $abs_tmp i32)");
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            self.emitter.emit("block $");
+            self.emitter.emit(bb->base.name);
+            self.emitter.emit("\n");
+            self.emitter.indent = self.emitter.indent + 1;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+                self.emitInst(bb->insts[ii]);
+            self.emitter.indent = self.emitter.indent - 1;
+            self.emitter.emitLine("end");
+        }
+    }
+
+    void emitInst(IrInst* inst)
+    {
+        switch (inst->opcode)
+        {
+            IrOpcode::Add => { self.emitBinOp(inst, "i32.add", "i64.add"); },
+            IrOpcode::Sub => { self.emitBinOp(inst, "i32.sub", "i64.sub"); },
+            IrOpcode::Mul => { self.emitBinOp(inst, "i32.mul", "i64.mul"); },
+            IrOpcode::SDiv => { self.emitBinOp(inst, "i32.div_s", "i64.div_s"); },
+            IrOpcode::UDiv => { self.emitBinOp(inst, "i32.div_u", "i64.div_u"); },
+            IrOpcode::SRem => { self.emitBinOp(inst, "i32.rem_s", "i64.rem_s"); },
+            IrOpcode::URem => { self.emitBinOp(inst, "i32.rem_u", "i64.rem_u"); },
+            IrOpcode::And => { self.emitBinOp(inst, "i32.and", "i64.and"); },
+            IrOpcode::Or => { self.emitBinOp(inst, "i32.or", "i64.or"); },
+            IrOpcode::Xor => { self.emitBinOp(inst, "i32.xor", "i64.xor"); },
+            IrOpcode::Shl => { self.emitBinOp(inst, "i32.shl", "i64.shl"); },
+            IrOpcode::Ashr => { self.emitBinOp(inst, "i32.shr_s", "i64.shr_s"); },
+            IrOpcode::Lshr => { self.emitBinOp(inst, "i32.shr_u", "i64.shr_u"); },
+            IrOpcode::Neg =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                self.emitter.emitLine(is64 ? "i64.const 0" : "i32.const 0");
+                self.emitter.emitLine(is64 ? "i64.sub" : "i32.sub");
+            },
+            IrOpcode::Not =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                self.emitter.emitLine(is64 ? "i64.const -1" : "i32.const -1");
+                self.emitter.emitLine(is64 ? "i64.xor" : "i32.xor");
+            },
+            IrOpcode::FAdd => { self.emitBinOp(inst, "f32.add", "f64.add"); },
+            IrOpcode::FSub => { self.emitBinOp(inst, "f32.sub", "f64.sub"); },
+            IrOpcode::FMul => { self.emitBinOp(inst, "f32.mul", "f64.mul"); },
+            IrOpcode::FDiv => { self.emitBinOp(inst, "f32.div", "f64.div"); },
+            IrOpcode::FAbs =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                if (inst->base.type != null && inst->base.type->width > 32)
+                    self.emitter.emitLine("f64.abs");
+                else
+                    self.emitter.emitLine("f32.abs");
+            },
+            IrOpcode::FSqrt =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                if (inst->base.type != null && inst->base.type->width > 32)
+                    self.emitter.emitLine("f64.sqrt");
+                else
+                    self.emitter.emitLine("f32.sqrt");
+            },
+            IrOpcode::Load => { self.emitLoadType(inst); },
+            IrOpcode::Store => { self.emitStoreType(inst); },
+            IrOpcode::Alloca =>
+            {
+                u32 allocSize = 16;
+                if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                {
+                    allocSize = (u32)inst->ops[0]->valData;
+                    allocSize = (allocSize + 15) & 0xFFFFFFF0;
+                }
+                self.emitter.emitLine("global.get $__stack_pointer");
+                self.emitter.emitLine("local.tee $alloca_ptr");
+                if (inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->kind == IrValueKind::ConstInt)
+                {
+                    self.emitter.emit("i32.const ");
+                    self.emitter.emitU32(allocSize);
+                    self.emitter.emitLine("");
+                }
+                else
+                {
+                    if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                    self.emitter.emitLine("i32.const 15");
+                    self.emitter.emitLine("i32.add");
+                    self.emitter.emitLine("i32.const -16");
+                    self.emitter.emitLine("i32.and");
+                }
+                self.emitter.emitLine("i32.sub");
+                self.emitter.emitLine("global.set $__stack_pointer");
+                self.emitter.emitLine("local.get $alloca_ptr");
+            },
+            IrOpcode::Gep =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+                self.emitter.emitLine("i32.add");
+            },
+            IrOpcode::Br =>
+            {
+                if (inst->nops > 0 && inst->ops[0] != null)
+                {
+                    self.emitter.emit("br $");
+                    self.emitter.emitLine(inst->ops[0]->name);
+                }
+            },
+            IrOpcode::CondBr =>
+            {
+                if (inst->nops >= 3)
+                {
+                    if (inst->ops[0] != null) self.emitValuePush(inst->ops[0]);
+                    self.emitter.emit("br_if $");
+                    self.emitter.emitLine(inst->ops[1]->name);
+                    self.emitter.emit("br $");
+                    self.emitter.emitLine(inst->ops[2]->name);
+                }
+            },
+            IrOpcode::Ret =>
+            {
+                if (inst->nops > 0 && inst->ops[0] != null)
+                {
+                    self.emitValuePush(inst->ops[0]);
+                }
+                self.emitter.emitLine("return");
+            },
+            IrOpcode::ICmp => { self.emitICmp(inst); },
+            IrOpcode::FCmp => { self.emitFCmp(inst); },
+            IrOpcode::Call =>
+            {
+                if (inst->nops > 0 && inst->ops[0] != null)
+                {
+                    for (u32 i = 1; i < inst->nops; i++)
+                        self.emitValuePush(inst->ops[i]);
+                    self.emitter.emit("call $");
+                    self.emitter.emitLine(inst->ops[0]->name);
+                }
+            },
+            IrOpcode::Select =>
+            {
+                if (inst->nops >= 3)
+                {
+                    if (inst->ops[0] != null) self.emitValuePush(inst->ops[0]);
+                    self.emitter.emitLine("if (result i32)");
+                    self.emitter.indent = self.emitter.indent + 1;
+                    if (inst->ops[1] != null) self.emitValuePush(inst->ops[1]);
+                    self.emitter.indent = self.emitter.indent - 1;
+                    self.emitter.emitLine("else");
+                    self.emitter.indent = self.emitter.indent + 1;
+                    if (inst->ops[2] != null) self.emitValuePush(inst->ops[2]);
+                    self.emitter.indent = self.emitter.indent - 1;
+                    self.emitter.emitLine("end");
+                }
+            },
+            IrOpcode::SiToFp =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool srcIs64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                bool dstIs64 = inst->base.type != null && inst->base.type->width > 32;
+                if (dstIs64)
+                    self.emitter.emitLine(srcIs64 ? "f64.convert_s/i64" : "f64.convert_s/i32");
+                else
+                    self.emitter.emitLine(srcIs64 ? "f32.convert_s/i64" : "f32.convert_s/i32");
+            },
+            IrOpcode::FpToSi =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool dstIs64 = inst->base.type != null && inst->base.type->width > 32;
+                bool srcIs64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                if (dstIs64)
+                    self.emitter.emitLine(srcIs64 ? "i64.trunc_s/f64" : "i64.trunc_s/f32");
+                else
+                    self.emitter.emitLine(srcIs64 ? "i32.trunc_s/f64" : "i32.trunc_s/f32");
+            },
+            IrOpcode::FpToUi =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool dstIs64 = inst->base.type != null && inst->base.type->width > 32;
+                bool srcIs64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                if (dstIs64)
+                    self.emitter.emitLine(srcIs64 ? "i64.trunc_u/f64" : "i64.trunc_u/f32");
+                else
+                    self.emitter.emitLine(srcIs64 ? "i32.trunc_u/f64" : "i32.trunc_u/f32");
+            },
+            IrOpcode::UiToFp =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool srcIs64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                bool dstIs64 = inst->base.type != null && inst->base.type->width > 32;
+                if (dstIs64)
+                    self.emitter.emitLine(srcIs64 ? "f64.convert_u/i64" : "f64.convert_u/i32");
+                else
+                    self.emitter.emitLine(srcIs64 ? "f32.convert_u/i64" : "f32.convert_u/i32");
+            },
+            IrOpcode::FpTrunc =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                self.emitter.emitLine("f32.demote/f64");
+            },
+            IrOpcode::FpExt =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                self.emitter.emitLine("f64.promote/f32");
+            },
+            IrOpcode::Trunc =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                self.emitter.emitLine("i32.wrap_i64");
+            },
+            IrOpcode::Zext =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                u32 srcWidth = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 32;
+                if (srcWidth <= 8)
+                {
+                    self.emitter.emitLine("i32.const 0xFF");
+                    self.emitter.emitLine("i32.and");
+                }
+                else if (srcWidth <= 16)
+                {
+                    self.emitter.emitLine("i32.const 0xFFFF");
+                    self.emitter.emitLine("i32.and");
+                }
+                else if (srcWidth > 32)
+                {
+                    self.emitter.emitLine("i32.wrap_i64");
+                }
+                // else: i32->i32 zero extend is a no-op
+            },
+            IrOpcode::Sext =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                u32 srcWidth = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 32;
+                if (srcWidth <= 8)
+                    self.emitter.emitLine("i32.extend8_s");
+                else if (srcWidth <= 16)
+                    self.emitter.emitLine("i32.extend16_s");
+                // else: i32->i32 sign extend is a no-op
+            },
+            IrOpcode::Bitcast => { if (inst->nops > 0) self.emitValuePush(inst->ops[0]); },
+            IrOpcode::Unreachable => { self.emitter.emitLine("unreachable"); },
+            IrOpcode::SMin => { self.emitMin(inst, true); },
+            IrOpcode::SMax => { self.emitMax(inst, true); },
+            IrOpcode::UMin => { self.emitMin(inst, false); },
+            IrOpcode::UMax => { self.emitMax(inst, false); },
+            IrOpcode::Abs =>
+            {
+                if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+                bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+                self.emitter.emitLine("local.tee $abs_tmp");
+                self.emitter.emitLine("local.get $abs_tmp");
+                self.emitter.emitLine(is64 ? "i64.const 0" : "i32.const 0");
+                self.emitter.emitLine(is64 ? "i64.sub" : "i32.sub");
+                self.emitter.emitLine("local.get $abs_tmp");
+                self.emitter.emitLine(is64 ? "i64.const 0" : "i32.const 0");
+                self.emitter.emitLine(is64 ? "i64.gt_s" : "i32.gt_s");
+                self.emitter.emitLine("select");
+            },
+            else =>
+            {
+                self.emitter.emit(";; unhandled opcode ");
+                self.emitter.emitU32((u32)inst->opcode);
+                self.emitter.emitLine("");
+            }
+        }
+    }
+
+    void emitBinOp(IrInst* inst, const cchar* op32, const cchar* op64)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        bool is64 = inst->base.type != null && inst->base.type->width > 32;
+        self.emitter.emitLine(is64 ? op64 : op32);
+    }
+
+    void emitLoadType(IrInst* inst)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->base.type == null) { self.emitter.emitLine("i32.load"); return; }
+        switch (inst->base.type->kind)
+        {
+            IrTypeKind::Int =>
+            {
+                // NOTE: IrType does not currently track signedness, so we always
+                // sign-extend sub-word loads. To support unsigned loads, add an
+                // isSigned field to IrType and use i32.load8_u / i32.load16_u
+                // for unsigned types.
+                if (inst->base.type->width <= 8) self.emitter.emitLine("i32.load8_s");
+                else if (inst->base.type->width <= 16) self.emitter.emitLine("i32.load16_s");
+                else if (inst->base.type->width <= 32) self.emitter.emitLine("i32.load");
+                else self.emitter.emitLine("i64.load");
+            },
+            IrTypeKind::Float =>
+            {
+                if (inst->base.type->width <= 32) self.emitter.emitLine("f32.load");
+                else self.emitter.emitLine("f64.load");
+            },
+            else => { self.emitter.emitLine("i32.load"); }
+        }
+    }
+
+    void emitStoreType(IrInst* inst)
+    {
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        IrType* ty = inst->nops > 0 && inst->ops[0] != null ? inst->ops[0]->type : null;
+        if (ty == null) { self.emitter.emitLine("i32.store"); return; }
+        switch (ty->kind)
+        {
+            IrTypeKind::Int =>
+            {
+                if (ty->width <= 8) self.emitter.emitLine("i32.store8");
+                else if (ty->width <= 16) self.emitter.emitLine("i32.store16");
+                else if (ty->width <= 32) self.emitter.emitLine("i32.store");
+                else self.emitter.emitLine("i64.store");
+            },
+            IrTypeKind::Float =>
+            {
+                if (ty->width <= 32) self.emitter.emitLine("f32.store");
+                else self.emitter.emitLine("f64.store");
+            },
+            else => { self.emitter.emitLine("i32.store"); }
+        }
+    }
+
+    void emitICmp(IrInst* inst)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        // the prefix follows the operand: a compare's result is i1, so the old
+        // result-type check always saw a narrow width and demoted i64 compares
+        bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+        const cchar* pfx = is64 ? "i64." : "i32.";
+        switch (inst->icmpPred)
+        {
+            IrICmpPred::Eq => { self.emitter.emit(pfx); self.emitter.emitLine("eq"); },
+            IrICmpPred::Ne => { self.emitter.emit(pfx); self.emitter.emitLine("ne"); },
+            IrICmpPred::Slt => { self.emitter.emit(pfx); self.emitter.emitLine("lt_s"); },
+            IrICmpPred::Sle => { self.emitter.emit(pfx); self.emitter.emitLine("le_s"); },
+            IrICmpPred::Sgt => { self.emitter.emit(pfx); self.emitter.emitLine("gt_s"); },
+            IrICmpPred::Sge => { self.emitter.emit(pfx); self.emitter.emitLine("ge_s"); },
+            IrICmpPred::Ult => { self.emitter.emit(pfx); self.emitter.emitLine("lt_u"); },
+            IrICmpPred::Ule => { self.emitter.emit(pfx); self.emitter.emitLine("le_u"); },
+            IrICmpPred::Ugt => { self.emitter.emit(pfx); self.emitter.emitLine("gt_u"); },
+            IrICmpPred::Uge => { self.emitter.emit(pfx); self.emitter.emitLine("ge_u"); },
+
+            else => { self.emitter.emit(pfx); self.emitter.emitLine("eq"); }
+        }
+    }
+
+    void emitFCmp(IrInst* inst)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        // the prefix follows the operand: a compare's result is i1, so the old
+        // result-type check always saw a narrow width and demoted i64 compares
+        bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+        const cchar* pfx = is64 ? "f64." : "f32.";
+        switch (inst->fcmpPred)
+        {
+            // Ordered predicates (WASM native)
+            IrFCmpPred::Oeq => { self.emitter.emit(pfx); self.emitter.emitLine("eq"); },
+            IrFCmpPred::One => { self.emitter.emit(pfx); self.emitter.emitLine("ne"); },
+            IrFCmpPred::Olt => { self.emitter.emit(pfx); self.emitter.emitLine("lt"); },
+            IrFCmpPred::Ole => { self.emitter.emit(pfx); self.emitter.emitLine("le"); },
+            IrFCmpPred::Ogt => { self.emitter.emit(pfx); self.emitter.emitLine("gt"); },
+            IrFCmpPred::Oge => { self.emitter.emit(pfx); self.emitter.emitLine("ge"); },
+            // Unordered predicates: complement of the opposite ordered predicate
+            // Ueq = !ne, Une = !eq, Ult = !ge, Ule = !gt, Ugt = !le, Uge = !lt
+            IrFCmpPred::Ueq => { self.emitter.emit(pfx); self.emitter.emitLine("ne"); self.emitter.emitLine("i32.eqz"); },
+            IrFCmpPred::Une => { self.emitter.emit(pfx); self.emitter.emitLine("eq"); self.emitter.emitLine("i32.eqz"); },
+            IrFCmpPred::Ult => { self.emitter.emit(pfx); self.emitter.emitLine("ge"); self.emitter.emitLine("i32.eqz"); },
+            IrFCmpPred::Ule => { self.emitter.emit(pfx); self.emitter.emitLine("gt"); self.emitter.emitLine("i32.eqz"); },
+            IrFCmpPred::Ugt => { self.emitter.emit(pfx); self.emitter.emitLine("le"); self.emitter.emitLine("i32.eqz"); },
+            IrFCmpPred::Uge => { self.emitter.emit(pfx); self.emitter.emitLine("lt"); self.emitter.emitLine("i32.eqz"); },
+
+            else => { self.emitter.emit(pfx); self.emitter.emitLine("eq"); }
+        }
+    }
+
+    void emitMin(IrInst* inst, bool isSigned)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+        if (isSigned)
+            self.emitter.emitLine(is64 ? "i64.lt_s" : "i32.lt_s");
+        else
+            self.emitter.emitLine(is64 ? "i64.lt_u" : "i32.lt_u");
+        self.emitter.emitLine("select");
+    }
+
+    void emitMax(IrInst* inst, bool isSigned)
+    {
+        if (inst->nops > 0) self.emitValuePush(inst->ops[0]);
+        if (inst->nops > 1) self.emitValuePush(inst->ops[1]);
+        bool is64 = inst->nops > 0 && inst->ops[0] != null && inst->ops[0]->type != null && inst->ops[0]->type->width > 32;
+        if (isSigned)
+            self.emitter.emitLine(is64 ? "i64.gt_s" : "i32.gt_s");
+        else
+            self.emitter.emitLine(is64 ? "i64.gt_u" : "i32.gt_u");
+        self.emitter.emitLine("select");
+    }
+
+    void emitValuePush(IrValue* val)
+    {
+        if (val == null) return;
+        if (val->kind == IrValueKind::ConstInt) {
+            bool is64 = val->type != null && val->type->width > 32;
+            self.emitter.emit(is64 ? "i64.const " : "i32.const ");
+            self.emitter.emitI64((i64)val->valData);
+            self.emitter.emitLine("");
+            return;
+        }
+        if (val->kind == IrValueKind::ConstFloat) {
+            bool is64 = val->type != null && val->type->width > 32;
+            self.emitter.emit(is64 ? "f64.const " : "f32.const ");
+            // an f32 lives in the low 32 bits of valData, widen after the pun
+            if (is64) self.emitter.emitDoubleLiteral(f64OfU64(val->valData));
+            else self.emitter.emitDoubleLiteral((f64)f32OfU32((u32)(val->valData & 0xFFFFFFFF)));
+            self.emitter.emitLine("");
+            return;
+        }
+        if (val->kind == IrValueKind::Arg) {
+            self.emitter.emit("local.get $");
+            self.emitter.emitU32(val->id);
+            self.emitter.emitLine("");
+            return;
+        }
+        // For Inst values (and other non-Arg, non-Const values), the value is
+        // already on the WASM stack from the previous instruction that computed
+        // it. This relies on SSA form where each value is produced exactly once.
+        // For multi-use values, the instruction emitter should use local.tee
+        // to save the result to a local for later retrieval.
+    }
+}
+
+pub bool irCodegenWasm32(IrModule* modd, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || modd == null) return false;
+
+    WasmCodeGen codegen;
+    codegen.init(ctx, modd);
+    codegen.emitModule();
+    return true;
+}
+
+pub const cchar* irCodegenWasm32Asm(IrModule* modd, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || modd == null) return null;
+
+    WasmCodeGen codegen;
+    codegen.init(ctx, modd);
+    codegen.emitModule();
+    return codegen.emitter.getOutput();
+}
