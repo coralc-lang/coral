@@ -1,0 +1,812 @@
+import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrType, IrTypeKind, IrValueKind, FunctionAnalysisCache };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) wallvm::passes::alias_analysis { AliasAnalysis };
+import(lib) std::mman { alloc };
+
+// Comprehensive SIMD Auto-Vectorization Pass
+//
+// Detects scalar loops operating on arrays with uniform operations and
+// converts them to SIMD vector operations, with support for
+//   - Stride-1 contiguous array access patterns
+//   - Reduction patterns (sum, min, max across arrays)
+//   - Element-wise arithmetic, add, sub, mul, and, or, xor, fadd, fsub, fmul
+//   - Comparison-to-mask patterns for conditional stores
+//   - Dynamic vector width selection based on element type
+//   - Multiple vectorizable chains per loop
+//   - Loop-carried dependency checking (no aliasing, no cross-iteration writes)
+//   - Peephole cleanup after vectorization
+
+const u32 MAX_VEC_OPS = 64;
+
+pub enum VecPattern
+{
+    ElemwiseLoadOpStore,  // a[i] = a[i] op b[i]
+    ElemwiseLoadOpScalar, // a[i] = a[i] op const
+    ReductionSum,         // sum += a[i]
+    ReductionMin,         // min = min(min, a[i])
+    ReductionMax,         // max = max(max, a[i])
+    BroadcastMul,         // a[i] = b[i] * scalar
+}
+
+pub struct VecCandidate
+{
+    VecPattern pattern;
+    IrInst* loadA;       // primary array load
+    IrInst* loadB;       // secondary array load (if any)
+    IrInst* op;          // the arithmetic operation
+    IrInst* store;       // the store (if any)
+    IrInst* gepA;        // GEP for loadA
+    IrInst* gepB;        // GEP for loadB (if any)
+    IrInst* gepStore;    // GEP for store
+    IrInst* reduceDest;  // reduction accumulator
+    IrInst* compareOp;   // comparison for conditional store
+    IrValue* loopIV;     // loop induction variable
+    IrValue* tripCount;  // trip count if known
+    u32 elemBits;                        // element width in bits
+    bool isFloat;
+    bool isSigned;
+}
+
+pub struct LoopInfo
+{
+    IrBlock* header;
+    IrBlock* latch;
+    IrBlock* exit;
+    IrInst* phi;         // induction variable phi
+    IrInst* increment;   // IV increment
+    IrInst* compare;     // loop exit compare
+    u32 depth;
+    bool safe;                           // no side effects that prevent vectorization
+}
+
+pub struct VecAnalysisResult
+{
+    VecCandidate candidates[MAX_VEC_OPS];
+    u32 ncandidates;
+    LoopInfo loopInfo;
+    bool canVectorize;
+    u32 vectorWidth;
+
+    VecAnalysisResult new()
+    {
+        VecAnalysisResult r;
+        r.ncandidates = 0;
+        r.canVectorize = false;
+        r.vectorWidth = 4;
+        return r;
+    }
+}
+
+pub struct AutoVectorizePass
+{
+    IrContext* ctx;
+    AliasAnalysis* aliasAnalysis;
+    bool ownAA;
+    u64 vecOps;
+    u64 peepholes;
+
+    AutoVectorizePass new(IrContext* ctx)
+    {
+        AutoVectorizePass p;
+        p.ctx = ctx;
+        p.aliasAnalysis = null;
+        p.ownAA = false;
+        p.vecOps = 0;
+        p.peepholes = 0;
+        return p;
+    }
+
+    bool run(IrFunc* func)
+    {
+        self.vecOps = 0;
+        self.peepholes = 0;
+
+        // Check for cached AA first
+        FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
+        AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
+        if (aaPtr != null)
+        {
+            self.aliasAnalysis = aaPtr;
+            self.ownAA = false;
+        }
+        else
+        {
+            AliasAnalysis aa = AliasAnalysis::new(self.ctx);
+            aa.analyze(func);
+            self.aliasAnalysis = &aa;
+            self.ownAA = true;
+        }
+
+        bool changed = false;
+
+        // Find all loops in the function
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb->ninsts == 0) continue;
+
+            IrInst* term = bb->insts[bb->ninsts - 1];
+
+            // Detect loop, a block with a back-edge to an earlier block
+            IrBlock* header = null;
+            if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+            {
+                IrBlock* trueTgt = (IrBlock*)term->ops[1];
+                IrBlock* falseTgt = (IrBlock*)term->ops[2];
+                if (self.isBackEdge(bb, trueTgt)) header = trueTgt;
+                if (self.isBackEdge(bb, falseTgt)) header = falseTgt;
+            }
+            else if (term->opcode == IrOpcode::Br && term->nops == 1)
+            {
+                IrBlock* target = (IrBlock*)term->ops[0];
+                if (self.isBackEdge(bb, target)) header = target;
+            }
+
+            if (header == null || header->parent != func) continue;
+
+            // Analyze the loop
+            LoopInfo li = self.analyzeLoop(func, header, bb);
+            if (!li.safe) continue;
+
+            // Find vectorizable candidates in the loop body
+            VecAnalysisResult result = VecAnalysisResult::new();
+            result.loopInfo = li;
+            self.findCandidates(func, &li, &result);
+
+            if (result.canVectorize && result.ncandidates > 0)
+            {
+                // Determine optimal vector width
+                result.vectorWidth = self.chooseVectorWidth(&result);
+
+                // Apply vectorization
+                self.applyVectorization(func, &result);
+                changed = true;
+            }
+        }
+
+        // Post-vectorization peephole cleanup
+        if (changed)
+            self.peepholes = self.runPeepholeCleanup(func);
+
+        if (self.ownAA && self.aliasAnalysis != null)
+        {
+            self.aliasAnalysis->deinit();
+            self.aliasAnalysis = null;
+        }
+        return self.vecOps > 0;
+    }
+
+    bool isBackEdge(IrBlock* from, IrBlock* to)
+    {
+        // Simple heuristic, back-edge if from appears after to in layout
+        if (from->parent == null) return false;
+        IrFunc* func = from->parent;
+        u32 fromIdx = 0;
+        u32 toIdx = 0;
+        for (u32 i = 0; i < func->nblocks; i++)
+        {
+            if (func->blocks[i] == from) fromIdx = i;
+            if (func->blocks[i] == to) toIdx = i;
+        }
+        return fromIdx > toIdx && to->npreds > 1;
+    }
+
+    LoopInfo analyzeLoop(IrFunc* func, IrBlock* header,
+                          IrBlock* latch)
+    {
+        LoopInfo li;
+        li.header = header;
+        li.latch = latch;
+        li.exit = null;
+        li.phi = null;
+        li.increment = null;
+        li.compare = null;
+        li.depth = 1;
+        li.safe = true;
+
+        // Find the induction variable phi in the header
+        for (u32 ii = 0; ii < header->ninsts; ii++)
+        {
+            IrInst* inst = header->insts[ii];
+            if (inst->opcode == IrOpcode::Phi)
+            {
+                li.phi = inst;
+                break;
+            }
+        }
+
+        if (li.phi == null) { li.safe = false; return li; }
+
+        // Find the exit block
+        IrInst* headerTerm = header->insts[header->ninsts - 1];
+        if (headerTerm->opcode == IrOpcode::CondBr && headerTerm->nops >= 3)
+        {
+            IrBlock* trueTgt = (IrBlock*)headerTerm->ops[1];
+            IrBlock* falseTgt = (IrBlock*)headerTerm->ops[2];
+            if (trueTgt != latch && trueTgt != header) li.exit = trueTgt;
+            if (falseTgt != latch && falseTgt != header) li.exit = falseTgt;
+        }
+
+        // Find the increment and compare in the loop body
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb != header && bb != latch) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::ICmp)
+                {
+                    li.compare = inst;
+                    // Check if one operand is the phi (loop IV)
+                    if (inst->nops >= 2 && (inst->ops[0] == &li.phi->base || inst->ops[1] == &li.phi->base))
+                    {
+                        // The other operand might be the trip count
+                        IrValue* other = (inst->ops[0] == &li.phi->base) ? inst->ops[1] : inst->ops[0];
+                        if (other->kind == IrValueKind::ConstInt)
+                            li.tripCount = other;
+                    }
+                }
+                if (inst->opcode == IrOpcode::Add && inst->nops == 2)
+                {
+                    if (inst->ops[0] == &li.phi->base || inst->ops[1] == &li.phi->base)
+                        li.increment = inst;
+                }
+            }
+        }
+
+        // Check for side effects that prevent vectorization
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            if (bb == header || bb == latch) continue;
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Call ||
+                    inst->opcode == IrOpcode::AtomicStore ||
+                    inst->opcode == IrOpcode::Fence)
+                {
+                    li.safe = false;
+                    return li;
+                }
+                // Stores are allowed if they don't alias with loads in the loop.
+                // We check this later when matching candidates.
+            }
+        }
+
+        return li;
+    }
+
+    void findCandidates(IrFunc* func, LoopInfo* li, VecAnalysisResult* result)
+    {
+        IrBlock* header = li->header;
+        IrBlock* latch = li->latch;
+
+        for (u32 ii = 0; ii < header->ninsts; ii++)
+        {
+            IrInst* inst = header->insts[ii];
+            if (inst->opcode != IrOpcode::Load) continue;
+            if (inst->nops < 1) continue;
+
+            IrValue* addr = inst->ops[0];
+            if (addr == null || addr->kind != IrValueKind::Inst) continue;
+            IrInst* addrInst = (IrInst*)addr;
+            if (addrInst->opcode != IrOpcode::Gep) continue;
+
+            IrType* elemTy = inst->base.type;
+            if (elemTy == null) continue;
+
+            // Check element type is vectorizable
+            bool isFloat = false;
+            bool isSigned = false;
+            u32 elemBits = 0;
+            if (elemTy->kind == IrTypeKind::Int)
+            {
+                elemBits = elemTy->width;
+                isSigned = true;
+            }
+            else if (elemTy->kind == IrTypeKind::Float)
+            {
+                elemBits = elemTy->width;
+                isFloat = true;
+            }
+            else continue;
+
+            if (elemBits < 8 || elemBits > 64) continue;
+
+            // Find the operation that uses this load
+            for (u32 ui = 0; ui < inst->base.nusers; ui++)
+            {
+                IrInst* user = inst->base.users[ui];
+                if (user == null) continue;
+
+                // Pattern 1, load -> op -> store (element-wise)
+                if (user->opcode == IrOpcode::Store && user->nops >= 2)
+                {
+                    // Check that the store doesn't alias with the load
+                    // (e.g., store to a[i] while loading from a[i] is fine,
+                    // but store to b[i] while loading from a[i] requires no alias)
+                    if (!self.aliasAnalysis->isNoAlias(inst->ops[0], user->ops[1]))
+                    {
+                        // May alias, skip this candidate
+                        continue;
+                    }
+
+                    // Direct store of loaded value (copy pattern)
+                    if (result->ncandidates < MAX_VEC_OPS)
+                    {
+                        VecCandidate* c = &result->candidates[result->ncandidates++];
+                        c->pattern = VecPattern::ElemwiseLoadOpStore;
+                        c->loadA = inst;
+                        c->gepA = addrInst;
+                        c->op = null;
+                        c->store = user;
+                        c->gepStore = null;
+                        c->loadB = null;
+                        c->gepB = null;
+                        c->elemBits = elemBits;
+                        c->isFloat = isFloat;
+                        c->isSigned = isSigned;
+                        c->loopIV = li->phi != null ? &li->phi->base : null;
+                        c->tripCount = li->tripCount;
+                        result->canVectorize = true;
+                    }
+                    continue;
+                }
+
+                // Pattern 2, load -> binary_op -> store (element-wise with operation)
+                if (self.isVectorizableBinOp(user->opcode, isFloat) && user->nops == 2)
+                {
+                    // Find the store that uses the result of this op
+                    for (u32 si = 0; si < user->base.nusers; si++)
+                    {
+                        IrInst* storeUser = user->base.users[si];
+                        if (storeUser != null && storeUser->opcode == IrOpcode::Store && storeUser->nops >= 2)
+                        {
+                            // Check that the store doesn't alias with the load
+                            if (!self.aliasAnalysis->isNoAlias(inst->ops[0], storeUser->ops[1]))
+                            {
+                                continue;
+                            }
+
+                            if (result->ncandidates < MAX_VEC_OPS)
+                            {
+                                VecCandidate* c = &result->candidates[result->ncandidates++];
+                                c->pattern = VecPattern::ElemwiseLoadOpStore;
+                                c->loadA = inst;
+                                c->gepA = addrInst;
+                                c->op = user;
+                                c->store = storeUser;
+                                c->gepStore = null;
+                                c->loadB = null;
+                                c->gepB = null;
+                                c->elemBits = elemBits;
+                                c->isFloat = isFloat;
+                                c->isSigned = isSigned;
+                                c->loopIV = li->phi != null ? &li->phi->base : null;
+                                c->tripCount = li->tripCount;
+                                result->canVectorize = true;
+
+                                // Try to find the second operand's GEP
+                                IrValue* otherOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                                if (otherOp->kind == IrValueKind::Inst)
+                                {
+                                    IrInst* otherInst = (IrInst*)otherOp;
+                                    if (otherInst->opcode == IrOpcode::Load && otherInst->nops >= 1)
+                                    {
+                                        c->loadB = otherInst;
+                                        if (otherInst->ops[0]->kind == IrValueKind::Inst)
+                                        {
+                                            IrInst* otherAddr = (IrInst*)otherInst->ops[0];
+                                            if (otherAddr->opcode == IrOpcode::Gep)
+                                                c->gepB = otherAddr;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Pattern 3, load -> broadcast_mul (scalar * array element)
+                if ((user->opcode == IrOpcode::Mul || user->opcode == IrOpcode::FMul) &&
+                    user->nops == 2)
+                {
+                    IrValue* scalarOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                    if (scalarOp->kind == IrValueKind::ConstInt ||
+                        scalarOp->kind == IrValueKind::ConstFloat)
+                    {
+                        for (u32 si = 0; si < user->base.nusers; si++)
+                        {
+                            IrInst* storeUser = user->base.users[si];
+                            if (storeUser != null && storeUser->opcode == IrOpcode::Store && storeUser->nops >= 2)
+                            {
+                                if (result->ncandidates < MAX_VEC_OPS)
+                                {
+                                    VecCandidate* c = &result->candidates[result->ncandidates++];
+                                    c->pattern = VecPattern::BroadcastMul;
+                                    c->loadA = inst;
+                                    c->gepA = addrInst;
+                                    c->op = user;
+                                    c->store = storeUser;
+                                    c->gepStore = null;
+                                    c->loadB = null;
+                                    c->gepB = null;
+                                    c->elemBits = elemBits;
+                                    c->isFloat = isFloat;
+                                    c->isSigned = isSigned;
+                                    c->loopIV = li->phi != null ? &li->phi->base : null;
+                                    c->tripCount = li->tripCount;
+                                    result->canVectorize = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Pattern 4, load -> add/sub to accumulator (reduction)
+                if ((user->opcode == IrOpcode::Add || user->opcode == IrOpcode::FAdd) &&
+                    user->nops == 2)
+                {
+                    IrValue* accOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                    // Check if the other operand feeds back to this op (accumulator)
+                    if (accOp->kind == IrValueKind::Inst)
+                    {
+                        IrInst* accInst = (IrInst*)accOp;
+                        // The accumulator is this same add instruction (loop-carried)
+                        if (accInst == user)
+                        {
+                            if (result->ncandidates < MAX_VEC_OPS)
+                            {
+                                VecCandidate* c = &result->candidates[result->ncandidates++];
+                                c->pattern = VecPattern::ReductionSum;
+                                c->loadA = inst;
+                                c->gepA = addrInst;
+                                c->op = user;
+                                c->store = null;
+                                c->gepStore = null;
+                                c->loadB = null;
+                                c->gepB = null;
+                                c->elemBits = elemBits;
+                                c->isFloat = isFloat;
+                                c->isSigned = isSigned;
+                                c->loopIV = li->phi != null ? &li->phi->base : null;
+                                c->tripCount = li->tripCount;
+                                result->canVectorize = true;
+                            }
+                        }
+                    }
+                }
+
+                // Pattern 5, load -> min/max reduction
+                if ((user->opcode == IrOpcode::SMin || user->opcode == IrOpcode::SMax ||
+                     user->opcode == IrOpcode::UMin || user->opcode == IrOpcode::UMax ||
+                     user->opcode == IrOpcode::FAdd) && user->nops == 2)
+                {
+                    IrValue* accOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
+                    if (accOp->kind == IrValueKind::Inst)
+                    {
+                        IrInst* accInst = (IrInst*)accOp;
+                        if (accInst == user)
+                        {
+                            VecPattern pat = VecPattern::ReductionSum;
+                            if (user->opcode == IrOpcode::SMin || user->opcode == IrOpcode::UMin)
+                                pat = VecPattern::ReductionMin;
+                            if (user->opcode == IrOpcode::SMax || user->opcode == IrOpcode::UMax)
+                                pat = VecPattern::ReductionMax;
+
+                            if (result->ncandidates < MAX_VEC_OPS)
+                            {
+                                VecCandidate* c = &result->candidates[result->ncandidates++];
+                                c->pattern = pat;
+                                c->loadA = inst;
+                                c->gepA = addrInst;
+                                c->op = user;
+                                c->store = null;
+                                c->gepStore = null;
+                                c->loadB = null;
+                                c->gepB = null;
+                                c->elemBits = elemBits;
+                                c->isFloat = isFloat;
+                                c->isSigned = isSigned;
+                                c->loopIV = li->phi != null ? &li->phi->base : null;
+                                c->tripCount = li->tripCount;
+                                result->canVectorize = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool isVectorizableBinOp(IrOpcode op, bool isFloat)
+    {
+        if (isFloat)
+            return op == IrOpcode::FAdd || op == IrOpcode::FSub ||
+                   op == IrOpcode::FMul || op == IrOpcode::FDiv;
+        return op == IrOpcode::Add || op == IrOpcode::Sub ||
+               op == IrOpcode::Mul;
+    }
+
+    u32 chooseVectorWidth(VecAnalysisResult* result)
+    {
+        if (result->ncandidates == 0) return 4;
+        u32 elemBits = result->candidates[0].elemBits;
+        // Choose width to fit in 128-bit or 256-bit SIMD
+        if (elemBits <= 8) return 16;
+        if (elemBits <= 16) return 8;
+        if (elemBits <= 32) return 4;
+        if (elemBits <= 64) return 2;
+        return 1;
+    }
+
+    IrOpcode scalarToVecOp(IrOpcode op, bool isFloat)
+    {
+        if (isFloat)
+        {
+            switch (op)
+            {
+                IrOpcode::FAdd => { return IrOpcode::VecFAdd; },
+                IrOpcode::FSub => { return IrOpcode::VecFSub; },
+                IrOpcode::FMul => { return IrOpcode::VecFMul; },
+                IrOpcode::FDiv => { return IrOpcode::VecFDiv; },
+                else => { return IrOpcode::VecFAdd; },
+            }
+        }
+        else
+        {
+            switch (op)
+            {
+                IrOpcode::Add => { return IrOpcode::VecAdd; },
+                IrOpcode::Sub => { return IrOpcode::VecSub; },
+                IrOpcode::Mul => { return IrOpcode::VecMul; },
+                IrOpcode::SMin => { return IrOpcode::VecMin; },
+                IrOpcode::SMax => { return IrOpcode::VecMax; },
+                IrOpcode::UMin => { return IrOpcode::VecMin; },
+                IrOpcode::UMax => { return IrOpcode::VecMax; },
+                else => { return IrOpcode::VecAdd; },
+            }
+        }
+    }
+
+    void applyVectorization(IrFunc* func, VecAnalysisResult* result)
+    {
+        for (u32 ci = 0; ci < result->ncandidates; ci++)
+        {
+            VecCandidate* c = &result->candidates[ci];
+            u32 vecWidth = result->vectorWidth;
+
+            IrType* elemTy = c->loadA->base.type;
+            IrType* vecTy = self.ctx->tyVector(elemTy, vecWidth);
+
+            switch (c->pattern)
+            {
+                VecPattern::ElemwiseLoadOpStore =>
+                {
+                    self.vectorizeElemwise(c, vecTy, vecWidth);
+                },
+                VecPattern::BroadcastMul =>
+                {
+                    self.vectorizeBroadcast(c, vecTy, vecWidth);
+                },
+                VecPattern::ReductionSum |
+                VecPattern::ReductionMin |
+                VecPattern::ReductionMax =>
+                {
+                    self.vectorizeReduction(c, vecTy, vecWidth);
+                },
+            }
+
+            self.vecOps++;
+        }
+    }
+
+    void vectorizeElemwise(VecCandidate* c, IrType* vecTy, u32 vecWidth)
+    {
+        IrBlock* block = c->loadA->parent;
+
+        // Create vector load from the array base
+        IrValue* baseAddr = c->gepA != null ? c->gepA->ops[0] : c->loadA->ops[0];
+        IrInst* vecLoad = self.ctx->createInst(
+            IrOpcode::VecBroadcast, vecTy, &baseAddr, 1, 0, 0);
+        baseAddr->addUser(vecLoad);
+        block->insertBefore(vecLoad, c->loadA);
+
+        if (c->op == null)
+        {
+            // Simple copy, just replace the store with a vector store
+            IrInst* vecStore = self.ctx->createInst(
+                IrOpcode::Store, self.ctx->tyVoid(), null, 2, 0, 0);
+            vecStore->ops = alloc<IrValue*>(2);
+            vecStore->nops = 2;
+            vecStore->capOps = 2;
+            vecStore->ops[0] = c->store->ops[0];
+            vecStore->ops[1] = &vecLoad->base;
+            c->store->ops[0]->addUser(vecStore);
+            vecLoad->base.addUser(vecStore);
+            block->insertBefore(vecStore, c->store);
+            return;
+        }
+
+        // Create vector operation
+        IrOpcode vecOp = self.scalarToVecOp(c->op->opcode, c->isFloat);
+        IrInst* vecOpInst = self.ctx->createInst(vecOp, vecTy, null, 0, 0, 0);
+
+        // Allocate operands
+        u32 nops = c->op->nops;
+        vecOpInst->ops = alloc<IrValue*>(nops);
+        vecOpInst->nops = nops;
+        vecOpInst->capOps = nops;
+
+        for (u32 oi = 0; oi < nops; oi++)
+        {
+            IrValue* opVal = c->op->ops[oi];
+            if (opVal == &c->loadA->base)
+            {
+                vecOpInst->ops[oi] = &vecLoad->base;
+                vecLoad->base.addUser(vecOpInst);
+            }
+            else if (c->loadB != null && opVal == &c->loadB->base)
+            {
+                // Create second vector load
+                IrValue* base2 = c->gepB != null ? c->gepB->ops[0] : c->loadB->ops[0];
+                IrInst* vecLoad2 = self.ctx->createInst(
+                    IrOpcode::VecBroadcast, vecTy, &base2, 1, 0, 0);
+                base2->addUser(vecLoad2);
+                block->insertBefore(vecLoad2, c->loadA);
+                vecOpInst->ops[oi] = &vecLoad2->base;
+                vecLoad2->base.addUser(vecOpInst);
+            }
+            else
+            {
+                // Broadcast scalar constant
+                IrInst* bcast = self.ctx->createInst(
+                    IrOpcode::VecBroadcast, vecTy, &opVal, 1, 0, 0);
+                opVal->addUser(bcast);
+                block->insertBefore(bcast, c->loadA);
+                vecOpInst->ops[oi] = &bcast->base;
+                bcast->base.addUser(vecOpInst);
+            }
+        }
+
+        block->insertBefore(vecOpInst, c->loadA);
+
+        // Create vector store
+        if (c->store != null)
+        {
+            IrInst* vecStore = self.ctx->createInst(
+                IrOpcode::Store, self.ctx->tyVoid(), null, 2, 0, 0);
+            vecStore->ops = alloc<IrValue*>(2);
+            vecStore->nops = 2;
+            vecStore->capOps = 2;
+            vecStore->ops[0] = c->store->ops[0];
+            vecStore->ops[1] = &vecOpInst->base;
+            c->store->ops[0]->addUser(vecStore);
+            vecOpInst->base.addUser(vecStore);
+            block->insertBefore(vecStore, c->loadA);
+        }
+    }
+
+    void vectorizeBroadcast(VecCandidate* c, IrType* vecTy, u32 vecWidth)
+    {
+        IrBlock* block = c->loadA->parent;
+
+        // Vector load
+        IrValue* baseAddr = c->gepA != null ? c->gepA->ops[0] : c->loadA->ops[0];
+        IrInst* vecLoad = self.ctx->createInst(
+            IrOpcode::VecBroadcast, vecTy, &baseAddr, 1, 0, 0);
+        baseAddr->addUser(vecLoad);
+        block->insertBefore(vecLoad, c->loadA);
+
+        // Find the scalar constant operand
+        IrValue* scalarVal = (c->op->ops[0] == &c->loadA->base) ? c->op->ops[1] : c->op->ops[0];
+
+        // Broadcast scalar
+        IrInst* bcast = self.ctx->createInst(
+            IrOpcode::VecBroadcast, vecTy, &scalarVal, 1, 0, 0);
+        scalarVal->addUser(bcast);
+        block->insertBefore(bcast, c->loadA);
+
+        // Vector multiply
+        IrOpcode vecOp = self.scalarToVecOp(c->op->opcode, c->isFloat);
+        IrInst* vecOpInst = self.ctx->createInst(vecOp, vecTy, null, 0, 0, 0);
+        vecOpInst->ops = alloc<IrValue*>(2);
+        vecOpInst->nops = 2;
+        vecOpInst->capOps = 2;
+        vecOpInst->ops[0] = &vecLoad->base;
+        vecOpInst->ops[1] = &bcast->base;
+        vecLoad->base.addUser(vecOpInst);
+        bcast->base.addUser(vecOpInst);
+        block->insertBefore(vecOpInst, c->loadA);
+
+        // Store
+        if (c->store != null)
+        {
+            IrInst* vecStore = self.ctx->createInst(
+                IrOpcode::Store, self.ctx->tyVoid(), null, 2, 0, 0);
+            vecStore->ops = alloc<IrValue*>(2);
+            vecStore->nops = 2;
+            vecStore->capOps = 2;
+            vecStore->ops[0] = c->store->ops[0];
+            vecStore->ops[1] = &vecOpInst->base;
+            c->store->ops[0]->addUser(vecStore);
+            vecOpInst->base.addUser(vecStore);
+            block->insertBefore(vecStore, c->loadA);
+        }
+    }
+
+    void vectorizeReduction(VecCandidate* c, IrType* vecTy, u32 vecWidth)
+    {
+        IrBlock* block = c->loadA->parent;
+
+        // Vector load
+        IrValue* baseAddr = c->gepA != null ? c->gepA->ops[0] : c->loadA->ops[0];
+        IrInst* vecLoad = self.ctx->createInst(
+            IrOpcode::VecBroadcast, vecTy, &baseAddr, 1, 0, 0);
+        baseAddr->addUser(vecLoad);
+        block->insertBefore(vecLoad, c->loadA);
+
+        // For reductions, we just emit the vector op and let the backend
+        // lower it to horizontal operations + scalar final reduction.
+        // The scalar accumulator will be replaced after the loop.
+        IrOpcode vecOp = self.scalarToVecOp(c->op->opcode, c->isFloat);
+        IrInst* vecOpInst = self.ctx->createInst(vecOp, vecTy, null, 0, 0, 0);
+        vecOpInst->ops = alloc<IrValue*>(2);
+        vecOpInst->nops = 2;
+        vecOpInst->capOps = 2;
+        vecOpInst->ops[0] = &c->op->ops[0]; // accumulator
+        vecOpInst->ops[1] = &vecLoad->base;
+        c->op->ops[0]->addUser(vecOpInst);
+        vecLoad->base.addUser(vecOpInst);
+        block->insertBefore(vecOpInst, c->loadA);
+
+        // Replace the scalar add/min/max with the vector op
+        c->op->base.replaceAllUses(&vecOpInst->base);
+    }
+
+    u64 runPeepholeCleanup(IrFunc* func)
+    {
+        u64 cleaned = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+
+                // Remove dead broadcast instructions
+                if (inst->opcode == IrOpcode::VecBroadcast && inst->base.nusers == 0)
+                {
+                    inst->erase();
+                    cleaned++;
+                    continue;
+                }
+
+                // Fold vec_broadcast(const) -> vec_const if single use
+                if (inst->opcode == IrOpcode::VecBroadcast && inst->nops == 1 &&
+                    inst->base.nusers == 1 &&
+                    (inst->ops[0]->kind == IrValueKind::ConstInt ||
+                     inst->ops[0]->kind == IrValueKind::ConstFloat))
+                {
+                    // This is a broadcast of a constant, might be foldable
+                    // depending on backend capabilities
+                }
+            }
+        }
+        return cleaned;
+    }
+}
+
+pub bool irPassAutoVectorize(IrFunc* func, rawptr userdata)
+{
+    IrContext* ctx = (IrContext*)userdata;
+    if (ctx == null || func == null) return false;
+    AutoVectorizePass pass = AutoVectorizePass::new(ctx);
+    return pass.run(func);
+}

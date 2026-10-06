@@ -1,0 +1,198 @@
+import(lib) wallvm::irtypes { IrFunc, IrBlock, IrInst, IrType, IrTypeKind, IrValueKind };
+import(lib) wallvm::irOps { IrOpcode };
+import(lib) std::mman { alloc, dealloc };
+
+// Static Spatial Layout Sorting of Stack Variables (Anti-Clustering)
+// Reorganizes local stack variables by access frequency and size class,
+// grouping hot variables together to fit within cache lines.
+
+struct StackVarInfo
+{
+    IrInst* alloca;
+    u32 accessCount;
+    u32 sizeBytes;
+    bool isHot;
+}
+
+pub bool irPassStackLayout(IrFunc* func, rawptr userdata)
+{
+    if (func == null || func->isExtern) return false;
+    bool changed = false;
+
+    // Count allocas and their access frequencies
+    u32 allocaCap = 16;
+    StackVarInfo* vars = alloc<StackVarInfo>(allocaCap);
+    u32 nvars = 0;
+
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+
+            // Collect allocas
+            if (inst->opcode == IrOpcode::Alloca)
+            {
+                if (nvars >= allocaCap)
+                {
+                    allocaCap *= 2;
+                    StackVarInfo* newV = alloc<StackVarInfo>(allocaCap);
+                    for (u32 i = 0; i < nvars; i++) newV[i] = vars[i];
+                    dealloc<StackVarInfo>(vars);
+                    vars = newV;
+                }
+                vars[nvars].alloca = inst;
+                vars[nvars].accessCount = 0;
+
+                // Estimate size from type
+                IrType* ty = inst->base.type;
+                if (ty != null)
+                {
+                    switch (ty->kind)
+                    {
+                        IrTypeKind::Int => { vars[nvars].sizeBytes = (ty->width + 7) / 8; },
+                        IrTypeKind::Float => { vars[nvars].sizeBytes = (ty->width + 7) / 8; },
+                        IrTypeKind::Ptr => { vars[nvars].sizeBytes = 8; },
+                        else => { vars[nvars].sizeBytes = 8; },
+                    }
+                }
+                else
+                {
+                    vars[nvars].sizeBytes = 8;
+                }
+
+                vars[nvars].isHot = false;
+                nvars++;
+            }
+        }
+    }
+
+    if (nvars == 0)
+    {
+        dealloc<StackVarInfo>(vars);
+        return false;
+    }
+
+    // Count accesses to each alloca (loads/stores that use it as pointer)
+    for (u32 bi = 0; bi < func->nblocks; bi++)
+    {
+        IrBlock* bb = func->blocks[bi];
+        for (u32 ii = 0; ii < bb->ninsts; ii++)
+        {
+            IrInst* inst = bb->insts[ii];
+            if (inst->opcode == IrOpcode::Load ||
+                inst->opcode == IrOpcode::Store ||
+                inst->opcode == IrOpcode::Gep)
+            {
+                if (inst->nops > 0 && inst->ops[0] != null &&
+                    inst->ops[0]->kind == IrValueKind::Inst)
+                {
+                    IrInst* src = (IrInst*)inst->ops[0];
+                    if (src->opcode == IrOpcode::Alloca)
+                    {
+                        // Find which variable this is
+                        for (u32 vi = 0; vi < nvars; vi++)
+                        {
+                            if (vars[vi].alloca == src)
+                            {
+                                vars[vi].accessCount++;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by access count (descending), hot variables first
+    for (u32 i = 0; i < nvars - 1; i++)
+    {
+        for (u32 j = i + 1; j < nvars; j++)
+        {
+            if (vars[j].accessCount > vars[i].accessCount)
+            {
+                StackVarInfo tmp = vars[i];
+                vars[i] = vars[j];
+                vars[j] = tmp;
+            }
+        }
+    }
+
+    // Mark hot variables (those with above-median access count)
+    u32 medianIdx = nvars / 2;
+    u32 medianCount = vars[medianIdx].accessCount;
+    for (u32 i = 0; i < nvars; i++)
+    {
+        vars[i].isHot = (vars[i].accessCount >= medianCount);
+    }
+
+    // Reorder the allocas in the entry block
+    IrBlock* entry = func->blocks[0];
+    if (entry == null)
+    {
+        dealloc<StackVarInfo>(vars);
+        return false;
+    }
+
+    // Find all allocas in entry block
+    u32 entryAllocas = 0;
+    for (u32 ii = 0; ii < entry->ninsts; ii++)
+    {
+        if (entry->insts[ii]->opcode == IrOpcode::Alloca)
+            entryAllocas++;
+    }
+
+    if (entryAllocas < 2)
+    {
+        dealloc<StackVarInfo>(vars);
+        return false;
+    }
+
+    // Build new instruction order, hot allocas first, then cold
+    u32 newCap = entry->ninsts;
+    IrInst** newInsts = alloc<IrInst*>(newCap);
+    u32 newCount = 0;
+
+    // First, all non-alloca instructions (in order)
+    for (u32 ii = 0; ii < entry->ninsts; ii++)
+    {
+        if (entry->insts[ii]->opcode != IrOpcode::Alloca)
+        {
+            newInsts[newCount] = entry->insts[ii];
+            newCount++;
+        }
+    }
+
+    // Then, hot allocas in sorted order
+    // I push every collected alloca here, the old pass did too, including the
+    // ones that were gathered from blocks other than the entry block.
+    for (u32 vi = 0; vi < nvars; vi++)
+    {
+        if (vars[vi].isHot)
+        {
+            newInsts[newCount] = vars[vi].alloca;
+            newCount++;
+        }
+    }
+
+    // Then, cold allocas in sorted order
+    for (u32 vi = 0; vi < nvars; vi++)
+    {
+        if (!vars[vi].isHot)
+        {
+            newInsts[newCount] = vars[vi].alloca;
+            newCount++;
+        }
+    }
+
+    // Replace entry block instructions
+    dealloc<IrInst*>(entry->insts);
+    entry->insts = newInsts;
+    entry->ninsts = newCount;
+    changed = true;
+
+    dealloc<StackVarInfo>(vars);
+    return changed;
+}

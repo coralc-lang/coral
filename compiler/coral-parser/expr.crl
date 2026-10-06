@@ -454,6 +454,28 @@ pub extend Parser
                 return self.storeExpr(ExprKind::Ident{ .name = name });
             },
 
+            TokenKind::Str => {
+                Token nameTok = self.advance();
+                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                if (self.current.kind == TokenKind::LBrace)
+                {
+                    /* a pure Str tuple value: `str { .ptr = p, .len = n }` */
+                    TypeKind k;
+                    k.tag = TypeKind::Str;
+                    Ty ty = self.allocTypeKind(k);
+                    return self.parseLiteralFields(ty, 0);
+                }
+                /* `str::foo(...)` — allow `str` as an identifier in a
+                 * path position (e.g. calls like str::fromParts); the
+                 * postfix loop handles the rest. */
+                if (self.current.kind == TokenKind::ColonColon)
+                {
+                    return self.storeExpr(ExprKind::Ident{ .name = name });
+                }
+                self.addError();
+                return self.noneNode();
+            },
+
             TokenKind::Self => {
                 self.advance();
                 return self.storeExpr(ExprKind::Ident{ .name = self.ctx.intern("self", 4) });
@@ -475,7 +497,13 @@ pub extend Parser
                 {
                     ParserMark mk0 = self.save();
                     self.advance();
-                    castable = self.current.kind == TokenKind::Star;
+                    if (self.current.kind == TokenKind::Star ||
+                        self.current.kind == TokenKind::RParen ||
+                        self.current.kind == TokenKind::Less ||
+                        self.current.kind == TokenKind::ColonColon)
+                    {
+                        castable = true;
+                    }
                     self.restore(mk0);
                 }
                 if (castable)

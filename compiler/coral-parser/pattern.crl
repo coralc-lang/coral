@@ -32,10 +32,105 @@ pub extend Parser
             NodeId* values = self.ctx.nodeListFinish(&alternatives);
             return self.storePat(PatKind::Or{ .alternatives = values, .alternativesLen = count });
         }
-        if (k == TokenKind::Ident)
+        if (k == TokenKind::Any)
+        {
+            self.advance(); /* any */
+            Token tTok = self.expect(TokenKind::Ident);
+            Str tn = self.ctx.intern(tTok.data.ptr, tTok.data.len);
+            /* stored as a nominal pattern naming `any <trait>` — semantic
+             * refinement plus codegen-on-AnyTrait is a later todo */
+            return self.storePat(PatKind::Ident{ .name = tn });
+        }
+        if (k == TokenKind::Const)
+        {
+            /* `const T*` style pattern-name: read a type prefix and turn it
+             * into a nominal pattern storing its source text (the pattern
+             * selector in control flow will be this text). */
+            u8* buf = (u8*)malloc(256);
+            u32 bpos = 0;
+            /* current is TokenKind::Const */
+            while (true)
+            {
+                TokenKind kk = self.current.kind;
+                bool takes = false;
+                if (kk == TokenKind::Ident || kk == TokenKind::Void || kk == TokenKind::Bool ||
+                    kk == TokenKind::Char || kk == TokenKind::U8 || kk == TokenKind::I8 ||
+                    kk == TokenKind::U16 || kk == TokenKind::I16 || kk == TokenKind::U32 ||
+                    kk == TokenKind::I32 || kk == TokenKind::U64 || kk == TokenKind::I64 ||
+                    kk == TokenKind::U128 || kk == TokenKind::I128 || kk == TokenKind::F32 ||
+                    kk == TokenKind::F64 || kk == TokenKind::Usize || kk == TokenKind::Isize ||
+                    kk == TokenKind::Rawptr || kk == TokenKind::Str || kk == TokenKind::Const ||
+                    kk == TokenKind::Star || kk == TokenKind::Ampersand || kk == TokenKind::LParen ||
+                    kk == TokenKind::RParen || kk == TokenKind::LBracket || kk == TokenKind::RBracket ||
+                    kk == TokenKind::Less || kk == TokenKind::Greater || kk == TokenKind::ColonColon)
+                {
+                    takes = true;
+                }
+                if (!takes) break;
+                Token tk2 = self.advance();
+                if (bpos > 0 && bpos + tk2.data.len < 255)
+                {
+                    /* separate two alphanums with a space, the rest flush*/
+                    if (tk2.kind != TokenKind::Star && tk2.kind != TokenKind::RParen) buf[bpos++] = ' ';
+                }
+                if (bpos + tk2.data.len < 255)
+                {
+                    u32 qq2 = 0;
+                    while (qq2 < tk2.data.len) buf[bpos++] = tk2.data.ptr[qq2++];
+                }
+            }
+            buf[bpos] = 0;
+            Str nameStr = self.ctx.intern(buf, bpos);
+            return self.storePat(PatKind::Ident{ .name = nameStr });
+        }
+        if (k == TokenKind::Ident ||
+            k == TokenKind::Void || k == TokenKind::Bool || k == TokenKind::Char ||
+            k == TokenKind::U8 || k == TokenKind::I8 || k == TokenKind::U16 || k == TokenKind::I16 ||
+            k == TokenKind::U32 || k == TokenKind::I32 || k == TokenKind::U64 || k == TokenKind::I64 ||
+            k == TokenKind::U128 || k == TokenKind::I128 || k == TokenKind::F32 || k == TokenKind::F64 ||
+            k == TokenKind::Usize || k == TokenKind::Isize || k == TokenKind::Rawptr || k == TokenKind::Str)
         {
             Token first = self.advance();
             Str firstName = self.ctx.intern(first.data.ptr, first.data.len);
+            /* a name immediately MASTERed by pointer/ref/array or
+             * generic markers again denotes a type-prefix pattern: 'T*',
+             * 'const*', 'T<T>', '...' collect text up to this branch
+             * separator and match as a nominal pattern */
+            if (self.current.kind == TokenKind::Star || self.current.kind == TokenKind::Ampersand ||
+                self.current.kind == TokenKind::LBracket || self.current.kind == TokenKind::Less)
+            {
+                u8* buf = (u8*)malloc(256);
+                u32 ppos = 0;
+                /* prefix with firstName words */
+                if (0) {}
+                u32 i0 = 0;
+                while (i0 < first.data.len) buf[ppos++] = first.data.ptr[i0++];
+                while (true)
+                {
+                    TokenKind kk = self.current.kind;
+                    bool take =  (kk == TokenKind::Ident || kk == TokenKind::Void || kk == TokenKind::Bool ||
+                        kk == TokenKind::Char || kk == TokenKind::U8 || kk == TokenKind::I8 ||
+                        kk == TokenKind::U16 || kk == TokenKind::I16 || kk == TokenKind::U32 ||
+                        kk == TokenKind::I32 || kk == TokenKind::U64 || kk == TokenKind::I64 ||
+                        kk == TokenKind::U128 || kk == TokenKind::I128 || kk == TokenKind::F32 ||
+                        kk == TokenKind::F64 || kk == TokenKind::Usize || kk == TokenKind::Isize ||
+                        kk == TokenKind::Rawptr || kk == TokenKind::Str || kk == TokenKind::Const ||
+                        kk == TokenKind::Star || kk == TokenKind::Ampersand || kk == TokenKind::LParen ||
+                        kk == TokenKind::RParen || kk == TokenKind::LBracket || kk == TokenKind::RBracket ||
+                        kk == TokenKind::Less || kk == TokenKind::Greater || kk == TokenKind::Comma ||
+                        kk == TokenKind::ColonColon);
+                    if (!take) break;
+                    Token tk2 = self.advance();
+                    if (ppos > 0 && tk2.kind != TokenKind::Star && tk2.kind != TokenKind::RParen && tk2.kind != TokenKind::RBracket && tk2.kind != TokenKind::Greater && tk2.kind != TokenKind::Comma)
+                        buf[ppos++] = ' ';
+                    u32 j0 = 0;
+                    while (j0 < tk2.data.len) buf[ppos++] = tk2.data.ptr[j0++];
+                }
+                buf[ppos] = 0;
+                Str nameStr = self.ctx.intern(buf, ppos);
+                return self.storePat(PatKind::Ident{ .name = nameStr });
+            }
+
             if (self.match(TokenKind::ColonColon))
             {
                 Token second = self.expect(TokenKind::Ident);

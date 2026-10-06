@@ -1,6 +1,6 @@
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) platform::libc { strlen };
-import irOps { IrOpcode };
+import irOps { IrOpcode, irOpcodeIsTerminator };
 import(lib) core::cchar { cchar };
 
 pub enum IrTypeKind
@@ -390,6 +390,34 @@ pub struct IrBlock
         for (u32 i = 0; i < self.npreds; i++)
             if (self.preds[i] == pred) return true;
         return false;
+    }
+
+    // I report true when no non-terminator here stores memory, calls out,
+    // touches atomics or otherwise escapes, the tail-duplication and
+    // jump-threading passes ask me before they steal a block
+    bool hasNoSideEffects()
+    {
+        for (u32 i = 0; i < self.ninsts; i++)
+        {
+            IrOpcode op = self.insts[i]->opcode;
+            if (irOpcodeIsTerminator(op)) continue;
+            switch (op)
+            {
+                IrOpcode::Store |
+                IrOpcode::InlineAsm |
+                IrOpcode::AtomicStore |
+                IrOpcode::AtomicRmw |
+                IrOpcode::AtomicCmpXchg |
+                IrOpcode::Fence |
+                IrOpcode::LandingPad |
+                IrOpcode::GcRoot |
+                IrOpcode::GcWriteBarrier |
+                IrOpcode::GcSafepoint |
+                IrOpcode::Call => { return false; },
+                else => { },
+            }
+        }
+        return true;
     }
 
     IrInst* terminator()
