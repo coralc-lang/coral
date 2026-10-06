@@ -1038,12 +1038,18 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::StringLit => {
-            /* str literal: immutable slice; the compiler counts the length */
+            /* C"..." → plain NUL-terminated C string literal; any other
+             * string literal → immutable slice, the compiler counts the len */
             Slice s = cgIntern(cg, e.kind.payload.StringLit.value);
-            stP(&cg.ebuf, "(_coral_str){ (const uint8_t*)\"");
+            bool isC = (e.kind.payload.StringLit.flags & 1) != 0;
+            if (isC) stP(&cg.ebuf, "\"");
+            else stP(&cg.ebuf, "(_coral_str){ (const uint8_t*)\"");
             usize begin = 0;
             usize end = s.len;
-            if (s.len >= 2 && s.ptr[0] == '"') { begin = 1; end = s.len - 1; }
+            if (isC) {
+                /* token text is `C"…"` — drop the prefix and both quotes */
+                if (s.len >= 3 && s.ptr[0] == 'C' && s.ptr[1] == '"') { begin = 2; end = s.len - 1; }
+            } else if (s.len >= 2 && s.ptr[0] == '"') { begin = 1; end = s.len - 1; }
             usize i = begin;
             usize dlen = 0;
             while (i < end)
@@ -1077,9 +1083,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     i = i + 1;
                 }
             }
-            stP(&cg.ebuf, "\", ");
-            stU64(&cg.ebuf, (u64)dlen);
-            stP(&cg.ebuf, " }");
+            if (isC) {
+                stP(&cg.ebuf, "\"");
+            } else {
+                stP(&cg.ebuf, "\", ");
+                stU64(&cg.ebuf, (u64)dlen);
+                stP(&cg.ebuf, " }");
+            }
             return stTail(&cg.ebuf, es);
         },
         ExprKind::CharLit => {
