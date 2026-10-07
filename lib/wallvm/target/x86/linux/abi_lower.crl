@@ -1,0 +1,290 @@
+import(lib) wallvm::irtypes { IrContext, IrType, IrFunc, IrBlock, IrInst, IrValue, IrTypeKind };
+import(lib) wallvm::irOps { IrOpcode };
+
+// ABI Lowering Pass for 32-bit x86 (SysV i386 psABI).
+// Rules implemented here, per the i386 psABI:
+// 1. All function arguments are passed on the stack, in cdecl order
+// 2. Large aggregates (bigger than 8 bytes) are returned through a
+//    hidden sret pointer supplied by the caller
+// 3. Small structs (8 bytes or less) return in eax:edx
+// 4. Floating point results come back on the x87 FPU stack (st0);
+//    SSE does not carry scalar floats on this ABI — XMM is only for
+//    128-bit vector arguments, handled as MEMORY-class elsewhere
+//
+// The interned IR types are 64-bit flavored (pointers are 8 bytes,
+// struct alignment reports 8), so this pass treats pointers and offsets
+// as 4 bytes in its own layout math rather than trusting type widths.
+
+pub struct ABILowering
+{
+    IrContext* ctx;
+
+    ABILowering new(IrContext* ctx)
+    {
+        return (ABILowering) { .ctx = ctx };
+    }
+
+    // Classify a single field type
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = FPU (SSE kept 2 for shape)
+    u32 classifyField(IrType* ty)
+    {
+        if (ty == null) return 0;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int => { return 1; },  // INTEGER
+            IrTypeKind::Ptr => { return 1; },  // INTEGER (pointer)
+
+            IrTypeKind::Float => {
+                if (ty->width == 32 || ty->width == 64)
+                    return 2;  // x87 FPU class, not XMM
+                return 0;  // MEMORY for anything else
+            },
+
+            IrTypeKind::Array => {
+                if (ty->elem == null) return 0;
+                u32 elemClass = classifyField(ty->elem);
+                if (elemClass == 0) return 0;
+                u32 totalSize = ty->count * (ty->elem->width / 8);
+                if (totalSize > 8) return 0;
+                return elemClass;
+            },
+
+            IrTypeKind::Struct => { return classifyStructType(ty); },
+            else => { return 0; },
+        }
+    }
+
+    // Classify a struct type for ABI purposes
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = FPU, 3 = MIXED
+    // Returns never travel in registers beyond eax:edx; anything
+    // larger than 8 bytes is MEMORY (sret). A struct made only of
+    // floats falls in the FPU class and returns in st0.
+    u32 classifyStructType(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+
+        u32 sz = ty->width;
+        if (sz == 0) return 0;
+        if (sz > 8) return 0;  // MEMORY — sret hidden pointer
+
+        bool allFloat = ty->nparams > 0;
+        for (u32 i = 0; i < ty->nparams; i++)
+        {
+            if (classifyField(ty->params[i]) != 2)
+                allFloat = false;
+        }
+
+        if (allFloat) return 2;  // FPU — st0
+        return 1;  // INTEGER — eax:edx
+    }
+
+    // Count register fields for a struct
+    u32 structRegCount(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+        // eax for a single word, eax:edx for two, sret for anything
+        // bigger means no return registers at all
+        u32 sz = ty->width;
+        if (sz <= 4 && sz > 0) return 1;
+        if (sz <= 8) return 2;
+        return 0;
+    }
+
+    // Check if struct fits in integer registers
+    bool isIntegerStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 1;
+    }
+
+    // Check if struct fits in SSE registers
+    // i386 psABI never returns whole structs in XMM; the fp struct is
+    // the FPU class, so this only fires for degenerate cases
+    bool isSSEStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 2;
+    }
+
+    // Check if struct must go in memory
+    bool isMemoryStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 0;
+    }
+
+    // Check if struct has mixed integer/SSE fields (per-eightbyte classification)
+    // i386 psABI has no MIXED class; mixed-content structs classify
+    // INTEGER (returned in eax:edx as raw words), so this stays false
+    bool isMixedStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 3;
+    }
+
+    // Natural alignment of a field type on i386: scalars at their size
+    // (capped at 4 — doubles are 4-byte aligned in this psABI),
+    // pointers at 4, aggregates at their largest member's
+    u32 fieldAlign(IrType* ty)
+    {
+        if (ty == null) return 1;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int | IrTypeKind::Float => {
+                u32 a = ty->width / 8;
+                if (a == 0) a = 1;
+                if (a > 4) a = 4;
+                return a;
+            },
+
+            IrTypeKind::Ptr => { return 4; },
+            IrTypeKind::Array | IrTypeKind::Vector => { return fieldAlign(ty->elem); },
+
+            IrTypeKind::Struct => {
+                u32 a = 1;
+                for (u32 i = 0; i < ty->nparams; i++)
+                {
+                    u32 fa = fieldAlign(ty->params[i]);
+                    if (fa > a) a = fa;
+                }
+                if (a > 4) a = 4;
+                return a;
+            },
+
+            else => { return 1; },
+        }
+    }
+
+    // Byte size of a field type, with pointers measured as 4 bytes —
+    // the interned IR still says 8, this pass does its own math
+    u32 fieldSize(IrType* ty)
+    {
+        if (ty == null) return 0;
+        if (ty->kind == IrTypeKind::Int || ty->kind == IrTypeKind::Float)
+            return ty->width / 8;
+        if (ty->kind == IrTypeKind::Ptr) return 4;
+        if (ty->kind == IrTypeKind::Struct) return ty->width;
+        if (ty->kind == IrTypeKind::Array)
+            return fieldSize(ty->elem) * (ty->count > 0 ? ty->count : 1);
+        return 0;
+    }
+
+    // Get field byte offsets for a struct
+    // For packed structs, no alignment padding
+    // For normal structs, fields are aligned to their natural alignment
+    u32 getFieldOffset(IrType* ty, u32 fieldIdx, bool isPacked)
+    {
+        if (ty == null) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            u32 off = 0;
+            for (u32 i = 0; i < fieldIdx && i < ty->nparams; i++)
+            {
+                if (!isPacked) {
+                    u32 align = fieldAlign(ty->params[i]);
+                    off = (off + align - 1) / align * align;
+                }
+                off += fieldSize(ty->params[i]);
+            }
+            return off;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 elemSize = fieldSize(ty->elem);
+            if (!isPacked) {
+                u32 align = fieldAlign(ty->elem);
+                return fieldIdx * ((elemSize + align - 1) / align * align);
+            }
+            return fieldIdx * elemSize;
+        }
+
+        return 0;
+    }
+
+    // Flatten compound structs (recursive)
+    // Returns the total number of leaf fields
+    u32 flattenStruct(IrType* ty, IrType** outFields, u32 maxFields)
+    {
+        if (ty == null || maxFields == 0) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            // struct field types ride on the interned IrType itself
+            // (params/nparams), not elem — elem is null for structs
+            u32 count = 0;
+            for (u32 i = 0; i < ty->nparams && count < maxFields; i++)
+                count += flattenStruct(ty->params[i], outFields + count, maxFields - count);
+            return count;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 count = 0;
+            for (u32 i = 0; i < ty->count && count < maxFields; i++)
+            {
+                if (ty->elem->kind == IrTypeKind::Struct)
+                    count += flattenStruct(ty->elem, outFields + count, maxFields - count);
+                else if (count < maxFields)
+                {
+                    outFields[count] = ty->elem;
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        if (outFields != null)
+            outFields[0] = ty;
+        return 1;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if洪tu="https://chatgpt.com/c/" func == null || func->isExtern) return false;
+
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                // I kept the address-of from the old file rather than reading the slot directly
+                IrInst* inst = &bb->insts[ii];
+
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+                {
+                    IrValue* val = inst->ops[0];
+                    if (val != null && val->type != null && val->type->kind == IrTypeKind::Struct)
+                    {
+                        u32 cls = classifyStructType(val->type);
+                        if (cls == 1 || cls == 2)
+                            changed = true;
+                    }
+                }
+
+                if (inst->opcode == IrOpcode::Load && inst->nops >= 1)
+                {
+                    if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Struct)
+                    {
+                        u32 cls = classifyStructType(inst->base.type);
+                        if (cls == 1 || cls == 2)
+                            changed = true;
+                    }
+                }
+            }
+        }
+
+        return changed;
+    }
+}
+
+pub bool irABILower(IrFunc* func, rawptr userdata)
+{
+    if (func == null) return false;
+    IrContext* ctx = (IrContext*)userdata;
+    ABILowering lower = ABILowering::new(ctx);
+    return lower.run(func);
+}

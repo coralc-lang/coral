@@ -1,0 +1,288 @@
+import(lib) wallvm::irtypes { IrContext, IrType, IrFunc, IrBlock, IrInst, IrValue, IrTypeKind };
+import(lib) wallvm::irOps { IrOpcode };
+
+// ABI Lowering Pass for the Windows x64 (Microsoft) ABI.
+// Rules implemented here, per the Microsoft x64 calling convention:
+// 1. Integer and pointer arguments go in RCX, RDX, R8, R9
+// 2. Float arguments go in XMM0 through XMM3
+// 3. 1, 2, 4 and 8-byte POD arguments are passed by value in an integer
+//    register (so an aggregate today never lands in an SSE register)
+// 4. Larger aggregates, and aggregates whose size is not a power of two,
+//    are passed via a hidden pointer to caller-allocated storage; the
+//    callee may copy or write through that pointer
+// 5. The 32-byte shadow space is a codegen concern, not a pass concern
+//
+// For hidden-pointer (MEMORY class) aggregates the calling convention
+// rewrite, like the SysV one, is still a stub: run() classifies and
+// flags, the real IR mutation plugs in when the backend drivers do.
+
+pub struct ABILowering
+{
+    IrContext* ctx;
+
+    ABILowering new(IrContext* ctx)
+    {
+        return (ABILowering) { .ctx = ctx };
+    }
+
+    // Classify a single field type
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = SSE
+    u32 classifyField(IrType* ty)
+    {
+        if (ty == null) return 0;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int => { return 1; },  // INTEGER
+            IrTypeKind::Ptr => { return 1; },  // INTEGER (pointer)
+
+            IrTypeKind::Float => {
+                if (ty->width == 32 || ty->width == 64)
+                    return 2;  // SSE — scalar floats ride XMM0-3
+                return 0;  // MEMORY for anything else
+            },
+
+            IrTypeKind::Array => {
+                if (ty->elem == null) return 0;
+                u32 elemClass = classifyField(ty->elem);
+                if (elemClass == 0) return 0;
+                u32 totalSize = ty->count * (ty->elem->width / 8);
+                // PODs of 1/2/4/8 bytes can go by value in an integer
+                // register; the 8-byte ceiling matches that POD limit
+                if (totalSize > 8) return 0;
+                // An aggregate is never SSE under MS x64, so an array of
+                // floats passed by value still reports INTEGER
+                if (elemClass == 2) return 1;
+                return elemClass;
+            },
+
+            IrTypeKind::Struct => { return classifyStructType(ty); },
+            else => { return 0; },
+        }
+    }
+
+    // Classify a struct type for ABI purposes
+    // Returns 0 = MEMORY, 1 = INTEGER, 2 = SSE, 3 = MIXED
+    // MS x64 has no per-eightbyte split and no MIXED class: a POD of
+    // 1/2/4/8 bytes is INTEGER, everything else is MEMORY. Structs
+    // never classify SSE, and the MIXED result is unreachable here.
+    u32 classifyStructType(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+
+        u32 sz = ty->width;
+        if (sz == 0) return 0;
+
+        // Only exact 1/2/4/8-byte power-of-two PODs travel by value in
+        // a register; a 12-byte struct is already a hidden pointer.
+        if (sz == 1 || sz == 2 || sz == 4 || sz == 8) return 1;
+        return 0;
+    }
+
+    // Count register fields for a struct
+    u32 structRegCount(IrType* ty)
+    {
+        if (ty == null || ty->kind != IrTypeKind::Struct) return 0;
+        // By-value PODs take exactly one integer register; anything
+        // bigger goes through the hidden pointer, so zero registers
+        u32 sz = ty->width;
+        if (sz == 1 || sz == 2 || sz == 4 || sz == 8) return 1;
+        return 0;
+    }
+
+    // Check if struct fits in integer registers
+    bool isIntegerStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 1;
+    }
+
+    // Check if struct fits in SSE registers
+    // Under MS x64 a whole struct never qualifies — only scalar floats
+    // do — so this only ever reports true for degenerate cases where
+    // classifyStructType would have said INTEGER anyway
+    bool isSSEStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 2;
+    }
+
+    // Check if struct must go in memory
+    bool isMemoryStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 0;
+    }
+
+    // Check if struct has mixed integer/SSE fields (per-eightbyte classification)
+    // MS x64 has no MIXED class, this stays false
+    bool isMixedStruct(IrType* ty)
+    {
+        u32 cls = classifyStructType(ty);
+        return cls == 3;
+    }
+
+    // Natural alignment of a field type; scalars at their size (capped
+    // at 8), pointers at 8, aggregates at their largest member's
+    u32 fieldAlign(IrType* ty)
+    {
+        if (ty == null) return 1;
+        switch (ty->kind)
+        {
+            IrTypeKind::Int | IrTypeKind::Float => {
+                u32 a = ty->width / 8;
+                if (a == 0) a = 1;
+                if (a > 8) a = 8;
+                return a;
+            },
+
+            IrTypeKind::Ptr => { return 8; },
+            IrTypeKind::Array | IrTypeKind::Vector => { return fieldAlign(ty->elem); },
+
+            IrTypeKind::Struct => {
+                u32 a = 1;
+                for (u32 i = 0; i < ty->nparams; i++)
+                {
+                    u32 fa = fieldAlign(ty->params[i]);
+                    if (fa > a) a = fa;
+                }
+                if (a > 8) a = 8;
+                return a;
+            },
+
+            else => { return 1; },
+        }
+    }
+
+    // Byte size of a field type; used for offset math where the
+    // interned struct width alone cannot tell fields apart
+    u32 fieldSize(IrType* ty)
+    {
+        if (ty == null) return 0;
+        if (ty->kind == IrTypeKind::Int || ty->kind == IrTypeKind::Float)
+            return ty->width / 8;
+        if (ty->kind == IrTypeKind::Ptr) return 8;
+        if (ty->kind == IrTypeKind::Struct) return ty->width;
+        if (ty->kind == IrTypeKind::Array)
+            return fieldSize(ty->elem) * (ty->count > 0 ? ty->count : 1);
+        return 0;
+    }
+
+    // Get field byte offsets for a struct
+    // For packed structs, no alignment padding
+    // For normal structs, fields are aligned to their natural alignment
+    u32 getFieldOffset(IrType* ty, u32 fieldIdx, bool isPacked)
+    {
+        if (ty == null) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            u32 off = 0;
+            for (u32 i = 0; i < fieldIdx && i < ty->nparams; i++)
+            {
+                if (!isPacked) {
+                    u32 align = fieldAlign(ty->params[i]);
+                    off = (off + align - 1) / align * align;
+                }
+                off += fieldSize(ty->params[i]);
+            }
+            return off;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 elemSize = fieldSize(ty->elem);
+            if (!isPacked) {
+                u32 align = fieldAlign(ty->elem);
+                return fieldIdx * ((elemSize + align - 1) / align * align);
+            }
+            return fieldIdx * elemSize;
+        }
+
+        return 0;
+    }
+
+    // Flatten compound structs (recursive)
+    // Returns the total number of leaf fields
+    u32 flattenStruct(IrType* ty, IrType** outFields, u32 maxFields)
+    {
+        if (ty == null || maxFields == 0) return 0;
+
+        if (ty->kind == IrTypeKind::Struct)
+        {
+            // struct field types ride on the interned IrType itself
+            // (params/nparams), not elem — elem is null for structs
+            u32 count = 0;
+            for (u32 i = 0; i < ty->nparams && count < maxFields; i++)
+                count += flattenStruct(ty->params[i], outFields + count, maxFields - count);
+            return count;
+        }
+
+        if (ty->kind == IrTypeKind::Array && ty->elem != null)
+        {
+            u32 count = 0;
+            for (u32 i = 0; i < ty->count && count < maxFields; i++)
+            {
+                if (ty->elem->kind == IrTypeKind::Struct)
+                    count += flattenStruct(ty->elem, outFields + count, maxFields - count);
+                else if (count < maxFields)
+                {
+                    outFields[count] = ty->elem;
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        if (outFields != null)
+            outFields[0] = ty;
+        return 1;
+    }
+
+    bool run(IrFunc* func)
+    {
+        if (func == null || func->isExtern) return false;
+
+        bool changed = false;
+
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                // I kept the address-of from the old file rather than reading the slot directly
+                IrInst* inst = &bb->insts[ii];
+
+                if (inst->opcode == IrOpcode::Store && inst->nops >= 2)
+                {
+                    IrValue* val = inst->ops[0];
+                    if (val != null && val->type != null && val->type->kind == IrTypeKind::Struct)
+                    {
+                        u32 cls = classifyStructType(val->type);
+                        if (cls == 1 || cls == 2)
+                            changed = true;
+                    }
+                }
+
+                if (inst->opcode == IrOpcode::Load && inst->nops >= 1)
+                {
+                    if (inst->base.type != null && inst->base.type->kind == IrTypeKind::Struct)
+                    {
+                        u32 cls = classifyStructType(inst->base.type);
+                        if (cls == 1 || cls == 2)
+                            changed = true;
+                    }
+                }
+            }
+        }
+
+        return changed;
+    }
+}
+
+pub bool irABILower(IrFunc* func, rawptr userdata)
+{
+    if (func == null) return false;
+    IrContext* ctx = (IrContext*)userdata;
+    ABILowering lower = ABILowering::new(ctx);
+    return lower.run(func);
+}

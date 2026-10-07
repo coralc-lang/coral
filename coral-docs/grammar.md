@@ -35,22 +35,30 @@ consumes any `#[[ attr ]]` attributes and then dispatched on modifiers:
 `#[[attr]]` attributes are the only annotation channel. Today they parse but
 are **not** stored/honored. The full set coralc should eventually support:
 
+- `#[[no_drop_all]]` to turn off the drop trait from performing auto raii, on a whole file. lib files will need this, because frees are done automatically.
+- it is done, so the std would comile faster than it would waiting on auto raii. though user files u=not top declarig it will have auto raii for types thata implement it.
+- `#[[no_drop]]` for single variables or scoped blocks. 
+- `#[[packed]]` — packed structs. 
+- `#[[reorder]]` — reorder the memory layout to the most efficient.
 - `#[[inline]]` — hint the fn is inlinable (recognized spelling like inline)
 - `#[[const]]` — const method/fn (cannot mutate self/params) ⇐ also spelled
   `Type name(params) const {}`.
-- `#[[no_std]]`? not yet. `#[[extern]]`? fn extern already uses `extern("C")`.
+- `#[[no_std]]`? not yet. `#[[extern]]`? fn extern already uses `extern name()` or `extern("C") name()`.
 - `#[[threadlocal]]` — static storage is thread-local
 - `#[[noalias]]` — the pointer arg does not alias
 - `#[[condassign]]` — allow `=` (assign) at the top level of the next condition
-- `#[[pub]]` on items? no—`pub` is the visibility keyword itself.
-- `#[[derive(...)]]` (planned) — the **generator** attribute like Rust `derive`,
-  produces trait/impl boilerplate. Suggested spelling: `#[[derive(Debug, Eq)]]`
+- `#[[hot]]`, `#[[cold]]`
+- `#[[pub]]` on items? no —`pub` is the visibility keyword itself. not allowed!
+- `#[[generate(...)]]` (planned) — the **generator** attribute like Rust `derive`,
+  produces trait/impl boilerplate. Suggested spelling: `#[[generate(Drop, Eq)]]`
   (see "derive vs import" below).
+- `#[[fallthrough]]` for switches when you dont want to add for all cases or use an `else` case,
 - `#[[no_mangle]]`, `#[[test]]`, `#[[bench]]`, `#[[cfg]]`,
   `#[[link]]`, `#[[simd]]` — future slots.
+- Adding multiple attributes(chained), but should be compatible, say: `#[[reorder, packed]] struct foo {...}`
 
 Renaming idea: the `mod name = import …;` keyword is a candidate to become
-`derive` (same length, so lexing is unchanged and it slots in where `mod` sits
+`derive` (same length, so lexing is unchanged and it slots in where `import` sits
 — noted for a future keyword audit).
 
 ## 3. Type syntax
@@ -107,11 +115,11 @@ Tuple, `TypeParam`, `Distinct`, plus `Str` used as a `u8*` interned-id in AST.
 
 ## 7. Statements (parser/stmt.crl)
 
-- Local declaration `var name = expr;` — `var` exists to drive **type inference**;
-  the concrete `Type name = expr;` and `name: Type` forms are not part of local decl.
+- Local declaration `Type name = expr;` and `var name = expr;` — `var` exists to drive **type inference**;
+  the concrete `name: Type` forms are not part of local decl.
 - `flag` declarations are also allowed as statements where the flag value is
   evaluated for its side effect.
-- `for (init; cond; inc) {…}` (C-style) and `for (Type name : iterable) {…}` (range-based), plus `if`/`else`, `while`, and `switch` may
+- `for (init; cond; inc) {…}` (C-style) and `for (Type/var name : iterable) {…}` (range-based), plus `for (const type/var [ name, name2, ... ] : iterable )` plus `if`/`else`, `while`, and `switch` may
   all be expressions and may appear at statement level.
   `comptime {…}` (stub), `defer expr;` (unsupported in codegen), `asm "…" {outputs}` (partially supported), `return expr;`, `break;`,
   `continue;`, `<block as expr>`, expression-statements, `defer expr;`.
