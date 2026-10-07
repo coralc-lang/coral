@@ -127,7 +127,22 @@ pub extend Parser
             TokenKind::Union => { return self.parseUnionDecl(isPub); },
             TokenKind::Trait => { return self.parseTraitDecl(isPub); },
             TokenKind::Extend => { return self.parseExtendDecl(isPub); },
-            TokenKind::Const => { return self.parseConstDecl(isPub); },
+            TokenKind::Const => {
+                /* `const T* name(...)` declares a function with a const
+                 * return type; only a non-fn shape is a constant */
+                ParserMark m = self.save();
+                self.advance();
+                self.parseType();
+                bool fnAfterConst = false;
+                if (self.current.kind == TokenKind::Ident)
+                {
+                    self.advance();
+                    fnAfterConst = self.current.kind == TokenKind::LParen;
+                }
+                self.restore(m);
+                if (fnAfterConst) return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, true);
+                return self.parseConstDecl(isPub);
+            },
             TokenKind::Var => { return self.parseVarDecl(isPub); },
             TokenKind::Typedef => { return self.parseTypedefDecl(); },
             TokenKind::Distinct => { return self.parseDistinctDecl(); },
@@ -313,7 +328,7 @@ pub extend Parser
         NodeId value = self.noneNode();
         Ty varType = self.parseDeclaratorArray(retType);
         if (self.match(TokenKind::Equal)) {
-            value = self.parseExpr();
+            value = self.parseInitExpr();
             self.expect(TokenKind::Semicolon);
         } else {
             self.expect(TokenKind::Semicolon);
@@ -881,7 +896,7 @@ pub extend Parser
         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
         if (typed) ty = self.parseDeclaratorArray(ty);
         NodeId value = self.noneNode();
-        if (self.match(TokenKind::Equal)) value = self.parseExpr();
+        if (self.match(TokenKind::Equal)) value = self.parseInitExpr();
         self.expect(TokenKind::Semicolon);
         u8 flags = isPub ? 1 : 0;
         return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = ty, .value = value, .flags = flags });

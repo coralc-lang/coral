@@ -24,10 +24,25 @@ extern("C") void free(rawptr ptr);
 
 pub extend Parser
 {
+    /* `T(params)` is a fn-pointer type only when what follows `(` can be a
+     * parameter type (or the list is empty). Without this a statement like
+     * `take(&a[1]);` speculatively reads `take(` as a function type,
+     * error recovery lands on `[`, and the decl-vs-expr guess commits a
+     * bogus declaration full of PAR errors. */
+    bool fnTypeAhead()
+    {
+        if (self.current.kind != TokenKind::LParen) return false;
+        ParserMark m = self.save();
+        self.advance();
+        bool ok = self.current.kind == TokenKind::RParen || self.isTypeStart();
+        self.restore(m);
+        return ok;
+    }
+
     /* suffixes on a base type: fn-pointer, pointer, slice, array */
     Ty parseTypeSuffix(Ty base)
     {
-        if (self.current.kind == TokenKind::LParen && base != 0)
+        if (base != 0 && self.fnTypeAhead())
         {
             /* fn-pointer type over a keyword base: `void(i32)`,
              * `rawptr(rawptr)`, `u32(rawptr)` — RET(params) */
@@ -259,7 +274,7 @@ pub extend Parser
             Ty* genericArgs = null;
             u32 genericArgsLen = 0;
             self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
-            if (self.current.kind == TokenKind::LParen)
+            if (self.fnTypeAhead())
             {
                 self.advance();
                 TyListBuilder params;
