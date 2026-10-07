@@ -8,6 +8,9 @@ import diagnostics { ErrorCode };
 import diagnostic_engine { DiagnosticEngine };
 import base { Parser };
 
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr ptr);
+
 pub extend Parser
 {
     u32 errorCount() { return self.panicMode & 0x3fffffff; }
@@ -62,9 +65,42 @@ pub extend Parser
     void reportExpected(TokenKind kind)
     {
         if (self.current.kind == TokenKind::Eof)
+        {
             self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
-        else
-            self.reportError(ErrorCode::ParseExpectedToken, self.current, self.expectedTokenText(kind));
+            return;
+        }
+        /* "expected ';', found 'x'" — built on the heap, freed after the
+         * diagnostic has been rendered (reportError uses it synchronously) */
+        u8* base = self.expectedTokenText(kind);
+        usize bl = 0;
+        while (base[bl] != 0) bl = bl + 1;
+        Token t = self.current;
+        usize tl = t.data.len;
+        if (tl > 64) tl = 64;
+        u8* buf = (u8*)malloc(bl + tl + 24);
+        if (buf == null)
+        {
+            self.reportError(ErrorCode::ParseExpectedToken, t, base);
+            return;
+        }
+        usize n = 0;
+        usize i = 0;
+        while (i < bl) { buf[n] = base[i]; n = n + 1; i = i + 1; }
+        buf[n] = 44; n = n + 1;              /* , */
+        buf[n] = 32; n = n + 1;              /* space */
+        buf[n] = 102; n = n + 1;             /* f */
+        buf[n] = 111; n = n + 1;             /* o */
+        buf[n] = 117; n = n + 1;             /* u */
+        buf[n] = 110; n = n + 1;             /* n */
+        buf[n] = 100; n = n + 1;             /* d */
+        buf[n] = 32; n = n + 1;              /* space */
+        buf[n] = 39; n = n + 1;              /* \' */
+        i = 0;
+        while (i < tl) { buf[n] = t.data.ptr[i]; n = n + 1; i = i + 1; }
+        buf[n] = 39; n = n + 1;              /* \' */
+        buf[n] = 0;
+        self.reportError(ErrorCode::ParseExpectedToken, t, buf);
+        free(buf);
     }
 
     bool isRecoveryBoundary(TokenKind kind)

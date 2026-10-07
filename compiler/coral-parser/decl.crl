@@ -52,17 +52,19 @@ pub extend Parser
         return self.storeNode(NodeKind::Field{ .value = value });
     }
 
-    NodeId parseDecl()
+    /* `#[[name(args), …]]*` — one or more attribute lists.
+     * Returns flags: bit0 = carries `const`. Shared by decl, method and
+     * struct/union member parsing so every position accepts attributes. */
+    u8 parseAttrList()
     {
-        bool isConst = false;
+        u8 flags = 0;
         while (self.match(TokenKind::Hash))
         {
             self.expect(TokenKind::LBracket);
             self.expect(TokenKind::LBracket);
-            /* attribute name — an identifier or keyword (e.g. `const`) */
             if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
             {
-                if (self.current.kind == TokenKind::Const) isConst = true;
+                if (self.current.kind == TokenKind::Const) flags = flags | 1;
                 self.advance();
             }
             if (self.current.kind == TokenKind::LParen)
@@ -76,7 +78,7 @@ pub extend Parser
             {
                 if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
                 {
-                    if (self.current.kind == TokenKind::Const) isConst = true;
+                    if (self.current.kind == TokenKind::Const) flags = flags | 1;
                     self.advance();
                 }
                 if (self.current.kind == TokenKind::LParen)
@@ -90,6 +92,13 @@ pub extend Parser
             self.expect(TokenKind::RBracket);
             self.expect(TokenKind::RBracket);
         }
+        return flags;
+    }
+
+    NodeId parseDecl()
+    {
+        u8 attrFlags = self.parseAttrList();
+        bool isConst = (attrFlags & 1) != 0;
         bool isPub = self.match(TokenKind::Pub);
         bool isExtern = self.match(TokenKind::Extern);
         if (isExtern && self.current.kind == TokenKind::LParen)
@@ -102,7 +111,15 @@ pub extend Parser
 
         switch (self.current.kind)
         {
-            TokenKind::Struct => { return self.parseStructDecl(isPub); },
+            /* `struct(...) fn name(...)` is a function returning a tuple —
+             * only a bare `struct` starts a struct declaration */
+            TokenKind::Struct => {
+                ParserMark m = self.save();
+                self.advance();
+                bool tupleRet = self.current.kind == TokenKind::LParen;
+                self.restore(m);
+                if (!tupleRet) return self.parseStructDecl(isPub);
+            },
             TokenKind::Enum => { return self.parseEnumDecl(isPub); },
             TokenKind::Variant => { return self.parseVariantDecl(isPub); },
             TokenKind::Union => { return self.parseUnionDecl(isPub); },
@@ -233,6 +250,9 @@ pub extend Parser
     NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic, bool isConst)
     {
         Ty retType = self.parseType();
+        /* `u8 const NAME = …` — type-first constant; `const u8 NAME` is
+         * routed to parseConstDecl before we ever get here */
+        if (self.match(TokenKind::Const)) isConst = true;
         Token nameTok = self.expectName();
         Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
         NodeListBuilder genericParams;
@@ -324,41 +344,14 @@ pub extend Parser
 
     NodeId parseFuncDecl()
     {
-        bool isConst = false;
-        while (self.match(TokenKind::Hash))
-        {
-            self.expect(TokenKind::LBracket);
-            self.expect(TokenKind::LBracket);
-            if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
-            {
-                if (self.current.kind == TokenKind::Const) isConst = true;
-                self.advance();
-            }
-            if (self.current.kind == TokenKind::LParen)
-            {
-                self.advance();
-                while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                    self.advance();
-                self.expect(TokenKind::RParen);
-            }
-            while (self.match(TokenKind::Comma))
-            {
-                if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
-                {
-                    if (self.current.kind == TokenKind::Const) isConst = true;
-                    self.advance();
-                }
-                if (self.current.kind == TokenKind::LParen)
-                {
-                    self.advance();
-                    while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                        self.advance();
-                    self.expect(TokenKind::RParen);
-                }
-            }
-            self.expect(TokenKind::RBracket);
-            self.expect(TokenKind::RBracket);
-        }
+        return self.parseFuncDeclFlags(0);
+    }
+
+    /* attrs already consumed by a member loop get folded in here */
+    NodeId parseFuncDeclFlags(u8 attrFlags)
+    {
+        attrFlags = attrFlags | self.parseAttrList();
+        bool isConst = (attrFlags & 1) != 0;
         return self.parseFuncOrVarDecl(false, false, false, isConst);
     }
 
@@ -459,6 +452,7 @@ pub extend Parser
         self.expect(TokenKind::LBrace);
         while (self.current.kind != TokenKind::RBrace && !self.atEnd())
         {
+            u8 memberAttrs = self.parseAttrList();
             u8 fieldFlags = 0;
             if (self.match(TokenKind::Pub)) fieldFlags = 1;
             if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
@@ -471,7 +465,7 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
-                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, false);
+                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
                 continue;
             }
@@ -479,12 +473,13 @@ pub extend Parser
             ParserMark mark = self.save();
             self.parseType();
             self.expect(TokenKind::Ident);
-            bool isMethod = self.current.kind == TokenKind::LParen;
+            bool isMethod = self.current.kind == TokenKind::LParen ||
+                            self.current.kind == TokenKind::Less;
             self.restore(mark);
 
             if (isMethod)
             {
-                NodeId method = self.parseFuncDecl();
+                NodeId method = self.parseFuncDeclFlags(memberAttrs);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
                 continue;
             }
@@ -653,6 +648,7 @@ pub extend Parser
         self.expect(TokenKind::LBrace);
         while (self.current.kind != TokenKind::RBrace && !self.atEnd())
         {
+            u8 memberAttrs = self.parseAttrList();
             u8 fieldFlags = 0;
             if (self.match(TokenKind::Pub)) fieldFlags = 1;
             if (self.current.kind == TokenKind::Extern || self.current.kind == TokenKind::Static)
@@ -665,18 +661,19 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
-                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, false);
+                NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
                 continue;
             }
             ParserMark mark = self.save();
             self.parseType();
             self.expect(TokenKind::Ident);
-            bool isMethod = self.current.kind == TokenKind::LParen;
+            bool isMethod = self.current.kind == TokenKind::LParen ||
+                            self.current.kind == TokenKind::Less;
             self.restore(mark);
             if (isMethod)
             {
-                NodeId method = self.parseFuncDecl();
+                NodeId method = self.parseFuncDeclFlags(memberAttrs);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
                 continue;
             }
@@ -768,8 +765,26 @@ pub extend Parser
         Str traitName = 0;
         if (self.match(TokenKind::Colon))
         {
+            /* builtin traits are spelled `@name` (`@drop`, `@toStr`, …);
+             * keep the `@` so they stay distinct from user traits */
+            bool atMark = self.match(TokenKind::At);
             Token traitTok = self.expect(TokenKind::Ident);
-            traitName = self.ctx.intern(traitTok.data.ptr, traitTok.data.len);
+            if (atMark)
+            {
+                u8* buf = (u8*)malloc(traitTok.data.len + 1);
+                if (buf != null)
+                {
+                    buf[0] = '@';
+                    u32 i = 0;
+                    while (i < traitTok.data.len) { buf[i + 1] = traitTok.data.ptr[i]; i = i + 1; }
+                    /* intern keeps the pointer — the buffer lives as long as the context */
+                    if (!self.ctx.track((rawptr)buf)) self.addError();
+                    traitName = self.ctx.intern(buf, traitTok.data.len + 1);
+                }
+            }
+            else {
+                traitName = self.ctx.intern(traitTok.data.ptr, traitTok.data.len);
+            }
         }
         NodeListBuilder methods;
         self.ctx.nodeListInit(&methods);
