@@ -1,4 +1,5 @@
 /* parser/decl.crl — declaration parsing */
+mod diagnostics = import "../coral-diagnostics/code";
 
 mod base = import "base";
 mod node_ast = import "../coral-ast/node";
@@ -9,6 +10,7 @@ mod context = import "../coral-context/context";
 mod token = import "../coral-common/token";
 mod id = import "../coral-ast/id";
 
+import diagnostics { ErrorCode };
 import base { Parser, ParserMark };
 import parser { Parser };
 import context { AstContext, InternEntry, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
@@ -125,7 +127,8 @@ pub extend Parser
             TokenKind::Union => { return self.parseUnionDecl(isPub); },
             TokenKind::Trait => { return self.parseTraitDecl(isPub); },
             TokenKind::Extend => { return self.parseExtendDecl(isPub); },
-            TokenKind::Const => { return self.parseConstDecl(); },
+            TokenKind::Const => { return self.parseConstDecl(isPub); },
+            TokenKind::Var => { return self.parseVarDecl(isPub); },
             TokenKind::Typedef => { return self.parseTypedefDecl(); },
             TokenKind::Distinct => { return self.parseDistinctDecl(); },
             TokenKind::Flag => { return self.parseFlagDecl(); },
@@ -138,7 +141,7 @@ pub extend Parser
         if (isExtern || isStatic || self.isTypeStart())
             return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, isConst);
 
-        self.addError();
+        self.reportCurrentError(ErrorCode::ParseExpectedDecl, "expected a declaration: a function, var, const, struct or a type");
         if (!self.atEnd()) self.advance();
         return self.noneNode();
     }
@@ -277,11 +280,11 @@ pub extend Parser
             if (self.current.kind != TokenKind::RParen)
             {
                 NodeId param = self.parseParam();
-                if (!self.ctx.nodeListAppend(&params, param)) self.addError();
+                if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
                 while (self.match(TokenKind::Comma))
                 {
                     param = self.parseParam();
-                    if (!self.ctx.nodeListAppend(&params, param)) self.addError();
+                    if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
                 }
             }
             self.expect(TokenKind::RParen);
@@ -308,13 +311,14 @@ pub extend Parser
             return self.storeDecl(DeclKind::Func{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .params = paramValues, .paramsLen = paramCount, .returnType = retType, .body = body, .flags = flags });
         }
         NodeId value = self.noneNode();
+        Ty varType = self.parseDeclaratorArray(retType);
         if (self.match(TokenKind::Equal)) {
             value = self.parseExpr();
             self.expect(TokenKind::Semicolon);
         } else {
             self.expect(TokenKind::Semicolon);
         }
-        return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = retType, .value = value, .flags = flags });
+        return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = varType, .value = value, .flags = flags });
     }
 
     NodeId parseGenericParam()
@@ -336,10 +340,10 @@ pub extend Parser
         while (true)
         {
             NodeId param = self.parseGenericParam();
-            if (!self.ctx.nodeListAppend(params, param)) self.addError();
+            if (!self.ctx.nodeListAppend(params, param)) self.reportAllocFailed();
             if (!self.match(TokenKind::Comma)) break;
         }
-        if (!self.consumeGreater()) self.addError();
+        if (!self.consumeGreater()) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected '>' to close generic parameters");
     }
 
     NodeId parseFuncDecl()
@@ -466,7 +470,7 @@ pub extend Parser
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
-                if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 continue;
             }
 
@@ -480,7 +484,7 @@ pub extend Parser
             if (isMethod)
             {
                 NodeId method = self.parseFuncDeclFlags(memberAttrs);
-                if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 continue;
             }
 
@@ -499,7 +503,7 @@ pub extend Parser
                 field.flags = field.flags | 2;
             }
             NodeId fieldNode = self.storeField(field);
-            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.addError();
+            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
             self.match(TokenKind::Comma);
             self.match(TokenKind::Semicolon);
         }
@@ -547,7 +551,7 @@ pub extend Parser
                     enumValue.flags = 1;
                 }
                 NodeId variantNode = self.storeNode(NodeKind::EnumVariant{ .value = enumValue });
-                if (!self.ctx.nodeListAppend(&variants, variantNode)) self.addError();
+                if (!self.ctx.nodeListAppend(&variants, variantNode)) self.reportAllocFailed();
                 if (!self.match(TokenKind::Comma)) break;
                 if (self.current.kind == TokenKind::RBrace) break;
             }
@@ -582,7 +586,7 @@ pub extend Parser
             {
                 self.advance();
                 NodeId method = self.parseFuncDecl();
-                if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 continue;
             }
             Token variantTok = self.expect(TokenKind::Ident);
@@ -604,8 +608,8 @@ pub extend Parser
                     Ty fieldType = self.parseType();
                     Token fieldTok = self.expect(TokenKind::Ident);
                     Str fieldName = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
-                    if (!self.ctx.tyListAppend(&fieldTypes, fieldType)) self.addError();
-                    if (!self.ctx.strListAppend(&fieldNames, fieldName)) self.addError();
+                    if (!self.ctx.tyListAppend(&fieldTypes, fieldType)) self.reportAllocFailed();
+                    if (!self.ctx.strListAppend(&fieldNames, fieldName)) self.reportAllocFailed();
                     if (!self.match(TokenKind::Comma) && !self.match(TokenKind::Semicolon)) break;
                 }
                 self.expect(TokenKind::RBrace);
@@ -613,7 +617,7 @@ pub extend Parser
                 variantValue.fieldNames = self.ctx.strListFinish(&fieldNames);
                 variantValue.fieldTypes = self.ctx.tyListFinish(&fieldTypes);
             }
-            if (!self.ctx.variantListAppend(&variants, variantValue)) self.addError();
+            if (!self.ctx.variantListAppend(&variants, variantValue)) self.reportAllocFailed();
             self.match(TokenKind::Comma);
         }
         self.expect(TokenKind::RBrace);
@@ -662,7 +666,7 @@ pub extend Parser
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
-                if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 continue;
             }
             ParserMark mark = self.save();
@@ -674,7 +678,7 @@ pub extend Parser
             if (isMethod)
             {
                 NodeId method = self.parseFuncDeclFlags(memberAttrs);
-                if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+                if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 continue;
             }
             Ty fieldType = self.parseType();
@@ -686,7 +690,7 @@ pub extend Parser
             field.loc.data = 0;
             field.flags = fieldFlags;
             NodeId fieldNode = self.storeField(field);
-            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.addError();
+            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
             self.match(TokenKind::Comma);
             self.match(TokenKind::Semicolon);
         }
@@ -737,7 +741,7 @@ pub extend Parser
             {
                 method = self.parseFuncDecl();
             }
-            if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+            if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
         }
         self.expect(TokenKind::RBrace);
         self.outerGenerics = null;
@@ -778,7 +782,7 @@ pub extend Parser
                     u32 i = 0;
                     while (i < traitTok.data.len) { buf[i + 1] = traitTok.data.ptr[i]; i = i + 1; }
                     /* intern keeps the pointer — the buffer lives as long as the context */
-                    if (!self.ctx.track((rawptr)buf)) self.addError();
+                    if (!self.ctx.track((rawptr)buf)) self.reportAllocFailed();
                     traitName = self.ctx.intern(buf, traitTok.data.len + 1);
                 }
             }
@@ -808,7 +812,7 @@ pub extend Parser
             {
                 method = self.parseFuncDecl();
             }
-            if (!self.ctx.nodeListAppend(&methods, method)) self.addError();
+            if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
         }
         self.expect(TokenKind::RBrace);
         self.outerGenerics = null;
@@ -820,7 +824,7 @@ pub extend Parser
         return self.storeDecl(DeclKind::Extend{ .selfType = selfType, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount });
     }
 
-    NodeId parseConstDecl()
+    NodeId parseConstDecl(bool isPub)
     {
         self.expect(TokenKind::Const);
         Ty typeNode = self.parseType();
@@ -843,11 +847,44 @@ pub extend Parser
             if (typeNode != 0) typeNode = self.parseDeclaratorArray(typeNode);
             nameId = self.ctx.intern(name.data.ptr, name.data.len);
         }
-        if (nameId == 0) self.addError();
+        if (nameId == 0) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a constant name");
         self.expect(TokenKind::Equal);
         NodeId value = self.parseInitExpr();
         self.expect(TokenKind::Semicolon);
-        return self.storeDecl(DeclKind::Constant{ .name = nameId, .typeNode = typeNode, .value = value, .flags = 1 });
+        /* flags: 1 = pub, 16 = const (see parseFuncOrVarDecl) */
+        u8 cflags = 16;
+        if (isPub) cflags = cflags | 1;
+        return self.storeDecl(DeclKind::Constant{ .name = nameId, .typeNode = typeNode, .value = value, .flags = cflags });
+    }
+
+    /* `var NAME = expr;` (inferred storage) and `var T NAME [N] [= expr];`
+     * (typed storage) at file scope. */
+    NodeId parseVarDecl(bool isPub)
+    {
+        self.expect(TokenKind::Var);
+        Ty ty = 0;
+        bool typed = false;
+        if (self.isTypeStart())
+        {
+            ParserMark m = self.save();
+            Ty parsed = self.parseType();
+            if (self.current.kind == TokenKind::Ident)
+            {
+                /* a name follows the type: `var i32 x = …` */
+                typed = true;
+                ty = parsed;
+                self.endSpeculation();
+            }
+            else self.restore(m);
+        }
+        Token nameTok = self.expectName();
+        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        if (typed) ty = self.parseDeclaratorArray(ty);
+        NodeId value = self.noneNode();
+        if (self.match(TokenKind::Equal)) value = self.parseExpr();
+        self.expect(TokenKind::Semicolon);
+        u8 flags = isPub ? 1 : 0;
+        return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = ty, .value = value, .flags = flags });
     }
 
     NodeId parseTypedefDecl()
@@ -975,7 +1012,7 @@ pub extend Parser
         u8* text = (u8*)malloc(total);
         if (text == null)
         {
-            self.addError();
+            self.reportAllocFailed();
             return 0;
         }
         usize offset = 0;
@@ -1001,7 +1038,7 @@ pub extend Parser
             i = i + 1;
         }
         Str result = self.ctx.intern(text, total);
-        if (!self.ctx.track((rawptr)text)) self.addError();
+        if (!self.ctx.track((rawptr)text)) self.reportAllocFailed();
         return result;
     }
 
@@ -1015,7 +1052,7 @@ pub extend Parser
             Str part = self.ctx.intern(tok.data.ptr, tok.data.len);
             if (!self.ctx.strListAppend(&parts, part))
             {
-                self.addError();
+                self.reportAllocFailed();
                 break;
             }
             if (self.current.kind != TokenKind::ColonColon) break;
@@ -1049,7 +1086,7 @@ pub extend Parser
                     rawptr raw = realloc((rawptr)list->items, (usize)newCap * sizeof(ImportSymbol));
                     if (raw == null)
                     {
-                        self.addError();
+                        self.reportAllocFailed();
                         return false;
                     }
                     list->items = (ImportSymbol*)raw;
@@ -1107,7 +1144,7 @@ pub extend Parser
                         rawptr raw = realloc((rawptr)list->items, (usize)newCap * sizeof(ImportSymbol));
                         if (raw == null)
                         {
-                            self.addError();
+                            self.reportAllocFailed();
                             return false;
                         }
                         list->items = (ImportSymbol*)raw;
@@ -1140,7 +1177,7 @@ pub extend Parser
         list.cap = 0;
         self.parseSymbolList(prefix, &list);
         self.expect(TokenKind::RBrace);
-        if (list.items != null && !self.ctx.track((rawptr)list.items)) self.addError();
+        if (list.items != null && !self.ctx.track((rawptr)list.items)) self.reportAllocFailed();
         *outSymbols = (rawptr)list.items;
         *outLen = list.len;
     }
@@ -1158,8 +1195,12 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            self.addError();
-            self.advance();
+            /* `import "std";` — quoted path (token text keeps the quotes) */
+            Token ptok = self.advance();
+            if (ptok.data.len >= 2)
+                path = self.ctx.intern(ptok.data.ptr + 1, ptok.data.len - 2);
+            else
+                self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a non-empty import path");
         }
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;
@@ -1186,8 +1227,12 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            self.addError();
-            self.advance();
+            /* `import "std";` — quoted path (token text keeps the quotes) */
+            Token ptok = self.advance();
+            if (ptok.data.len >= 2)
+                path = self.ctx.intern(ptok.data.ptr + 1, ptok.data.len - 2);
+            else
+                self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a non-empty import path");
         }
         else path = self.parseNamespacePath();
         ImportSymbol* symbols = null;

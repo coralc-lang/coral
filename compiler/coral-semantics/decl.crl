@@ -24,6 +24,7 @@ pub extend Sema
         Node* node = self.ctx.nodes + id.index;
         if (node->kind.tag != NodeKind::Decl) return true;
         Decl* decl = &node->kind.payload.Decl.value;
+        u8 symbolFlags = 0;
         u8 kind = 0;
         Str name = 0;
         Ty typeNode = 0;
@@ -73,6 +74,9 @@ pub extend Sema
                 kind = 1;
                 name = decl->kind.payload.Constant.name;
                 typeNode = decl->kind.payload.Constant.typeNode;
+                /* parser flags bit 16 = `const` — mark the symbol const so
+                 * assignments to it are rejected (TC-0008) */
+                if ((decl->kind.payload.Constant.flags & 16) != 0) symbolFlags = symbolFlags | 1;
                 if (typeNode == 0 && decl->kind.payload.Constant.value.index != 0)
                 {
                     if (self.checkExpr(decl->kind.payload.Constant.value))
@@ -95,7 +99,17 @@ pub extend Sema
             },
             else => {}
         }
-        if (name != 0) self.scopes.declare(name, kind, typeNode, id, 0);
+        /* symbols are declared once, on the declareAll pass — checkBodies
+         * would only repeat the declaration (and re-count its failure) */
+        if (name != 0 && !bodies)
+        {
+            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags))
+            {
+                Symbol* prev = self.scopes.lookup(name);
+                if (prev != null && prev->declaration.index != id.index)
+                    self.semaErrorNode(ErrorCode::SemaDuplicateDecl, id, "duplicate declaration of this name");
+            }
+        }
         if (!bodies) return true;
         if (decl->kind.tag == DeclKind::Func)
             return self.checkFunction(decl, 0);

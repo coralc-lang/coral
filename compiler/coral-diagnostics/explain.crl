@@ -1,0 +1,339 @@
+/* diagnostics/explain.crl — `coralc --explain CODE` long-form help.
+ *
+ * One entry per stable diagnostic code (see code.crl). Output goes to
+ * stdout: a bold header, a short summary, then "why" and "how to fix"
+ * sections. Unknown codes print the index of every code we know.
+ */
+
+extern("C") i32 write(i32 fd, u8* buf, usize len);
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr realloc(rawptr p, usize size);
+extern("C") void free(rawptr p);
+
+struct ExBuf
+{
+    u8* p;
+    usize len;
+    usize cap;
+}
+
+void exBufInit(ExBuf* b)
+{
+    b->p = (u8*)malloc(256);
+    b->len = 0;
+    b->cap = b->p != null ? 256 : 0;
+}
+
+void exBufEnsure(ExBuf* b, usize need)
+{
+    if (b->len + need <= b->cap) return;
+    usize nc = b->cap == 0 ? 512 : b->cap * 2;
+    while (nc < b->len + need) nc = nc * 2;
+    u8* np = (u8*)realloc((rawptr)b->p, nc);
+    if (np == null) return;
+    b->p = np;
+    b->cap = nc;
+}
+
+void exBufStr(ExBuf* b, u8* s)
+{
+    if (s == null) return;
+    usize n = 0;
+    while (s[n] != 0) n = n + 1;
+    if (n == 0) return;
+    exBufEnsure(b, n);
+    if (b->len + n <= b->cap)
+    {
+        usize i = 0;
+        while (i < n) { b->p[b->len + i] = s[i]; i = i + 1; }
+        b->len = b->len + n;
+    }
+}
+
+void exBufByte(ExBuf* b, u8 c)
+{
+    exBufEnsure(b, 1);
+    if (b->len < b->cap) { b->p[b->len] = c; b->len = b->len + 1; }
+}
+
+bool exEq(u8* a, u8* b)
+{
+    usize i = 0;
+    while (a[i] != 0 && b[i] != 0)
+    {
+        if (a[i] != b[i]) return false;
+        i = i + 1;
+    }
+    return a[i] == b[i];
+}
+
+void exTitle(ExBuf* b, u8* code, u8* summary)
+{
+    exBufByte(b, 27); exBufStr(b, (u8*)"[1m");
+    exBufStr(b, code);
+    exBufByte(b, 27); exBufStr(b, (u8*)"[0m");
+    exBufStr(b, (u8*)" — ");
+    exBufStr(b, summary);
+    exBufStr(b, (u8*)"\n\n");
+}
+
+void exWhy(ExBuf* b, u8* s) { exBufStr(b, (u8*)"why:  "); exBufStr(b, s); exBufStr(b, (u8*)"\n"); }
+void exFix(ExBuf* b, u8* s) { exBufStr(b, (u8*)"fix:  "); exBufStr(b, s); exBufStr(b, (u8*)"\n"); }
+
+/* returns true when the code was recognised */
+bool exOne(ExBuf* b, u8* code)
+{
+    if (exEq(code, (u8*)"LEX-0001"))
+    {
+        exTitle(b, code, (u8*)"unknown character");
+        exWhy(b, (u8*)"the lexer found a byte that cannot start any Coral token.");
+        exFix(b, (u8*)"delete the character, or quote it if it belongs in a string.");
+        exFix(b, (u8*)"watch for smart quotes/ dashes copied from documents, and for stray tabs in odd places.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0002"))
+    {
+        exTitle(b, code, (u8*)"unterminated string literal");
+        exWhy(b, (u8*)"a '\"' opened a string that is never closed before the end of the line.");
+        exFix(b, (u8*)"add the closing quote; use \\n for a newline inside the string.");
+        exFix(b, (u8*)"for a string that must span lines, build it from pieces instead.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0003"))
+    {
+        exTitle(b, code, (u8*)"unterminated character literal");
+        exWhy(b, (u8*)"a '\\'' opened a char literal that is never closed.");
+        exFix(b, (u8*)"char literals hold exactly one character: '\\n', 'a', '7'.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0004"))
+    {
+        exTitle(b, code, (u8*)"unterminated block comment");
+        exWhy(b, (u8*)"a '/*' is missing its closing '*/'.");
+        exFix(b, (u8*)"close the comment; block comments may nest, so count the levels.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0005"))
+    {
+        exTitle(b, code, (u8*)"invalid escape sequence");
+        exWhy(b, (u8*)"the backslash is followed by a character that has no meaning.");
+        exFix(b, (u8*)"valid escapes: \\n \\r \\t \\\\ \\' \\\" \\0 \\xNN");
+        exFix(b, (u8*)"for a literal backslash, write \\\\.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0006"))
+    {
+        exTitle(b, code, (u8*)"invalid number literal");
+        exWhy(b, (u8*)"a digit sequence is not a well-formed number in its base.");
+        exFix(b, (u8*)"decimal: 42; hex: 0xFF; binary: 0b1010; octal: 0o755");
+        exFix(b, (u8*)"suffixes: 255u (unsigned), 12i32-style casts go on the outside.");
+        return true;
+    }
+    if (exEq(code, (u8*)"LEX-0007"))
+    {
+        exTitle(b, code, (u8*)"invalid character in token");
+        exWhy(b, (u8*)"this byte cannot appear where it was found.");
+        exFix(b, (u8*)"split the token, or move the character into a string literal.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0001"))
+    {
+        exTitle(b, code, (u8*)"expected a specific token, found something else");
+        exWhy(b, (u8*)"the grammar requires a token here — usually ';', ')', '}' or '>'.");
+        exWhy(b, (u8*)"the location points at the token that was found instead.");
+        exFix(b, (u8*)"add the missing token; a missing ';' at the end of a statement is the usual cause.");
+        exFix(b, (u8*)"if the found token looks right, check the line above — an unclosed '(' or '{' earlier shifts everything.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0002"))
+    {
+        exTitle(b, code, (u8*)"expected an expression");
+        exWhy(b, (u8*)"an operand was required here (after an operator, inside '()', ...).");
+        exFix(b, (u8*)"supply a value: a literal, identifier, call, or parenthesised expression.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0003"))
+    {
+        exTitle(b, code, (u8*)"expected a type");
+        exWhy(b, (u8*)"a type name was required here (declaration, cast, or generic argument).");
+        exFix(b, (u8*)"use a primitive (i32, u8, bool, str, ...) or a declared struct/enum/trait name.");
+        exFix(b, (u8*)"if the type lives elsewhere, import its module first.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0004"))
+    {
+        exTitle(b, code, (u8*)"expected a declaration");
+        exWhy(b, (u8*)"at file level, only declarations are valid.");
+        exFix(b, (u8*)"declarations are: var, const, struct, enum, trait, union, variant, typedef,");
+        exFix(b, (u8*)"distinct, import, mod, extend, extern, static, comptime, flag — each optionally");
+        exFix(b, (u8*)"after `pub`. a function has no keyword: `i32 name(i32 a) { ... }`.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0005"))
+    {
+        exTitle(b, code, (u8*)"expected a statement");
+        exWhy(b, (u8*)"a statement was required in this block.");
+        exFix(b, (u8*)"statements start with: var, if, for, while, loop, switch, return,");
+        exFix(b, (u8*)"break, continue, defer, comptime, or an expression.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0006"))
+    {
+        exTitle(b, code, (u8*)"unexpected end of file");
+        exWhy(b, (u8*)"input ended while a construct was still open.");
+        exFix(b, (u8*)"close every '{', '(' and '['; the file is most likely truncated.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0007"))
+    {
+        exTitle(b, code, (u8*)"invalid assignment target");
+        exWhy(b, (u8*)"the left side of '=' is not something that can be stored into.");
+        exFix(b, (u8*)"assign to a variable, field, or dereferenced pointer; use '==' to compare.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0008"))
+    {
+        exTitle(b, code, (u8*)"duplicate modifier");
+        exWhy(b, (u8*)"a modifier (pub, extern, static, ...) appears twice on one declaration.");
+        exFix(b, (u8*)"keep a single copy of each modifier.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0009"))
+    {
+        exTitle(b, code, (u8*)"missing ';'");
+        exWhy(b, (u8*)"statements and simple declarations end with a semicolon.");
+        exFix(b, (u8*)"add ';' at the end of the line pointed at.");
+        return true;
+    }
+    if (exEq(code, (u8*)"PAR-0010"))
+    {
+        exTitle(b, code, (u8*)"assignment in condition");
+        exWhy(b, (u8*)"Coral rejects '=' inside an if/while condition to avoid the C 'if (x = y)' bug.");
+        exFix(b, (u8*)"use '==' to compare, or mark the declaration #[[condassign]] if the assignment is intended.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0001"))
+    {
+        exTitle(b, code, (u8*)"unknown name");
+        exWhy(b, (u8*)"this identifier is not declared in scope, or its module was never imported.");
+        exFix(b, (u8*)"check spelling (Coral is case-sensitive) and that the declaring module is imported.");
+        exFix(b, (u8*)"for names from another file: mod m = import(lib, \"name\"); then qualify as m::name.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0002"))
+    {
+        exTitle(b, code, (u8*)"type mismatch");
+        exWhy(b, (u8*)"the operand's type does not match what this position requires.");
+        exFix(b, (u8*)"Coral has no implicit conversions — convert explicitly: x as i64.");
+        exFix(b, (u8*)"widening (u8 → u32) still needs the cast to be written out.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0003"))
+    {
+        exTitle(b, code, (u8*)"wrong number of arguments");
+        exWhy(b, (u8*)"the call passes a different number of arguments than the declaration accepts.");
+        exFix(b, (u8*)"match the parameter list; variadic functions (… params) accept a tail of extra arguments.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0004"))
+    {
+        exTitle(b, code, (u8*)"duplicate declaration");
+        exWhy(b, (u8*)"this name is already declared in the same scope.");
+        exFix(b, (u8*)"rename one of them, or move one into another module.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0005"))
+    {
+        exTitle(b, code, (u8*)"invalid cast");
+        exWhy(b, (u8*)"these two types have no legal conversion between them.");
+        exFix(b, (u8*)"convert through a common type, or rebuild the value from its parts.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0006"))
+    {
+        exTitle(b, code, (u8*)"no such member or method");
+        exWhy(b, (u8*)"the type has no field/method with this name.");
+        exFix(b, (u8*)"check the spelling; declare the method with `extend Type { ... }` if it should exist.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0007"))
+    {
+        exTitle(b, code, (u8*)"internal type-checker failure");
+        exWhy(b, (u8*)"the checker hit a state it does not handle — this is a compiler bug.");
+        exFix(b, (u8*)"minimise the input to the smallest file that still triggers it and report it.");
+        return true;
+    }
+    if (exEq(code, (u8*)"TC-0008"))
+    {
+        exTitle(b, code, (u8*)"cannot assign to this");
+        exWhy(b, (u8*)"the left-hand side is not storage this statement may write to.");
+        exWhy(b, (u8*)"typical causes: the name is a `const`, a type, a function, or a `comptime` value.");
+        exFix(b, (u8*)"make the target a `var` if it must change, or compute a new value instead of overwriting it.");
+        exFix(b, (u8*)"a const local can be redeclared with `var`; a const global must be declared `var` at file scope.");
+        return true;
+    }
+    if (exEq(code, (u8*)"CG-0001"))
+    {
+        exTitle(b, code, (u8*)"construct not supported by codegen");
+        exWhy(b, (u8*)"this construct has no lowering for the current target.");
+        exFix(b, (u8*)"rewrite it with supported constructs, or report the gap if the feature is documented.");
+        return true;
+    }
+    if (exEq(code, (u8*)"CG-0002"))
+    {
+        exTitle(b, code, (u8*)"internal codegen failure");
+        exWhy(b, (u8*)"the backend hit a state it does not handle — this is a compiler bug.");
+        exFix(b, (u8*)"minimise the input and report it.");
+        return true;
+    }
+    if (exEq(code, (u8*)"DRV-0001"))
+    {
+        exTitle(b, code, (u8*)"file not found");
+        exWhy(b, (u8*)"the compiler could not open the given path.");
+        exFix(b, (u8*)"check the path spelling and that the file exists relative to the working directory.");
+        return true;
+    }
+    if (exEq(code, (u8*)"DRV-0002"))
+    {
+        exTitle(b, code, (u8*)"invalid flag");
+        exWhy(b, (u8*)"the command line contains an option coralc does not accept.");
+        exFix(b, (u8*)"run `coralc --help` for the list of accepted flags.");
+        return true;
+    }
+    if (exEq(code, (u8*)"DRV-0003"))
+    {
+        exTitle(b, code, (u8*)"out of memory");
+        exWhy(b, (u8*)"an allocation failed while compiling.");
+        exFix(b, (u8*)"close other programs and retry; report it if it reproduces on a small input.");
+        return true;
+    }
+    return false;
+}
+
+void exIndex(ExBuf* b)
+{
+    exBufStr(b, (u8*)"No explanation available for this code.\n\nAvailable codes:\n");
+    exBufStr(b, (u8*)"  LEX-0001 .. LEX-0007   lexer\n");
+    exBufStr(b, (u8*)"  PAR-0001 .. PAR-0010   parser\n");
+    exBufStr(b, (u8*)"  TC-0001  .. TC-0008    type check / semantics\n");
+    exBufStr(b, (u8*)"  CG-0001  .. CG-0002    codegen\n");
+    exBufStr(b, (u8*)"  DRV-0001 .. DRV-0003   driver\n");
+}
+
+pub void explain(u8* code, usize len)
+{
+    /* normalise to a NUL-terminated copy so callers can pass a Slice */
+    u8* c = (u8*)malloc(len + 1);
+    if (c == null) return;
+    usize i = 0;
+    while (i < len) { c[i] = code[i]; i = i + 1; }
+    c[len] = 0;
+
+    ExBuf b;
+    exBufInit(&b);
+    if (!exOne(&b, c)) exIndex(&b);
+    exBufByte(&b, 10);
+    if (b.p != null) write(1, b.p, b.len);
+    if (b.p != null) free((rawptr)b.p);
+    free((rawptr)c);
+}

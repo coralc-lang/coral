@@ -3189,6 +3189,25 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
     stP(&cg.defs, ";\n");
 }
 
+/* `T name` / `T name[len]` at file scope (C puts array bounds after the name) */
+void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
+{
+    if (cty != 0 && (cg.ctx->types + cty)->kind.tag == TypeKind::Array)
+    {
+        TypeEntry* ae = cg.ctx->types + cty;
+        stPS(&cg.defs, tyStr(cg, ae->kind.payload.Array.base));
+        stCh(&cg.defs, ' ');
+        stPS(&cg.defs, cgIdent(cg, name));
+        stCh(&cg.defs, '[');
+        stU64(&cg.defs, (u64)ae->kind.payload.Array.len);
+        stCh(&cg.defs, ']');
+        return;
+    }
+    stPS(&cg.defs, tyStr(cg, cty));
+    stCh(&cg.defs, ' ');
+    stPS(&cg.defs, cgIdent(cg, name));
+}
+
 void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
 {
     u32 f = 0;
@@ -3380,7 +3399,7 @@ void cgEmitTypeDefs(Codegen* cg)
         }
         i = i + 1;
     }
-    /* sweep 4: constants */
+    /* sweep 4: file-scope constants and variables */
     i = 0;
     while (i < cg.file.declsLen)
     {
@@ -3392,27 +3411,49 @@ void cgEmitTypeDefs(Codegen* cg)
             {
                 u8 cflags = dd.kind.payload.Constant.flags;
                 NodeId cval = dd.kind.payload.Constant.value;
+                Ty cty = dd.kind.payload.Constant.typeNode;
+                Str cname = dd.kind.payload.Constant.name;
                 if ((cflags & 2) != 0)
                 {
                     /* extern variable: declaration only */
                     stP(&cg.defs, "extern ");
-                    stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
-                    stCh(&cg.defs, ' ');
-                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Constant.name));
+                    cgEmitGlobalDeclarator(cg, cty, cname);
                     stP(&cg.defs, ";\n");
                 }
                 else
                 {
-                    cgError(cg, (u8*)"constant must be a constant atom");
-                    stP(&cg.defs, "static ");
-                    stPS(&cg.defs, tyStr(cg, dd.kind.payload.Constant.typeNode));
-                    stCh(&cg.defs, ' ');
-                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Constant.name));
+                    if ((cflags & 4) != 0) stP(&cg.defs, "static ");
+                    cgEmitGlobalDeclarator(cg, cty, cname);
                     if (cval.index != 0)
                     {
-                        stP(&cg.defs, " = ");
-                        Slice v = cgExpr(cg, cval);
-                        stPS(&cg.defs, v);
+                        bool isArray = cty != 0 &&
+                            (cg.ctx->types + cty)->kind.tag == TypeKind::Array;
+                        if (isArray)
+                        {
+                            Node* inn = cgNode(cg, cval);
+                            if (inn.kind.tag == NodeKind::Expr &&
+                                inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral)
+                            {
+                                Expr* al = &inn.kind.payload.Expr.value;
+                                stP(&cg.defs, " = {");
+                                u32 ai = 0;
+                                while (ai < al.kind.payload.ArrayLiteral.elemsLen)
+                                {
+                                    if (ai > 0) stP(&cg.defs, ", ");
+                                    Slice ev = cgExpr(cg, al.kind.payload.ArrayLiteral.elems[ai]);
+                                    stPS(&cg.defs, ev);
+                                    ai = ai + 1;
+                                }
+                                stCh(&cg.defs, '}');
+                            }
+                            else cgError(cg, (u8*)"array constant needs an array-literal initializer");
+                        }
+                        else
+                        {
+                            stP(&cg.defs, " = ");
+                            Slice v = cgExpr(cg, cval);
+                            stPS(&cg.defs, v);
+                        }
                     }
                     stP(&cg.defs, ";\n");
                 }

@@ -18,6 +18,7 @@ pub struct DiagnosticEngine
     usize errors;
     usize warnings;
     usize errorLimit;
+    bool limitNotified;
     usize lexerErrors;
     usize parserErrors;
     u8* bufStart;
@@ -34,7 +35,8 @@ pub struct DiagnosticEngine
         self = DiagnosticEngine {
             .errors = 0,
             .warnings = 0,
-            .errorLimit = 4000,
+            .errorLimit = 20,
+            .limitNotified = false,
             .lexerErrors = 0,
             .parserErrors = 0,
             .bufStart = bufStart,
@@ -53,7 +55,8 @@ pub struct DiagnosticEngine
     usize lexerErrorCount() { return self.lexerErrors; }
     usize parserErrorCount() { return self.parserErrors; }
     bool hasErrors() { return self.errors > 0; }
-    bool tooManyErrors() { return self.errorLimit == 0 || self.errors >= self.errorLimit; }
+    /* -ferror-limit=N (0 = unlimited); stop rendering the N+1st error */
+    bool tooManyErrors() { return self.errorLimit != 0 && self.errors > self.errorLimit; }
 
     /* register a source file; returns its file id */
     u32 addFile(u8* path, usize pathLen, u8* bufStart, u8* bufEnd)
@@ -132,7 +135,15 @@ pub struct DiagnosticEngine
     void emitError(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
     {
         self.errors = self.errors + 1;
-        if (self.tooManyErrors()) return;
+        if (self.tooManyErrors())
+        {
+            if (!self.limitNotified)
+            {
+                self.limitNotified = true;
+                write(2, "note: too many errors emitted, stopping now (use -ferror-limit=0 to disable)\n", 77);
+            }
+            return;
+        }
         self.renderAt(code, "error", loc, msg, help);
     }
 

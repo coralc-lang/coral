@@ -4,6 +4,7 @@
  * binary operators, parameterized by minimum precedence.
  */
 
+mod diagnostics = import "../coral-diagnostics/code";
 mod base = import "base";
 mod parser = import "parser";
 mod context = import "../coral-context/context";
@@ -14,6 +15,7 @@ mod expr = import "../coral-ast/expr";
 mod stmt = import "../coral-ast/stmt";
 mod node = import "../coral-ast/node";
 
+import diagnostics { ErrorCode };
 import base { Parser, ParserMark };
 import parser { Parser };
 import context { AstContext, NodeListBuilder, StrListBuilder, SwitchListBuilder };
@@ -95,12 +97,12 @@ pub extend Parser
         self.ctx.nodeListInit(args);
         if (self.current.kind == TokenKind::RParen) return;
         NodeId arg = self.parseExpr();
-        if (!self.ctx.nodeListAppend(args, arg)) self.addError();
+        if (!self.ctx.nodeListAppend(args, arg)) self.reportAllocFailed();
         while (self.match(TokenKind::Comma))
         {
             if (self.current.kind == TokenKind::RParen) break;
             arg = self.parseExpr();
-            if (!self.ctx.nodeListAppend(args, arg)) self.addError();
+            if (!self.ctx.nodeListAppend(args, arg)) self.reportAllocFailed();
         }
     }
 
@@ -116,7 +118,7 @@ pub extend Parser
             while (self.current.kind != TokenKind::RBrace && !self.atEnd())
             {
                 NodeId e = self.parseExpr();
-                if (!self.ctx.nodeListAppend(&elems, e)) self.addError();
+                if (!self.ctx.nodeListAppend(&elems, e)) self.reportAllocFailed();
                 if (!self.match(TokenKind::Comma)) break;
             }
             self.expect(TokenKind::RBrace);
@@ -293,8 +295,8 @@ pub extend Parser
                 NodeId segment = self.storeExpr(ExprKind::Ident{ .name = partName });
                 NodeListBuilder segments;
                 self.ctx.nodeListInit(&segments);
-                if (!self.ctx.nodeListAppend(&segments, expr)) self.addError();
-                if (!self.ctx.nodeListAppend(&segments, segment)) self.addError();
+                if (!self.ctx.nodeListAppend(&segments, expr)) self.reportAllocFailed();
+                if (!self.ctx.nodeListAppend(&segments, segment)) self.reportAllocFailed();
                 u32 count = segments.len;
                 NodeId* values = self.ctx.nodeListFinish(&segments);
                 expr = self.storeExpr(ExprKind::Path{ .segments = values, .segmentsLen = count });
@@ -372,7 +374,7 @@ pub extend Parser
         self.expect(TokenKind::RBrace);
         if (chosenNodeId.index != 0) return chosenNodeId;
         if (elseNodeId.index != 0) return elseNodeId;
-        self.addError();
+        self.reportCurrentError(ErrorCode::ParseExpectedExpr, "no arm of this flag expression matched; add an `else` arm");
         return self.noneNode();
     }
 
@@ -477,7 +479,7 @@ pub extend Parser
                 {
                     return self.storeExpr(ExprKind::Ident{ .name = name });
                 }
-                self.addError();
+                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected a path, call or struct literal after `str`");
                 return self.noneNode();
             },
 
@@ -531,12 +533,12 @@ pub extend Parser
                 NodeListBuilder elems;
                 self.ctx.nodeListInit(&elems);
                 NodeId elem = self.parseExpr();
-                if (!self.ctx.nodeListAppend(&elems, elem)) self.addError();
+                if (!self.ctx.nodeListAppend(&elems, elem)) self.reportAllocFailed();
                 while (self.match(TokenKind::Comma))
                 {
                     if (self.current.kind == TokenKind::RParen) break;
                     elem = self.parseExpr();
-                    if (!self.ctx.nodeListAppend(&elems, elem)) self.addError();
+                    if (!self.ctx.nodeListAppend(&elems, elem)) self.reportAllocFailed();
                 }
                 self.expect(TokenKind::RParen);
                 u32 count = elems.len;
@@ -566,11 +568,11 @@ pub extend Parser
                     if (isStatement)
                     {
                         result = self.parseStmt();
-                        if (!self.ctx.nodeListAppend(&stmts, result)) self.addError();
+                        if (!self.ctx.nodeListAppend(&stmts, result)) self.reportAllocFailed();
                     }
                     else {
                         result = self.parseExpr();
-                        if (!self.ctx.nodeListAppend(&stmts, result)) self.addError();
+                        if (!self.ctx.nodeListAppend(&stmts, result)) self.reportAllocFailed();
                         self.match(TokenKind::Semicolon);
                     }
                          if (self.errorCount() > errorsBefore) break;
@@ -604,7 +606,7 @@ pub extend Parser
                 while (self.current.kind != TokenKind::RBrace && !self.atEnd())
                 {
                     SwitchCase c = self.parseSwitchExprCase();
-                    if (!self.ctx.switchListAppend(&cases, c)) self.addError();
+                    if (!self.ctx.switchListAppend(&cases, c)) self.reportAllocFailed();
                 }
                 self.expect(TokenKind::RBrace);
                 u32 count = cases.len;
@@ -643,10 +645,10 @@ pub extend Parser
                 self.ctx.nodeListInit(&bargs);
                 if (self.current.kind != TokenKind::RParen) {
                     NodeId barg = self.parseExpr();
-                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.addError();
+                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
                     while (self.match(TokenKind::Comma)) {
                         barg = self.parseExpr();
-                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.addError();
+                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
                     }
                 }
                 self.expect(TokenKind::RParen);
@@ -673,10 +675,10 @@ pub extend Parser
                 self.ctx.nodeListInit(&bargs);
                 if (self.current.kind != TokenKind::RParen) {
                     NodeId barg = self.parseExpr();
-                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.addError();
+                    if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
                     while (self.match(TokenKind::Comma)) {
                         barg = self.parseExpr();
-                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.addError();
+                        if (!self.ctx.nodeListAppend(&bargs, barg)) self.reportAllocFailed();
                     }
                 }
                 self.expect(TokenKind::RParen);
@@ -686,7 +688,7 @@ pub extend Parser
             },
             
             else => {
-                self.addError();
+                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected an expression");
                 if (!self.atEnd()) self.advance();
                 return self.noneNode();
             }
@@ -709,8 +711,8 @@ pub extend Parser
             Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
             self.expect(TokenKind::Equal);
             NodeId value = self.parseExpr();
-            if (!self.ctx.strListAppend(&fields, fieldName)) self.addError();
-            if (!self.ctx.nodeListAppend(&values, value)) self.addError();
+            if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
+            if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
             if (!self.match(TokenKind::Comma)) break;
         }
         self.expect(TokenKind::RBrace);
@@ -754,14 +756,14 @@ pub extend Parser
         NodeListBuilder patterns;
         self.ctx.nodeListInit(&patterns);
         NodeId pattern = self.parseSwitchPattern();
-        if (!self.ctx.nodeListAppend(&patterns, pattern)) self.addError();
+        if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
         while (self.match(TokenKind::Pipe)) {
             pattern = self.parseSwitchPattern();
-            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.addError();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
         }
         while (self.match(TokenKind::Comma)) {
             pattern = self.parseSwitchPattern();
-            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.addError();
+            if (!self.ctx.nodeListAppend(&patterns, pattern)) self.reportAllocFailed();
         }
         c.patternsLen = patterns.len;
         c.patterns = self.ctx.nodeListFinish(&patterns);
