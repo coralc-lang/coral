@@ -735,6 +735,8 @@ class Parser:
                 tp = self.parse_type()
                 self.expect(TokenKind.Rparen)
                 return SizeofExpr(tp)
+        if t.kind == TokenKind.At:
+            return self.parse_builtin_call()
         return self.parse_postfix()
 
     def parse_postfix(self):
@@ -1197,6 +1199,12 @@ class Parser:
             name = t.value if t.value else t.kind.lower().replace("builtin", "")
         else:
             name = self.expect(TokenKind.Ident).value
+        if name == "sizeof":
+            # @sizeof(T) takes a type, not an expression
+            self.expect(TokenKind.LParen)
+            tp = self.parse_type()
+            self.expect(TokenKind.Rparen)
+            return SizeofExpr(tp)
         args = []
         if self.match(TokenKind.LParen):
             if self.peek().kind != TokenKind.Rparen:
