@@ -41,7 +41,7 @@ pub struct VecCandidate
     IrInst* reduceDest;  // reduction accumulator
     IrInst* compareOp;   // comparison for conditional store
     IrValue* loopIV;     // loop induction variable
-    IrValue* tripCount;  // trip count if known
+    u32 tripCount;       // trip count if known, 0xFFFFFFFF if not constant
     u32 elemBits;                        // element width in bits
     bool isFloat;
     bool isSigned;
@@ -56,6 +56,7 @@ pub struct LoopInfo
     IrInst* increment;   // IV increment
     IrInst* compare;     // loop exit compare
     u32 depth;
+    u32 tripCount;       // 0xFFFFFFFF when the trip count is not a constant
     bool safe;                           // no side effects that prevent vectorization
 }
 
@@ -203,6 +204,7 @@ pub struct AutoVectorizePass
         li.compare = null;
         li.depth = 1;
         li.safe = true;
+        li.tripCount = 0xFFFFFFFF;
 
         // Find the induction variable phi in the header
         for (u32 ii = 0; ii < header->ninsts; ii++)
@@ -244,7 +246,7 @@ pub struct AutoVectorizePass
                         // The other operand might be the trip count
                         IrValue* other = (inst->ops[0] == &li.phi->base) ? inst->ops[1] : inst->ops[0];
                         if (other->kind == IrValueKind::ConstInt)
-                            li.tripCount = other;
+                            li.tripCount = (u32)other->valData;
                     }
                 }
                 if (inst->opcode == IrOpcode::Add && inst->nops == 2)
@@ -424,6 +426,9 @@ pub struct AutoVectorizePass
                             IrInst* storeUser = user->base.users[si];
                             if (storeUser != null && storeUser->opcode == IrOpcode::Store && storeUser->nops >= 2)
                             {
+                                // Same no-alias store check patterns 1/2 do
+                                if (!self.aliasAnalysis->isNoAlias(inst->ops[0], storeUser->ops[1]))
+                                    continue;
                                 if (result->ncandidates < MAX_VEC_OPS)
                                 {
                                     VecCandidate* c = &result->candidates[result->ncandidates++];
@@ -449,7 +454,7 @@ pub struct AutoVectorizePass
                     continue;
                 }
 
-                // Pattern 4, load -> add/sub to accumulator (reduction)
+                // Pattern 4, load -> add to phi accumulator (reduction)
                 if ((user->opcode == IrOpcode::Add || user->opcode == IrOpcode::FAdd) &&
                     user->nops == 2)
                 {
@@ -458,8 +463,16 @@ pub struct AutoVectorizePass
                     if (accOp->kind == IrValueKind::Inst)
                     {
                         IrInst* accInst = (IrInst*)accOp;
-                        // The accumulator is this same add instruction (loop-carried)
-                        if (accInst == user)
+                        // A real loop-carried accumulator is a phi whose
+                        // incoming values include this very op's result
+                        bool isAccPhi = accInst->opcode == IrOpcode::Phi;
+                        bool carriesBack = false;
+                        if (isAccPhi)
+                        {
+                            for (u32 pi = 0; pi < accInst->nops; pi++)
+                                if (accInst->ops[pi] == &user->base) carriesBack = true;
+                        }
+                        if (isAccPhi && carriesBack)
                         {
                             if (result->ncandidates < MAX_VEC_OPS)
                             {
@@ -468,6 +481,7 @@ pub struct AutoVectorizePass
                                 c->loadA = inst;
                                 c->gepA = addrInst;
                                 c->op = user;
+                                c->reduceDest = accInst;
                                 c->store = null;
                                 c->gepStore = null;
                                 c->loadB = null;
@@ -485,14 +499,20 @@ pub struct AutoVectorizePass
 
                 // Pattern 5, load -> min/max reduction
                 if ((user->opcode == IrOpcode::SMin || user->opcode == IrOpcode::SMax ||
-                     user->opcode == IrOpcode::UMin || user->opcode == IrOpcode::UMax ||
-                     user->opcode == IrOpcode::FAdd) && user->nops == 2)
+                     user->opcode == IrOpcode::UMin || user->opcode == IrOpcode::UMax) && user->nops == 2)
                 {
                     IrValue* accOp = (user->ops[0] == &inst->base) ? user->ops[1] : user->ops[0];
                     if (accOp->kind == IrValueKind::Inst)
                     {
                         IrInst* accInst = (IrInst*)accOp;
-                        if (accInst == user)
+                        bool isAccPhi = accInst->opcode == IrOpcode::Phi;
+                        bool carriesBack = false;
+                        if (isAccPhi)
+                        {
+                            for (u32 pi = 0; pi < accInst->nops; pi++)
+                                if (accInst->ops[pi] == &user->base) carriesBack = true;
+                        }
+                        if (isAccPhi && carriesBack)
                         {
                             VecPattern pat = VecPattern::ReductionSum;
                             if (user->opcode == IrOpcode::SMin || user->opcode == IrOpcode::UMin)
@@ -507,6 +527,7 @@ pub struct AutoVectorizePass
                                 c->loadA = inst;
                                 c->gepA = addrInst;
                                 c->op = user;
+                                c->reduceDest = accInst;
                                 c->store = null;
                                 c->gepStore = null;
                                 c->loadB = null;
@@ -626,11 +647,13 @@ pub struct AutoVectorizePass
             vecStore->ops = alloc<IrValue*>(2);
             vecStore->nops = 2;
             vecStore->capOps = 2;
-            vecStore->ops[0] = c->store->ops[0];
-            vecStore->ops[1] = &vecLoad->base;
-            c->store->ops[0]->addUser(vecStore);
+            // Store layout, ops[0]=value, ops[1]=address
+            vecStore->ops[0] = &vecLoad->base;
+            vecStore->ops[1] = c->store->ops[1];
             vecLoad->base.addUser(vecStore);
+            c->store->ops[1]->addUser(vecStore);
             block->insertBefore(vecStore, c->store);
+            self.neuterScalarStore(c);
             return;
         }
 
@@ -685,11 +708,13 @@ pub struct AutoVectorizePass
             vecStore->ops = alloc<IrValue*>(2);
             vecStore->nops = 2;
             vecStore->capOps = 2;
-            vecStore->ops[0] = c->store->ops[0];
-            vecStore->ops[1] = &vecOpInst->base;
-            c->store->ops[0]->addUser(vecStore);
+            // Store layout, ops[0]=value, ops[1]=address
+            vecStore->ops[0] = &vecOpInst->base;
+            vecStore->ops[1] = c->store->ops[1];
             vecOpInst->base.addUser(vecStore);
+            c->store->ops[1]->addUser(vecStore);
             block->insertBefore(vecStore, c->loadA);
+            self.neuterScalarStore(c);
         }
     }
 
@@ -733,12 +758,29 @@ pub struct AutoVectorizePass
             vecStore->ops = alloc<IrValue*>(2);
             vecStore->nops = 2;
             vecStore->capOps = 2;
-            vecStore->ops[0] = c->store->ops[0];
-            vecStore->ops[1] = &vecOpInst->base;
-            c->store->ops[0]->addUser(vecStore);
+            // Store layout, ops[0]=value, ops[1]=address
+            vecStore->ops[0] = &vecOpInst->base;
+            vecStore->ops[1] = c->store->ops[1];
             vecOpInst->base.addUser(vecStore);
+            c->store->ops[1]->addUser(vecStore);
             block->insertBefore(vecStore, c->loadA);
+            self.neuterScalarStore(c);
         }
+    }
+
+    // Neuter the scalar store left behind by a vectorized candidate, with
+    // removeUser on its old operands so user lists stay accurate, then let
+    // the dead scalar chain (store -> op -> load) be reclaimed by the
+    // peephole cleanup below. elemwise/broadcast never had a use-rewrite,
+    // reductions replace uses via replaceAllUses, so this is the cleanup
+    // path for the former two.
+    void neuterScalarStore(VecCandidate* c)
+    {
+        if (c->store == null) return;
+        for (u32 oi = 0; oi < c->store->nops; oi++)
+            if (c->store->ops[oi]) c->store->ops[oi]->removeUser(c->store);
+        c->store->opcode = IrOpcode::Noret;
+        c->store->nops = 0;
     }
 
     void vectorizeReduction(VecCandidate* c, IrType* vecTy, u32 vecWidth)
@@ -760,9 +802,11 @@ pub struct AutoVectorizePass
         vecOpInst->ops = alloc<IrValue*>(2);
         vecOpInst->nops = 2;
         vecOpInst->capOps = 2;
-        vecOpInst->ops[0] = &c->op->ops[0]; // accumulator
+        // Accumulator is the phi recorded at match time, the raw
+        // operand value (not &ops[i], which would be the slot address)
+        vecOpInst->ops[0] = &c->reduceDest->base;
         vecOpInst->ops[1] = &vecLoad->base;
-        c->op->ops[0]->addUser(vecOpInst);
+        c->reduceDest->base.addUser(vecOpInst);
         vecLoad->base.addUser(vecOpInst);
         block->insertBefore(vecOpInst, c->loadA);
 
@@ -780,11 +824,28 @@ pub struct AutoVectorizePass
             {
                 IrInst* inst = bb->insts[ii];
 
-                // Remove dead broadcast instructions
-                if (inst->opcode == IrOpcode::VecBroadcast && inst->base.nusers == 0)
+                // Remove dead broadcast instructions and Noret'd
+                // instructions, then dead scalar chains with no users
+                if (inst->opcode == IrOpcode::Noret ||
+                    (inst->base.nusers == 0 &&
+                     (inst->opcode == IrOpcode::VecBroadcast ||
+                      inst->opcode == IrOpcode::Load ||
+                      inst->opcode == IrOpcode::Gep ||
+                      inst->opcode == IrOpcode::Add ||
+                      inst->opcode == IrOpcode::Sub ||
+                      inst->opcode == IrOpcode::Mul ||
+                      inst->opcode == IrOpcode::FAdd ||
+                      inst->opcode == IrOpcode::FSub ||
+                      inst->opcode == IrOpcode::FMul ||
+                      inst->opcode == IrOpcode::FDiv ||
+                      inst->opcode == IrOpcode::SMin ||
+                      inst->opcode == IrOpcode::SMax ||
+                      inst->opcode == IrOpcode::UMin ||
+                      inst->opcode == IrOpcode::UMax)))
                 {
                     inst->erase();
                     cleaned++;
+                    ii--;
                     continue;
                 }
 
