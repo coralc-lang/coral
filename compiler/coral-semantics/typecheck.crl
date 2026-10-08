@@ -417,7 +417,7 @@ pub extend Sema
             TypeKind::Named => {
                 Symbol* symbol = self.scopes.lookup(entry->kind.payload.Named.name);
                 if (symbol == null) {
-                    self.semaError(ErrorCode::SemaUndeclaredIdent, entry->loc, "unknown type name");
+                    self.semaError(ErrorCode::SemaUndeclaredIdent, entry->loc, self.nameMsg((u8*)"unknown type name: ", entry->kind.payload.Named.name));
                     return false;
                 }
                 u32 expected = self.genericCount(symbol->declaration);
@@ -736,6 +736,23 @@ pub extend Sema
             if (self.sameType(sb, tb)) return true;
         }
         if (source->kind.tag == TypeKind::Pointer && target->kind.tag == TypeKind::Rawptr)
+            return true;
+
+        /* array decay: T[] matches T* / rawptr (stack buffers passed to
+         * pointer params, `p >= buf` comparisons) */
+        if (source->kind.tag == TypeKind::Array && target->kind.tag == TypeKind::Pointer)
+        {
+            Ty tb2 = target->kind.payload.Pointer.base;
+            while (tb2 != 0)
+            {
+                TypeEntry* te2 = self.ctx.types + tb2;
+                if (te2->kind.tag == TypeKind::Const) tb2 = te2->kind.payload.Const.base;
+                else if (te2->kind.tag == TypeKind::Comptime) tb2 = te2->kind.payload.Comptime.base;
+                else break;
+            }
+            if (self.sameType(source->kind.payload.Array.base, tb2)) return true;
+        }
+        if (source->kind.tag == TypeKind::Array && target->kind.tag == TypeKind::Rawptr)
             return true;
 
         /* Integer conversion only when it cannot narrow (C-style

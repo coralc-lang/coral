@@ -95,7 +95,7 @@ pub extend Sema
                 name = decl->kind.payload.ModReexport.alias;
             },
             DeclKind::Import => {
-                if (!self.checkImportDecl(id, decl)) return false;
+                if (!bodies && !self.checkImportDecl(id, decl)) return false;
             },
             else => {}
         }
@@ -103,7 +103,7 @@ pub extend Sema
          * would only repeat the declaration (and re-count its failure) */
         if (name != 0 && !bodies)
         {
-            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags) &&
+            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags, self.fileOf(id)) &&
                 self.scopes.lastDeclFail == 1)
                 self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, "duplicate declaration of this name");
         }
@@ -144,7 +144,7 @@ pub extend Sema
             {
                 GenericParam* generic = &genericNode->kind.payload.GenericParam.value;
                 Ty typeNode = self.typeParamType(generic->name, genericIndex);
-                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0)) ok = false;
+                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0, 0)) ok = false;
             }
             genericIndex = genericIndex + 1;
         }
@@ -165,7 +165,7 @@ pub extend Sema
                         Ty typeNode = self.typeParamType(ae->kind.payload.Named.name, a);
                         NodeId nid;
                         nid.index = 0;
-                        self.scopes.declare(ae->kind.payload.Named.name, 4, typeNode, nid, 0);
+                        self.scopes.declare(ae->kind.payload.Named.name, 4, typeNode, nid, 0, 0);
                     }
                     a = a + 1;
                 }
@@ -213,6 +213,58 @@ pub extend Sema
         return false;
     }
 
+    /* Bind every named symbol of an import into THIS file's scope, pointing
+     * at the real declaration. Two direct pulls of the same local name in one
+     * file conflict — alias one with `as` or use a qualified path; the same
+     * name in different files stays legal (mangling keeps them apart). */
+    bool bindImportSymbols(NodeId id, Decl* decl, u8* notFoundMsg)
+    {
+        u32 fileId = self.fileOf(id);
+        u32 i = 0;
+        while (i < decl->kind.payload.Import.symbolsLen)
+        {
+            ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
+            if ((symbol->flags & 2) == 0 && symbol->name != 0)
+            {
+                /* tail segment for nested `mod::{ Sym }` groups */
+                Str lookupName = symbol->name;
+                InternEntry* se = self.ctx.interns + lookupName;
+                u8* sp = se->ptr;
+                usize sl = se->len;
+                usize lastCol = 0;
+                usize q = 0;
+                while (q + 1 < sl)
+                {
+                    if (sp[q] == 58 && sp[q + 1] == 58) lastCol = q;
+                    q = q + 1;
+                }
+                if (lastCol > 0 && lastCol + 2 < sl)
+                    lookupName = self.ctx.intern(sp + lastCol + 2, sl - (lastCol + 2));
+                Symbol* real = self.scopes.lookup(lookupName);
+                if (real == null)
+                {
+                    self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, notFoundMsg);
+                    return false;
+                }
+                Str local = lookupName;
+                if (symbol->alias != 0) local = symbol->alias;
+                if (!self.claimDirectImport(fileId, local))
+                {
+                    self.semaError(ErrorCode::SemaDuplicateDecl, (self.ctx.nodes + id.index)->loc, self.nameMsg((u8*)"conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", local));
+                    return false;
+                }
+                if (!self.scopes.declare(local, real->kind, real->typeNode, real->declaration, 0, fileId))
+                {
+                    if (self.scopes.lastDeclFail == 1)
+                        self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, self.nameMsg((u8*)"conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", local));
+                    return false;
+                }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
     bool checkImportDecl(NodeId id, Decl* decl)
     {
         Str path = decl->kind.payload.Import.path;
@@ -221,52 +273,35 @@ pub extend Sema
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "missing import path");
             return false;
         }
+        /* path-only import: bind the last path segment as the module name
+         * so qualified calls (`libc::printf`) resolve */
+        if (decl->kind.payload.Import.symbolsLen == 0)
+        {
+            Str modName = path;
+            InternEntry* pe = self.ctx.interns + path;
+            usize lastCol = 0;
+            usize q = 0;
+            while (q + 1 < pe->len)
+            {
+                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) lastCol = q;
+                q = q + 1;
+            }
+            if (lastCol > 0 && lastCol + 2 < pe->len)
+                modName = self.ctx.intern(pe->ptr + lastCol + 2, pe->len - (lastCol + 2));
+            u32 impFileId = self.fileOf(id);
+            if (!self.claimDirectImport(impFileId, modName))
+            {
+                self.semaError(ErrorCode::SemaDuplicateDecl, (self.ctx.nodes + id.index)->loc, self.nameMsg((u8*)"conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", modName));
+                return false;
+            }
+            if (!self.scopes.declare(modName, 5, 0, id, 0, impFileId) && self.scopes.lastDeclFail == 1)
+                self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, self.nameMsg((u8*)"conflicting import: already bound in this file — alias it with `as` or use a qualified path: ", modName));
+        }
         if ((decl->kind.payload.Import.flags & 1) != 0)
         {
-            /* import(lib): the target file's decls are merged flat into this
-             * unit by the loader, so plain symbols must already be declared
-             * before this import is checked; `name as alias` bindings get an
-             * extra declaration here */
-            u32 i = 0;
-            while (i < decl->kind.payload.Import.symbolsLen)
-            {
-                ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
-                if ((symbol->flags & 2) != 0)
-                {
-                    /* `*` — members resolve at use sites */
-                }
-                else if (symbol->name != 0)
-                {
-                    /* nested item group `mod::{ Sym }` — the loader merged
-                     * the submodule file; the binding is the tail segment */
-                    Str lookupName = symbol->name;
-                    InternEntry* se = self.ctx.interns + lookupName;
-                    u8* sp = se->ptr;
-                    usize sl = se->len;
-                    usize lastCol = 0;
-                    usize q = 0;
-                    while (q + 1 < sl)
-                    {
-                        if (sp[q] == 58 && sp[q + 1] == 58) lastCol = q;
-                        q = q + 1;
-                    }
-                    if (lastCol > 0 && lastCol + 2 < sl)
-                        lookupName = self.ctx.intern(sp + lastCol + 2, sl - (lastCol + 2));
-                    Symbol* real = self.scopes.lookup(lookupName);
-                    if (real == null)
-                    {
-                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported library");
-                        return false;
-                    }
-                    if (symbol->alias != 0)
-                    {
-                        if (!self.scopes.declare(symbol->alias, real->kind, real->typeNode, real->declaration, 0))
-                            return false;
-                    }
-                }
-                i = i + 1;
-            }
-            return true;
+            /* import(lib): the loader merges the target's decls flat — bind
+             * each named symbol to its real declaration in this file's scope */
+            return self.bindImportSymbols(id, decl, (u8*)"symbol not found in imported library");
         }
         Decl* modDecl = null;
         if ((decl->kind.payload.Import.flags & 1) == 0)
@@ -287,33 +322,8 @@ pub extend Sema
                 {
                     /* sibling file import — the loader merged <first>.crl
                      * flat, so the named symbols are plain declarations in
-                     * scope; verify they exist and skip the placeholders */
-                    u32 si = 0;
-                    while (si < decl->kind.payload.Import.symbolsLen)
-                    {
-                        ImportSymbol* ss = decl->kind.payload.Import.symbols + si;
-                        if ((ss->flags & 2) == 0 && ss->name != 0)
-                        {
-                            Str want = ss->name;
-                            InternEntry* se = self.ctx.interns + want;
-                            usize lastCol = 0;
-                            usize q = 0;
-                            while (q + 1 < se->len)
-                            {
-                                if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) lastCol = q;
-                                q = q + 1;
-                            }
-                            if (lastCol > 0 && lastCol + 2 < se->len)
-                                want = self.ctx.intern(se->ptr + lastCol + 2, se->len - (lastCol + 2));
-                            if (self.scopes.lookup(want) == null)
-                            {
-                                self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported file");
-                                return false;
-                            }
-                        }
-                        si = si + 1;
-                    }
-                    return true;
+                     * scope; bind them into this file */
+                    return self.bindImportSymbols(id, decl, (u8*)"symbol not found in imported file");
                 }
                 if (symbol->kind == 5 && symbol->declaration.index != 0)
                 {
@@ -360,23 +370,7 @@ pub extend Sema
                 i = i + 1;
             }
         }
-        u32 i = 0;
-        while (i < decl->kind.payload.Import.symbolsLen)
-        {
-            ImportSymbol* symbol = decl->kind.payload.Import.symbols + i;
-            if ((symbol->flags & 2) == 0)
-            {
-                Str local = symbol->name;
-                if (symbol->alias != 0) local = symbol->alias;
-                /* a merged sibling/lib file may already declare this name
-                 * as a real symbol — don't duplicate (declare errors on
-                 * collisions) */
-                if (local != 0 && self.scopes.lookup(local) == null)
-                    self.scopes.declare(local, 2, 0, id, 0);
-            }
-            i = i + 1;
-        }
-        return true;
+        return self.bindImportSymbols(id, decl, (u8*)"symbol not found in imported module");
     }
 
     bool checkFile(File* file)

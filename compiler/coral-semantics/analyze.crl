@@ -680,89 +680,270 @@ bool libPushFile(LibLoader* L, File* f)
                          }
                      }
                  }
-                 if (tPtrs == null)
-                 {
-                     tPtrs = (u8**)malloc(sizeof(u8*));
-                     tLens = (usize*)malloc(sizeof(usize));
-                     if (tPtrs == null || tLens == null)
-                     {
-                         if (tPtrs != null) free(tPtrs);
-                         if (tLens != null) free(tLens);
-                         tPtrs = null;
-                         tLens = null;
-                         L->errors = L->errors + 1;
-                     }
-                     else targets = 1;
-                 }
-                 if (tPtrs != null)
-                 {
-                     tPtrs[0] = nsPtr;
-                     tLens[0] = nsLen;
-                 }
-                 u32 k = 0;
-                 while (k < targets && tPtrs != null)
-                 {
-                     u8* target = tPtrs[k];
-                     usize targetLen = tLens[k];
-                     u8* resolved = libResolve(L, target, targetLen);
-                     if (resolved == null)
-                     {
-                         write(2, "coral: cannot resolve import(lib) ", 34);
-                         write(2, target, targetLen);
-                         write(2, "\n", 1);
-                         L->errors = L->errors + 1;
-                     }
-                     else if (libHas(L, resolved))
-                     {
-                         free(resolved);
-                     }
-                     else
-                     {
-                         if (!libPush(L, resolved))
-                         {
-                             L->errors = L->errors + 1;
-                         }
-                         else
-                         {
-                             usize len = 0;
-                             u8* buf = libRead(resolved, &len);
-                             File* lf = null;
-                             if (buf != null)
-                             {
-                                 u32 fid = 0;
-                                 DiagnosticEngine* dg = L->diag;
-                                 if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
-                                 if (L->bufsLen >= L->bufsCap)
-                                 {
-                                     u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
-                                     rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * sizeof(u8*));
-                                     if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
-                                 }
-                                 if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
-                                 else free(buf);
-                                 L->bufsLen = L->bufsLen + 1;
-                                 lf = libParse(L, buf, len, resolved, dg, fid);
-                             }
-                             if (lf == null)
-                             {
-                                 write(2, "coral: cannot read import(lib) file ", 36);
-                                 write(2, resolved, libLen(resolved));
-                                 write(2, "\n", 1);
-                                 L->errors = L->errors + 1;
-                             }
-                             else
-                             {
-                                 libLoadImports(L, lf);   /* dependencies first */
-                                 libLoadSiblingImports(L, lf);
-                                 if (!libPushFile(L, lf)) L->errors = L->errors + 1;
-                             }
-                         }
-                     }
-                     k = k + 1;
-                 }
-                 if (comps != null) free(comps);
-                 if (tPtrs != null) free(tPtrs);
-                 if (tLens != null) free(tLens);
+                  u32 tCap = targets;
+                  u8* tHard = null;
+                  u8** tOwned = null;
+                  if (tPtrs == null)
+                  {
+                      tPtrs = (u8**)malloc(sizeof(u8*));
+                      tLens = (usize*)malloc(sizeof(usize));
+                      tHard = (u8*)malloc(1);
+                      tOwned = (u8**)malloc(sizeof(u8*));
+                      if (tPtrs == null || tLens == null || tHard == null || tOwned == null)
+                      {
+                          if (tPtrs != null) free(tPtrs);
+                          if (tLens != null) free(tLens);
+                          if (tHard != null) free(tHard);
+                          if (tOwned != null) free(tOwned);
+                          tPtrs = null;
+                          tLens = null;
+                          tHard = null;
+                          tOwned = null;
+                          L->errors = L->errors + 1;
+                      }
+                      else tCap = 1;
+                  }
+                  if (tPtrs == null)
+                  {
+                      if (comps != null) free(comps);
+                      continue;
+                  }
+                  /* hard = missing file is an error; chased re-export
+                   * targets are soft (a dead re-export may not exist here) */
+                  if (tHard == null || tOwned == null)
+                  {
+                      u8* nh = (u8*)malloc(tCap);
+                      u8** no = (u8**)malloc(((usize)tCap) * sizeof(u8*));
+                      if (nh != null && no != null)
+                      {
+                          tHard = nh;
+                          tOwned = no;
+                      }
+                      else
+                      {
+                          if (nh != null) free(nh);
+                          if (no != null) free(no);
+                          free(tPtrs);
+                          free(tLens);
+                          if (comps != null) free(comps);
+                          tPtrs = null;
+                          continue;
+                      }
+                  }
+                  u32 zi = 0;
+                  while (zi < tCap)
+                  {
+                      tHard[zi] = 1;
+                      tOwned[zi] = null;
+                      zi = zi + 1;
+                  }
+                  tPtrs[0] = nsPtr;
+                  tLens[0] = nsLen;
+                  u32 k = 0;
+                  while (k < targets && tPtrs != null)
+                  {
+                      u8* target = tPtrs[k];
+                      usize targetLen = tLens[k];
+                      u8* resolved = libResolve(L, target, targetLen);
+                      if (resolved == null)
+                      {
+                          if (tHard[k] != 0)
+                          {
+                              write(2, "coral: cannot resolve import(lib) ", 34);
+                              write(2, target, targetLen);
+                              write(2, "\n", 1);
+                              L->errors = L->errors + 1;
+                          }
+                      }
+                      else
+                      {
+                          if (getenv((u8*)"CORAL_TRACE_LOAD") != null)
+                          {
+                              write(2, "coral: load ", 12);
+                              write(2, resolved, libLen(resolved));
+                              write(2, "\n", 1);
+                          }
+                          if (libHas(L, resolved))
+                          {
+                              free(resolved);
+                          }
+                          else if (!libPush(L, resolved))
+                          {
+                              L->errors = L->errors + 1;
+                          }
+                          else
+                          {
+                              usize len = 0;
+                              u8* buf = libRead(resolved, &len);
+                              File* lf = null;
+                              if (buf != null)
+                              {
+                                  u32 fid = 0;
+                                  DiagnosticEngine* dg = L->diag;
+                                  if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
+                                  if (L->bufsLen >= L->bufsCap)
+                                  {
+                                      u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+                                      rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * sizeof(u8*));
+                                      if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+                                  }
+                                  if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
+                                  else free(buf);
+                                  L->bufsLen = L->bufsLen + 1;
+                                  lf = libParse(L, buf, len, resolved, dg, fid);
+                              }
+                              if (lf == null)
+                              {
+                                  write(2, "coral: cannot read import(lib) file ", 36);
+                                  write(2, resolved, libLen(resolved));
+                                  write(2, "\n", 1);
+                                  L->errors = L->errors + 1;
+                              }
+                              else
+                              {
+                                  libLoadImports(L, lf);   /* dependencies first */
+                                  libLoadSiblingImports(L, lf);
+                                  if (!libPushFile(L, lf)) L->errors = L->errors + 1;
+
+                                  /* directory-manifest re-exports: a path that
+                                   * lands on <dir>/lib.crl must chase its
+                                   * `pub mod X = import …` targets so members
+                                   * resolve (std::math → math/lib.crl →
+                                   * math/math.crl). Chased only for symbols
+                                   * this import asked for when any alias
+                                   * matches, else all aliases (the path names
+                                   * the directory itself). Targets are soft. */
+                                  Str* rxAliases = (Str*)malloc(((usize)lf->declsLen + 1) * sizeof(Str));
+                                  u8* rxWant = null;
+                                  u32 rxCount = 0;
+                                  if (rxAliases != null)
+                                  {
+                                      u32 rx = 0;
+                                      while (rx < lf->declsLen)
+                                      {
+                                          Node* rn = L->ctx->nodes + lf->decls[rx].index;
+                                          if (rn->kind.tag == NodeKind::Decl)
+                                          {
+                                              Decl* rd = &rn->kind.payload.Decl.value;
+                                              if (rd->kind.tag == DeclKind::ModReexport)
+                                              {
+                                                  rxAliases[rxCount] = rd->kind.payload.ModReexport.alias;
+                                                  rxCount = rxCount + 1;
+                                              }
+                                          }
+                                          rx = rx + 1;
+                                      }
+                                  }
+                                  if (rxAliases != null && rxCount > 0)
+                                  {
+                                      rxWant = (u8*)malloc(rxCount);
+                                      if (rxWant != null)
+                                      {
+                                          u32 a = 0;
+                                          u32 any = 0;
+                                          while (a < rxCount)
+                                          {
+                                              rxWant[a] = 0;
+                                              if (symCount > 0)
+                                              {
+                                                  u32 s2 = 0;
+                                                  while (s2 < symCount)
+                                                  {
+                                                      Str nm = dd->kind.payload.Import.symbols[s2].name;
+                                                      if (nm != 0)
+                                                      {
+                                                          if (nm == rxAliases[a]) rxWant[a] = 1;
+                                                          else
+                                                          {
+                                                              InternEntry* se2 = L->ctx->interns + nm;
+                                                              u8* np2 = se2->ptr;
+                                                              usize nl2 = se2->len;
+                                                              usize lc = 0;
+                                                              usize q2 = 0;
+                                                              while (q2 + 1 < nl2)
+                                                              {
+                                                                  if (np2[q2] == 58 && np2[q2 + 1] == 58) lc = q2;
+                                                                  q2 = q2 + 1;
+                                                              }
+                                                              if (lc > 0 && lc + 2 < nl2)
+                                                              {
+                                                                  AstContext* ac = L->ctx;
+                                                                  Str pref = ac.intern(np2, lc);
+                                                                  Str tail = ac.intern(np2 + lc + 2, nl2 - (lc + 2));
+                                                                  if (pref == rxAliases[a] || tail == rxAliases[a]) rxWant[a] = 1;
+                                                              }
+                                                          }
+                                                      }
+                                                      s2 = s2 + 1;
+                                                  }
+                                              }
+                                              if (rxWant[a] != 0) any = 1;
+                                              a = a + 1;
+                                          }
+                                          a = 0;
+                                          while (a < rxCount)
+                                          {
+                                              if (symCount == 0 || any == 0 || rxWant[a] != 0)
+                                              {
+                                                  if (targets >= tCap)
+                                                  {
+                                                      u32 nc = 16;
+                                                      if (tCap != 0) nc = tCap * 2;
+                                                      u8** np = (u8**)realloc((rawptr)tPtrs, (usize)nc * sizeof(u8*));
+                                                      if (np != null) tPtrs = np;
+                                                      usize* nl = (usize*)realloc((rawptr)tLens, (usize)nc * sizeof(usize));
+                                                      if (nl != null) tLens = nl;
+                                                      u8* nhh = (u8*)realloc((rawptr)tHard, (usize)nc);
+                                                      if (nhh != null) tHard = nhh;
+                                                      u8** noo = (u8**)realloc((rawptr)tOwned, (usize)nc * sizeof(u8*));
+                                                      if (noo != null) tOwned = noo;
+                                                      if (targets < nc) tCap = nc;
+                                                  }
+                                                  if (targets < tCap)
+                                                  {
+                                                      InternEntry* ae = L->ctx->interns + rxAliases[a];
+                                                      u8* nt = (u8*)malloc(targetLen + 2 + ae->len);
+                                                      if (nt != null)
+                                                      {
+                                                          usize w = 0;
+                                                          while (w < targetLen) { nt[w] = target[w]; w = w + 1; }
+                                                          nt[targetLen] = 58;
+                                                          nt[targetLen + 1] = 58;
+                                                          w = 0;
+                                                          while (w < ae->len) { nt[targetLen + 2 + w] = ae->ptr[w]; w = w + 1; }
+                                                          tPtrs[targets] = nt;
+                                                          tLens[targets] = targetLen + 2 + ae->len;
+                                                          tHard[targets] = 0;
+                                                          tOwned[targets] = nt;
+                                                          targets = targets + 1;
+                                                      }
+                                                  }
+                                              }
+                                              a = a + 1;
+                                          }
+                                      }
+                                  }
+                                  if (rxAliases != null) free(rxAliases);
+                                  if (rxWant != null) free(rxWant);
+                              }
+                          }
+                      }
+                      k = k + 1;
+                  }
+                  if (comps != null) free(comps);
+                  if (tPtrs != null) free(tPtrs);
+                  if (tLens != null) free(tLens);
+                  if (tHard != null) free(tHard);
+                  if (tOwned != null)
+                  {
+                      u32 fi = 0;
+                      while (fi < targets)
+                      {
+                          if (tOwned[fi] != null) free(tOwned[fi]);
+                          fi = fi + 1;
+                      }
+                      free(tOwned);
+                  }
              }
          }
          i = i + 1;

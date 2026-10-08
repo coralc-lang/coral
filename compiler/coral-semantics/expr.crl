@@ -27,7 +27,7 @@ pub extend Sema
 {
     bool checkIdent(NodeId id, Str name)
     {
-        Symbol* symbol = self.scopes.lookup(name);
+        Symbol* symbol = self.lookupAt(name, id);
         if (symbol == null)
         {
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "undeclared identifier");
@@ -68,7 +68,7 @@ pub extend Sema
         if (expr->kind.tag == ExprKind::Ident)
         {
             Str targetName = expr->kind.payload.Ident.name;
-            Symbol* symbol = self.scopes.lookup(targetName);
+            Symbol* symbol = self.lookupAt(targetName, id);
             if (symbol == null)
             {
                 self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "cannot assign: undeclared identifier");
@@ -151,7 +151,7 @@ pub extend Sema
 
     bool checkCall(NodeId callId, Str name, NodeId* args, u32 argsLen, Ty calleeTy)
     {
-        Symbol* symbol = self.scopes.lookup(name);
+        Symbol* symbol = self.lookupAt(name, callId);
         if (symbol == null)
         {
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, callId, "call to undeclared function");
@@ -231,7 +231,7 @@ pub extend Sema
         if (rightExpr->kind.tag != ExprKind::Ident) return true;
         Str root = leftExpr->kind.payload.Ident.name;
         Str member = rightExpr->kind.payload.Ident.name;
-        Symbol* symbol = self.scopes.lookup(root);
+        Symbol* symbol = self.lookupAt(root, id);
         if (symbol == null)
         {
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "undeclared module in path");
@@ -307,6 +307,22 @@ pub extend Sema
                 }
             }
         }
+        /* function name → fn-pointer field/param (`T { .alloc = _foo }`,
+         * fn-pointer arguments): fn symbols carry their return type, so
+         * compatible() alone can never match a FnPtr target */
+        if (value.index != 0 && targetTy != 0)
+        {
+            TypeEntry* tte = self.ctx.types + targetTy;
+            if (tte->kind.tag == TypeKind::FnPtr)
+            {
+                Node* vn2 = self.ctx.nodes + value.index;
+                if (vn2->kind.tag == NodeKind::Expr && vn2->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    Symbol* vs = self.lookupAt(vn2->kind.payload.Expr.value.kind.payload.Ident.name, value);
+                    if (vs != null && vs->kind == 2) return true;
+                }
+            }
+        }
         return false;
     }
 
@@ -357,7 +373,28 @@ pub extend Sema
             self.setExprType(id, leftType);
             return true;
         }
-        if (!self.compatible(leftType, rightType))
+        /* pointer arithmetic: `p + i`, `i + p`, `p - i`, `arr + n` — result
+         * keeps the pointer side (C semantics; the backend lowers it natively) */
+        Ty lpTy = self.ptrArithType(leftType);
+        if (lpTy != 0 && (self.integerType(rightType) || (right.index != 0 && self.isIntLitNode(right))))
+        {
+            self.setExprType(id, lpTy);
+            return true;
+        }
+        Ty rpTy = self.ptrArithType(rightType);
+        if (rpTy != 0 && (self.integerType(leftType) || (left.index != 0 && self.isIntLitNode(left))))
+        {
+            self.setExprType(id, rpTy);
+            return true;
+        }
+        /* literal on the left, typed integer on the right: the literal
+         * takes the other side's type (`8 + (u32)x` → u32, not i32) */
+        if (left.index != 0 && self.isIntLitNode(left) && self.integerType(rightType))
+        {
+            self.setExprType(id, rightType);
+            return true;
+        }
+        if (!self.compatible(leftType, rightType) && !self.compatible(rightType, leftType))
         {
             /* int literal vs float gets the same leniency as initializers
              * (assignCompatible's IntLit arm): `x > 0`, `0.5 * n` — the
@@ -380,9 +417,63 @@ pub extend Sema
         return n.kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
     }
 
+    /* Pointer or rawptr, looking through Const/Comptime wrappers — the
+     * pointer side of `p + i` keeps its own (possibly const) type */
+    bool pointerLike(Ty typeNode)
+    {
+        while (typeNode != 0)
+        {
+            TypeEntry* te = self.ctx.types + typeNode;
+            if (te->kind.tag == TypeKind::Pointer || te->kind.tag == TypeKind::Rawptr) return true;
+            if (te->kind.tag == TypeKind::Const) typeNode = te->kind.payload.Const.base;
+            else if (te->kind.tag == TypeKind::Comptime) typeNode = te->kind.payload.Comptime.base;
+            else return false;
+        }
+        return false;
+    }
+
+    /* result type of pointer arithmetic: the pointer side itself, or the
+     * decayed Pointer(T) for arrays (`stackBuf + n`); 0 when not pointer-like */
+    Ty ptrArithType(Ty typeNode)
+    {
+        Ty orig = typeNode;
+        while (typeNode != 0)
+        {
+            TypeEntry* te = self.ctx.types + typeNode;
+            if (te->kind.tag == TypeKind::Pointer || te->kind.tag == TypeKind::Rawptr) return orig;
+            if (te->kind.tag == TypeKind::Array)
+            {
+                TypeKind pk;
+                pk = TypeKind::Pointer{ .base = te->kind.payload.Array.base };
+                return self.allocType(pk);
+            }
+            if (te->kind.tag == TypeKind::Const) typeNode = te->kind.payload.Const.base;
+            else if (te->kind.tag == TypeKind::Comptime) typeNode = te->kind.payload.Comptime.base;
+            else return 0;
+        }
+        return 0;
+    }
+
     bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
     {
         if (!self.checkBinary(id, left, right)) return false;
+        self.setExprType(id, self.boolType());
+        return true;
+    }
+
+    /* `&&` / `||` — C truthiness: bool, any integer, or a pointer on
+     * either side (`!inStack && alloc->fallback`), result always bool.
+     * checkBinary's strict operand compatibility does not apply here. */
+    bool checkCondBinary(NodeId id, NodeId left, NodeId right)
+    {
+        if (!self.checkExpr(left)) return false;
+        if (!self.checkExpr(right)) return false;
+        Ty lt = self.exprType(left);
+        Ty rt = self.exprType(right);
+        if (lt != 0 && lt != self.boolType() && !self.integerType(lt) && !self.pointerLike(lt))
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "left operand of &&/|| must be bool");
+        if (rt != 0 && rt != self.boolType() && !self.integerType(rt) && !self.pointerLike(rt))
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "right operand of &&/|| must be bool");
         self.setExprType(id, self.boolType());
         return true;
     }
@@ -429,7 +520,7 @@ pub extend Sema
             ExprKind::NullLit => { return true; },
             ExprKind::Ident => {
                 if (!self.checkIdent(id, expr->kind.payload.Ident.name)) return false;
-                Symbol* symbol = self.scopes.lookup(expr->kind.payload.Ident.name);
+                Symbol* symbol = self.lookupAt(expr->kind.payload.Ident.name, id);
                 if (symbol != null) self.setExprType(id, symbol->typeNode);
                 return true;
             },
@@ -461,6 +552,25 @@ pub extend Sema
                     {
                         Str tn = s0n->kind.payload.Expr.value.kind.payload.Ident.name;
                         Str mn = s1n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        /* module root: math::sqrt(a) — a free function in the
+                         * module's namespace, not a static method on a type */
+                        Symbol* rootSym = self.lookupAt(tn, id);
+                        if (rootSym != null && rootSym->kind == 5)
+                        {
+                            if (rootSym->declaration.index != 0)
+                            {
+                                Node* modNode = self.ctx.nodes + rootSym->declaration.index;
+                                if (modNode->kind.tag == NodeKind::Decl)
+                                {
+                                    if (!self.moduleExportsContain(&modNode->kind.payload.Decl.value, mn))
+                                    {
+                                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
+                                        return false;
+                                    }
+                                }
+                            }
+                            return self.checkCall(id, mn, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                        }
                         Ty ownerTy = self.namedType(tn);
                         MemberInfo m = self.findMethod(ownerTy, mn);
                         if (m.declaration.index == 0)
@@ -512,6 +622,24 @@ pub extend Sema
                 MemberInfo methodInfo = self.findMethod(self.exprType(expr->kind.payload.MethodCall.receiver), expr->kind.payload.MethodCall.method);
                 if (methodInfo.declaration.index == 0)
                 {
+                    /* fn-pointer field (vtable style): `alloc->alloc(ctx, n)`
+                     * — a struct field of FnPtr type called directly */
+                    MemberInfo fnField = self.findMember(self.exprType(expr->kind.payload.MethodCall.receiver), expr->kind.payload.MethodCall.method);
+                    if (fnField.typeNode != 0)
+                    {
+                        Ty ffTy = self.stripType(fnField.typeNode);
+                        TypeEntry* ffEntry = self.ctx.types + ffTy;
+                        if (ffEntry->kind.tag == TypeKind::FnPtr)
+                        {
+                            u32 ai = 0;
+                            while (ai < expr->kind.payload.MethodCall.argsLen)
+                            {
+                                if (!self.checkExpr(expr->kind.payload.MethodCall.args[ai])) return false;
+                                ai = ai + 1;
+                            }
+                            return self.checkFnPtrCall(id, fnField.typeNode, expr->kind.payload.MethodCall.args, expr->kind.payload.MethodCall.argsLen);
+                        }
+                    }
                     self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "method not found on type");
                     return false;
                 }
@@ -614,6 +742,16 @@ pub extend Sema
             ExprKind::Deref => {
                 if (!self.checkExpr(expr->kind.payload.Deref.expr)) return false;
                 Ty inner = self.exprType(expr->kind.payload.Deref.expr);
+                /* `*(const T*)p` — type-position const wraps the whole
+                 * type (Const{Pointer}), so look through Const/Comptime
+                 * before deciding the operand is not a pointer */
+                while (inner != 0)
+                {
+                    TypeEntry* te = self.ctx.types + inner;
+                    if (te->kind.tag == TypeKind::Const) inner = te->kind.payload.Const.base;
+                    else if (te->kind.tag == TypeKind::Comptime) inner = te->kind.payload.Comptime.base;
+                    else break;
+                }
                 if (inner != 0)
                 {
                     TypeEntry* te = self.ctx.types + inner;
@@ -669,8 +807,8 @@ pub extend Sema
             ExprKind::Le => { return self.checkBinaryBool(id, expr->kind.payload.Le.left, expr->kind.payload.Le.right); },
             ExprKind::Gt => { return self.checkBinaryBool(id, expr->kind.payload.Gt.left, expr->kind.payload.Gt.right); },
             ExprKind::Ge => { return self.checkBinaryBool(id, expr->kind.payload.Ge.left, expr->kind.payload.Ge.right); },
-            ExprKind::And => { return self.checkBinaryBool(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
-            ExprKind::Or => { return self.checkBinaryBool(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
+            ExprKind::And => { return self.checkCondBinary(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
+            ExprKind::Or => { return self.checkCondBinary(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
             ExprKind::BitAnd => { return self.checkBinary(id, expr->kind.payload.BitAnd.left, expr->kind.payload.BitAnd.right); },
             ExprKind::BitOr => { return self.checkBinary(id, expr->kind.payload.BitOr.left, expr->kind.payload.BitOr.right); },
             ExprKind::BitXor => { return self.checkBinary(id, expr->kind.payload.BitXor.left, expr->kind.payload.BitXor.right); },
@@ -734,7 +872,22 @@ pub extend Sema
                 if (!self.checkExpr(expr->kind.payload.AssignShr.value)) return false;
                 return true;
             },
-            ExprKind::TupleField => { return self.checkExpr(expr->kind.payload.TupleField.obj); },
+            ExprKind::TupleField => {
+                if (!self.checkExpr(expr->kind.payload.TupleField.obj)) return false;
+                Ty objTy = self.stripType(self.exprType(expr->kind.payload.TupleField.obj));
+                if (objTy == 0) return false;
+                TypeEntry* te = self.ctx.types + objTy;
+                if (te->kind.tag != TypeKind::Tuple) return false;
+                /* `n.1` — source indices are 1-based (codegen emits ._1) */
+                u32 tIdx = expr->kind.payload.TupleField.index;
+                if (tIdx == 0 || tIdx > te->kind.payload.Tuple.elemsLen)
+                {
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "tuple index out of range");
+                    return false;
+                }
+                self.setExprType(id, te->kind.payload.Tuple.elems[tIdx - 1]);
+                return true;
+            },
             ExprKind::StructLiteral => {
                 if (!self.checkType(expr->kind.payload.StructLiteral.typeNode)) return false;
                 Str variantName = expr->kind.payload.StructLiteral.variantName;
@@ -753,7 +906,7 @@ pub extend Sema
                     Symbol* symbol = self.scopes.lookup(te->kind.payload.Named.name);
                     if (symbol == null || symbol->declaration.index == 0)
                     {
-                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "unknown type name");
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, self.nameMsg((u8*)"unknown type name: ", te->kind.payload.Named.name));
                         return false;
                     }
                     Node* dn = self.ctx.nodes + symbol->declaration.index;
@@ -815,12 +968,12 @@ pub extend Sema
                             self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in variant construction");
                             return false;
                         }
-                        NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
-                        if (!self.checkExpr(valueId)) return false;
-                        Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
-                        Ty actual = self.exprType(valueId);
-                        if (!self.compatible(actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
-                        if (actual == 0) self.coerceArrayLit(valueId, expected);
+                    NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
+                    if (!self.checkExpr(valueId)) return false;
+                    Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
+                    Ty actual = self.exprType(valueId);
+                    if (!self.assignCompatible(valueId, actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
+                    if (actual == 0) self.coerceArrayLit(valueId, expected);
                         i = i + 1;
                     }
                     self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
@@ -843,7 +996,7 @@ pub extend Sema
                     if (!self.checkExpr(valueId)) return false;
                     Ty expected = self.substituteFieldTy(member.typeNode, expr->kind.payload.StructLiteral.typeNode);
                     Ty actual = self.exprType(valueId);
-                    if (!self.compatible(actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "struct literal field type mismatch");
+                    if (!self.assignCompatible(valueId, actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "struct literal field type mismatch");
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                     i = i + 1;
                 }
@@ -987,7 +1140,7 @@ pub extend Sema
             ExprKind::Ternary => {
                 if (!self.checkExpr(expr->kind.payload.Ternary.cond)) return false;
                 Ty ternCondTy = self.exprType(expr->kind.payload.Ternary.cond);
-                if (ternCondTy != 0 && ternCondTy != self.boolType())
+                if (ternCondTy != 0 && ternCondTy != self.boolType() && !self.integerType(ternCondTy) && !self.pointerLike(ternCondTy))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary condition must be bool");
                 if (!self.checkExpr(expr->kind.payload.Ternary.thenExpr)) return false;
                 if (!self.checkExpr(expr->kind.payload.Ternary.elseExpr)) return false;
@@ -998,11 +1151,12 @@ pub extend Sema
                 Ty ternTy = thenTy;
                 if (!self.compatible(thenTy, elseTy))
                 {
-                    /* bool branch vs integer branch (typically an int
-                     * literal `1`/`0`): C-style unification — the result
-                     * takes the integer side and the generated C does the
-                     * bool→int promotion in the conditional. */
-                    if (thenTy == self.boolType() && self.integerType(elseTy)) ternTy = elseTy;
+                    /* literal branches (`cond ? x : 0`) convert the way
+                     * initializers do; bool branch vs integer branch unifies
+                     * to the integer side (generated C promotes the bool) */
+                    if (self.assignCompatible(expr->kind.payload.Ternary.thenExpr, thenTy, elseTy)) ternTy = elseTy;
+                    else if (self.assignCompatible(expr->kind.payload.Ternary.elseExpr, elseTy, thenTy)) ternTy = thenTy;
+                    else if (thenTy == self.boolType() && self.integerType(elseTy)) ternTy = elseTy;
                     else if (elseTy == self.boolType() && self.integerType(thenTy)) ternTy = thenTy;
                     else self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary branch types do not match");
                 }

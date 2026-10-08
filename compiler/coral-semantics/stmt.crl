@@ -67,7 +67,7 @@ pub extend Sema
                 }
                 if (stmt->kind.payload.VarDecl.name != 0)
                 {
-                    if (!self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags) &&
+                    if (!self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags, 0) &&
                         self.scopes.lastDeclFail == 1)
                         self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id, "duplicate declaration of this name");
                 }
@@ -88,8 +88,9 @@ pub extend Sema
             },
             
             StmtKind::Return => {
-                if (!self.checkExpr(stmt->kind.payload.Return.value)) return false;
-                if (!self.compatible(self.exprType(stmt->kind.payload.Return.value), self.currentReturnType))
+                NodeId retVal = stmt->kind.payload.Return.value;
+                if (!self.checkExpr(retVal)) return false;
+                if (!self.assignCompatible(retVal, self.exprType(retVal), self.currentReturnType))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "return type does not match function return type");
                 return true;
             },
@@ -97,7 +98,7 @@ pub extend Sema
             StmtKind::If => {
                 if (!self.checkExpr(stmt->kind.payload.If.cond)) return false;
                 Ty ifCondTy = self.exprType(stmt->kind.payload.If.cond);
-                if (ifCondTy != 0 && ifCondTy != self.boolType())
+                if (ifCondTy != 0 && ifCondTy != self.boolType() && !self.integerType(ifCondTy) && !self.pointerLike(ifCondTy))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if condition must be bool");
                 if (!self.checkStmt(stmt->kind.payload.If.thenBody)) return false;
                 return self.checkStmt(stmt->kind.payload.If.elseBody);
@@ -106,7 +107,7 @@ pub extend Sema
             StmtKind::While => {
                 if (!self.checkExpr(stmt->kind.payload.While.cond)) return false;
                 Ty whileCondTy = self.exprType(stmt->kind.payload.While.cond);
-                if (whileCondTy != 0 && whileCondTy != self.boolType())
+                if (whileCondTy != 0 && whileCondTy != self.boolType() && !self.integerType(whileCondTy) && !self.pointerLike(whileCondTy))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "while condition must be bool");
                 return self.checkStmt(stmt->kind.payload.While.body);
             },
@@ -132,20 +133,26 @@ pub extend Sema
                     }
                 }
                 self.scopes.enter();
-                self.scopes.declare(stmt->kind.payload.ForIn.bindName, 1, stmt->kind.payload.ForIn.bindType, id, 2);
+                self.scopes.declare(stmt->kind.payload.ForIn.bindName, 1, stmt->kind.payload.ForIn.bindType, id, 2, 0);
                 bool ok = self.checkStmt(stmt->kind.payload.ForIn.body);
                 self.scopes.leave();
                 return ok;
             },
             
             StmtKind::For => {
-                if (!self.checkStmt(stmt->kind.payload.For.init)) return false;
-                if (!self.checkExpr(stmt->kind.payload.For.cond)) return false;
+                /* the loop variable lives in the loop's own scope: two
+                 * `for (u32 i = ...)` loops in the same block must not
+                 * collide (C scoping) */
+                self.scopes.enter();
+                bool forOk = self.checkStmt(stmt->kind.payload.For.init);
+                if (!self.checkExpr(stmt->kind.payload.For.cond)) forOk = false;
                 Ty forCondTy = self.exprType(stmt->kind.payload.For.cond);
-                if (forCondTy != 0 && forCondTy != self.boolType())
+                if (forCondTy != 0 && forCondTy != self.boolType() && !self.integerType(forCondTy) && !self.pointerLike(forCondTy))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "for condition must be bool");
-                if (!self.checkExpr(stmt->kind.payload.For.post)) return false;
-                return self.checkStmt(stmt->kind.payload.For.body);
+                if (!self.checkExpr(stmt->kind.payload.For.post)) forOk = false;
+                if (!self.checkStmt(stmt->kind.payload.For.body)) forOk = false;
+                self.scopes.leave();
+                return forOk;
             },
             
             StmtKind::Comptime => {
@@ -261,7 +268,7 @@ pub extend Sema
             {
                 GenericParam* generic = &genericNode->kind.payload.GenericParam.value;
                 Ty typeNode = self.typeParamType(generic->name, genericIndex);
-                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0)) ok = false;
+                if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0, 0)) ok = false;
             }
             genericIndex = genericIndex + 1;
         }
@@ -283,7 +290,7 @@ pub extend Sema
             /* self is a pointer in the C implementation — declare it as one
              * so member access emits `self->field` */
             Ty selfPtr = self.allocType(TypeKind::Pointer{ .base = selfType });
-            self.scopes.declare(selfStr, 1, selfPtr, decl->kind.payload.Func.body, 0);
+            self.scopes.declare(selfStr, 1, selfPtr, decl->kind.payload.Func.body, 0, 0);
         }
         i = 0;
         while (i < decl->kind.payload.Func.paramsLen)
@@ -296,14 +303,14 @@ pub extend Sema
                 if (param->name != 0) {
                     if ((param->flags & 8) != 0) {
                         Ty typeNode = self.typeParamType(param->name, i);
-                        if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0)) ok = false;
+                        if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0, 0)) ok = false;
                     } else if ((param->flags & 1) != 0) {
                         Ty selfTy = param->typeNode;
                         if (selfTy == 0) selfTy = selfType;
                         else selfTy = self.resolveSelfTy(selfTy, selfType);
-                        if (!self.scopes.declare(param->name, 1, selfTy, paramId, 0)) ok = false;
+                        if (!self.scopes.declare(param->name, 1, selfTy, paramId, 0, 0)) ok = false;
                     } else {
-                        if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0)) ok = false;
+                        if (!self.scopes.declare(param->name, 1, param->typeNode, paramId, 0, 0)) ok = false;
                     }
                 }
                 if ((param->flags & 1) == 0 && !self.checkType(param->typeNode)) ok = false;
@@ -414,7 +421,7 @@ pub extend Sema
             else
             {
                 Ty boundTy = self.substituteFieldTy(ft, scrutTy);
-                if (!self.scopes.declare(fieldName, 1, boundTy, patId, 0)) ok = false;
+                if (!self.scopes.declare(fieldName, 1, boundTy, patId, 0, 0)) ok = false;
             }
             f = f + 1;
         }

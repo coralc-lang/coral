@@ -15,6 +15,10 @@ pub struct Symbol
     Ty typeNode;
     NodeId declaration;
     u8 flags;
+    /* source file the declaration lives in (diagnostic file id). symbols
+     * with the same name from different files are distinct (the backend
+     * mangles their names apart) — see coral-docs/mangle_asm.md */
+    u32 fileId;
 }
 
 pub struct Scope
@@ -115,7 +119,7 @@ pub extend ScopeStack
         return true;
     }
 
-    bool declare(Str name, u8 kind, Ty typeNode, NodeId declaration, u8 flags)
+    bool declare(Str name, u8 kind, Ty typeNode, NodeId declaration, u8 flags, u32 fileId)
     {
         self.lastDeclFail = 0;
         Scope* scope = self.current();
@@ -130,6 +134,14 @@ pub extend ScopeStack
         {
             if (scope->symbols[i].name == name)
             {
+                /* different source file: distinct (mangled) symbols —
+                 * allowed; this also lets an import binding coexist with
+                 * the real merged declaration it points at */
+                if (scope->symbols[i].fileId != fileId)
+                {
+                    i = i + 1;
+                    continue;
+                }
                 if (scope->symbols[i].declaration.index == declaration.index) return true;
                 self.lastDeclFail = 1;
                 self.errors = self.errors + 1;
@@ -157,6 +169,7 @@ pub extend ScopeStack
         symbol->typeNode = typeNode;
         symbol->declaration = declaration;
         symbol->flags = flags;
+        symbol->fileId = fileId;
         scope->symbolsLen = scope->symbolsLen + 1;
         return true;
     }
@@ -172,6 +185,31 @@ pub extend ScopeStack
                 if (scope->symbols[i].name == name) return scope->symbols + i;
                 i = i + 1;
             }
+            scope = scope->parent;
+        }
+        return null;
+    }
+
+    /* like lookup, but the symbol declared in `fileId`'s own file wins over
+     * same-named symbols merged from other files; shadowing still applies
+     * (an inner scope's entry beats any outer entry) */
+    Symbol* lookupFrom(Str name, u32 fileId)
+    {
+        Scope* scope = self.current();
+        while (scope != null)
+        {
+            Symbol* first = null;
+            u32 i = 0;
+            while (i < scope->symbolsLen)
+            {
+                if (scope->symbols[i].name == name)
+                {
+                    if (scope->symbols[i].fileId == fileId) return scope->symbols + i;
+                    if (first == null) first = scope->symbols + i;
+                }
+                i = i + 1;
+            }
+            if (first != null) return first;
             scope = scope->parent;
         }
         return null;

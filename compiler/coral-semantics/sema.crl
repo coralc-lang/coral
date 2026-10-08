@@ -6,16 +6,17 @@ mod scope = import "scope";
 mod diag_engine = import "../coral-diagnostics/engine";
 mod diag_code = import "../coral-diagnostics/code";
 
-import id { Str, NodeId, SourceLoc };
+import id { Str, NodeId, SourceLoc, locFile };
 import types { Ty };
 import node_ast { Node, NodeKind };
-import context { AstContext };
-import scope { ScopeStack };
+import context { AstContext, InternEntry };
+import scope { ScopeStack, Symbol };
 import diag_engine { DiagnosticEngine };
 import diag_code { ErrorCode };
 
 extern("C") rawptr calloc(usize count, usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") rawptr malloc(usize size);
 extern("C") void free(rawptr ptr);
 
 pub struct Sema
@@ -28,10 +29,31 @@ pub struct Sema
     u32 extendsLen;
     u32 extendsCap;
     DiagnosticEngine* diag;
+    /* direct (unqualified) import bindings by (file, local name) — a
+     * second direct pull of the same name in one file conflicts */
+    Str* directNames;
+    u32* directFiles;
+    u32 directLen;
+    u32 directCap;
 }
 
 pub extend Sema
 {
+    /* diagnostic file id of the node's source file — 0 for absent ids */
+    u32 fileOf(NodeId id)
+    {
+        if (id.index == 0) return 0;
+        Node* n = self.ctx.nodes + id.index;
+        return locFile(n->loc);
+    }
+
+    /* name lookup that prefers the symbol declared in the use-site's own
+     * file (same-name symbols from other merged files mangle apart) */
+    Symbol* lookupAt(Str name, NodeId id)
+    {
+        return self.scopes.lookupFrom(name, self.fileOf(id));
+    }
+
     void init(AstContext* ctx, DiagnosticEngine* diag)
     {
         self.ctx = ctx;
@@ -43,6 +65,10 @@ pub extend Sema
         self.extendsLen = 0;
         self.extendsCap = 0;
         self.diag = diag;
+        self.directNames = null;
+        self.directFiles = null;
+        self.directLen = 0;
+        self.directCap = 0;
     }
 
     void deinit()
@@ -53,6 +79,8 @@ pub extend Sema
             free((rawptr)self.scopes);
         }
         if (self.extends != null) free((rawptr)self.extends);
+        if (self.directNames != null) free((rawptr)self.directNames);
+        if (self.directFiles != null) free((rawptr)self.directFiles);
         self.scopes = null;
         self.ctx = null;
         self.currentReturnType = 0;
@@ -61,6 +89,38 @@ pub extend Sema
         self.extendsLen = 0;
         self.extendsCap = 0;
         self.diag = null;
+        self.directNames = null;
+        self.directFiles = null;
+        self.directLen = 0;
+        self.directCap = 0;
+    }
+
+    /* record a direct (unqualified) import binding — false if this file
+     * already pulled the same local name (conflict; alias with `as`) */
+    bool claimDirectImport(u32 fileId, Str name)
+    {
+        u32 i = 0;
+        while (i < self.directLen)
+        {
+            if (self.directFiles[i] == fileId && self.directNames[i] == name) return false;
+            i = i + 1;
+        }
+        if (self.directLen >= self.directCap)
+        {
+            u32 newCap = 16;
+            if (self.directCap != 0) newCap = self.directCap * 2;
+            Str* n1 = (Str*)realloc((rawptr)self.directNames, (usize)newCap * 4);
+            if (n1 == null) return true;
+            self.directNames = n1;
+            u32* n2 = (u32*)realloc((rawptr)self.directFiles, (usize)newCap * 4);
+            if (n2 == null) return true;
+            self.directFiles = n2;
+            self.directCap = newCap;
+        }
+        self.directNames[self.directLen] = name;
+        self.directFiles[self.directLen] = fileId;
+        self.directLen = self.directLen + 1;
+        return true;
     }
 
     void addExtend(NodeId id)
@@ -116,5 +176,22 @@ pub extend Sema
             loc = node->loc;
         }
         self.semaError(code, loc, msg);
+    }
+
+    /* "<prefix><interned name>" as a fresh cstr — diagnostics name the
+     * offending identifier instead of a bare generic message */
+    u8* nameMsg(u8* prefix, Str name)
+    {
+        usize pl = 0;
+        while (prefix[pl] != 0) pl = pl + 1;
+        InternEntry* ie = self.ctx.interns + name;
+        u8* m = (u8*)malloc(pl + ie->len + 1);
+        if (m == null) return prefix;
+        usize i = 0;
+        while (i < pl) { m[i] = prefix[i]; i = i + 1; }
+        i = 0;
+        while (i < ie->len) { m[pl + i] = ie->ptr[i]; i = i + 1; }
+        m[pl + ie->len] = 0;
+        return m;
     }
 }
