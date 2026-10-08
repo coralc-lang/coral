@@ -1659,9 +1659,11 @@ Slice cgExpr(Codegen* cg, NodeId id)
             while (i < fvLen) {
                 if (first) first = false;
                 else stP(&vs, ", ");
-                stP(&vs, ".");
-                stPS(&vs, cgIdent(cg, e.kind.payload.StructLiteral.fieldNames[i]));
-                stP(&vs, " = ");
+                if (e.kind.payload.StructLiteral.fieldNames != 0) {
+                    stP(&vs, ".");
+                    stPS(&vs, cgIdent(cg, e.kind.payload.StructLiteral.fieldNames[i]));
+                    stP(&vs, " = ");
+                }
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i = i + 1;
             }
@@ -2906,7 +2908,7 @@ bool cgTyHasParam(Codegen* cg, Ty t)
 /* parameter list → stream (comptime/type-level params are erased) */
 void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
 {
-    bool any = false;
+    bool hadOne = false;
     /* methods without an explicit `self` still take the receiver as their
      * first parameter — sema declares an implicit `self` for them */
     bool explicitSelf = false;
@@ -2919,7 +2921,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
     {
         stPS(s, owner);
         stP(s, "* self");
-        any = true;
+        hadOne = true;
     }
     u32 i = 0;
     while (i < dd.kind.payload.Func.paramsLen)
@@ -2931,14 +2933,14 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
             if ((p.flags & 8) != 0) { i = i + 1; continue; }
             if ((p.flags & 16) != 0)
             {
-                if (any) stP(s, ", ");
+                if (hadOne) stP(s, ", ");
                 stP(s, "...");
-                any = true;
+                hadOne = true;
                 i = i + 1;
                 continue;
             }
-            if (any) stP(s, ", ");
-            any = true;
+            if (hadOne) stP(s, ", ");
+            hadOne = true;
             if ((p.flags & 1) != 0)
             {
                 if (owner.len == 0) {
@@ -2973,7 +2975,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner)
         }
         i = i + 1;
     }
-    if (!any) stP(s, "void");
+    if (!hadOne) stP(s, "void");
 }
 
 void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner)
@@ -3208,10 +3210,57 @@ void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
     stPS(&cg.defs, cgIdent(cg, name));
 }
 
+/* file-scope initializer value: brace literals stay inline (temp
+ * statements cannot be emitted at file scope) and recurse into
+ * nested braces; anything else falls back to cgExpr. */
+void cgEmitInitValue(Codegen* cg, NodeId v)
+{
+    Node* n = cgNode(cg, v);
+    if (n.kind.tag == NodeKind::Expr && n.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral)
+    {
+        Expr* al = &n.kind.payload.Expr.value;
+        stP(&cg.defs, "{");
+        u32 i = 0;
+        while (i < al.kind.payload.ArrayLiteral.elemsLen)
+        {
+            if (i > 0) stP(&cg.defs, ", ");
+            cgEmitInitValue(cg, al.kind.payload.ArrayLiteral.elems[i]);
+            i = i + 1;
+        }
+        stCh(&cg.defs, '}');
+        return;
+    }
+    if (n.kind.tag == NodeKind::Expr && n.kind.payload.Expr.value.kind.tag == ExprKind::StructLiteral &&
+        n.kind.payload.Expr.value.kind.payload.StructLiteral.variantName == 0)
+    {
+        Expr* se = &n.kind.payload.Expr.value;
+        stP(&cg.defs, "(");
+        stPS(&cg.defs, tyStr(cg, se->kind.payload.StructLiteral.typeNode));
+        stP(&cg.defs, "){");
+        u32 i = 0;
+        while (i < se->kind.payload.StructLiteral.fieldValuesLen)
+        {
+            if (i > 0) stP(&cg.defs, ", ");
+            if (se->kind.payload.StructLiteral.fieldNames != 0)
+            {
+                stP(&cg.defs, ".");
+                stPS(&cg.defs, cgIdent(cg, se->kind.payload.StructLiteral.fieldNames[i]));
+                stP(&cg.defs, " = ");
+            }
+            cgEmitInitValue(cg, se->kind.payload.StructLiteral.fieldValues[i]);
+            i = i + 1;
+        }
+        stCh(&cg.defs, '}');
+        return;
+    }
+    Slice ev = cgExpr(cg, v);
+    stPS(&cg.defs, ev);
+}
+
 void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
 {
     u32 f = 0;
-    bool any = false;
+    bool hadOne = false;
     while (f < fieldsLen)
     {
         Node* fn = cgNode(cg, fields[f]);
@@ -3242,11 +3291,11 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
                 stPS(&cg.defs, cgIdent(cg, fd.name));
                 stCh(&cg.defs, ';');
             }
-            any = true;
+            hadOne = true;
         }
         f = f + 1;
     }
-    if (!any) stP(&cg.defs, "\n    char _empty;");
+    if (!hadOne) stP(&cg.defs, "\n    char _empty;");
 }
 
 void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
@@ -3428,32 +3477,13 @@ void cgEmitTypeDefs(Codegen* cg)
                     {
                         bool isArray = cty != 0 &&
                             (cg.ctx->types + cty)->kind.tag == TypeKind::Array;
-                        if (isArray)
-                        {
-                            Node* inn = cgNode(cg, cval);
-                            if (inn.kind.tag == NodeKind::Expr &&
-                                inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral)
-                            {
-                                Expr* al = &inn.kind.payload.Expr.value;
-                                stP(&cg.defs, " = {");
-                                u32 ai = 0;
-                                while (ai < al.kind.payload.ArrayLiteral.elemsLen)
-                                {
-                                    if (ai > 0) stP(&cg.defs, ", ");
-                                    Slice ev = cgExpr(cg, al.kind.payload.ArrayLiteral.elems[ai]);
-                                    stPS(&cg.defs, ev);
-                                    ai = ai + 1;
-                                }
-                                stCh(&cg.defs, '}');
-                            }
-                            else cgError(cg, (u8*)"array constant needs an array-literal initializer");
-                        }
-                        else
-                        {
-                            stP(&cg.defs, " = ");
-                            Slice v = cgExpr(cg, cval);
-                            stPS(&cg.defs, v);
-                        }
+                        Node* inn = cgNode(cg, cval);
+                        bool isArrLit = inn.kind.tag == NodeKind::Expr &&
+                            inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
+                        if (isArray && !isArrLit)
+                            cgError(cg, (u8*)"array constant needs an array-literal initializer");
+                        stP(&cg.defs, " = ");
+                        cgEmitInitValue(cg, cval);
                     }
                     stP(&cg.defs, ";\n");
                 }

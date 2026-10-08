@@ -21,7 +21,7 @@ import parser { Parser };
 import context { AstContext, NodeListBuilder, StrListBuilder, SwitchListBuilder };
 import token { Token, TokenKind };
 import id { NodeId, Str };
-import types { Ty };
+import types { Ty, TypeEntry };
 import expr { Expr, ExprKind };
 import stmt { SwitchCase };
 import node { Node, NodeKind };
@@ -127,6 +127,20 @@ pub extend Parser
             return self.storeExpr(ExprKind::ArrayLiteral{ .elems = values, .elemsLen = count });
         }
         return self.parseExpr();
+    }
+
+    /* `T name[] = { … }` — an unsized declarator with a brace initializer
+     * is a C-style array sized from the initializer, not a slice view. */
+    Ty inferArrayFromInit(Ty ty, NodeId init)
+    {
+        if (ty == 0 || init.index == 0) return ty;
+        TypeEntry* te = self.ctx.types + ty;
+        if (te->kind.tag != TypeKind::Slice) return ty;
+        Node* n = self.ctx.nodes + init.index;
+        if (n.kind.tag != NodeKind::Expr) return ty;
+        Expr* e = &n.kind.payload.Expr.value;
+        if (e.kind.tag != ExprKind::ArrayLiteral) return ty;
+        return self.makeArray(te->kind.payload.Slice.base, (u32)e.kind.payload.ArrayLiteral.elemsLen);
     }
 
     NodeId parseExpr()
@@ -696,28 +710,56 @@ pub extend Parser
     }
 
     /* `{ .name = expr, ... }` fields of a struct literal, or of a
-     * variant construction (`Type::Variant { ... }`, variant != 0) */
+     * variant construction (`Type::Variant { ... }`, variant != 0).
+     * When no entry carries `name =` the literal is positional:
+     * values map onto fields in declaration order (same as the
+     * untyped brace form `T x = { v1, v2 }`). */
     NodeId parseLiteralFields(Ty typeNode, Str variantName)
     {
         self.expect(TokenKind::LBrace);
+        bool positional = false;
+        if (self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Dot)
+        {
+            if (self.current.kind == TokenKind::Ident)
+            {
+                ParserMark m = self.save();
+                self.advance();
+                positional = self.current.kind != TokenKind::Equal;
+                self.restore(m);
+            }
+            else positional = true;
+        }
         StrListBuilder fields;
         NodeListBuilder values;
         self.ctx.strListInit(&fields);
         self.ctx.nodeListInit(&values);
-        while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+        if (positional)
         {
-            self.match(TokenKind::Dot);
-            Token field = self.expectName();
-            Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
-            self.expect(TokenKind::Equal);
-            NodeId value = self.parseExpr();
-            if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
-            if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
-            if (!self.match(TokenKind::Comma)) break;
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            {
+                NodeId value = self.parseInitExpr();
+                if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
+        }
+        else
+        {
+            while (self.current.kind != TokenKind::RBrace && !self.atEnd())
+            {
+                self.match(TokenKind::Dot);
+                Token field = self.expectName();
+                Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                self.expect(TokenKind::Equal);
+                NodeId value = self.parseExpr();
+                if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
+                if (!self.ctx.nodeListAppend(&values, value)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
         }
         self.expect(TokenKind::RBrace);
-        u32 count = fields.len;
+        u32 count = positional ? values.len : fields.len;
         Str* fieldNames = self.ctx.strListFinish(&fields);
+        if (positional) fieldNames = null;
         NodeId* fieldValues = self.ctx.nodeListFinish(&values);
         return self.storeExpr(ExprKind::StructLiteral{ .typeNode = typeNode, .variantName = variantName, .fieldNames = fieldNames, .fieldValues = fieldValues, .fieldValuesLen = count });
     }

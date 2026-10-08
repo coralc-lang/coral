@@ -36,6 +36,29 @@ pub extend Sema
         return true;
     }
 
+    /* An untyped brace literal `{ v1, v2 }` has no type of its own; when
+     * it lands where a struct type is expected, record that type so
+     * codegen emits a cast compound literal, recursing through nested
+     * braces (`T { { ... }, ... }`). */
+    void coerceArrayLit(NodeId arrId, Ty ty)
+    {
+        if (ty == 0 || arrId.index == 0) return;
+        Node* n = self.ctx.nodes + arrId.index;
+        if (n.kind.tag != NodeKind::Expr) return;
+        Expr* e = &n.kind.payload.Expr.value;
+        if (e.kind.tag != ExprKind::ArrayLiteral) return;
+        if (e.resolvedType != 0) return;
+        self.setExprType(arrId, ty);
+        u32 i = 0;
+        while (i < e.kind.payload.ArrayLiteral.elemsLen)
+        {
+            NodeId ev = e.kind.payload.ArrayLiteral.elems[i];
+            MemberInfo m = self.findMemberByIndex(ty, i);
+            if (m.typeNode != 0) self.coerceArrayLit(ev, self.substituteFieldTy(m.typeNode, ty));
+            i = i + 1;
+        }
+    }
+
     bool assignExpr(NodeId id)
     {
         if (id.index == 0) return false;
@@ -743,9 +766,20 @@ pub extend Sema
                         return false;
                     }
                     u32 i = 0;
+                    Str* litNames = expr->kind.payload.StructLiteral.fieldNames;
                     while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
                     {
-                        Str fieldName = expr->kind.payload.StructLiteral.fieldNames[i];
+                        Str fieldName;
+                        if (litNames != 0) fieldName = litNames[i];
+                        else
+                        {
+                            if (i >= vv->fieldsLen)
+                            {
+                                self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "too many positional fields in variant construction");
+                                return false;
+                            }
+                            fieldName = vv->fieldNames[i];
+                        }
                         Ty ft = 0;
                         u32 k = 0;
                         while (k < vv->fieldsLen)
@@ -762,26 +796,36 @@ pub extend Sema
                             self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in variant construction");
                             return false;
                         }
-                        if (!self.checkExpr(expr->kind.payload.StructLiteral.fieldValues[i])) return false;
+                        NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
+                        if (!self.checkExpr(valueId)) return false;
                         Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
-                        if (!self.compatible(self.exprType(expr->kind.payload.StructLiteral.fieldValues[i]), expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
+                        Ty actual = self.exprType(valueId);
+                        if (!self.compatible(actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
+                        if (actual == 0) self.coerceArrayLit(valueId, expected);
                         i = i + 1;
                     }
                     self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
                     return true;
                 }
                 u32 i = 0;
+                Str* litNames = expr->kind.payload.StructLiteral.fieldNames;
                 while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
                 {
-                    MemberInfo member = self.findMember(expr->kind.payload.StructLiteral.typeNode, expr->kind.payload.StructLiteral.fieldNames[i]);
+                    MemberInfo member;
+                    if (litNames != 0) member = self.findMember(expr->kind.payload.StructLiteral.typeNode, litNames[i]);
+                    else member = self.findMemberByIndex(expr->kind.payload.StructLiteral.typeNode, i);
                     if (member.typeNode == 0)
                     {
-                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in struct literal");
+                        if (litNames != 0) self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in struct literal");
+                        else self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "too many positional fields in struct literal");
                         return false;
                     }
-                    if (!self.checkExpr(expr->kind.payload.StructLiteral.fieldValues[i])) return false;
+                    NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];
+                    if (!self.checkExpr(valueId)) return false;
                     Ty expected = self.substituteFieldTy(member.typeNode, expr->kind.payload.StructLiteral.typeNode);
-                    if (!self.compatible(self.exprType(expr->kind.payload.StructLiteral.fieldValues[i]), expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "struct literal field type mismatch");
+                    Ty actual = self.exprType(valueId);
+                    if (!self.compatible(actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "struct literal field type mismatch");
+                    if (actual == 0) self.coerceArrayLit(valueId, expected);
                     i = i + 1;
                 }
                 self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);

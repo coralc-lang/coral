@@ -625,23 +625,23 @@ pub bool irPassRangeBranchElim(IrFunc* func, rawptr userdata)
 
             // Extract constant bound
             IrValue* cval = null;
-            IrValue* var = null;
+            IrValue* val = null;
             if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::Inst)
             {
                 cval = a;
-                var = b;
+                val = b;
             }
             else if (b->kind == IrValueKind::ConstInt && a->kind == IrValueKind::Inst)
             {
                 cval = b;
-                var = a;
+                val = a;
             }
             else continue;
 
-            if (cval == null || var == null) continue;
+            if (cval == null || val == null) continue;
 
             // Record range info
-            blockRanges[bi].addConstraint(var, inst->icmpPred, cval->valData, a == cval);
+            blockRanges[bi].addConstraint(val, inst->icmpPred, cval->valData, a == cval);
         }
     }
 
@@ -714,14 +714,14 @@ struct ValueRange
             IrICmpPred::Ult => {
                 if (constOnLeft)
                 {
-                    // bound < var  =>  var > bound  =>  loBound = bound+1
+                    // bound < val  =>  val > bound  =>  loBound = bound+1
                     self.loBound = bound + 1;
                     self.hasLo = true;
                     self.loInclusive = false;
                 }
                 else
                 {
-                    // var < bound  =>  hiBound = bound-1
+                    // val < bound  =>  hiBound = bound-1
                     self.hiBound = bound - 1;
                     self.hasHi = true;
                     self.hiInclusive = false;
@@ -731,14 +731,14 @@ struct ValueRange
             IrICmpPred::Ule => {
                 if (constOnLeft)
                 {
-                    // bound <= var  =>  var >= bound
+                    // bound <= val  =>  val >= bound
                     self.loBound = bound;
                     self.hasLo = true;
                     self.loInclusive = true;
                 }
                 else
                 {
-                    // var <= bound
+                    // val <= bound
                     self.hiBound = bound;
                     self.hasHi = true;
                     self.hiInclusive = true;
@@ -748,14 +748,14 @@ struct ValueRange
             IrICmpPred::Ugt => {
                 if (constOnLeft)
                 {
-                    // bound > var  =>  var < bound  =>  hiBound = bound-1
+                    // bound > val  =>  val < bound  =>  hiBound = bound-1
                     self.hiBound = bound - 1;
                     self.hasHi = true;
                     self.hiInclusive = false;
                 }
                 else
                 {
-                    // var > bound  =>  loBound = bound+1
+                    // val > bound  =>  loBound = bound+1
                     self.loBound = bound + 1;
                     self.hasLo = true;
                     self.loInclusive = false;
@@ -765,14 +765,14 @@ struct ValueRange
             IrICmpPred::Uge => {
                 if (constOnLeft)
                 {
-                    // bound >= var  =>  var <= bound
+                    // bound >= val  =>  val <= bound
                     self.hiBound = bound;
                     self.hasHi = true;
                     self.hiInclusive = true;
                 }
                 else
                 {
-                    // var >= bound
+                    // val >= bound
                     self.loBound = bound;
                     self.hasLo = true;
                     self.loInclusive = true;
@@ -836,12 +836,12 @@ struct RangeInfo
         self.capRanges = 0;
     }
 
-    void addConstraint(IrValue* var, IrICmpPred pred, i64 bound, bool constOnLeft)
+    void addConstraint(IrValue* val, IrICmpPred pred, i64 bound, bool constOnLeft)
     {
         // Find or create range for this variable
         for (u32 i = 0; i < self.numRanges; i++)
         {
-            if (self.ranges[i].value == var)
+            if (self.ranges[i].value == val)
             {
                 self.ranges[i].updateFromICmp(pred, bound, constOnLeft);
                 return;
@@ -860,15 +860,15 @@ struct RangeInfo
             self.capRanges = newCap;
         }
 
-        self.ranges[self.numRanges].init(var);
+        self.ranges[self.numRanges].init(val);
         self.ranges[self.numRanges].updateFromICmp(pred, bound, constOnLeft);
         self.numRanges++;
     }
 
-    ValueRange* findRange(IrValue* var)
+    ValueRange* findRange(IrValue* val)
     {
         for (u32 i = 0; i < self.numRanges; i++)
-            if (self.ranges[i].value == var)
+            if (self.ranges[i].value == val)
                 return &self.ranges[i];
         return null;
     }
@@ -885,28 +885,28 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
     if (a == null || b == null) return null;
 
     // Case 1, Comparing a variable with a known constant range
-    IrValue* var = null;
+    IrValue* val = null;
     IrValue* cval = null;
     bool constOnLeft = false;
 
     if (a->kind == IrValueKind::ConstInt && b->kind == IrValueKind::Inst)
     {
         cval = a;
-        var = b;
+        val = b;
         constOnLeft = true;
     }
     else if (b->kind == IrValueKind::ConstInt && a->kind == IrValueKind::Inst)
     {
         cval = b;
-        var = a;
+        val = a;
         constOnLeft = false;
     }
     else return null;
 
-    if (var == null || cval == null) return null;
+    if (val == null || cval == null) return null;
 
     // Look up range for the variable
-    ValueRange* range = info.findRange(var);
+    ValueRange* range = info.findRange(val);
     if (range == null) return null;
 
     i64 cvalData = cval->valData;
@@ -921,32 +921,32 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
         IrICmpPred::Ult => {
             if (constOnLeft)
             {
-                // cval < var
+                // cval < val
                 if (range->hasLo && range->loBound > cvalData)
                 {
-                    // var > range.loBound > cval, so cval < var is always true
+                    // val > range.loBound > cval, so cval < val is always true
                     result = true;
                     determined = true;
                 }
                 else if (range->hasHi && range->hiBound <= cvalData)
                 {
-                    // var <= range.hiBound <= cval, so cval < var is always false
+                    // val <= range.hiBound <= cval, so cval < val is always false
                     result = false;
                     determined = true;
                 }
             }
             else
             {
-                // var < cval
+                // val < cval
                 if (range->hasHi && range->hiBound < cvalData)
                 {
-                    // var <= range.hiBound < cval, so var < cval is always true
+                    // val <= range.hiBound < cval, so val < cval is always true
                     result = true;
                     determined = true;
                 }
                 else if (range->hasLo && range->loBound >= cvalData)
                 {
-                    // var >= range.loBound >= cval, so var < cval is always false
+                    // val >= range.loBound >= cval, so val < cval is always false
                     result = false;
                     determined = true;
                 }
@@ -956,7 +956,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
         IrICmpPred::Ule => {
             if (constOnLeft)
             {
-                // cval <= var
+                // cval <= val
                 if (range->hasLo && range->loBound > cvalData)
                 {
                     result = true;
@@ -970,7 +970,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
             }
             else
             {
-                // var <= cval
+                // val <= cval
                 if (range->hasHi && range->hiBound <= cvalData)
                 {
                     result = true;
@@ -987,7 +987,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
         IrICmpPred::Ugt => {
             if (constOnLeft)
             {
-                // cval > var
+                // cval > val
                 if (range->hasHi && range->hiBound < cvalData)
                 {
                     result = true;
@@ -1001,7 +1001,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
             }
             else
             {
-                // var > cval
+                // val > cval
                 if (range->hasLo && range->loBound > cvalData)
                 {
                     result = true;
@@ -1018,7 +1018,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
         IrICmpPred::Uge => {
             if (constOnLeft)
             {
-                // cval >= var
+                // cval >= val
                 if (range->hasHi && range->hiBound <= cvalData)
                 {
                     result = true;
@@ -1032,7 +1032,7 @@ static IrValue* tryFoldByRange(IrContext* ctx, IrInst* icmp, RangeInfo* info, Ir
             }
             else
             {
-                // var >= cval
+                // val >= cval
                 if (range->hasLo && range->loBound >= cvalData)
                 {
                     result = true;

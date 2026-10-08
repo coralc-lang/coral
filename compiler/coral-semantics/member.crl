@@ -114,6 +114,59 @@ pub extend Sema
         return none;
     }
 
+    /* positional lookup: field at declaration order `index`; mirrors
+     * findMember but without a name (brace literals like `T { v1, v2 }`) */
+    MemberInfo findMemberByIndex(Ty receiver, u32 index)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        /* str is an immutable slice view: { ptr, len } */
+        if (typeEntry->kind.tag == TypeKind::Str)
+        {
+            if (index == 0) {
+                none.typeNode = self.strPtrType();
+                none.kind = 1;
+                return none;
+            }
+            if (index == 1) {
+                none.typeNode = self.usizeType();
+                none.kind = 1;
+                return none;
+            }
+            return none;
+        }
+        if (typeEntry->kind.tag != TypeKind::Named) return none;
+        Symbol* symbol = self.scopes.lookup(typeEntry->kind.payload.Named.name);
+        if (symbol == null) return none;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return none;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null || index >= fieldCount) return none;
+        Node* fieldNode = self.ctx.nodes + fields[index].index;
+        if (fieldNode->kind.tag != NodeKind::Field) return none;
+        none.typeNode = fieldNode->kind.payload.Field.value.typeNode;
+        none.declaration = fields[index];
+        none.kind = 1;
+        return none;
+    }
+
     MemberInfo findMethod(Ty receiver, Str name)
     {
         MemberInfo none;
