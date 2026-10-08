@@ -1,8 +1,9 @@
 // Register names the allocator must never see in a vreg: the frame and
 // stack pointer, plus every register this backend needs as scratch for its
-// own instruction sequences (div/rem need rax+rdx, shifts need rcx,
-// VecDiv/Abs/Fcvt walk through r10 and r11, and all spill reloads use
-// xmm0/xmm1/xmm15 or rax). lsra filters these out of its allocatable set
+// own instruction sequences (VecDiv/Abs/Fcvt walk through r10 and r11,
+// spill reloads use xmm0/xmm1/xmm15, shift counts dance through rcx with
+// %r11 as the save, and call marshalling's cycle-breaker is r10).
+// lsra filters these out of its allocatable set
 // via RegAllocConfig.reservedIntRegs/reservedFloatRegs, so the two lists
 // below must contain exactly the registers the emitter treats as scratch.
 // The platform drivers all come through this one shared base while the
@@ -10,7 +11,7 @@
 // apart for good, each platform taking its own copy, so nothing carries
 // a pile of if comparisons along the way to ask which platform it is.
 pub str X86_64_RESERVED_INT[] = {
-    "rsp", "rbp", "rax", "rcx", "rdx", "r10", "r11"
+    "rsp", "rbp", "r10", "r11"
 };
 
 pub str X86_64_RESERVED_FLOAT[] = {
@@ -18,10 +19,11 @@ pub str X86_64_RESERVED_FLOAT[] = {
 };
 
 // The allocatable set lsra hands out, in exactly lsra's order:
-// SystemV caller-save minus the reserved scratch set above.
+// SystemV caller-save (rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11) minus the
+// reserved scratch set above. Must match the lsra filter order, since
 // LSRA reg index i decodes to X86_64_INT_REGS[i] / X86_64_FLOAT_REGS[i].
 pub str X86_64_INT_REGS[] = {
-    "rsi", "rdi", "r8", "r9"
+    "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9"
 };
 
 pub str X86_64_FLOAT_REGS[] = {
@@ -218,6 +220,11 @@ static const cchar* toReg16(const cchar* r)
 
 static cchar _ymmbuf[2][16];
 static int _ymmI = 0;
+
+// predicate ordinals run 0..9, a name table beats a ten-arm switch
+static const cchar* SETCC_INT[10] = {
+    "sete", "setne", "setl", "setle", "setg", "setge", "setb", "setbe", "seta", "setae"
+};
 static cchar _r8buf[2][16];
 static int _r8i = 0;
 static cchar _slotBuf[16][24];
@@ -226,6 +233,10 @@ static int _slotI = 0;
 static const cchar* toReg8(const cchar* r)
 {
     cchar* buf = _r8buf[_r8i++ & 1];
+    if (r[0] == 'r' && r[1] == 'a' && r[2] == 'x' && r[3] == 0) return "al";
+    if (r[0] == 'r' && r[1] == 'b' && r[2] == 'x' && r[3] == 0) return "bl";
+    if (r[0] == 'r' && r[1] == 'c' && r[2] == 'x' && r[3] == 0) return "cl";
+    if (r[0] == 'r' && r[1] == 'd' && r[2] == 'x' && r[3] == 0) return "dl";
     if (r[0] == 'r' && r[1] >= 'a' && r[1] <= 'z')
     {
         if (r[2] == 0)
@@ -299,6 +310,9 @@ pub struct X86_64CodeGen
         return false;
     }
 
+    // Register name for a non-spilled value, slot text for a spill,
+    // empty string only for out-of-range. Emission sites must go
+    // through opFor/opForReg/opForRegF instead of reading this.
     const cchar* getRegName(IrValue* val)
     {
         if (val == null) return "rax";
@@ -312,7 +326,7 @@ pub struct X86_64CodeGen
             return "";
         }
         u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 4) return X86_64_INT_REGS[reg].ptr;
+        if (reg < 7) return X86_64_INT_REGS[reg].ptr;
         return "";
     }
 
@@ -577,20 +591,24 @@ pub struct X86_64CodeGen
         self.calleeSavesPushed = false;
         self.hasDeferredFrame = false;
 
-        bool canShrinkWrap = !isVararg && usesAnyCalleeSave && !hasFrame;
+        // Spill slots are addressed rbp-relative, so a frame is
+        // mandatory whenever the allocator spilled anything — a leaf
+        // or an omitFramePointer path cannot use spill slots safely.
+        bool needFrame = !isLeaf || self.spillSlotCount > 0;
+        bool canShrinkWrap = !isVararg && usesAnyCalleeSave && !hasFrame && self.spillSlotCount == 0;
         if (canShrinkWrap)
         {
             self.currentFuncHasFrame = false;
             if (self.isWindows)
                 self.shadowAllocSize = 32;
         }
-        else if (!isLeaf && self.omitFramePointer)
+        else if (!isLeaf && self.omitFramePointer && self.spillSlotCount == 0)
         {
             self.currentFuncHasFrame = false;
             if (self.isWindows)
                 self.shadowAllocSize = 32;
         }
-        else if (!isLeaf)
+        else if (needFrame)
         {
             if (self.emitter.useAtt)
             {
@@ -609,13 +627,32 @@ pub struct X86_64CodeGen
             self.currentFuncHasFrame = false;
         }
 
-        if (!canShrinkWrap && !isLeaf)
+        if (!canShrinkWrap && needFrame)
         {
             self.calleeSavesPushed = true;
             for (u32 i = 0; i < 6; i++)
             {
                 if (self.savedCalleeSaves[i])
                     self.emitPushCalleeSave(calleeSaveRegs[i]);
+            }
+        }
+
+        if (self.currentFuncHasFrame)
+        {
+            // Reserve the spill area below the saved callee saves;
+            // slots address it rbp-relative, so the reservation only
+            // has to exist as a stable offset source. Padding to an
+            // odd 8 keeps the call instruction's stack 16-byte aligned.
+            u32 n = self.spillSlotCount;
+            if (n > 0 || ((self.numCalleeSaves % 2) == 1))
+            {
+                u32 pad = (self.numCalleeSaves % 2) == 1 ? 8 : 0;
+                self.spillFrameBytes = n * 16 + pad;
+                cchar buf2[16];
+                u32ToStr(self.spillFrameBytes, buf2);
+                self.emitter.emit("\tsubq $");
+                self.emitter.emit(buf2);
+                self.emitter.emitLine(", %rsp");
             }
         }
 
@@ -710,7 +747,7 @@ pub struct X86_64CodeGen
                 else if (isFloat && fpIdx < maxFpRegs)
                 {
                     const cchar* abiReg = fpRegs[fpIdx];
-                    if (assignedToReg && assignedRegIdx < 13)
+                    if (assignedToReg && assignedRegIdx < 6)
                     {
                         const cchar* destReg = X86_64_FLOAT_REGS[assignedRegIdx].ptr;
                         if (strcmp(abiReg, destReg) != 0)
@@ -726,7 +763,7 @@ pub struct X86_64CodeGen
                 else if (!isFloat && !isStruct && intIdx < maxIntRegs)
                 {
                     const cchar* abiReg = intRegs[intIdx];
-                    if (assignedToReg && assignedRegIdx < 12)
+                    if (assignedToReg && assignedRegIdx < 7)
                     {
                         const cchar* destReg = X86_64_INT_REGS[assignedRegIdx].ptr;
                         if (strcmp(abiReg, destReg) != 0)
@@ -745,12 +782,18 @@ pub struct X86_64CodeGen
 
     void emitEpilogue()
     {
-        if (self.currentFuncHasFrame)
+        // Mirror the prologue's stack adjustments in reverse: spill
+        // area first (it sits below the saved callee saves), then the
+        // callee-save pops, then the frame teardown frees rbp's slot,
+        // then the vararg area that was allocated below the frame.
+        if (self.spillFrameBytes > 0)
         {
-            self.emitter.emitTab("leave");
+            cchar buf3[16];
+            u32ToStr(self.spillFrameBytes, buf3);
+            self.emitter.emit("\taddq $");
+            self.emitter.emit(buf3);
+            self.emitter.emitLine(", %rsp");
         }
-        // Note: shadow space is allocated/deallocated at each call site on Windows,
-        // not in the prologue/epilogue, so no stack adjustment is needed here.
 
         if (self.calleeSavesPushed)
         {
@@ -775,6 +818,11 @@ pub struct X86_64CodeGen
                     }
                 }
             }
+        }
+
+        if (self.currentFuncHasFrame)
+        {
+            self.emitter.emitTab("leave");
         }
 
         if (self.varargAllocSize > 0)
@@ -810,7 +858,7 @@ pub struct X86_64CodeGen
             if (isStruct)
             {
                 u32 sz = retVal->type->width;
-                const cchar* src = getRegForValue(retVal);
+                const cchar* src = opForReg(retVal, "r10");
 
                 if (sz <= 8)
                 {
@@ -836,7 +884,7 @@ pub struct X86_64CodeGen
             }
             else if (valueIsFloatClass(retVal))
             {
-                const cchar* src = getRegForValue(retVal);
+                const cchar* src = opFor(retVal);
                 if (strcmp(src, "xmm0") != 0)
                 {
                     self.emitter.emit("\tmovsd ");
@@ -846,7 +894,7 @@ pub struct X86_64CodeGen
             }
             else
             {
-                const cchar* src = getRegForValue(retVal);
+                const cchar* src = opFor(retVal);
                 if (strcmp(src, "rax") != 0)
                 {
                     self.emitter.emit("\tmovq ");
@@ -1411,7 +1459,8 @@ pub struct X86_64CodeGen
 
         if (loadInst->ops[0] != addrVal) return false;
 
-        const cchar* addr = getRegForValue(addrVal);
+        // the memory operand's address register, a spill reloads first
+        const cchar* addr = self.opForReg(addrVal, "r10");
         const cchar* operand = getRegForValue(srcInst->ops[1]);
         u32 width = loadInst->base.type != null ? loadInst->base.type->width : 64;
 
@@ -1471,8 +1520,9 @@ pub struct X86_64CodeGen
         if (addrInst->nops < 3) return false;
 
         const cchar* dst = getRegForValue(&inst->base);
-        const cchar* base = getRegForValue(addrInst->ops[0]);
-        const cchar* idx = getRegForValue(addrInst->ops[1]);
+        // sib parts are register-only, spills reload into the scratches
+        const cchar* base = self.opForReg(addrInst->ops[0], "r10");
+        const cchar* idx = self.opForReg(addrInst->ops[1], "r11");
         u32 width = inst->base.type != null ? inst->base.type->width : 64;
 
         self.emitter.emit("\t");
@@ -1531,8 +1581,9 @@ pub struct X86_64CodeGen
         if (addrInst->nops < 3) return false;
 
         const cchar* src = getRegForValue(inst->ops[0]);
-        const cchar* base = getRegForValue(addrInst->ops[0]);
-        const cchar* idx = getRegForValue(addrInst->ops[1]);
+        // sib parts are register-only, spills reload into the scratches
+        const cchar* base = self.opForReg(addrInst->ops[0], "r10");
+        const cchar* idx = self.opForReg(addrInst->ops[1], "r11");
         u32 width = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
 
         self.emitter.emit("\t");
@@ -1765,15 +1816,24 @@ pub struct X86_64CodeGen
             return "xmm0";
         }
         u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 4) return X86_64_INT_REGS[reg].ptr;
+        if (reg < 7) return X86_64_INT_REGS[reg].ptr;
         return "rax";
     }
 
+    // the old name stays as an alias so every unconverted call site is
+    // spill-correct for memory-accepting positions; register-only positions
+    // go through opForReg/opForRegF instead
+    const cchar* getRegForValue(IrValue* v)
+    {
+        return self.opFor(v);
+    }
+
     // Forced register operand: a spill slot is loaded into the scratch
-    // first. Scratch must be one of the reserved int registers.
+    // first, and a register-resident value is moved into the scratch
+    // as well, so the caller always gets a value in the scratch register.
     const cchar* opForReg(IrValue* v, const cchar* scratch)
     {
-        if (v == null) return "rax";
+        if (v == null) return scratch;
         if (valueIsSpill(v))
         {
             self.emitter.emit("\tmovq ");
@@ -1782,12 +1842,20 @@ pub struct X86_64CodeGen
             self.emitter.emitLine(scratch);
             return scratch;
         }
-        return opFor(v);
+        const cchar* home = opFor(v);
+        if (strcmp(home, scratch) != 0)
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(home);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+        }
+        return scratch;
     }
 
     const cchar* opForRegF(IrValue* v, const cchar* scratch)
     {
-        if (v == null) return "xmm0";
+        if (v == null) return scratch;
         if (valueIsSpill(v))
         {
             bool isVec = valueIsVec(v);
@@ -1799,19 +1867,51 @@ pub struct X86_64CodeGen
             self.emitter.emitLine(scratch);
             return scratch;
         }
+        const cchar* home = opFor(v);
+        if (strcmp(home, scratch) != 0)
+        {
+            bool isVec = valueIsVec(v);
+            bool dbl = v->type != null && v->type->width == 64;
+            self.emitter.emit("\t");
+            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(home);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+        }
+        return scratch;
+    }
+
+    // Destination for producing a value: a spill slot's value is
+    // collected in a scratch (the producing op overwrites it, so the
+    // old slot content is never worth a reload), while a
+    // register-resident value is produced straight into its home.
+    const cchar* outForInt(IrValue* v, const cchar* scratch)
+    {
+        if (v != null && valueIsSpill(v)) return scratch;
+        return opFor(v);
+    }
+
+    const cchar* outForF(IrValue* v, const cchar* scratch)
+    {
+        if (v != null && valueIsSpill(v)) return scratch;
         return opFor(v);
     }
 
     // Write a register's value back to its home — the slot when the
     // value spilled, otherwise the allocated register (mov only when
-    // the homes differ).
+    // the homes differ), width-aware so a spilled narrow value isn't
+    // written with a full-width mov.
     void sinkInt(IrValue* v, const cchar* reg)
     {
         if (v == null) return;
+        u32 w = v->type != null ? v->type->width : 64;
+        const cchar* mv = w == 8 ? "movb " : w == 16 ? "movw " : w == 32 ? "movl " : "movq ";
+        const cchar* r = w == 8 ? toReg8(reg) : w == 16 ? toReg16(reg) : w == 32 ? toReg32(reg) : reg;
         if (valueIsSpill(v))
         {
-            self.emitter.emit("\tmovq ");
-            self.emitter.emit(reg);
+            self.emitter.emit("\t");
+            self.emitter.emit(mv);
+            self.emitter.emit(r);
             self.emitter.emit(", ");
             self.emitter.emitLine(slotText((u32)(v->valData & 0x3FFFFFFF)));
             return;
@@ -1819,10 +1919,12 @@ pub struct X86_64CodeGen
         const cchar* home = opFor(v);
         if (strcmp(home, reg) != 0)
         {
-            self.emitter.emit("\tmovq ");
-            self.emitter.emit(reg);
+            const cchar* h = w == 8 ? toReg8(home) : w == 16 ? toReg16(home) : w == 32 ? toReg32(home) : home;
+            self.emitter.emit("\t");
+            self.emitter.emit(mv);
+            self.emitter.emit(r);
             self.emitter.emit(", ");
-            self.emitter.emitLine(home);
+            self.emitter.emitLine(h);
         }
     }
 
@@ -2066,6 +2168,9 @@ pub struct X86_64CodeGen
                 const cchar* dst = getRegForValue(&inst->base);
                 const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "xmm0";
                 const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "xmm1";
+                // pinsr wants an xmm destination, a spill packs in xmm0 first
+                bool dstSpill = valueIsSpill(&inst->base);
+                const cchar* work = dstSpill ? "xmm0" : dst;
                 bool qword = inst->base.type != null && inst->base.type->elem != null &&
                              inst->base.type->elem->width == 64;
                 u32 lanes = qword ? 2 : 4;
@@ -2088,6 +2193,11 @@ pub struct X86_64CodeGen
                     self.emitter.emit(qword ? "\tpinsrq " : "\tpinsrd ");
                     self.emitter.emit(imm);
                     self.emitter.emit(qword ? ", rax, " : ", eax, ");
+                    self.emitter.emitLine(work);
+                }
+                if (dstSpill)
+                {
+                    self.emitter.emit("\tmovdqa xmm0, ");
                     self.emitter.emitLine(dst);
                 }
             },
@@ -2247,19 +2357,28 @@ pub struct X86_64CodeGen
         const cchar* dst = getRegForValue(&inst->base);
         const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rdx";
-        if (strcmp(src1, dst) != 0)
+        // a spilled destination rides r10 through the op and stores back,
+        // x86 has no memory to memory form
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "r10" : dst;
+        if (strcmp(src1, work) != 0)
         {
             self.emitter.emit("\tmovq ");
             self.emitter.emit(src1);
             self.emitter.emit(", ");
-            self.emitter.emitLine(dst);
+            self.emitter.emitLine(work);
         }
         self.emitter.emit("\t");
         self.emitter.emit(qOp);
         self.emitter.emit(" ");
         self.emitter.emit(src2);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitDiv(IrInst* inst, bool isSigned)
@@ -2321,10 +2440,12 @@ pub struct X86_64CodeGen
         const cchar* dst = getRegForValue(&inst->base);
         const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rcx";
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "r10" : dst;
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src1);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
         if (strcmp(src2, "rcx") != 0)
         {
             self.emitter.emit("\tmovq ");
@@ -2334,30 +2455,43 @@ pub struct X86_64CodeGen
         self.emitter.emit("\t");
         self.emitter.emit(qOp);
         self.emitter.emit(" %cl, ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitUnOp(IrInst* inst, const cchar* qOp, const cchar* lOp)
     {
         const cchar* dst = getRegForValue(&inst->base);
         const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
-        if (strcmp(src, dst) != 0)
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "r10" : dst;
+        if (strcmp(src, work) != 0)
         {
             self.emitter.emit("\tmovq ");
             self.emitter.emit(src);
             self.emitter.emit(", ");
-            self.emitter.emitLine(dst);
+            self.emitter.emitLine(work);
         }
         self.emitter.emit("\t");
         self.emitter.emit(qOp);
         self.emitter.emit(" ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitLoad(IrInst* inst)
     {
         const cchar* dst = getRegForValue(&inst->base);
-        const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
+        // the address must be a register, a spilled address reloads first
+        const cchar* src = (inst->nops > 0) ? self.opForReg(inst->ops[0], "r10") : "rax";
         self.emitter.emit("\tmovq (");
         self.emitter.emit(src);
         self.emitter.emit("), ");
@@ -2367,7 +2501,7 @@ pub struct X86_64CodeGen
     void emitStore(IrInst* inst)
     {
         const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
-        const cchar* dst = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rbx";
+        const cchar* dst = (inst->nops > 1) ? self.opForReg(inst->ops[1], "r10") : "r10";
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src);
         self.emitter.emit(", (");
@@ -2386,8 +2520,12 @@ pub struct X86_64CodeGen
     void emitGep(IrInst* inst)
     {
         const cchar* dst = getRegForValue(&inst->base);
-        const cchar* base = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
-        const cchar* idx = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rdx";
+        // sib parts are register-only, spills reload into the scratches
+        const cchar* base = (inst->nops > 0) ? self.opForReg(inst->ops[0], "r10") : "rax";
+        const cchar* idx = (inst->nops > 1) ? self.opForReg(inst->ops[1], "r11") : "rdx";
+        // lea writes a register, a spilled destination reuses r10 after base
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "r10" : dst;
         u32 scale = 8;
         if (inst->ops[0] != null && inst->ops[0]->type)
         {
@@ -2405,7 +2543,12 @@ pub struct X86_64CodeGen
         self.emitter.emit(", ");
         self.emitter.emit(scaleBuf);
         self.emitter.emit("), ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitICmp(IrInst* inst)
@@ -2413,14 +2556,13 @@ pub struct X86_64CodeGen
         const cchar* dst = getRegForValue(&inst->base);
         const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rdx";
+        // cmp takes one memory operand at most, two spills need a reload
+        if (valueIsSpill(inst->ops[0]) && valueIsSpill(inst->ops[1]))
+            src1 = self.opForReg(inst->ops[0], "r10");
         self.emitter.emit("\tcmpq ");
         self.emitter.emit(src2);
         self.emitter.emit(", ");
         self.emitter.emitLine(src1);
-        // predicate ordinals run 0..9, a name table beats a ten-arm switch
-        static const cchar* SETCC_INT[10] = {
-            "sete", "setne", "setl", "setle", "setg", "setge", "setb", "setbe", "seta", "setae"
-        };
         u32 pred = (u32)inst->icmpPred;
         const cchar* setOp = pred < 10 ? SETCC_INT[pred] : "sete";
         self.emitter.emit("\t");
@@ -2434,7 +2576,8 @@ pub struct X86_64CodeGen
     void emitFCmp(IrInst* inst)
     {
         const cchar* dst = getRegForValue(&inst->base);
-        const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "xmm0";
+        // the second ucomiss operand must be a register, a spill reloads
+        const cchar* src1 = (inst->nops > 0) ? self.opForRegF(inst->ops[0], "xmm0") : "xmm0";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "xmm1";
         bool isDouble = inst->ops[0]->type != null && inst->ops[0]->type->width == 64;
         self.emitter.emit("\t");
@@ -2678,18 +2821,26 @@ pub struct X86_64CodeGen
         const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "xmm0";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "xmm1";
         bool isDouble = inst->ops[0]->type != null && inst->ops[0]->type->width == 64;
+        // float alu wants a register destination, a spill works in xmm0
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "xmm0" : dst;
         self.emitter.emit("\tmov");
         self.emitter.emit(isDouble ? "sd" : "ss");
         self.emitter.emit("\t");
         self.emitter.emit(src1);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
         self.emitter.emit("\t");
         self.emitter.emit(isDouble ? sdOp : ssOp);
         self.emitter.emit("\t");
         self.emitter.emit(src2);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit(isDouble ? "\tmovsd xmm0, " : "\tmovss xmm0, ");
+            self.emitter.emitLine(dst);
+        }
     }
 
     void emitFma(IrInst* inst)
@@ -3112,6 +3263,9 @@ pub struct X86_64CodeGen
             const cchar* cond = getRegForValue(inst->ops[0]);
             const cchar* src1 = getRegForValue(inst->ops[1]);
             const cchar* src2 = getRegForValue(inst->ops[2]);
+            // cmov destinations are register-only, a spill works in r10
+            bool dstSpill = valueIsSpill(&inst->base);
+            const cchar* work = dstSpill ? "r10" : dst;
             self.emitter.emit("\ttestq ");
             self.emitter.emit(cond);
             self.emitter.emit(", ");
@@ -3119,11 +3273,16 @@ pub struct X86_64CodeGen
             self.emitter.emit("\tcmovne ");
             self.emitter.emit(src1);
             self.emitter.emit(", ");
-            self.emitter.emitLine(dst);
+            self.emitter.emitLine(work);
             self.emitter.emit("\tcmovz ");
             self.emitter.emit(src2);
             self.emitter.emit(", ");
-            self.emitter.emitLine(dst);
+            self.emitter.emitLine(work);
+            if (dstSpill)
+            {
+                self.emitter.emit("\tmovq r10, ");
+                self.emitter.emitLine(dst);
+            }
         }
     }
 
@@ -3366,14 +3525,17 @@ pub struct X86_64CodeGen
         const cchar* dst = getRegForValue(&inst->base);
         const cchar* src1 = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "xmm0";
         const cchar* src2 = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "xmm1";
+        // cmp and cmov destinations are register-only, a spill works in r10
+        bool dstSpill = valueIsSpill(&inst->base);
+        const cchar* work = dstSpill ? "r10" : dst;
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src1);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
         self.emitter.emit("\tcmpq ");
         self.emitter.emit(src2);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
         self.emitter.emit("\t");
         // Use unsigned comparison for UMin/UMax
         if (isUnsigned)
@@ -3382,7 +3544,12 @@ pub struct X86_64CodeGen
             self.emitter.emit(isMin ? "cmovle " : "cmovge ");
         self.emitter.emit(src2);
         self.emitter.emit(", ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(work);
+        if (dstSpill)
+        {
+            self.emitter.emit("\tmovq r10, ");
+            self.emitter.emitLine(dst);
+        }
     }
 }
 
