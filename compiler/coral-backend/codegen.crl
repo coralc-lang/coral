@@ -319,6 +319,25 @@ bool cgIsStrTy(Codegen* cg, NodeId id)
     return (cg.ctx->types + t)->kind.tag == TypeKind::Str;
 }
 
+/* true when the expr's type is a `struct` decl (Named → DeclKind::Struct) */
+bool cgIsStructTy(Codegen* cg, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Ty t = cgSubstTy(cg, n.kind.payload.Expr.value.resolvedType);
+    while (t != 0 && ((cg.ctx->types + t)->kind.tag == TypeKind::Const ||
+                      (cg.ctx->types + t)->kind.tag == TypeKind::Comptime))
+    {
+        if ((cg.ctx->types + t)->kind.tag == TypeKind::Const) t = (cg.ctx->types + t)->kind.payload.Const.base;
+        else t = (cg.ctx->types + t)->kind.payload.Comptime.base;
+    }
+    if (t == 0) return false;
+    if ((cg.ctx->types + t)->kind.tag != TypeKind::Named) return false;
+    NodeId d = cgFindDecl(cg, (cg.ctx->types + t)->kind.payload.Named.name, (u32)DeclKind::Struct);
+    return d.index != 0;
+}
+
 NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
 {
     NodeId none;
@@ -515,7 +534,8 @@ Slice tyStr(Codegen* cg, Ty t)
     {
         TypeKind::Void => { return tyStrPut(cg, Slice::from((u8*)"void", 4), start); },
         TypeKind::Bool => { return tyStrPut(cg, Slice::from((u8*)"_Bool", 5), start); },
-        TypeKind::Char => { return tyStrPut(cg, Slice::from((u8*)"char", 4), start); },
+        /* char = UTF-32 codepoint (u32 width), never C's 1-byte char */
+        TypeKind::Char => { return tyStrPut(cg, Slice::from((u8*)"uint32_t", 8), start); },
         TypeKind::I8 => { return tyStrPut(cg, Slice::from((u8*)"int8_t", 6), start); },
         TypeKind::U8 => { return tyStrPut(cg, Slice::from((u8*)"uint8_t", 7), start); },
         TypeKind::I16 => { return tyStrPut(cg, Slice::from((u8*)"int16_t", 7), start); },
@@ -539,6 +559,12 @@ Slice tyStr(Codegen* cg, Ty t)
             Ty sub = cgSubstTy(cg, t);
             if (sub != t) return tyStr(cg, sub);
             Str name = k.payload.Named.name;
+            /* cchar = the C-ABI byte type → C's plain `char` (the platform
+             * char signedness matches cchar's flag(i8/u8) arms, and libc
+             * prototypes take `char`). coral `char` itself is utf32 and
+             * emits uint32_t — never C's char. */
+            if (slEqU8(cgIntern(cg, name), (u8*)"cchar", 5))
+                return tyStrPut(cg, Slice::from((u8*)"char", 4), start);
             if (k.payload.Named.genericArgsLen > 0) {
                 return cgInstanceName(cg, name, k.payload.Named.genericArgs, k.payload.Named.genericArgsLen);
             }
@@ -1104,7 +1130,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stCh(&cg.ebuf, (u8)v);
                 stCh(&cg.ebuf, '\'');
             } else {
-                stP(&cg.ebuf, "(char)");
+                stP(&cg.ebuf, "(uint32_t)");
                 stU64(&cg.ebuf, (u64)v);
             }
             return stTail(&cg.ebuf, es);
@@ -1305,6 +1331,31 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stCh(&cg.body, ';');
                 return sn;
             }
+            /* structs have no C `==` — compare their bytes (like str above,
+             * deterministic for same-type values of POD structs) */
+            if (cgIsStructTy(cg, left) &&
+                (e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne))
+            {
+                Node* ln = cgNode(cg, left);
+                Slice lty = ln.kind.tag == NodeKind::Expr
+                    ? cgResultTy(cg, left, &ln.kind.payload.Expr.value)
+                    : Slice::from((u8*)"void*", 5);
+                u32 ts = cgNewTemp(cg, Slice::from((u8*)"_Bool", 5), 0);
+                Slice sn = cgTempName(cg, ts);
+                stNL(&cg.body, cg.ind);
+                stPS(&cg.body, sn);
+                stP(&cg.body, " = (memcmp(&(");
+                stPS(&cg.body, l);
+                stP(&cg.body, "), &(");
+                stPS(&cg.body, r);
+                stP(&cg.body, "), sizeof(");
+                stPS(&cg.body, lty);
+                stP(&cg.body, ")) ");
+                if (e.kind.tag == ExprKind::Eq) stP(&cg.body, "== 0)");
+                else stP(&cg.body, "!= 0)");
+                stCh(&cg.body, ';');
+                return sn;
+            }
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
@@ -1459,6 +1510,17 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
+            if (slEqU8(retTy, (u8*)"void", 4))
+            {
+                /* void return: no result temp (a `void` temp + assignment
+                 * is invalid C) — emit the call as a plain statement */
+                stNL(&cg.body, cg.ind);
+                stPS(&cg.body, calleeText);
+                stCh(&cg.body, '(');
+                stPS(&cg.body, argTexts);
+                stP(&cg.body, ");");
+                return Slice::from(null, 0);
+            }
             u32 t = cgNewTemp(cg, retTy, 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
@@ -1531,7 +1593,17 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (argsLen + (recvKind != 0 ? 1 : 0) > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
-            u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
+            Slice methResTy = cgResultTy(cg, id, e);
+            if (slEqU8(methResTy, (u8*)"void", 4))
+            {
+                stNL(&cg.body, cg.ind);
+                stPS(&cg.body, callee);
+                stCh(&cg.body, '(');
+                stPS(&cg.body, argTexts);
+                stP(&cg.body, ");");
+                return Slice::from(null, 0);
+            }
+            u32 t = cgNewTemp(cg, methResTy, 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, tn);
@@ -1567,7 +1639,17 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
-            u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
+            Slice statResTy = cgResultTy(cg, id, e);
+            if (slEqU8(statResTy, (u8*)"void", 4))
+            {
+                stNL(&cg.body, cg.ind);
+                stPS(&cg.body, callee);
+                stCh(&cg.body, '(');
+                stPS(&cg.body, argTexts);
+                stP(&cg.body, ");");
+                return Slice::from(null, 0);
+            }
+            u32 t = cgNewTemp(cg, statResTy, 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, tn);
@@ -2018,13 +2100,16 @@ Slice cgLvalue(Codegen* cg, NodeId id)
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
             }
-            Slice o = cgLvalue(cg, obj);
             Node* on = cgNode(cg, obj);
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
                 if (ot != 0 && (cg.ctx->types + ot)->kind.tag == TypeKind::Pointer) isPtr = true;
             }
+            /* `base->field` — the base is a pointer *value*, so take the
+             * value form (an lvalue deref like `*(self)` would bind as
+             * `*((self)->field)`); a plain field still needs an lvalue */
+            Slice o = isPtr ? cgExpr(cg, obj) : cgLvalue(cg, obj);
             usize rs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
             if (isPtr) stP(&cg.ebuf, "->");
@@ -2125,6 +2210,36 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
         {
             PatKind::Wildcard => { *isWildcard = true; return Slice::from(null, 0); },
             PatKind::Variant => {
+                /* enum scrutinee: members are C enum constants
+                 * `Root_Name` — compare the value directly (variant decls
+                 * are structs and compare their .tag field below) */
+                {
+                    Ty et = scrutTy;
+                    while (et != 0)
+                    {
+                        TypeEntry* ee = cg.ctx->types + et;
+                        if (ee->kind.tag == TypeKind::Pointer) et = ee->kind.payload.Pointer.base;
+                        else if (ee->kind.tag == TypeKind::Const) et = ee->kind.payload.Const.base;
+                        else if (ee->kind.tag == TypeKind::Comptime) et = ee->kind.payload.Comptime.base;
+                        else break;
+                    }
+                    if (et != 0 && (cg.ctx->types + et)->kind.tag == TypeKind::Named)
+                    {
+                        Str root = (cg.ctx->types + et)->kind.payload.Named.name;
+                        if (cgFindDecl(cg, root, (u32)DeclKind::Enum).index != 0)
+                        {
+                            usize es = cg.ebuf.len;
+                            stCh(&cg.ebuf, '(');
+                            stPS(&cg.ebuf, scrut);
+                            stP(&cg.ebuf, " == ");
+                            stPS(&cg.ebuf, cgIntern(cg, root));
+                            stCh(&cg.ebuf, '_');
+                            stPS(&cg.ebuf, cgIntern(cg, p.kind.payload.Variant.variantName));
+                            stCh(&cg.ebuf, ')');
+                            return stTail(&cg.ebuf, es);
+                        }
+                    }
+                }
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, scrutTy, p.kind.payload.Variant.variantName, &vidx);
                 if (vd.index == 0) {
@@ -2513,6 +2628,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::ExprStmt => {
             Slice t = cgExpr(cg, s.kind.payload.ExprStmt.expr);
+            if (t.len == 0) return; /* void call already emitted inline */
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, t);
             stCh(&cg.body, ';');
@@ -2543,13 +2659,21 @@ void cgStmt(Codegen* cg, NodeId id)
 
             if (isArray) {
                 stNL(&cg.body, cg.ind);
-                TypeEntry* te = cg.ctx->types + ty;
-                stPS(&cg.body, tyStr(cg, te.kind.payload.Array.base));
+                if ((s.kind.payload.VarDecl.flags & 4) != 0) stP(&cg.body, "static ");
+                Ty et = ty;
+                while ((cg.ctx->types + et)->kind.tag == TypeKind::Array)
+                    et = (cg.ctx->types + et)->kind.payload.Array.base;
+                stPS(&cg.body, tyStr(cg, et));
                 stCh(&cg.body, ' ');
                 stPS(&cg.body, cgIdent(cg, name));
-                stCh(&cg.body, '[');
-                stU64(&cg.body, (u64)te.kind.payload.Array.len);
-                stCh(&cg.body, ']');
+                Ty w = ty;
+                while ((cg.ctx->types + w)->kind.tag == TypeKind::Array)
+                {
+                    stCh(&cg.body, '[');
+                    stU64(&cg.body, (u64)(cg.ctx->types + w)->kind.payload.Array.len);
+                    stCh(&cg.body, ']');
+                    w = (cg.ctx->types + w)->kind.payload.Array.base;
+                }
                 if (initIsArrayLit) {
                     Expr* al = &inn.kind.payload.Expr.value;
                     stP(&cg.body, " = {");
@@ -2572,6 +2696,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 Slice initText;
                 if (hasInit) initText = cgExpr(cg, init);
                 stNL(&cg.body, cg.ind);
+                if ((s.kind.payload.VarDecl.flags & 4) != 0) stP(&cg.body, "static ");
                 stPS(&cg.body, tyText);
                 stCh(&cg.body, ' ');
                 stPS(&cg.body, cgIdent(cg, name));
@@ -2854,6 +2979,82 @@ void cgStmt(Codegen* cg, NodeId id)
             }
             stCh(&cg.body, '"');
             stPut(&cg.body, built, blen);
+            stCh(&cg.body, '"');
+            /* GCC extended asm sections: `: outputs : inputs : clobbers` */
+            {
+                bool needIn = s.kind.payload.Asm.inputsLen > 0 || s.kind.payload.Asm.clobbersLen > 0;
+                if (s.kind.payload.Asm.outputsLen > 0 || needIn)
+                {
+                    stP(&cg.body, " : ");
+                    u32 oi = 0;
+                    while (oi < s.kind.payload.Asm.outputsLen)
+                    {
+                        if (oi > 0) stP(&cg.body, ", ");
+                        Node* cn = cgNode(cg, s.kind.payload.Asm.outputs[oi]);
+                        if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        {
+                            Slice cs = cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            stCh(&cg.body, '"');
+                            stPut(&cg.body, cs.ptr, cs.len);
+                            stCh(&cg.body, '"');
+                        }
+                        else cgError(cg, (u8*)"asm operand constraint must be a string literal");
+                        if (oi + 1 < s.kind.payload.Asm.outputsLen)
+                        {
+                            stCh(&cg.body, '(');
+                            stPS(&cg.body, cgExpr(cg, s.kind.payload.Asm.outputs[oi + 1]));
+                            stCh(&cg.body, ')');
+                            oi = oi + 1;
+                        }
+                        oi = oi + 1;
+                    }
+                }
+                if (needIn)
+                {
+                    stP(&cg.body, " : ");
+                    u32 ii = 0;
+                    while (ii < s.kind.payload.Asm.inputsLen)
+                    {
+                        if (ii > 0) stP(&cg.body, ", ");
+                        Node* cn = cgNode(cg, s.kind.payload.Asm.inputs[ii]);
+                        if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        {
+                            Slice cs = cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            stCh(&cg.body, '"');
+                            stPut(&cg.body, cs.ptr, cs.len);
+                            stCh(&cg.body, '"');
+                        }
+                        else cgError(cg, (u8*)"asm operand constraint must be a string literal");
+                        if (ii + 1 < s.kind.payload.Asm.inputsLen)
+                        {
+                            stCh(&cg.body, '(');
+                            stPS(&cg.body, cgExpr(cg, s.kind.payload.Asm.inputs[ii + 1]));
+                            stCh(&cg.body, ')');
+                            ii = ii + 1;
+                        }
+                        ii = ii + 1;
+                    }
+                }
+                if (s.kind.payload.Asm.clobbersLen > 0)
+                {
+                    stP(&cg.body, " : ");
+                    u32 ci = 0;
+                    while (ci < s.kind.payload.Asm.clobbersLen)
+                    {
+                        if (ci > 0) stP(&cg.body, ", ");
+                        Node* cbn = cgNode(cg, s.kind.payload.Asm.clobbers[ci]);
+                        if (cbn.kind.tag == NodeKind::Expr && cbn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
+                        {
+                            Slice cs = cgIntern(cg, cbn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            stCh(&cg.body, '"');
+                            stPut(&cg.body, cs.ptr, cs.len);
+                            stCh(&cg.body, '"');
+                        }
+                        else cgError(cg, (u8*)"asm clobber must be a string literal");
+                        ci = ci + 1;
+                    }
+                }
+            }
             stP(&cg.body, ");");
             return;
         },
@@ -3196,13 +3397,20 @@ void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
 {
     if (cty != 0 && (cg.ctx->types + cty)->kind.tag == TypeKind::Array)
     {
-        TypeEntry* ae = cg.ctx->types + cty;
-        stPS(&cg.defs, tyStr(cg, ae->kind.payload.Array.base));
+        Ty et = cty;
+        while ((cg.ctx->types + et)->kind.tag == TypeKind::Array)
+            et = (cg.ctx->types + et)->kind.payload.Array.base;
+        stPS(&cg.defs, tyStr(cg, et));
         stCh(&cg.defs, ' ');
         stPS(&cg.defs, cgIdent(cg, name));
-        stCh(&cg.defs, '[');
-        stU64(&cg.defs, (u64)ae->kind.payload.Array.len);
-        stCh(&cg.defs, ']');
+        Ty w = cty;
+        while ((cg.ctx->types + w)->kind.tag == TypeKind::Array)
+        {
+            stCh(&cg.defs, '[');
+            stU64(&cg.defs, (u64)(cg.ctx->types + w)->kind.payload.Array.len);
+            stCh(&cg.defs, ']');
+            w = (cg.ctx->types + w)->kind.payload.Array.base;
+        }
         return;
     }
     stPS(&cg.defs, tyStr(cg, cty));
@@ -3271,17 +3479,22 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
             if (fd.typeNode != 0 &&
                 (cg.ctx->types + fd.typeNode)->kind.tag == TypeKind::Array)
             {
-                TypeEntry* ae = cg.ctx->types + fd.typeNode;
-                stPS(&cg.defs, tyStr(cg, ae->kind.payload.Array.base));
+                /* strip every dim for the element type, then re-emit the
+                 * dims after the name: `T name[A][B];` */
+                Ty et = fd.typeNode;
+                while ((cg.ctx->types + et)->kind.tag == TypeKind::Array)
+                    et = (cg.ctx->types + et)->kind.payload.Array.base;
+                stPS(&cg.defs, tyStr(cg, et));
                 stCh(&cg.defs, ' ');
                 stPS(&cg.defs, cgIdent(cg, fd.name));
-                u32 alen = (u32)ae->kind.payload.Array.len;
-                u8 tens = 1;
-                while (alen / tens >= 10) tens = tens * 10;
-                stCh(&cg.defs, '[');
-                u32 tmpA = alen;
-                while (tens > 0) { stCh(&cg.defs, (u8)('0' + (tmpA / tens) % 10)); tens = tens / 10; }
-                stCh(&cg.defs, ']');
+                Ty w = fd.typeNode;
+                while ((cg.ctx->types + w)->kind.tag == TypeKind::Array)
+                {
+                    stCh(&cg.defs, '[');
+                    stU64(&cg.defs, (u64)(cg.ctx->types + w)->kind.payload.Array.len);
+                    stCh(&cg.defs, ']');
+                    w = (cg.ctx->types + w)->kind.payload.Array.base;
+                }
                 stCh(&cg.defs, ';');
             }
             else
@@ -3604,8 +3817,8 @@ void cgEmitMethodSet(Codegen* cg, Decl* dd, bool withBodies)
                 }
                 else
                 {
-                    if ((flags & 2) != 0 && cgIsCrtFn(md.kind.payload.Func.name, cgIntern(cg, md.kind.payload.Func.name)))
-                        { m = m + 1; continue; }
+                    /* extern method: emit the prototype too — nothing
+                       (system header) declares it for us anymore */
                     cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, owner);
                 }
             }
@@ -3659,8 +3872,6 @@ void cgEmitInstMethodList(Codegen* cg, NodeId* methods, u32 mlen, Slice m, MonoI
                 }
                 else
                 {
-                    if ((flags & 2) != 0 && cgIsCrtFn(md.kind.payload.Func.name, cgIntern(cg, md.kind.payload.Func.name)))
-                        { k = k + 1; continue; }
                     cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, inst.substitutions, inst.substitutionsLen, m);
                 }
             }
@@ -3722,9 +3933,8 @@ void cgEmitProtos(Codegen* cg)
             if (dd.kind.tag == DeclKind::Func)
             {
                 if (cgDeclIsGeneric(cg, id)) { i = i + 1; continue; }
-                u8 flags = dd.kind.payload.Func.flags;
-                if ((flags & 2) != 0 && cgIsCrtFn(dd.kind.payload.Func.name, cgIntern(cg, dd.kind.payload.Func.name)))
-                    { i = i + 1; continue; }
+                /* emit prototypes for ALL extern fns too — the system
+                 * headers are gone, so coral's own decl is the only one */
                 cgEmitProto(cg, id, cgIdent(cg, dd.kind.payload.Func.name),
                             dd.kind.payload.Func.returnType, null, null, 0, Slice::from(null, 0));
             }
@@ -3883,9 +4093,18 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cgEmitBodies(&cg);
 
     /* assemble: preamble | fwd typedefs | registry typedefs | defs | protos | bodies */
+    /* Type/macro headers ONLY — no function-declaring headers (stdio,
+     * stdlib, string, unistd). The generated C carries coral's own extern
+     * prototypes (libc.crl / `extern` decls) and links against libc; a
+     * second set of system prototypes only causes conflicting-types
+     * errors (const placement, int32_t vs int, ...). assert.h stays:
+     * it defines the assert() macro and declares no libc function
+     * prototypes that coral also declares. */
     stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
-    stP(&cg.out, "#include <string.h>\n#include <stdlib.h>\n#include <stdio.h>\n");
-    stP(&cg.out, "#include <unistd.h>\n#include <assert.h>\n\n");
+    stP(&cg.out, "#include <assert.h>\n\n");
+    /* memcmp for str/struct equality — a bare prototype, not a header
+       (generated C must not include system headers) */
+    stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n\n");
     /* limits.crl defines the same names — drop the stdint macros so the
        emitted constants win */
     stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");

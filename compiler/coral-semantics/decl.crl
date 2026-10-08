@@ -235,23 +235,33 @@ pub extend Sema
                 {
                     /* `*` — members resolve at use sites */
                 }
-                else if (symbol->alias != 0 && symbol->name != 0)
+                else if (symbol->name != 0)
                 {
-                    Symbol* real = self.scopes.lookup(symbol->name);
+                    /* nested item group `mod::{ Sym }` — the loader merged
+                     * the submodule file; the binding is the tail segment */
+                    Str lookupName = symbol->name;
+                    InternEntry* se = self.ctx.interns + lookupName;
+                    u8* sp = se->ptr;
+                    usize sl = se->len;
+                    usize lastCol = 0;
+                    usize q = 0;
+                    while (q + 1 < sl)
+                    {
+                        if (sp[q] == 58 && sp[q + 1] == 58) lastCol = q;
+                        q = q + 1;
+                    }
+                    if (lastCol > 0 && lastCol + 2 < sl)
+                        lookupName = self.ctx.intern(sp + lastCol + 2, sl - (lastCol + 2));
+                    Symbol* real = self.scopes.lookup(lookupName);
                     if (real == null)
                     {
                         self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported library");
                         return false;
                     }
-                    if (!self.scopes.declare(symbol->alias, real->kind, real->typeNode, real->declaration, 0))
-                        return false;
-                }
-                else if (symbol->name != 0)
-                {
-                    if (self.scopes.lookup(symbol->name) == null)
+                    if (symbol->alias != 0)
                     {
-                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported library");
-                        return false;
+                        if (!self.scopes.declare(symbol->alias, real->kind, real->typeNode, real->declaration, 0))
+                            return false;
                     }
                 }
                 i = i + 1;
@@ -275,8 +285,35 @@ pub extend Sema
                 Symbol* symbol = self.scopes.lookup(first);
                 if (symbol == null)
                 {
-                    self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "unknown module in import path");
-                    return false;
+                    /* sibling file import — the loader merged <first>.crl
+                     * flat, so the named symbols are plain declarations in
+                     * scope; verify they exist and skip the placeholders */
+                    u32 si = 0;
+                    while (si < decl->kind.payload.Import.symbolsLen)
+                    {
+                        ImportSymbol* ss = decl->kind.payload.Import.symbols + si;
+                        if ((ss->flags & 2) == 0 && ss->name != 0)
+                        {
+                            Str want = ss->name;
+                            InternEntry* se = self.ctx.interns + want;
+                            usize lastCol = 0;
+                            usize q = 0;
+                            while (q + 1 < se->len)
+                            {
+                                if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) lastCol = q;
+                                q = q + 1;
+                            }
+                            if (lastCol > 0 && lastCol + 2 < se->len)
+                                want = self.ctx.intern(se->ptr + lastCol + 2, se->len - (lastCol + 2));
+                            if (self.scopes.lookup(want) == null)
+                            {
+                                self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "symbol not found in imported file");
+                                return false;
+                            }
+                        }
+                        si = si + 1;
+                    }
+                    return true;
                 }
                 if (symbol->kind == 5 && symbol->declaration.index != 0)
                 {
@@ -331,7 +368,11 @@ pub extend Sema
             {
                 Str local = symbol->name;
                 if (symbol->alias != 0) local = symbol->alias;
-                if (local != 0) self.scopes.declare(local, 2, 0, id, 0);
+                /* a merged sibling/lib file may already declare this name
+                 * as a real symbol — don't duplicate (declare errors on
+                 * collisions) */
+                if (local != 0 && self.scopes.lookup(local) == null)
+                    self.scopes.declare(local, 2, 0, id, 0);
             }
             i = i + 1;
         }

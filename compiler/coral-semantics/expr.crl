@@ -357,9 +357,27 @@ pub extend Sema
             self.setExprType(id, leftType);
             return true;
         }
-        if (!self.compatible(leftType, rightType)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match");
+        if (!self.compatible(leftType, rightType))
+        {
+            /* int literal vs float gets the same leniency as initializers
+             * (assignCompatible's IntLit arm): `x > 0`, `0.5 * n` — the
+             * literal behaves as the float operand; result = the float side */
+            if (left.index != 0 && self.isIntLitNode(left) && self.floatType(rightType))
+            { self.setExprType(id, rightType); return true; }
+            if (right.index != 0 && self.isIntLitNode(right) && self.floatType(leftType))
+            { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match");
+        }
         self.setExprType(id, leftType);
         return true;
+    }
+
+    bool isIntLitNode(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        return n.kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
     }
 
     bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
@@ -399,9 +417,10 @@ pub extend Sema
             },
             ExprKind::FloatLit => { if ((expr->kind.payload.FloatLit.flags & 2) != 0) self.setExprType(id, self.f32Type()); else self.setExprType(id, self.f64Type()); return true; },
             ExprKind::StringLit => {
-                /* C"..." → NUL-terminated `const char*` (no len); every other
-                 * string literal is a len-carrying `str`. */
-                if ((expr->kind.payload.StringLit.flags & 1) != 0) self.setExprType(id, self.strPtrType());
+                /* C"..." → NUL-terminated `const cchar*` (no len), the
+                 * C-ABI byte string for libc params; every other string
+                 * literal is a len-carrying `str`. */
+                if ((expr->kind.payload.StringLit.flags & 1) != 0) self.setExprType(id, self.ccharPtrType());
                 else self.setExprType(id, self.strType());
                 return true;
             },
@@ -976,8 +995,18 @@ pub extend Sema
                 Ty elseTy = self.exprType(expr->kind.payload.Ternary.elseExpr);
                 if (thenTy == 0) thenTy = elseTy;
                 if (elseTy == 0) elseTy = thenTy;
-                if (!self.compatible(thenTy, elseTy)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary branch types do not match");
-                self.setExprType(id, thenTy);
+                Ty ternTy = thenTy;
+                if (!self.compatible(thenTy, elseTy))
+                {
+                    /* bool branch vs integer branch (typically an int
+                     * literal `1`/`0`): C-style unification — the result
+                     * takes the integer side and the generated C does the
+                     * bool→int promotion in the conditional. */
+                    if (thenTy == self.boolType() && self.integerType(elseTy)) ternTy = elseTy;
+                    else if (elseTy == self.boolType() && self.integerType(thenTy)) ternTy = thenTy;
+                    else self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "ternary branch types do not match");
+                }
+                self.setExprType(id, ternTy);
                 return true;
             },
             ExprKind::PostInc => { if (!self.assignExpr(expr->kind.payload.PostInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostInc.expr)); return true; },

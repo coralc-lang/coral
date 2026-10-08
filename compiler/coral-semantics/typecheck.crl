@@ -110,20 +110,53 @@ pub extend Sema
         return self.allocType(kind);
     }
 
-    /* str.ptr — const char* (immutable byte view into the literal/storage) */
+    /* str.ptr — const u8* (immutable *byte* view into the literal/storage;
+     * str is a byte string, `char` is utf32 and never a byte) */
     Ty strPtrType()
     {
-        Ty ch = self.charType();
+        Ty b = self.u8Type();
         u32 i = 1;
         while (i < self.ctx.typesLen) {
             TypeEntry* e = self.ctx.types + i;
-            if (e->kind.tag == TypeKind::Pointer && e->kind.payload.Pointer.base == ch) return i;
+            if (e->kind.tag == TypeKind::Pointer && e->kind.payload.Pointer.base == b) return i;
             i++;
         }
-        TypeKind inner = TypeKind::Const{ .base = ch };
+        TypeKind inner = TypeKind::Const{ .base = b };
         Ty cst = self.allocType(inner);
         TypeKind kind = TypeKind::Pointer{ .base = cst };
         return self.allocType(kind);
+    }
+
+    /* C"..." → const cchar* — NUL-terminated C-ABI byte string, matching
+     * libc's `const cchar*` params (printf/snprintf/...). Built by name so
+     * the literal type-checks against those params without the calling
+     * file importing cchar itself; sameType compares Named by name. */
+    Ty ccharPtrType()
+    {
+        Str cn = self.ctx.intern((u8*)"cchar", 5);
+        Ty named = 0;
+        u32 i = 1;
+        while (i < self.ctx.typesLen) {
+            TypeEntry* e = self.ctx.types + i;
+            if (e->kind.tag == TypeKind::Named && e->kind.payload.Named.name == cn &&
+                e->kind.payload.Named.genericArgsLen == 0) { named = i; break; }
+            i = i + 1;
+        }
+        if (named == 0) {
+            TypeKind nk;
+            nk = TypeKind::Named{ .name = cn, .genericArgs = null, .genericArgsLen = 0 };
+            named = self.allocType(nk);
+        }
+        /* Const{Pointer{Named}} — the shape `const cchar*` params parse to
+         * (type-position const wraps the whole type) and, via compatible()'s
+         * source-const strip, also assignable to statement-const locals
+         * (`const cchar* s` = bare Pointer + const flag) */
+        TypeKind pk;
+        pk = TypeKind::Pointer{ .base = named };
+        Ty ptr = self.allocType(pk);
+        TypeKind ck;
+        ck = TypeKind::Const{ .base = ptr };
+        return self.allocType(ck);
     }
 
     Ty i32Type()
@@ -322,7 +355,10 @@ pub extend Sema
         TypeEntry* entry = self.ctx.types + t;
         switch (entry->kind.tag)
         {
-            TypeKind::U8, TypeKind::I8, TypeKind::Char => { return 8; },
+            TypeKind::U8, TypeKind::I8 => { return 8; },
+            /* char is a UTF-32 codepoint (u32 width), never a byte —
+             * bytes are u8/cchar */
+            TypeKind::Char => { return 32; },
             TypeKind::U16, TypeKind::I16 => { return 16; },
             TypeKind::U32, TypeKind::I32 => { return 32; },
             TypeKind::U64, TypeKind::I64, TypeKind::Usize, TypeKind::Isize => { return 64; },
