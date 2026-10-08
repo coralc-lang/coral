@@ -615,11 +615,26 @@ pub struct IrModule
     }
 }
 
+// Analysis-cache ownership contract (first-person): each rawptr slot here is
+// heap-owned by the cache. The publishing pass (the only one today is
+// irAliasAnalysis) transfers ownership of a fresh heap allocation to the
+// cache and registers a destroyer for it. clearAnalysisCaches runs every
+// registered destroyer before freeing the cache structs, so nothing leaks no
+// matter who calls it. memorySSA is optional and currently never published,
+// hence always null in practice.
 pub struct FunctionAnalysisCache
 {
     rawptr aliasAnalysis;
     rawptr memorySSA;
     IrFunc* func;
+    // Driver-managed generation at which the cached analyses were built; see
+    // IrContext.analysisGeneration. A cache entry whose generation is older
+    // than the context is stale and must be rebuilt by the publishing pass.
+    u32 generation;
+    // Destroyers registered by the publishing passes, invoked by
+    // clearAnalysisCaches. Null when the slot was never published.
+    void(rawptr) destroyAliasAnalysis;
+    void(rawptr) destroyMemorySSA;
 }
 
 // consumers (dse, licm, gvn, etc.) check this before creating their own
@@ -641,6 +656,10 @@ pub struct IrContext
     FunctionAnalysisCache** analysisCaches;
     u32 nCaches;
     u32 capCaches;
+    // Monotonic IR-mutation generation. The pipeline driver bumps this every
+    // time a pass reports `changed`; cached analyses stamp themselves with
+    // the current value when (re)built and treat a mismatch as stale.
+    u32 analysisGeneration;
 
     u32 nextValueId() { return self.nextId++; }
 
@@ -672,6 +691,9 @@ pub struct IrContext
         c->func = func;
         c->aliasAnalysis = null;
         c->memorySSA = null;
+        c->generation = 0;
+        c->destroyAliasAnalysis = null;
+        c->destroyMemorySSA = null;
         self.analysisCaches[self.nCaches++] = c;
         return c;
     }
@@ -679,7 +701,14 @@ pub struct IrContext
     void clearAnalysisCaches()
     {
         for (u32 i = 0; i < self.nCaches; i++)
-            dealloc<FunctionAnalysisCache>(self.analysisCaches[i]);
+        {
+            FunctionAnalysisCache* c = self.analysisCaches[i];
+            if (c->aliasAnalysis != null && c->destroyAliasAnalysis != null)
+                c->destroyAliasAnalysis(c->aliasAnalysis);
+            if (c->memorySSA != null && c->destroyMemorySSA != null)
+                c->destroyMemorySSA(c->memorySSA);
+            dealloc<FunctionAnalysisCache>(c);
+        }
         if (self.analysisCaches)
             dealloc<FunctionAnalysisCache*>(self.analysisCaches);
         self.analysisCaches = null;
@@ -984,6 +1013,7 @@ pub IrContext* irCtxCreate()
 pub void irCtxDestroy(IrContext* ctx)
 {
     if (!ctx) return;
+    ctx->clearAnalysisCaches();
     if (ctx->constInts) dealloc<IrValue*>(ctx->constInts);
     if (ctx->constFloats) dealloc<IrValue*>(ctx->constFloats);
     if (ctx->arrayConsts) dealloc<IrArrayConst*>(ctx->arrayConsts);

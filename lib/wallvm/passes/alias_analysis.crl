@@ -652,14 +652,32 @@ pub struct AliasAnalysis
     }
 }
 
+// Registered as FunctionAnalysisCache.destroyAliasAnalysis: the cache owns
+// the published heap copy, so both the internal buffers (deinit) and the
+// copy itself (dealloc) are released here.
+static void destroyCachedAliasAnalysis(rawptr p)
+{
+    AliasAnalysis* aa = (AliasAnalysis*)p;
+    aa->deinit();
+    dealloc<AliasAnalysis>(aa);
+}
+
 pub bool irAliasAnalysis(IrFunc* func, rawptr userdata)
 {
     IrContext* ctx = (IrContext*)userdata;
     if (ctx == null || func == null) return false;
 
     // Check if we already have cached results for this function
-        FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
-    if (cache->aliasAnalysis != null) return false;
+    FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
+    if (cache->aliasAnalysis != null)
+    {
+        if (cache->generation == ctx->analysisGeneration) return false;
+        // Stale — the IR mutated since this AA was built. Free it via the
+        // registered destroyer and rebuild below.
+        if (cache->destroyAliasAnalysis != null)
+            cache->destroyAliasAnalysis(cache->aliasAnalysis);
+        cache->aliasAnalysis = null;
+    }
 
     AliasAnalysis aa = AliasAnalysis::new(ctx);
     aa.analyze(func);
@@ -668,5 +686,7 @@ pub bool irAliasAnalysis(IrFunc* func, rawptr userdata)
     AliasAnalysis* cached = alloc<AliasAnalysis>(1);
     *cached = aa;
     cache->aliasAnalysis = cached;
+    cache->generation = ctx->analysisGeneration;
+    cache->destroyAliasAnalysis = destroyCachedAliasAnalysis;
     return false;
 }

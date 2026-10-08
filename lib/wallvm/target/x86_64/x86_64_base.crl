@@ -1,24 +1,31 @@
 // Register names the allocator must never see in a vreg: the frame and
-// stack pointer, plus the two xmm slots this backend keeps for itself.
+// stack pointer, plus every register this backend needs as scratch for its
+// own instruction sequences (div/rem need rax+rdx, shifts need rcx,
+// VecDiv/Abs/Fcvt walk through r10 and r11, and all spill reloads use
+// xmm0/xmm1/xmm15 or rax). lsra filters these out of its allocatable set
+// via RegAllocConfig.reservedIntRegs/reservedFloatRegs, so the two lists
+// below must contain exactly the registers the emitter treats as scratch.
 // The platform drivers all come through this one shared base while the
 // ports are in flight, and once everything is verified and tested we split them
 // apart for good, each platform taking its own copy, so nothing carries
 // a pile of if comparisons along the way to ask which platform it is.
 pub str X86_64_RESERVED_INT[] = {
-    "rsp", "rbp" 
+    "rsp", "rbp", "rax", "rcx", "rdx", "r10", "r11"
 };
 
 pub str X86_64_RESERVED_FLOAT[] = {
-    "xmm0", "xmm1"
+    "xmm0", "xmm1", "xmm15"
 };
 
+// The allocatable set lsra hands out, in exactly lsra's order:
+// SystemV caller-save minus the reserved scratch set above.
+// LSRA reg index i decodes to X86_64_INT_REGS[i] / X86_64_FLOAT_REGS[i].
 pub str X86_64_INT_REGS[] = {
-    "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"
+    "rsi", "rdi", "r8", "r9"
 };
 
 pub str X86_64_FLOAT_REGS[] = {
-    "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-    "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14"
+    "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"
 };
 
 import(lib) wallvm::irtypes { IrContext, IrModule, IrFunc, IrBlock, IrInst, IrValue, IrValueKind, IrTypeKind };
@@ -213,6 +220,8 @@ static cchar _ymmbuf[2][16];
 static int _ymmI = 0;
 static cchar _r8buf[2][16];
 static int _r8i = 0;
+static cchar _slotBuf[16][24];
+static int _slotI = 0;
 
 static const cchar* toReg8(const cchar* r)
 {
@@ -258,6 +267,9 @@ pub struct X86_64CodeGen
     bool calleeSavesPushed;
     u32 shrinkWrapFirstUseBlock;
     bool hasDeferredFrame;
+    u32 spillSlotCount;
+    u32 spillFrameBytes;
+    bool spillRbpPushed;
 
     void init(IrContext* ctx,
               IrModule* modd,
@@ -292,16 +304,16 @@ pub struct X86_64CodeGen
         if (val == null) return "rax";
         u64 vd = val->valData;
         if (vd & 0x80000000UL)
-            return "rax";
+            return "";
         if (vd & 0x40000000UL)
         {
             u32 reg = (u32)(vd & 0x3FFFFFFF);
-            if (reg < 13) return X86_64_FLOAT_REGS[reg].ptr;
-            return "xmm0";
+            if (reg < 6) return X86_64_FLOAT_REGS[reg].ptr;
+            return "";
         }
         u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 12) return X86_64_INT_REGS[reg].ptr;
-        return "rax";
+        if (reg < 4) return X86_64_INT_REGS[reg].ptr;
+        return "";
     }
 
     bool funcUsesReg(IrFunc* func, const cchar* reg)
@@ -437,6 +449,9 @@ pub struct X86_64CodeGen
         self.lastCallResult = null;
         self.varargAllocSize = 0;
         self.shadowAllocSize = 0;
+        self.spillSlotCount = countSpillSlots(func);
+        self.spillFrameBytes = self.spillSlotCount * 16;
+        self.spillRbpPushed = false;
 
         bool isLeaf = func->isLeaf();
         bool isVararg = func->base.type != null && func->base.type->isVararg;
@@ -444,7 +459,7 @@ pub struct X86_64CodeGen
         if (isVararg)
             isLeaf = false;
 
-        if (isLeaf && !self.isWindows)
+        if (isLeaf && !self.isWindows && self.spillSlotCount == 0)
         {
             self.currentFuncHasFrame = false;
             self.useRedZone = true;
@@ -819,7 +834,7 @@ pub struct X86_64CodeGen
                     self.emitter.emitLine(", %rax");
                 }
             }
-            else if (valueIsFloat(retVal))
+            else if (valueIsFloatClass(retVal))
             {
                 const cchar* src = getRegForValue(retVal);
                 if (strcmp(src, "xmm0") != 0)
@@ -1252,9 +1267,9 @@ pub struct X86_64CodeGen
 
     void emitStoreWidth(IrInst* inst)
     {
-        const cchar* src = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rax";
-        const cchar* dst = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rbx";
-        u32 width = inst->ops[1] != null && inst->ops[1]->type != null ? inst->ops[1]->type->width : 64;
+        const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
+        const cchar* dst = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rbx";
+        u32 width = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
         switch (width)
         {
             8 => {
@@ -1380,8 +1395,8 @@ pub struct X86_64CodeGen
         if (inst->opcode != IrOpcode::Store) return false;
         if (inst->nops < 2) return false;
 
-        IrValue* addrVal = inst->ops[0];
-        IrValue* srcVal = inst->ops[1];
+        IrValue* addrVal = inst->ops[1];
+        IrValue* srcVal = inst->ops[0];
         if (srcVal == null || srcVal->kind != IrValueKind::Inst) return false;
 
         IrInst* srcInst = (IrInst*)srcVal;
@@ -1509,16 +1524,16 @@ pub struct X86_64CodeGen
         if (inst->opcode != IrOpcode::Store) return false;
         if (inst->nops < 2) return false;
 
-        IrValue* addrVal = inst->ops[0];
+        IrValue* addrVal = inst->ops[1];
         if (addrVal->kind != IrValueKind::Inst) return false;
         IrInst* addrInst = (IrInst*)addrVal;
         if (addrInst->opcode != IrOpcode::Gep) return false;
         if (addrInst->nops < 3) return false;
 
-        const cchar* src = getRegForValue(inst->ops[1]);
+        const cchar* src = getRegForValue(inst->ops[0]);
         const cchar* base = getRegForValue(addrInst->ops[0]);
         const cchar* idx = getRegForValue(addrInst->ops[1]);
-        u32 width = inst->ops[1] != null && inst->ops[1]->type != null ? inst->ops[1]->type->width : 64;
+        u32 width = inst->ops[0] != null && inst->ops[0]->type != null ? inst->ops[0]->type->width : 64;
 
         self.emitter.emit("\t");
         switch (width)
@@ -1691,33 +1706,185 @@ pub struct X86_64CodeGen
         return true;
     }
 
-    const cchar* getRegForValue(IrValue* val)
-    {
-        if (val == null) return "rax";
-        u64 vd = val->valData;
-        if (vd & 0x80000000UL)
-            return "rax";
-        if (vd & 0x40000000UL)
-        {
-            u32 reg = (u32)(vd & 0x3FFFFFFF);
-            if (reg < 13) return X86_64_FLOAT_REGS[reg].ptr;
-            return "xmm0";
-        }
-        u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 12) return X86_64_INT_REGS[reg].ptr;
-        return "rax";
-    }
-
-    bool valueIsFloat(IrValue* val)
-    {
-        if (val == null) return false;
-        return (val->valData & 0x40000000UL) != 0;
-    }
-
     bool valueIsSpill(IrValue* val)
     {
         if (val == null) return false;
         return (val->valData & 0x80000000UL) != 0;
+    }
+
+    // A value is float-typed either through the FLOAT_BIT (register
+    // allocation) or, once spilled, only through its IR type — the spill
+    // encoding does not carry the float flag.
+    bool valueIsFloatClass(IrValue* val)
+    {
+        if (val == null || val->type == null) return false;
+        return val->type->kind == IrTypeKind::Float;
+    }
+
+    bool valueIsVec(IrValue* val)
+    {
+        if (val == null || val->type == null) return false;
+        return val->type->kind == IrTypeKind::Vector;
+    }
+
+    // Slot layout: every spilled vreg gets one slot of 16 bytes so vector
+    // values fit; scalar ints store their 8-byte register with movq and
+    // f32/f64 store 4/8 bytes with movss/movsd into the slot head. Slot
+    // i lives at -16*(i+1)(%rbp). rbp is established in the prologue
+    // whenever any spill slot exists, so the homes are stable for the
+    // whole function.
+    const cchar* slotText(u32 slot)
+    {
+        cchar* buf = _slotBuf[_slotI++ & 15];
+        u32 off = (slot + 1) * 16;
+        cchar num[12];
+        u32ToStr(off, num);
+        u32 i = 0;
+        buf[i++] = '-';
+        u32 k = 0;
+        while (num[k] != 0) buf[i++] = num[k++];
+        const cchar* tail = "(%rbp)";
+        k = 0;
+        while (tail[k] != 0) buf[i++] = tail[k++];
+        buf[i] = 0;
+        return buf;
+    }
+
+    // Operand usable in any position that accepts a memory operand:
+    // the value's register name, or its spill-slot address text.
+    const cchar* opFor(IrValue* v)
+    {
+        if (v == null) return "rax";
+        u64 vd = v->valData;
+        if (vd & 0x80000000UL)
+            return slotText((u32)(vd & 0x3FFFFFFF));
+        if (vd & 0x40000000UL)
+        {
+            u32 reg = (u32)(vd & 0x3FFFFFFF);
+            if (reg < 6) return X86_64_FLOAT_REGS[reg].ptr;
+            return "xmm0";
+        }
+        u32 reg = (u32)(vd & 0x3FFFFFFF);
+        if (reg < 4) return X86_64_INT_REGS[reg].ptr;
+        return "rax";
+    }
+
+    // Forced register operand: a spill slot is loaded into the scratch
+    // first. Scratch must be one of the reserved int registers.
+    const cchar* opForReg(IrValue* v, const cchar* scratch)
+    {
+        if (v == null) return "rax";
+        if (valueIsSpill(v))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(slotText((u32)(v->valData & 0x3FFFFFFF)));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        return opFor(v);
+    }
+
+    const cchar* opForRegF(IrValue* v, const cchar* scratch)
+    {
+        if (v == null) return "xmm0";
+        if (valueIsSpill(v))
+        {
+            bool isVec = valueIsVec(v);
+            bool dbl = v->type != null && v->type->width == 64;
+            self.emitter.emit("\t");
+            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(slotText((u32)(v->valData & 0x3FFFFFFF)));
+            self.emitter.emit(", ");
+            self.emitter.emitLine(scratch);
+            return scratch;
+        }
+        return opFor(v);
+    }
+
+    // Write a register's value back to its home — the slot when the
+    // value spilled, otherwise the allocated register (mov only when
+    // the homes differ).
+    void sinkInt(IrValue* v, const cchar* reg)
+    {
+        if (v == null) return;
+        if (valueIsSpill(v))
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(reg);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(slotText((u32)(v->valData & 0x3FFFFFFF)));
+            return;
+        }
+        const cchar* home = opFor(v);
+        if (strcmp(home, reg) != 0)
+        {
+            self.emitter.emit("\tmovq ");
+            self.emitter.emit(reg);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(home);
+        }
+    }
+
+    void sinkFloat(IrValue* v, const cchar* xr)
+    {
+        if (v == null) return;
+        if (valueIsSpill(v))
+        {
+            bool isVec = valueIsVec(v);
+            bool dbl = v->type != null && v->type->width == 64;
+            self.emitter.emit("\t");
+            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(xr);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(slotText((u32)(v->valData & 0x3FFFFFFF)));
+            return;
+        }
+        const cchar* home = opFor(v);
+        if (strcmp(home, xr) != 0)
+        {
+            bool isVec = valueIsVec(v);
+            bool dbl = v->type != null && v->type->width == 64;
+            self.emitter.emit("\t");
+            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
+            self.emitter.emit(xr);
+            self.emitter.emit(", ");
+            self.emitter.emitLine(home);
+        }
+    }
+
+    u32 countSpillSlots(IrFunc* func)
+    {
+        bool any = false;
+        u32 max = 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                u64 vd = inst->base.valData;
+                if ((vd & 0x80000000UL) != 0)
+                {
+                    u32 idx = (u32)(vd & 0x3FFFFFFF);
+                    if (!any || idx > max) max = idx;
+                    any = true;
+                }
+                for (u32 oi = 0; oi < inst->nops; oi++)
+                {
+                    IrValue* o = inst->ops[oi];
+                    if (o == null) continue;
+                    u64 ov = o->valData;
+                    if ((ov & 0x80000000UL) != 0)
+                    {
+                        u32 idx = (u32)(ov & 0x3FFFFFFF);
+                        if (!any || idx > max) max = idx;
+                        any = true;
+                    }
+                }
+            }
+        }
+        return any ? max + 1 : 0;
     }
 
     void emitInst(IrInst* inst)
@@ -2199,8 +2366,8 @@ pub struct X86_64CodeGen
 
     void emitStore(IrInst* inst)
     {
-        const cchar* src = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rax";
-        const cchar* dst = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rbx";
+        const cchar* src = (inst->nops > 0) ? getRegForValue(inst->ops[0]) : "rax";
+        const cchar* dst = (inst->nops > 1) ? getRegForValue(inst->ops[1]) : "rbx";
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src);
         self.emitter.emit(", (");
@@ -2774,7 +2941,7 @@ pub struct X86_64CodeGen
             IrValue* arg = inst->ops[i];
             if (arg == null) continue;
 
-            bool isFloat = valueIsFloat(arg);
+            bool isFloat = valueIsFloatClass(arg);
             bool isStruct = arg->type != null && arg->type->kind == IrTypeKind::Struct;
 
             if (isStruct && !isFloat)

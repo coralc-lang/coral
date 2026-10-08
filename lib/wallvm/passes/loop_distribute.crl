@@ -61,7 +61,7 @@ pub struct LoopDistributePass
         AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
         AliasAnalysis aa;
         bool ownAA = false;
-        if (aaPtr != null)
+        if (aaPtr != null && cache->generation == self.ctx->analysisGeneration)
         {
             aa = *aaPtr;
         }
@@ -164,6 +164,80 @@ pub struct LoopDistributePass
         IrBlock* lastBlock = null;
         IrBlock* newBlocks[MAX_PARTITIONS];
 
+        // Each partition must be self-contained, every header instruction
+        // its clones reference is either partitioned (cloned once and
+        // shared), a Phi (kept alive in the header), or cloned into the
+        // same new block so the erase below cannot dangle the clones
+        IrInst** closure[MAX_PARTITIONS];
+        u32 nClosure[MAX_PARTITIONS];
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            closure[pi] = alloc<IrInst*>(header->ninsts);
+            nClosure[pi] = 0;
+        }
+
+        for (u32 pi = 0; pi < nPartitions; pi++)
+        {
+            bool* inClosure = alloc<bool>(header->ninsts);
+            for (u32 ii = 0; ii < header->ninsts; ii++) inClosure[ii] = false;
+
+            // Seed with this partition's own instructions
+            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            {
+                IrInst* inst = partitions[pi].insts[ii];
+                for (u32 hi = 0; hi < header->ninsts; hi++)
+                {
+                    if (header->insts[hi] == inst) { inClosure[hi] = true; break; }
+                }
+            }
+
+            // Close under non-partitioned, non-Phi operands
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (u32 ii = 0; ii < header->ninsts; ii++)
+                {
+                    if (!inClosure[ii]) continue;
+                    for (u32 oi = 0; oi < header->insts[ii]->nops; oi++)
+                    {
+                        IrValue* op = header->insts[ii]->ops[oi];
+                        if (op == null || op->kind != IrValueKind::Inst) continue;
+                        IrInst* opInst = (IrInst*)op;
+                        if (opInst->parent != header) continue;
+                        if (opInst->opcode == IrOpcode::Phi) continue;
+
+                        // Already-partitioned instructions are remapped to
+                        // their own clone and need no extra copy here
+                        bool partitioned = false;
+                        for (u32 pj = 0; pj < nPartitions; pj++)
+                        {
+                            for (u32 jj = 0; jj < partitions[pj].ninsts; jj++)
+                            {
+                                if (partitions[pj].insts[jj] == opInst) { partitioned = true; break; }
+                            }
+                            if (partitioned) break;
+                        }
+                        if (partitioned) continue;
+
+                        for (u32 hi = 0; hi < header->ninsts; hi++)
+                        {
+                            if (header->insts[hi] == opInst && !inClosure[hi])
+                            {
+                                inClosure[hi] = true;
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // In header program order, which is topological within a block
+            for (u32 hi = 0; hi < header->ninsts; hi++)
+                if (inClosure[hi]) closure[pi][nClosure[pi]++] = header->insts[hi];
+            dealloc<bool>(inClosure);
+        }
+
         for (u32 pi = 0; pi < nPartitions; pi++)
         {
             // Create a new block for this partition
@@ -171,10 +245,11 @@ pub struct LoopDistributePass
             func->addBlock(newBlock);
             newBlocks[pi] = newBlock;
 
-            // Copy instructions from the partition to the new block
-            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            // Copy this partition's instructions with their needed
+            // non-partitioned dependencies, in topological order
+            for (u32 ii = 0; ii < nClosure[pi]; ii++)
             {
-                IrInst* inst = partitions[pi].insts[ii];
+                IrInst* inst = closure[pi][ii];
                 // Clone the instruction
                 IrInst* clone = self.ctx->createInst(inst->opcode, inst->base.type, null, 0, 0, 0);
                 clone->nops = inst->nops;
@@ -219,7 +294,7 @@ pub struct LoopDistributePass
         // we're about to erase
         for (u32 pi = 0; pi < nPartitions; pi++)
         {
-            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            for (u32 ii = 0; ii < nClosure[pi]; ii++)
             {
                 IrInst* clone = newBlocks[pi]->insts[ii];
                 for (u32 oi = 0; oi < clone->nops; oi++)
@@ -230,13 +305,29 @@ pub struct LoopDistributePass
                         IrInst* opInst = (IrInst*)op;
                         if (opInst->parent == header)
                         {
-                            // Find the clone of this operand instruction
+                            // Prefer the clone living in the same new block
+                            // (covers non-partitioned header instructions
+                            // cloned for this partition), then fall back to
+                            // the partition that owned the chain
+                            bool found = false;
+                            for (u32 k = 0; k < nClosure[pi]; k++)
+                            {
+                                if (closure[pi][k] == opInst)
+                                {
+                                    IrInst* opClone = newBlocks[pi]->insts[k];
+                                    opInst->base.removeUser(clone);
+                                    clone->ops[oi] = &opClone->base;
+                                    opClone->base.addUser(clone);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (found) continue;
                             for (u32 pj = 0; pj < nPartitions; pj++)
                             {
-                                bool found = false;
-                                for (u32 jj = 0; jj < partitions[pj].ninsts; jj++)
+                                for (u32 jj = 0; jj < nClosure[pj]; jj++)
                                 {
-                                    if (partitions[pj].insts[jj] == opInst)
+                                    if (closure[pj][jj] == opInst)
                                     {
                                         IrInst* opClone = newBlocks[pj]->insts[jj];
                                         opInst->base.removeUser(clone);
@@ -265,6 +356,97 @@ pub struct LoopDistributePass
             }
         }
 
+        // Retarget the edges that referenced the now-empty header to enter
+        // the partition chain at newBlocks[0]. The in-loop arm of the
+        // header terminator goes first, then every entry edge from a
+        // predecessor outside the loop
+        IrInst* hTerm = header->insts[header->ninsts - 1];
+        {
+            IrBlock* hOldTgt = null;
+            if (hTerm->opcode == IrOpcode::Br && hTerm->nops >= 1)
+                hOldTgt = (IrBlock*)hTerm->ops[0];
+            else if (hTerm->opcode == IrOpcode::CondBr && hTerm->nops >= 3)
+            {
+                for (u32 j = 1; j <= 2; j++)
+                {
+                    IrBlock* oldTgt = (IrBlock*)hTerm->ops[j];
+                    bool inLoop = false;
+                    for (u32 bi = 0; bi < lp->nblocks; bi++)
+                        if (lp->blocks[bi] == oldTgt) { inLoop = true; break; }
+                    if (inLoop)
+                    {
+                        hTerm->ops[j]->removeUser(hTerm);
+                        oldTgt->removePred(header);
+                        header->removeSucc(oldTgt);
+                        hTerm->ops[j] = &newBlocks[0]->base;
+                        newBlocks[0]->base.addUser(hTerm);
+                    }
+                }
+                if (hTerm->ops[1] == &newBlocks[0]->base ||
+                    hTerm->ops[2] == &newBlocks[0]->base)
+                    header->addSucc(newBlocks[0]);
+            }
+            if (hTerm->opcode == IrOpcode::Br && hOldTgt != null)
+            {
+                hTerm->ops[0]->removeUser(hTerm);
+                hOldTgt->removePred(header);
+                header->removeSucc(hOldTgt);
+                hTerm->ops[0] = &newBlocks[0]->base;
+                newBlocks[0]->base.addUser(hTerm);
+                header->addSucc(newBlocks[0]);
+            }
+        }
+
+        // The entry edge(s) from outside the loop must land on the first
+        // partition block. licm's preheader edge shows the bookkeeping shape
+        {
+            IrValue* headerVal = &header->base;
+            u32 i = 0;
+            while (i < header->npreds)
+            {
+                IrBlock* pred = header->preds[i];
+                bool inLoop = false;
+                for (u32 bi = 0; bi < lp->nblocks; bi++)
+                    if (lp->blocks[bi] == pred) { inLoop = true; break; }
+                if (!inLoop)
+                {
+                    IrInst* term = pred->terminator();
+                    if (term != null)
+                    {
+                        if (term->opcode == IrOpcode::Br && term->nops >= 1)
+                        {
+                            if (term->ops[0] == headerVal)
+                            {
+                                headerVal->removeUser(term);
+                                term->ops[0] = &newBlocks[0]->base;
+                                newBlocks[0]->base.addUser(term);
+                            }
+                        }
+                        else if (term->opcode == IrOpcode::CondBr && term->nops >= 3)
+                        {
+                            for (u32 j = 1; j <= 2; j++)
+                            {
+                                if (term->ops[j] == headerVal)
+                                {
+                                    headerVal->removeUser(term);
+                                    term->ops[j] = &newBlocks[0]->base;
+                                    newBlocks[0]->base.addUser(term);
+                                }
+                            }
+                        }
+
+                        pred->removeSucc(header);
+                        header->removePred(pred);
+                        pred->addSucc(newBlocks[0]);
+                    }
+                }
+                else
+                {
+                    i++;
+                }
+            }
+        }
+
         // Keep CFG predecessor/successor lists in sync with the new chain
         for (u32 pi = 0; pi + 1 < nPartitions; pi++)
             newBlocks[pi]->addSucc(newBlocks[pi + 1]);
@@ -275,6 +457,8 @@ pub struct LoopDistributePass
         {
             if (partitions[pi].insts != null)
                 dealloc<IrInst*>(partitions[pi].insts);
+            if (closure[pi] != null)
+                dealloc<IrInst*>(closure[pi]);
         }
 
         return true;
