@@ -52,6 +52,10 @@ import(lib) wallvm::target {
     x86_64::{ linux::{ abi_lower::{ irABILower } } }
 };
 
+// The MS x64 pass stays namespace-qualified: both abi_lower files export
+// `irABILower` and the bare symbol above is the System V one.
+import(lib) wallvm::target::x86_64::windows::abi_lower;
+
 import(lib) wallvm::regalloc {
     lsra::{ defaultRegAllocConfig, irLinearScanRegAlloc, RegAllocConfig },
     graph::{ irGraphRegAlloc }
@@ -178,11 +182,26 @@ pub PassPipeline pipelineLevel0()
     return p;
 }
 
-pub PassPipeline pipelineLevel1()
+// The abi_lower slot at the head of L1-L3 is picked per calling
+// convention — Win64/SyscallWin64 run the Microsoft x64 pass, every
+// other convention runs System V. Both entries take their module from
+// func->parent, so the pipeline keeps passing the context as userdata
+// like it does for every other pass.
+static PassFn* abiLowerPassFor(CallingConvention cc)
+{
+    switch (cc)
+    {
+        CallingConvention::Win64 |
+        CallingConvention::SyscallWin64 => { return abi_lower::irABILower; },
+        else => { return irABILower; },
+    }
+}
+
+pub PassPipeline pipelineLevel1(CallingConvention cc)
 {
     PassPipeline p = PassPipeline::new();
     p.add(irPassValidate, "validate");
-    p.add(irABILower, "abi_lower");
+    p.add(abiLowerPassFor(cc), "abi_lower");
     p.add(irPassCommCanonicalize, "comm_canon");
     p.add(irPassSimplify, "simplify");
     p.add(irPassConstfold, "constfold");
@@ -203,11 +222,11 @@ pub PassPipeline pipelineLevel1()
     return p;
 }
 
-pub PassPipeline pipelineLevel2()
+pub PassPipeline pipelineLevel2(CallingConvention cc)
 {
     PassPipeline p = PassPipeline::new();
     p.add(irPassValidate, "validate");
-    p.add(irABILower, "abi_lower");
+    p.add(abiLowerPassFor(cc), "abi_lower");
     p.add(irPassMem2Reg, "mem2reg");
     p.add(irPassSROA, "sroa");
     p.add(irPassCommCanonicalize, "comm_canon");
@@ -235,11 +254,11 @@ pub PassPipeline pipelineLevel2()
     return p;
 }
 
-pub PassPipeline pipelineLevel3()
+pub PassPipeline pipelineLevel3(CallingConvention cc)
 {
     PassPipeline p = PassPipeline::new();
     p.add(irPassValidate, "validate");
-    p.add(irABILower, "abi_lower");
+    p.add(abiLowerPassFor(cc), "abi_lower");
     p.add(irPassMem2Reg, "mem2reg");
     p.add(irPassSROA, "sroa");
     p.add(irPassStackLayout, "stack_layout");
