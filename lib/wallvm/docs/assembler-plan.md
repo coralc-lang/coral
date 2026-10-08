@@ -65,6 +65,27 @@ passthrough stays the emission mode while the encoder matures), direct
 object emission later. The wasm target has no system assembler to lean on,
 so its encoder is required for binary output regardless.
 
+## External toolchain alternative — TinyCC (user note, 2026-10-08)
+
+We might just use TinyCC's assembler and the linkers it provides instead of
+writing every encoder ourselves.
+
+- tcc ships an integrated, GAS-compatible assembler (text → object) and a
+  linker for ELF and PE targets, so inline asm and final link could both be
+  delegated: validate constraints on our side, hand the asm text to the tcc
+  path, let it assemble and link.
+- What it buys: full GAS-syntax coverage and battle-tested encodings for
+  x86/x86_64/ARM without maintaining our own tables, plus linking for free.
+- What it costs: an external dependency (or an embedded C codebase), less
+  control over diagnostics, and no wasm target — the wasm text→binary
+  encoder (P4) stays ours regardless.
+- Constraint/operand validation against the IR stays ours either way (the
+  InlineAsm gap closes the same); what changes is who turns validated text
+  into bytes.
+- If this route is taken, P1-P3 collapse into a tcc integration task (embed
+  or subprocess, diagnostics mapping); the golden-encoding fixtures stay
+  valuable either way — they double as equivalence tests against tcc output.
+
 ## Instruction breadth (the "wide amount" requirement)
 
 - **x86 / x86_64:** mov family (mov, movzx, movsx, movsxd, lea, xchg,
