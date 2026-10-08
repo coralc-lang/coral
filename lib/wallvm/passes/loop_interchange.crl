@@ -1,7 +1,7 @@
 import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
 import(lib) wallvm::irOps { IrOpcode };
 import(lib) wallvm::passes::loop_detect { IrLoop, irLoopDetectNatural };
-import(lib) std::mman { dealloc };
+import(lib) std::mman { alloc, dealloc };
 
 // Loop Interchange Pass
 //
@@ -271,13 +271,30 @@ pub struct LoopInterchangePass
         // Swap the phi initial values
         // The inner phi's initial value should be the outer phi's initial value
         // and vice versa
+        // In this IR a phi's operands are (value, predecessor-block) pairs,
+        // so exchange the even (value) slots, not the odd (block) ones
         if (innerPhi->nops >= 2 && outerPhi->nops >= 2)
         {
-            IrValue* innerInit = innerPhi->ops[1]; // incoming from preheader
-            IrValue* outerInit = outerPhi->ops[1];
+            u32 innerSlot = 0xFFFFFFFF;
+            u32 outerSlot = 0xFFFFFFFF;
+            for (u32 j = 1; j < innerPhi->nops; j += 2)
+                if ((IrBlock*)innerPhi->ops[j] == inner->preheader)
+                    innerSlot = j - 1;
+            for (u32 j = 1; j < outerPhi->nops; j += 2)
+                if ((IrBlock*)outerPhi->ops[j] == outer->preheader)
+                    outerSlot = j - 1;
 
-            innerPhi->ops[1] = outerInit;
-            outerPhi->ops[1] = innerInit;
+            if (innerSlot != 0xFFFFFFFF && outerSlot != 0xFFFFFFFF)
+            {
+                IrValue* innerInit = innerPhi->ops[innerSlot];
+                IrValue* outerInit = outerPhi->ops[outerSlot];
+                innerInit->removeUser(innerPhi);
+                outerInit->removeUser(outerPhi);
+                innerPhi->ops[innerSlot] = outerInit;
+                outerPhi->ops[outerSlot] = innerInit;
+                outerInit->addUser(innerPhi);
+                innerInit->addUser(outerPhi);
+            }
         }
 
         // Swap the increment operations' operands
@@ -302,7 +319,56 @@ pub struct LoopInterchangePass
         inner->header = outer->header;
         outer->header = tempHeader;
 
+        // The header swap leaves each phi's incoming-block operands to be
+        // re-derived; rebuild them from the containing blocks' preds so the
+        // CFG stays consistent
+        self.repairPhiIncoming(innerPhi);
+        self.repairPhiIncoming(outerPhi);
+
         return true;
+    }
+
+    // Rebuild a phi's operand list so the (value, block) pairs match the
+    // containing block's actual predecessor list, keeping the value that
+    // was previously paired with each predecessor
+    void repairPhiIncoming(IrInst* phi)
+    {
+        IrBlock* block = phi->parent;
+        if (block == null) return;
+
+        IrValue** newOps = alloc<IrValue*>(block->npreds * 2);
+        u32 n = 0;
+        for (u32 pi = 0; pi < block->npreds; pi++)
+        {
+            IrBlock* pred = block->preds[pi];
+            IrValue* val = null;
+            for (u32 j = 0; j + 1 < phi->nops; j += 2)
+            {
+                if ((IrBlock*)phi->ops[j + 1] == pred)
+                {
+                    val = phi->ops[j];
+                    break;
+                }
+            }
+            if (val == null)
+                val = phi->ops[0];
+            newOps[n++] = val;
+            newOps[n++] = &pred->base;
+        }
+
+        for (u32 i = 0; i < phi->nops; i++)
+            if (phi->ops[i] != null)
+                phi->ops[i]->removeUser(phi);
+
+        if (phi->capOps > 0)
+            dealloc<IrValue*>(phi->ops);
+
+        phi->ops = newOps;
+        phi->nops = n;
+        phi->capOps = block->npreds * 2;
+
+        for (u32 i = 0; i < n; i++)
+            phi->ops[i]->addUser(phi);
     }
 
     // Find the increment instruction for an induction variable

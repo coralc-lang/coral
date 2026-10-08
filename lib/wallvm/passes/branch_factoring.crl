@@ -15,7 +15,7 @@ pub struct BranchFactoringPass
 {
     u64 factors;
 
-    BranchFactoringPass new() { return BranchFactoringPass { .factors }; }
+    BranchFactoringPass new() {     return BranchFactoringPass { .factors = 0 }; }
 
     bool run(IrFunc* func)
     {
@@ -78,6 +78,7 @@ pub struct BranchFactoringPass
                                 // Replace cond_br with br to falseTgt
                                 term->ops[0]->removeUser(term);
                                 term->ops[1]->removeUser(term);
+                                term->ops[2]->removeUser(term);
                                 falseTgt->base.addUser(term);
                                 term->nops = 1;
                                 term->opcode = IrOpcode::Br;
@@ -186,42 +187,37 @@ pub struct BranchFactoringPass
                         if (ttTerm->icmpPred != ftTerm->icmpPred)
                         {
                             // Check if both targets' branches lead to the same blocks
-                            if (ttTerm->parent == ftTerm->parent)
+                            IrInst* ttBr = null;
+                            IrInst* ftBr = null;
+                            for (u32 ii = 0; ii < trueTgt->ninsts; ii++)
+                                if (trueTgt->insts[ii]->opcode == IrOpcode::Br)
+                                    { ttBr = trueTgt->insts[ii]; break; }
+                            for (u32 ii = 0; ii < falseTgt->ninsts; ii++)
+                                if (falseTgt->insts[ii]->opcode == IrOpcode::Br)
+                                    { ftBr = falseTgt->insts[ii]; break; }
+
+                            if (ttBr != null && ftBr != null && ttBr->nops == 1 && ftBr->nops == 1 &&
+                                ttBr->ops[0] == ftBr->ops[0])
                             {
-                                IrInst* ttBr = null;
-                                IrInst* ftBr = null;
-                                for (u32 ii = 0; ii < trueTgt->ninsts; ii++)
-                                    if (trueTgt->insts[ii]->opcode == IrOpcode::Br)
-                                        { ttBr = trueTgt->insts[ii]; break; }
-                                for (u32 ii = 0; ii < falseTgt->ninsts; ii++)
-                                    if (falseTgt->insts[ii]->opcode == IrOpcode::Br)
-                                        { ftBr = falseTgt->insts[ii]; break; }
+                                // Both branches go to the same target
+                                // The second comparison is always redundant
+                                // Merge, replace cond_br with br to the shared target
+                                IrBlock* shared = (IrBlock*)ttBr->ops[0];
+                                term->ops[0]->removeUser(term);
+                                term->ops[1]->removeUser(term);
+                                term->ops[2]->removeUser(term);
+                                shared->base.addUser(term);
+                                term->nops = 1;
+                                term->opcode = IrOpcode::Br;
+                                term->ops[0] = &shared->base;
 
-                                if (ttBr != null && ftBr != null && ttBr->nops == 1 && ftBr->nops == 1)
-                                {
-                                    if (ttBr->ops[0] == ftBr->ops[0])
-                                    {
-                                        // Both branches go to the same target
-                                        // The second comparison is always redundant
-                                        // Merge, replace cond_br with br to the shared target
-                                        IrBlock* shared = (IrBlock*)ttBr->ops[0];
-                                        term->ops[0]->removeUser(term);
-                                        term->ops[1]->removeUser(term);
-                                        term->ops[2]->removeUser(term);
-                                        shared->base.addUser(term);
-                                        term->nops = 1;
-                                        term->opcode = IrOpcode::Br;
-                                        term->ops[0] = &shared->base;
-
-                                        bb->nsuccs = 1;
-                                        bb->succs[0] = shared;
-                                        trueTgt->removePred(bb);
-                                        falseTgt->removePred(bb);
-                                        shared->addPred(bb);
-                                        self.factors++;
-                                        return true;
-                                    }
-                                }
+                                bb->nsuccs = 1;
+                                bb->succs[0] = shared;
+                                trueTgt->removePred(bb);
+                                falseTgt->removePred(bb);
+                                shared->addPred(bb);
+                                self.factors++;
+                                return true;
                             }
                         }
                     }

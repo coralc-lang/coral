@@ -40,15 +40,13 @@ pub struct MachineOptPass
         self.storesEliminated = 0;
         self.crossBlockOpts = 0;
 
-        // Check for cached AA and MSSA
+        // Check for cached AA
         FunctionAnalysisCache* cache = self.ctx->getOrCreateAnalysisCache(func);
         AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
-        MemorySSA* mssaPtr = (MemorySSA*)cache->memorySSA;
 
         AliasAnalysis aa;
         MemorySSA mssa;
         bool ownAA = false;
-        bool ownMssa = false;
 
         if (aaPtr != null)
         {
@@ -61,16 +59,12 @@ pub struct MachineOptPass
             ownAA = true;
         }
 
-        if (mssaPtr != null)
-        {
-            mssa = *mssaPtr;
-        }
-        else
-        {
-            mssa = MemorySSA::new(&aa);
-            mssa.build(func);
-            ownMssa = true;
-        }
+        // I rebuild the MSSA per run rather than reading cache->memorySSA: the
+        // cache has no destructor and an MSSA points at its AliasAnalysis, so
+        // a cached one would dangle (or a heap copy would leak). The local
+        // MSSA is torn down before returning.
+        mssa = MemorySSA::new(&aa);
+        mssa.build(func);
 
         bool changed = false;
 
@@ -87,7 +81,7 @@ pub struct MachineOptPass
         // Pass 3 — cross-block store-to-load forwarding via dominance
         if (self.crossBlockLoadForward(func, &mssa)) changed = true;
 
-        if (ownMssa) mssa.deinit();
+        mssa.deinit();
         if (ownAA) aa.deinit();
         return changed;
     }

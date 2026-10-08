@@ -162,12 +162,14 @@ pub struct LoopDistributePass
 
         // Create new loop bodies for each partition
         IrBlock* lastBlock = null;
+        IrBlock* newBlocks[MAX_PARTITIONS];
 
         for (u32 pi = 0; pi < nPartitions; pi++)
         {
             // Create a new block for this partition
             IrBlock* newBlock = self.ctx->createBlock(null);
             func->addBlock(newBlock);
+            newBlocks[pi] = newBlock;
 
             // Copy instructions from the partition to the new block
             for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
@@ -204,6 +206,7 @@ pub struct LoopDistributePass
                 IrInst* lastTerm = lastBlock->insts[lastBlock->ninsts - 1];
                 if (lastTerm->opcode == IrOpcode::Br)
                 {
+                    lastTerm->ops[0]->removeUser(lastTerm);
                     lastTerm->ops[0] = &newBlock->base;
                     newBlock->base.addUser(lastTerm);
                 }
@@ -212,16 +215,60 @@ pub struct LoopDistributePass
             lastBlock = newBlock;
         }
 
-        // Remove original instructions from header (they've been copied to partitions)
-        for (u32 ii = 0; ii < header->ninsts; ii++)
+        // Remap clone operands so they point at the clones, not the originals
+        // we're about to erase
+        for (u32 pi = 0; pi < nPartitions; pi++)
         {
-            IrInst* inst = header->insts[ii];
+            for (u32 ii = 0; ii < partitions[pi].ninsts; ii++)
+            {
+                IrInst* clone = newBlocks[pi]->insts[ii];
+                for (u32 oi = 0; oi < clone->nops; oi++)
+                {
+                    IrValue* op = clone->ops[oi];
+                    if (op != null && op->kind == IrValueKind::Inst)
+                    {
+                        IrInst* opInst = (IrInst*)op;
+                        if (opInst->parent == header)
+                        {
+                            // Find the clone of this operand instruction
+                            for (u32 pj = 0; pj < nPartitions; pj++)
+                            {
+                                bool found = false;
+                                for (u32 jj = 0; jj < partitions[pj].ninsts; jj++)
+                                {
+                                    if (partitions[pj].insts[jj] == opInst)
+                                    {
+                                        IrInst* opClone = newBlocks[pj]->insts[jj];
+                                        opInst->base.removeUser(clone);
+                                        clone->ops[oi] = &opClone->base;
+                                        opClone->base.addUser(clone);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (found) break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove original instructions from header (they've been copied to partitions)
+        for (u32 ii = header->ninsts; ii > 0; ii--)
+        {
+            IrInst* inst = header->insts[ii - 1];
             // Only remove non-PHI, non-terminator instructions
-            if (inst->opcode != IrOpcode::Phi && ii < header->ninsts - 1)
+            if (inst->opcode != IrOpcode::Phi && ii - 1 < header->ninsts - 1)
             {
                 inst->erase();
             }
         }
+
+        // Keep CFG predecessor/successor lists in sync with the new chain
+        for (u32 pi = 0; pi + 1 < nPartitions; pi++)
+            newBlocks[pi]->addSucc(newBlocks[pi + 1]);
+        newBlocks[nPartitions - 1]->addSucc(header);
 
         // Free partition allocations
         for (u32 pi = 0; pi < nPartitions; pi++)

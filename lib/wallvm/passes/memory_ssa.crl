@@ -361,9 +361,12 @@ pub bool irMemorySSA(IrFunc* func, rawptr userdata)
     if (ctx == null || func == null) return false;
 
     FunctionAnalysisCache* cache = ctx->getOrCreateAnalysisCache(func);
-    if (cache->memorySSA != null) return false;
 
-    // Use cached AA if available, otherwise create new
+    // I don't publish the MSSA into the cache: the cache has no destructor
+    // (clearAnalysisCaches frees only the cache struct) and an MSSA holds a
+    // pointer to its AliasAnalysis, so a published one would dangle once the
+    // local analysis dies and a heap-copy would leak. Consumer passes
+    // (machine_opt) recompute per run instead.
     AliasAnalysis* aaPtr = (AliasAnalysis*)cache->aliasAnalysis;
     AliasAnalysis aa;
     bool ownAA = false;
@@ -380,13 +383,7 @@ pub bool irMemorySSA(IrFunc* func, rawptr userdata)
 
     MemorySSA mssa = MemorySSA::new(&aa);
     mssa.build(func);
-
-    // Store in cache (heap-allocated copy)
-    MemorySSA* cached = alloc<MemorySSA>(1);
-    *cached = mssa;
-    cache->memorySSA = cached;
-
-    // We don't own the local mssa anymore (it was moved to cache)
-    // Don't deinit it. If we created AA, don't deinit it either since cache holds pointer.
+    mssa.deinit();
+    if (ownAA) aa.deinit();
     return false;
 }
