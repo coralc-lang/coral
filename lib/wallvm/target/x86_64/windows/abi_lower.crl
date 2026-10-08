@@ -16,9 +16,13 @@ import(lib) wallvm::irMetadata { attachFuncMetadata, addString, find, MetadataSe
 //    back in rax as a single integer word, everything else returns
 //    through a hidden sret pointer supplied by the caller
 // 6. The 32-byte shadow space is a codegen concern, not a pass concern
+// 7. Vectors of 8 or 16 bytes ride SSE registers like scalar floats;
+//    a vector wider than 16 bytes is passed in memory
 //
-// Contract for the entry point: `irABILower` treats `userdata` as the
-// owning `IrModule*` (falling back to func->parent when null). The
+// Contract for the entry point: `irABILower` reads the owning
+// `IrModule*` from `func->parent` first — the optimizer pipeline hands
+// every pass its `IrContext*` as userdata, which is not a module — and
+// only consults userdata as a module hint when parent is null. The
 // module is needed to find and rewrite every direct call of the target
 // function; `ABILowering.run` alone only transforms the one function.
 //
@@ -84,6 +88,16 @@ pub struct ABILowering
                 return elemClass;
             },
 
+            IrTypeKind::Vector => {
+                u32 sz = ctx->irTypeSizeOf(ty);
+                // 8- and 16-byte vectors ride an SSE register like a
+                // scalar float; anything wider is MEMORY like a large
+                // aggregate
+                if (sz == 8 || sz == 16) return 2;
+                if (sz > 16) return 0;
+                return 1;  // narrow vectors pass like any small POD
+            },
+
             IrTypeKind::Struct => { return classifyStructType(ty); },
             else => { return 0; },
         }
@@ -130,7 +144,9 @@ pub struct ABILowering
             return ty->width / 8;
         if (ty->kind == IrTypeKind::Ptr) return 8;
         if (ty->kind == IrTypeKind::Struct) return ty->width;
-        if (ty->kind == IrTypeKind::Array)
+        // a Vector carries width 0 like an Array, so size it from its
+        // element — same bytes irTypeSizeOf reports
+        if (ty->kind == IrTypeKind::Array || ty->kind == IrTypeKind::Vector)
             return fieldSize(ty->elem) * (ty->count > 0 ? ty->count : 1);
         return 0;
     }
@@ -765,8 +781,11 @@ pub struct ABILowering
 pub bool irABILower(IrFunc* func, rawptr userdata)
 {
     if (func == null) return false;
-    IrModule* modd = (IrModule*)userdata;
-    if (modd == null && func->parent != null) modd = func->parent;
+    // func->parent is the module of record (every module function gets
+    // one in IrModule.addFunc); userdata only serves a caller that
+    // hands us the module itself, never the pipeline's IrContext*.
+    IrModule* modd = func->parent;
+    if (modd == null && userdata != null) modd = (IrModule*)userdata;
     if (modd == null) return false;
     if (func->parent == null) func->parent = modd;
     ABILowering lower = ABILowering::new(modd->ctx);

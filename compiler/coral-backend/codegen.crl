@@ -512,6 +512,55 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     return cgInstanceName(cg, p.name, p.arguments, p.argumentsLen);
 }
 
+/* Name for an explicit-generic call `f<T>(...)`: the mono instance bound to
+ * the callee's generic arguments. Null slice when no instance matches;
+ * *outDecl always receives the callee's declaration when found. */
+Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool* found, NodeId* outDecl)
+{
+    *found = false;
+    *outRet = 0;
+    NodeId declId = cgFindDecl(cg, fname, (u32)DeclKind::Func);
+    if (outDecl != null) *outDecl = declId;
+    Ty* gargs = null;
+    u32 glen = 0;
+    if (namedTy != 0)
+    {
+        TypeEntry* ne = cg.ctx->types + namedTy;
+        if (ne->kind.tag == TypeKind::Named)
+        {
+            gargs = ne->kind.payload.Named.genericArgs;
+            glen = ne->kind.payload.Named.genericArgsLen;
+        }
+    }
+    if (cg.mono != null && cg.sema != null && declId.index != 0 && glen > 0)
+    {
+        u32 i = 0;
+        while (i < cg.mono.instancesLen)
+        {
+            MonoInstance* inst = cg.mono.instances + i;
+            if (inst.kind == MonoInstanceKind::FunctionInstance && inst.declaration.index == declId.index &&
+                inst.argumentsLen == glen)
+            {
+                bool ok = true;
+                u32 k = 0;
+                while (k < glen)
+                {
+                    if (!cg.sema.sameType(inst.arguments[k], gargs[k])) { ok = false; break; }
+                    k = k + 1;
+                }
+                if (ok)
+                {
+                    *found = true;
+                    *outRet = inst.returnType;
+                    return cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return Slice::from(null, 0);
+}
+
 /* ── C type emission ─────────────────────────────────────────── */
 
 extern("C") Slice tyStr(Codegen* cg, Ty t);
@@ -1449,14 +1498,53 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (s0->kind.tag == NodeKind::Expr && s0->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
                     s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
                 {
-                    usize cs = cg.ebuf.len;
-                    stPS(&cg.ebuf, cgIntern(cg, s0->kind.payload.Expr.value.kind.payload.Ident.name));
-                    stCh(&cg.ebuf, '_');
-                    stPS(&cg.ebuf, cgIntern(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name));
-                    calleeText = stTail(&cg.ebuf, cs);
+                    /* resolve through the declaration: the C name is the
+                       function's own name (flat), not `module_fn` */
+                    Str s1name = s1->kind.payload.Expr.value.kind.payload.Ident.name;
+                    fdecl = cgFindDecl(cg, s1name, (u32)DeclKind::Func);
+                    calleeText = cgResolveCall(cg, s1name, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
+                    if (resolved) {
+                        retTy = tyStr(cg, cgSubstTy(cg, rty));
+                    } else {
+                        usize cs = cg.ebuf.len;
+                        stPS(&cg.ebuf, cgIntern(cg, s0->kind.payload.Expr.value.kind.payload.Ident.name));
+                        stCh(&cg.ebuf, '_');
+                        stPS(&cg.ebuf, cgIntern(cg, s1name));
+                        calleeText = stTail(&cg.ebuf, cs);
+                        retTy = cgResultTy(cg, id, e);
+                        resolved = true;
+                    }
+                }
+                else if (s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef)
+                {
+                    /* `mod::f<T>(...)` — explicit generic args on the last segment */
+                    calleeText = cgResolveGenericCall(cg, s1->kind.payload.Expr.value.kind.payload.TypeRef.name,
+                                                      s1->kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
+                                                      &rty, &resolved, &fdecl);
+                    if (resolved) {
+                        retTy = tyStr(cg, cgSubstTy(cg, rty));
+                    } else {
+                        calleeText = cgExpr(cg, calleeId);
+                        retTy = cgResultTy(cg, id, e);
+                    }
+                }
+                else
+                {
+                    calleeText = cgExpr(cg, calleeId);
                     retTy = cgResultTy(cg, id, e);
-                    fdecl = cgFindDecl(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name, (u32)DeclKind::Func);
-                    resolved = true;
+                }
+            }
+            else if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::TypeRef) {
+                /* `f<T>(...)` — explicit generic call: pick the mono
+                   instance for the callee's generic arguments */
+                calleeText = cgResolveGenericCall(cg, cn.kind.payload.Expr.value.kind.payload.TypeRef.name,
+                                                  cn.kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
+                                                  &rty, &resolved, &fdecl);
+                if (resolved) {
+                    retTy = tyStr(cg, cgSubstTy(cg, rty));
+                } else {
+                    calleeText = cgExpr(cg, calleeId);
+                    retTy = cgResultTy(cg, id, e);
                 }
             }
             else if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {

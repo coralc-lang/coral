@@ -1120,19 +1120,56 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         loader.idents = &idents;
         loader.inputPath = path;
         loader.diag = engine;
-        /* default host platform — neutral lib paths resolve under
+        /* platform root — neutral lib paths resolve under
          * <platform_root>/ first, then the base tree (see
-         * coral-docs/builder_incomplete.md). target flags from the build
-         * manifest override this once manifest selection lands. */
-        LibSeg* prSegs = (LibSeg*)malloc(2 * @sizeof(LibSeg));
-        if (prSegs != null)
+         * coral-docs/builder_incomplete.md). CORAL_PLATFORM overrides the
+         * default host triple ('/'-separated, e.g. x86_64/windows);
+         * target flags from the build manifest override this once
+         * manifest selection lands. */
+        u8* plat = getenv((u8*)"CORAL_PLATFORM");
+        usize plen = 0;
+        while (plat != null && plat[plen] != 0) plen = plen + 1;
+        if (plat != null && plen > 0)
         {
-            prSegs[0].ptr = (u8*)"x86_64";
-            prSegs[0].len = 6;
-            prSegs[1].ptr = (u8*)"linux";
-            prSegs[1].len = 5;
-            loader.platformRootSegs = prSegs; // seems kinda hardcoded. there will be more 
-            loader.platformRootSegsLen = 2;   // host platforms and more target archs
+            u32 segCount = 1;
+            usize pi = 0;
+            while (pi < plen) { if (plat[pi] == 47) segCount = segCount + 1; pi = pi + 1; }
+            LibSeg* prSegs = (LibSeg*)malloc(segCount * sizeof(LibSeg));
+            if (prSegs != null)
+            {
+                u32 k = 0;
+                usize start = 0;
+                pi = 0;
+                while (pi <= plen)
+                {
+                    if (pi == plen || plat[pi] == 47)
+                    {
+                        if (pi > start && k < segCount)
+                        {
+                            prSegs[k].ptr = plat + start;
+                            prSegs[k].len = (u32)(pi - start);
+                            k = k + 1;
+                        }
+                        start = pi + 1;
+                    }
+                    pi = pi + 1;
+                }
+                loader.platformRootSegs = prSegs;
+                loader.platformRootSegsLen = k;
+            }
+        }
+        else
+        {
+            LibSeg* prSegs = (LibSeg*)malloc(2 * sizeof(LibSeg));
+            if (prSegs != null)
+            {
+                prSegs[0].ptr = (u8*)"x86_64";
+                prSegs[0].len = 6;
+                prSegs[1].ptr = (u8*)"linux";
+                prSegs[1].len = 5;
+                loader.platformRootSegs = prSegs; // seems kinda hardcoded. there will be more 
+                loader.platformRootSegsLen = 2;   // host platforms and more target archs
+            }
         }
         loader.loaded = (u8**)malloc(8 * @sizeof(u8*));
         loader.loadedLen = 0;

@@ -215,6 +215,19 @@ pub struct ABILowering
                     wordsOf(ty->elem, off + i * esz, w0, w1, mem);
             },
 
+            IrTypeKind::Vector => {
+                // SSE in each eightbyte the vector touches; wider than
+                // 16 bytes poisons the struct to MEMORY like >16-byte
+                // structs do
+                u32 sz = ctx->irTypeSizeOf(ty);
+                if (sz > 16) { *mem = true; return; }
+                for (u32 b = 0; b < sz; b += 8)
+                {
+                    if (off + b < 8) *w0 = mergeWord(*w0, 2);
+                    else *w1 = mergeWord(*w1, 2);
+                }
+            },
+
             IrTypeKind::Struct => {
                 if (ty->width > 16) { *mem = true; return; }
                 for (u32 i = 0; i < ty->nparams; i++)
@@ -896,8 +909,11 @@ pub struct ABILowering
 pub bool irABILower(IrFunc* func, rawptr userdata)
 {
     if (func == null) return false;
-    IrModule* modd = (IrModule*)userdata;
-    if (modd == null && func->parent != null) modd = func->parent;
+    // func->parent is the module of record (every module function gets
+    // one in IrModule.addFunc); userdata only serves a caller that
+    // hands us the module itself, never the pipeline's IrContext*.
+    IrModule* modd = func->parent;
+    if (modd == null && userdata != null) modd = (IrModule*)userdata;
     if (modd == null) return false;
     if (func->parent == null) func->parent = modd;
     ABILowering lower = ABILowering::new(modd->ctx);
