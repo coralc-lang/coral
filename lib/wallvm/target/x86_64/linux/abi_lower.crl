@@ -7,8 +7,10 @@ import(lib) wallvm::irMetadata { attachFuncMetadata, addString, find, MetadataSe
 // If this is for systemV alone, Then add it to the targets!
 // ABI Lowering Pass — System V AMD64.
 //
-// Contract for the entry point: `irABILower` treats `userdata` as the
-// owning `IrModule*` (falling back to func->parent when null). The
+// Contract for the entry point: `irABILower` reads the owning
+// `IrModule*` from `func->parent` first — the optimizer pipeline hands
+// every pass its `IrContext*` as userdata, which is not a module — and
+// only consults userdata as a module hint when parent is null. The
 // module is needed to find and rewrite every direct call of the target
 // function; `ABILowering.run` alone only transforms the one function.
 //
@@ -29,7 +31,8 @@ import(lib) wallvm::irMetadata { attachFuncMetadata, addString, find, MetadataSe
 // classes mean that class, two different non-empty classes mean MIXED;
 // objects larger than 16 bytes or containing unsupported fields go to
 // MEMORY. The IR has no 80-bit float, so X87 never arises; a Float of
-// a width other than 32 or 64 is classified MEMORY.
+// a width other than 32 or 64 is classified MEMORY. A Vector of 16
+// bytes or less is SSE, a wider Vector is MEMORY.
 
 static str dupStrVal(str s)
 {
@@ -72,6 +75,13 @@ pub struct ABILowering
                 u32 totalSize = ty->count * ctx->irTypeSizeOf(ty->elem);
                 if (totalSize > 8) return 0;
                 return elemClass;
+            },
+
+            IrTypeKind::Vector => {
+                // SSE when it fits one register; a wider vector is
+                // MEMORY like any >16-byte object
+                if (ctx->irTypeSizeOf(ty) <= 16) return 2;
+                return 0;
             },
 
             IrTypeKind::Struct => { return classifyStructType(ty); },
@@ -120,7 +130,9 @@ pub struct ABILowering
             return ty->width / 8;
         if (ty->kind == IrTypeKind::Ptr) return 8;
         if (ty->kind == IrTypeKind::Struct) return ty->width;
-        if (ty->kind == IrTypeKind::Array)
+        // a Vector carries width 0 like an Array, so size it from its
+        // element — same bytes irTypeSizeOf reports
+        if (ty->kind == IrTypeKind::Array || ty->kind == IrTypeKind::Vector)
             return fieldSize(ty->elem) * (ty->count > 0 ? ty->count : 1);
         return 0;
     }
