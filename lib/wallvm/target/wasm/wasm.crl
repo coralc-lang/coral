@@ -1497,17 +1497,43 @@ pub struct WasmCodeGen
         cchar sh[8];
         if (!self.vecShape(inst->base.type, sh)) { self.failOp(null, inst->opcode); return false; }
         bool isFloat = inst->base.type->elem->kind == IrTypeKind::Float;
-        if (!isFloat && inst->base.type->elem->width > 32)
+        u32 ew = inst->base.type->elem->width;
+        if (!isFloat && ew == 64)
         {
-            // there is no i64x2 min/max in wasm simd
-            self.failOp(null, inst->opcode);
-            return false;
+            // wasm has no i64x2 min/max, expand to an extract, compare,
+            // select, replace lane walk over the two lanes, the compare is
+            // unsigned to match the backend VecMin/VecMax contract
+            if (!self.emitValuePush(inst->ops[0])) return false;
+            self.emitter.emitLine("local.set $vecA");
+            if (!self.emitValuePush(inst->ops[1])) return false;
+            self.emitter.emitLine("local.set $vecB");
+            const cchar* cmp = isMin ? "i64.lt_u" : "i64.gt_u";
+            self.emitter.emitLine("local.get $vecA");
+            for (u32 lane = 0; lane < 2; lane++)
+            {
+                self.emitter.emitLine("local.get $vecA");
+                self.emitter.emit("i64x2.extract_lane ");
+                self.emitter.emitU32(lane);
+                self.emitter.emitLine("");
+                self.emitter.emitLine("local.get $vecB");
+                self.emitter.emit("i64x2.extract_lane ");
+                self.emitter.emitU32(lane);
+                self.emitter.emitLine("");
+                self.emitter.emitLine(cmp);
+                self.emitter.emitLine("select");
+                self.emitter.emit("i64x2.replace_lane ");
+                self.emitter.emitU32(lane);
+                self.emitter.emitLine("");
+            }
+            return true;
         }
         if (!self.emitValuePush(inst->ops[0])) return false;
         if (!self.emitValuePush(inst->ops[1])) return false;
         self.emitter.emit(sh);
         self.emitter.emit(".");
-        self.emitter.emitLine(isFloat ? (isMin ? "min" : "max") : (isMin ? "min_s" : "max_s"));
+        // min_u/max_u for the int lanes, the signed suffixes would break
+        // the unsigned backend contract the x86 lane loop honors
+        self.emitter.emitLine(isFloat ? (isMin ? "min" : "max") : (isMin ? "min_u" : "max_u"));
         return true;
     }
 
@@ -1688,8 +1714,11 @@ pub struct WasmCodeGen
                 }
                 if (!self.emitValuePush(inst->ops[0])) return false;
                 self.emitter.emit(sh);
+                // the _s/_u suffixes exist only on i8x16 and i16x8, the
+                // wider lanes use the plain form
                 bool intLane = inst->ops[0]->type->elem->kind == IrTypeKind::Int;
-                self.emitter.emit(intLane && inst->ops[0]->type->elem->width < 64 ? ".extract_lane_s " : ".extract_lane ");
+                u32 ew = inst->ops[0]->type->elem->width;
+                self.emitter.emit(intLane && (ew == 8 || ew == 16) ? ".extract_lane_s " : ".extract_lane ");
                 self.emitter.emitU32((u32)inst->ops[1]->valData);
                 self.emitter.emitLine("");
                 return true;
@@ -1981,6 +2010,8 @@ pub struct WasmCodeGen
         self.emitter.emitLine("(local $atN32 i32)");
         self.emitter.emitLine("(local $atO64 i64)");
         self.emitter.emitLine("(local $atN64 i64)");
+        self.emitter.emitLine("(local $vecA v128)");
+        self.emitter.emitLine("(local $vecB v128)");
         for (u32 i = 0; i < self.nsl; i++)
         {
             if (self.sls[i] < func->nargs) continue;

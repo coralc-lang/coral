@@ -436,7 +436,15 @@ a claimed GEP so no scalar leftover survives at the widened step
 GEP results, `Vec*` ops, stores at the scalar store's position, neuters the
 scalar store into the transient `Noret` marker, widens the increment via an
 interned `constInt` operand replacement (never mutating shared constants),
-and sweeps the dead scalar chain with a fixpoint peephole.
+and sweeps the dead scalar chain with a fixpoint peephole. Integer
+reductions (sum any of 8/16/32/64-bit, unsigned min/max i32/i64 only per the
+unsigned VecMin/VecMax and 64-bit scalar cmov contract) widen the
+accumulator phi into a second vector phi in the header (init broadcast from
+the entry pred, vector combine from the latch) and fold the lanes
+horizontally with `ExtractElement` + scalar combines plus the scalar init in
+the exit block (`vectorizeReduction`); float reductions and signed min/max
+stay scalar because reassociation changes rounding. Loops shorter than two
+vectors stay scalar (`verifyWidening`).
 
 ### 6.2 Findings
 
@@ -454,10 +462,12 @@ Resolved 2026-10-09 (pass rework + backend vector wave):
   emits `Load` with the vector result type at the GEP result address; the
   backend lowers it via the width-aware `emitLoadWidth` (`movdqu`/`movd`/
   `movq`).
-- **F4 — reductions mix scalar and vector types.** RESOLVED by removal:
-  sum/min/max reduction patterns are no longer generated; a horizontal
-  reduction with a vector accumulator phi is a follow-up. Signed integer
-  min/max stay scalar (the backend VecMin/VecMax contract is unsigned).
+- **F4 — reductions mix scalar and vector types.** RESOLVED by
+  implementation: integer sum/unsigned min/max reduce through a vector
+  accumulator phi plus a horizontal `ExtractElement` combine in the exit
+  block (`vectorizeReduction`, §6.1). Float reductions stay unvectorized
+  (reassociation changes rounding) and signed integer min/max stay scalar
+  (the backend VecMin/VecMax contract is unsigned).
 - **F5 — the side-effect safety scan skips header and latch.** RESOLVED:
   the scan covers every block in `lp->blocks` and additionally rejects
   AtomicLoad/AtomicRmw/AtomicCmpXchg, not just AtomicStore/Fence/Call.
@@ -478,9 +488,19 @@ Still open:
   `generic.crl:23-24,72-73` sets `features.avx`. The inline xmm→ymm
   promotion in `x86_64_base.crl` duplicates a subset of it. Either wire it
   deliberately or delete it.
-- **Wasm vector gap.** The wasm backend has no vector-typed `Load`/`Store`
-  lowering, so L3 vectorized functions will not lower for the wasm target;
-  x86-64 is the only supported target for this pass's output today.
+- **Wasm vector lowering.** The "no vector `Load`/`Store`" claim was stale —
+  the backend already emits `v128.load`/`v128.store`, all the `Vec*`
+  arithmetic, splat, and constant-index extract/replace lane
+  (`wasm.crl:869,899,1663+`), so vectorized L3 output does lower for wasm.
+  Three correctness fixes landed 2026-10-09: `extract_lane_s` is emitted
+  only for 8/16-bit lanes (`i32x4.extract_lane_s` is not valid wasm), the
+  integer `VecMin`/`VecMax` now use the unsigned `min_u`/`max_u` to honor
+  the same unsigned contract the x86 lane loop honors, and `i64x2` min/max
+  expand to an extract/compare/select/replace lane walk (wasm has no
+  `i64x2` min/max) over two v128 scratch locals. `VecDiv` already rejected
+  non-float lanes (wasm has no integer vector division). `ShuffleVector`
+  remains unlowered on wasm (`failOp`) but nothing in the pass pipeline
+  emits it, so it does not block vectorized output.
 
 ### 6.3 Verdict
 
@@ -488,12 +508,13 @@ Still open:
 its output is correct-by-construction for the constant-trip widening case,
 with a conservative reject list instead of the old semantic holes (F1-F5).
 The backend now has a width-aware 128-bit SSE floor with gated AVX
-promotion, vector memory ops, and extract/insert/shuffle lowering. What a
-full implementation still needs, in order: canonical loop form (§5.2, G17)
-so sunk exit tests and rotations stop disqualifying loops, runtime trip
-counts + scalar epilogue (remainder loops), horizontal reductions with a
-vector accumulator phi, runtime alias versioning, a profitability model —
-plus SLP for straight-line code (G16).
+promotion, vector memory ops, and extract/insert/shuffle lowering.
+Integer reductions widen through a vector accumulator phi with a horizontal
+exit combine (§6.1). What a full implementation still needs, in order:
+canonical loop form (§5.2, G17) so sunk exit tests and rotations stop
+disqualifying loops, runtime trip counts + scalar epilogue (remainder
+loops), runtime alias versioning, a profitability model — plus SLP for
+straight-line code (G16).
 
 ---
 
@@ -536,7 +557,7 @@ row 1 lands, and row 3 needs the loop form of row 2.
 |---|---|---|---|---|---|
 | R1 | Optimizer correctness sweep | Pipeline cannot converge; several passes are dead or unsafe, so optimization results are unverifiable | `mem2reg.crl:494-517` (UAF/double-free), `validate.crl:286` vs `wallvm.crl:144-155` (ran-vs-changed contract), `branch_inversion.crl:26-27`, `idempotent.crl:64-80,107-120`, `branch_factoring.crl:179`, `lex_canon.crl:200-210`, `select_to_branch.crl:52-53`, `memory_ssa.crl:385-387` (E1) | days | converging fixpoint, 5 passes that can actually fire, honest pipeline slots |
 | R2 | Loop substrate: canonical form + indvars-lite + placement | Every loop pass (and the future vectorizer) re-derives structure today; G10 keeps loop scalars in memory | new `passes/loop_canon.crl` (rotate + LCSSA + dedicated exits) inserted in L2/L3 before licm (`wallvm.crl:224,261`); mem2reg loop promotion behind an lsra fix (G10/G13); move `irPassUnroll` from the structure lane into the lane (`wallvm.crl:318`); LICM safety `licm.crl:379-400` | medium | unroll/interchange/distribute/macro-fusion all start firing; trip counts become computable |
-| R3 | Real vectorization (with E3) | The defining -O3 feature; backend + constant-trip widening landed 2026-10-09, remaining work builds on them | DONE: vector memory ops + width discipline in `x86_64_base.crl`, pass reworked (`simd_vec.crl` §6.1); remaining on top of R2's loop form: runtime trip counts, scalar epilogue, horizontal reductions, runtime alias check, cost model, then SLP | large | vector-width throughput on dense loops; retire or wire `avx.crl` |
+| R3 | Real vectorization (with E3) | The defining -O3 feature; backend + constant-trip widening + integer reductions landed 2026-10-09, remaining work builds on them | DONE: vector memory ops + width discipline in `x86_64_base.crl`, pass reworked (`simd_vec.crl` §6.1); remaining on top of R2's loop form: runtime trip counts, scalar epilogue, runtime alias check, cost model, then SLP | large | vector-width throughput on dense loops; retire or wire `avx.crl` |
 | R4 | CFG hygiene: simplifycfg + PRE + reassociate | CFG passes that exist cannot fire; two more do not exist (G14/G15) | new `passes/simplifycfg.crl` (empty-block fold, common-tail, branch-to-empty) run early in each lane; PRE inside `gvn.crl:244`; real chain sort in `lex_canon.crl:200` | medium | instruction count and branch quality across all code, plus fixes orphaned by jump_thread |
 | R5 | Module layer: ipscp + bottom-up inline + globaldce | G7 — the entire interprocedural tier is absent | new module stage in `irCompile` (`wallvm.crl:417`), resurrect `ipa_cp.crl:281-289` | medium-large | cross-function constants, dead-code elimination at module scope |
 
