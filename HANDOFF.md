@@ -10,6 +10,13 @@
 
 ## Completed this session
 
+## Session tick summary 2026-10-09 (wallvm SIMD: backend vector wave + simd_vec widening rework)
+Backend wave + windows.crl landed in 616cda2 (user committed); the simd_vec rework + doc updates below are UNCOMMITTED at handoff. Verify = check_crl.py PASS + gas-form assembly via system gcc + greps; no compiler runs (PORTING_RULES §0.5).
+- **x86_64_base.crl vector emitters** (4914 lines): width-aware `emitLoadWidth`/`emitStoreWidth` (vec/float → movdqu/movd/movq, fixes wrapped-paren slot bug + mem→mem via xmm0/xmm1, spilled int via r10, spilled float via xmm15); `rspSlotText`/`sibText`/`addrFor(r11 reload)`; dispatch arms VecAdd/Sub/Mul/Div/Min/Max/Broadcast + NEW ExtractElement/InsertElement/ShuffleVector; helpers sinkF, emitVecTwoOp (SSE copy+fold, VEX 3-op only when w>128 && avxReady), emitVecBinOp/FloatBinOp (pd/ps by elem width), emitBcastDword, emitBroadcast (vpbroadcastd/q + SSE shufps/shufpd/punpck paths), emitVecLaneOp (signed idiv lane loop with rax/rdx push/pop), emitVecMinMax (unsigned contract), emitShuffle, emitExtractElem/emitInsertElem (SIB dynamic idx, window roundtrips); `_ymmbuf[4][16]` scratch. Operand convention: bare dynamic regs, `%` only in hand-written literals.
+- **windows.crl**: sse/sse2/sse3/ssse3/sse41/sse42 flags added (was missing → SSE emitters dead on Windows target).
+- **simd_vec.crl rework (821 lines, uncommitted)** — F1-F5 from landscape §6.2 fixed: real widening vectorizer. Loops via `irLoopDetectNatural`; IV = header phi (0 outside, Add(phi,1) from latch, phi actually used by the step); exit compare = single-use `phi < const` as header/latch terminator (latch must re-enter on true); side-effect scan over ALL loop blocks incl. atomics; candidates anywhere in loop: single-consumer phi-indexed Gep chain ending in phi-indexed store, other operand const/invariant or a second phi-indexed same-type load; store-once claims; uniform elemBits per loop; read-only `verifyWidening` gate audits every in-loop IV user + every claimed-GEP user (kills leftovers/side-ifs/early exits); then vector Load at GEP result (NOT the old pointer-splat broadcast), vec ops anchored at the op (multi-block dominance), store at scalar store's position, neuter→Noret (transient; peephole fixpoint erases before final validate), widen via interned constInt operand REPLACE (never mutates shared consts). Reductions dropped (F4 type mixing — horizontal reduction = follow-up); signed int min/max stay scalar. Known scope: constant bounds only, no remainder loop, no cost model, no runtime alias check, wasm has no vector Load lowering.
+- **optimization-landscape.md §6/E3/R3 updated** to the reworked state (F1-F6,F8 resolved; F7 avx.crl wire-or-delete still open).
+
 ## Session tick summary 2026-10-08 (char=utf32, headers→link libc, local static, const prescan)
 All verified below; committed with this file.
 - **`char` is UTF-32 (user directive — char literal ≠ `char` type)**: sema `intWidth(Char)` = 32 (was 8); codegen tyStr `Char` → `uint32_t` (never C `char`; the slice literal must be NUL-free — len 8 not 9); CharLit fallback cast `(char)N` → `(uint32_t)N`; `str` stays a byte view → `strPtrType()` = `Pointer(Const(U8))` (was `Pointer(Const(Char))`). Probes green: `sizeof(char)==4`, codepoint roundtrip `(char)128512`.
@@ -379,3 +386,20 @@ import(lib) std::text {
 - `self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "allocTypeSlot failed (type table full)");` type table being ull is a result of bad management and naivety. dooes it ever happpen in cpp or c?
 - the addition of an @default() function, to set the default vals for a type.
 - implementation od #[[generator(debug, cmp, ..)]] 
+-
+-
+```crl
+  struct this
+  {
+    i32 goo, moo;
+
+    this new(i32 a, i32 b) { return this { .goo = a, .moo = b };
+  }
+
+  pub i32 main()
+  {
+      // c is an i32 here from type inference
+      var c = this::new(2, 3).goo; // where we access the item from the static method or something
+  }
+
+```

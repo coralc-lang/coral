@@ -420,84 +420,80 @@ each other.
 
 ### 6.1 What the pass does
 
-`irPassAutoVectorize` (`simd_vec.crl:867`) is wired into L3 only
-(`wallvm.crl:270`). Per function it finds loops by a layout-order back-edge
-heuristic (`simd_vec.crl:180-193`), analyzes header+latch for an induction
-phi, and matches six patterns — elementwise load-op-store, load-store copy,
-broadcast-mul, sum reduction, min/max reduction (`simd_vec.crl:21-29`). On a
-match it inserts `VecBroadcast` + `Vec*` ops next to the scalar chain,
-neuters the scalar store into `Noret` (`simd_vec.crl:777-784`), and relies on
-its own peephole sweep to delete the dead scalar chain
-(`simd_vec.crl:817-864`).
+`irPassAutoVectorize` (`simd_vec.crl`) is wired into L3 only
+(`wallvm.crl:289`). Reworked 2026-10-09 as a constant-trip-count widening
+vectorizer: loops come from `irLoopDetectNatural` (dominator-based, shared
+with unroll/licm/loopcse), the induction variable must be a header phi fed
+0 from outside and stepped by one from the latch, and the exit test must be
+a `phi < const` compare feeding the header or latch terminator with a bound
+divisible by the vector width (`analyzeLoop`). Candidates are searched in
+every loop block; each must be a phi-indexed `Gep(_, i)` chain with a
+single consumer ending in a phi-indexed store of its own, and every other
+operand of the op must be a constant or loop invariant (`findCandidates`).
+A read-only gate then audits every in-loop use of the IV and every user of
+a claimed GEP so no scalar leftover survives at the widened step
+(`verifyWidening`). On success the pass emits vector-typed `Load`s at the
+GEP results, `Vec*` ops, stores at the scalar store's position, neuters the
+scalar store into the transient `Noret` marker, widens the increment via an
+interned `constInt` operand replacement (never mutating shared constants),
+and sweeps the dead scalar chain with a fixpoint peephole.
 
 ### 6.2 Findings
 
-- **F1 — it is not loop vectorization.** The loop is never widened: the
-  IV step stays 1 element, there is no body replication by the vector width,
-  no trip-count/width interaction (`chooseVectorWidth` picks lanes purely
-  from element size, `simd_vec.crl:558-568`), no scalar remainder
-  handling, no runtime alias check, and no cost model at all —
-  `applyVectorization` transforms each candidate unconditionally
-  (`simd_vec.crl:599-629`). Even if every emitted instruction were
-  correct, the loop would still do one element per iteration; throughput
-  cannot improve. There is no SLP either (G16).
-- **F2 — candidates are only searched in the header block.**
-  `findCandidates` iterates `header->ninsts` exclusively
-  (`simd_vec.crl:288-291`); real loop bodies are separate blocks in
-  canonical form, so only degenerate single-block loops ever match.
-- **F3 — the "vector load" is a splat of the pointer.** The pass emits
-  `VecBroadcast` with the base address of the GEP as its operand
-  (`simd_vec.crl:636-640,681-687,726-730`), commented "Create vector load".
-  But `VecBroadcast` means *splat a value*: the x86 emitter does
-  `vbroadcastss src` from a register (`x86_64_base.crl:3374-3398`) and wasm
-  emits `<ty>.splat` (`wasm.crl:1673-1680`). There is **no vector load
-  opcode at all** in `base/irOps.crl:68-79` — so the emitted IR splats the
-  address bits instead of loading elements. On AVX2 the source is a GPR
-  (`getRegForValue` of a pointer), which `vbroadcastss %rax` cannot even
-  encode.
-- **F4 — reductions mix scalar and vector types.** The reduction transform
-  feeds the scalar accumulator phi and a vector load into a `Vec*` op and
-  then `replaceAllUses` the result of the scalar op with the vector-typed value
-  (`simd_vec.crl:800-815`), so the phi and its users change type
-  mid-function. The comment defers the horizontal-reduction lowering to "the
-  backend", which has no such lowering.
-- **F5 — the side-effect safety scan skips header and latch.**
-  `analyzeLoop` excludes `header` and `latch` when checking for
-  calls/atomics/fences (`simd_vec.crl:261-278`) — the two blocks that always
-  exist — so a call in the latch does not disqualify the loop.
-- **F6 — backend vector emission ignores width.** `emitVecBinOp` /
-  `emitVecFloatBinOp` promote xmm→ymm and emit 256-bit ops whenever AVX2/AVX
-  is enabled (`x86_64_base.crl:3311-3324,3345-3357`) with no check that the
-  vector type is 256 bits wide; `xmmToYmm` just renames the register string
-  (`x86_64_base.crl:3289-3304`). A `<4 x i32>` op writes garbage into the
-  upper 128 bits. `tyVector` stores width 0 (`irtypes.crl:726`), and
-  `emitStoreWidth` switches on `type->width` with `case 16 → movw` and
-  `default → movq` (`x86_64_base.crl:1316-1345`) — a vector store therefore
-  emits an 8-byte `movq` regardless of the real size of the vector
-  (`irTypeSizeOf` knows better: `irtypes.crl:795`).
+Resolved 2026-10-09 (pass rework + backend vector wave):
+
+- **F1 — it is not loop vectorization.** RESOLVED: the increment is widened
+  1→VF (`applyVectorization`), so each iteration covers a full vector; the
+  bound divisibility check replaces the absent trip-count/width interaction.
+  Still absent (follow-ups): runtime trip counts (constant bounds only),
+  scalar remainder loops, cost model, runtime alias versioning, SLP.
+- **F2 — candidates are only searched in the header block.** RESOLVED:
+  `findCandidates` walks `lp->blocks`, the full dominator-derived loop
+  membership.
+- **F3 — the "vector load" is a splat of the pointer.** RESOLVED: the pass
+  emits `Load` with the vector result type at the GEP result address; the
+  backend lowers it via the width-aware `emitLoadWidth` (`movdqu`/`movd`/
+  `movq`).
+- **F4 — reductions mix scalar and vector types.** RESOLVED by removal:
+  sum/min/max reduction patterns are no longer generated; a horizontal
+  reduction with a vector accumulator phi is a follow-up. Signed integer
+  min/max stay scalar (the backend VecMin/VecMax contract is unsigned).
+- **F5 — the side-effect safety scan skips header and latch.** RESOLVED:
+  the scan covers every block in `lp->blocks` and additionally rejects
+  AtomicLoad/AtomicRmw/AtomicCmpXchg, not just AtomicStore/Fence/Call.
+- **F6 — backend vector emission ignores width.** RESOLVED (backend wave):
+  `emitLoadWidth`/`emitStoreWidth` are width-aware (`movdqu` for >64-bit,
+  `movd`/`movq` below); xmm→ymm promotion is gated on AVX2 + 256-bit
+  operand width (`emitVecTwoOp`). The old "`tyVector` stores width 0" claim
+  was stale: `irtypes.crl:726` stores `elem->width * count` in bits.
+- **F8 — opcode coverage is one-way.** RESOLVED: `ExtractElement`,
+  `InsertElement` and `ShuffleVector` have x86-64 emitters and dispatch
+  arms (SSE shuffle forms, SIB dynamic lanes, window roundtrips).
+
+Still open:
+
 - **F7 — `avx.crl` is a dead file.** All 272 lines of
   `target/x86_64/avx.crl` (256/512-bit emitters, gather, FMA helpers) are
   imported by nothing — zero references outside the file; only
   `generic.crl:23-24,72-73` sets `features.avx`. The inline xmm→ymm
   promotion in `x86_64_base.crl` duplicates a subset of it. Either wire it
   deliberately or delete it.
-- **F8 — opcode coverage is one-way.** The IR has `ShuffleVector` and the
-  emitter handles it (`x86_64_base.crl:2315`), but `ExtractElement` /
-  `InsertElement` exist in the IR and are handled only by wasm — on x86-64
-  they fall into the silent comment arm (pipeline-gaps G28), so any
-  extract/insert a future vectorizer emits is dropped from the binary.
+- **Wasm vector gap.** The wasm backend has no vector-typed `Load`/`Store`
+  lowering, so L3 vectorized functions will not lower for the wasm target;
+  x86-64 is the only supported target for this pass's output today.
 
 ### 6.3 Verdict
 
-`simd_vec` scores 1: wired, active at -O3, and its output is semantically
-wrong (F3/F4) while being performance-neutral at best (F1/F2). The backend
-has a usable 128-bit SSE floor and partial AVX promotion, but no vector
-memory ops, no width discipline, and no reduction lowering. A real
-implementation needs, in order: vector load/store opcodes (or GEP-based
-loads feeding extract/shuffle) + width-aware emission (F6), a canonical
-loop form (§5.2, G17), then a proper loop vectorizer: trip-count/width
-analysis, runtime alias versioning, scalar epilogue, and a profitability
-model — plus SLP for straight-line code (G16).
+`simd_vec` scores 4: wired, active at -O3, and since the 2026-10-09 rework
+its output is correct-by-construction for the constant-trip widening case,
+with a conservative reject list instead of the old semantic holes (F1-F5).
+The backend now has a width-aware 128-bit SSE floor with gated AVX
+promotion, vector memory ops, and extract/insert/shuffle lowering. What a
+full implementation still needs, in order: canonical loop form (§5.2, G17)
+so sunk exit tests and rotations stop disqualifying loops, runtime trip
+counts + scalar epilogue (remainder loops), horizontal reductions with a
+vector accumulator phi, runtime alias versioning, a profitability model —
+plus SLP for straight-line code (G16).
 
 ---
 
@@ -518,13 +514,11 @@ model — plus SLP for straight-line code (G16).
   gives them a legal shape, they give the rotated loops macro-fusion and
   branch-chain friendliness (G31). One infrastructure change unlocks three
   currently-dead passes.
-- **E3 — vector memory ops as the thin end of the wedge.** Adding
-  `VecLoad`/`VecStore` (or vector-typed GEP loads) with width-aware
-  `emitStoreWidth`/`emitLoadWidth` and fixing `xmmToYmm` gating (F6) is a
-  contained backend change that (a) makes even the current broken `simd_vec`
-  output honest or loudly rejected, (b) unblocks future loop vectorization
-  and memset/memcpy idiom lowering (G16), and (c) resolves the fate of the
-  dead `avx.crl` (F7) — wire or delete, consciously.
+- **E3 — vector memory ops as the thin end of the wedge.** DONE 2026-10-09
+  (a)+(b): vector-typed `Load`/`Store` lower through width-aware
+  `emitLoadWidth`/`emitStoreWidth`, `xmmToYmm` is gated on AVX2 + 256-bit
+  width, and the reworked `simd_vec` emits them (§6.1). Remaining from (c):
+  the dead `avx.crl` (F7) still needs its wire-or-delete decision.
 - **E4 — resurrect `ipa_cp` as the module-layer beachhead.** The pass
   structure exists (`ipa_cp.crl:44-281`), the driver has no module stage
   (G7) — a minimal module pass that propagates constants into/through
@@ -542,7 +536,7 @@ row 1 lands, and row 3 needs the loop form of row 2.
 |---|---|---|---|---|---|
 | R1 | Optimizer correctness sweep | Pipeline cannot converge; several passes are dead or unsafe, so optimization results are unverifiable | `mem2reg.crl:494-517` (UAF/double-free), `validate.crl:286` vs `wallvm.crl:144-155` (ran-vs-changed contract), `branch_inversion.crl:26-27`, `idempotent.crl:64-80,107-120`, `branch_factoring.crl:179`, `lex_canon.crl:200-210`, `select_to_branch.crl:52-53`, `memory_ssa.crl:385-387` (E1) | days | converging fixpoint, 5 passes that can actually fire, honest pipeline slots |
 | R2 | Loop substrate: canonical form + indvars-lite + placement | Every loop pass (and the future vectorizer) re-derives structure today; G10 keeps loop scalars in memory | new `passes/loop_canon.crl` (rotate + LCSSA + dedicated exits) inserted in L2/L3 before licm (`wallvm.crl:224,261`); mem2reg loop promotion behind an lsra fix (G10/G13); move `irPassUnroll` from the structure lane into the lane (`wallvm.crl:318`); LICM safety `licm.crl:379-400` | medium | unroll/interchange/distribute/macro-fusion all start firing; trip counts become computable |
-| R3 | Real vectorization (with E3) | The defining -O3 feature; the current pass is worse than nothing | backend first: `base/irOps.crl:68-79` (VecLoad/VecStore), `x86_64_base.crl:1316-1345,3306-3398` (width discipline); then replace `passes/simd_vec.crl` on top of R2's loop form: cost model, runtime alias check, scalar epilogue, then SLP | large | vector-width throughput on dense loops; retire or wire `avx.crl` |
+| R3 | Real vectorization (with E3) | The defining -O3 feature; backend + constant-trip widening landed 2026-10-09, remaining work builds on them | DONE: vector memory ops + width discipline in `x86_64_base.crl`, pass reworked (`simd_vec.crl` §6.1); remaining on top of R2's loop form: runtime trip counts, scalar epilogue, horizontal reductions, runtime alias check, cost model, then SLP | large | vector-width throughput on dense loops; retire or wire `avx.crl` |
 | R4 | CFG hygiene: simplifycfg + PRE + reassociate | CFG passes that exist cannot fire; two more do not exist (G14/G15) | new `passes/simplifycfg.crl` (empty-block fold, common-tail, branch-to-empty) run early in each lane; PRE inside `gvn.crl:244`; real chain sort in `lex_canon.crl:200` | medium | instruction count and branch quality across all code, plus fixes orphaned by jump_thread |
 | R5 | Module layer: ipscp + bottom-up inline + globaldce | G7 — the entire interprocedural tier is absent | new module stage in `irCompile` (`wallvm.crl:417`), resurrect `ipa_cp.crl:281-289` | medium-large | cross-function constants, dead-code elimination at module scope |
 
