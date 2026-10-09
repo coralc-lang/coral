@@ -7,7 +7,7 @@
 
 mod id = import "../coral-ast/id";
 import id { SourceLoc };
-import id { Str, NodeId };
+import id { Str, NodeId, locFile };
 mod types_mod = import "../coral-ast/types";
 import types_mod { Ty, TypeEntry, TypeKind };
 mod node_mod = import "../coral-ast/node";
@@ -32,6 +32,10 @@ mod mono_mod = import "../coral-mono/mono";
 import mono_mod { MonoContext, MonoSubstitution, MonoInstance, MonoInstanceKind };
 mod sema_mod = import "../coral-semantics/sema";
 import sema_mod { Sema };
+mod scope_mod = import "../coral-semantics/scope";
+import scope_mod { Symbol, ScopeStack };
+mod diag_engine_mod = import "../coral-diagnostics/engine";
+import diag_engine_mod { DiagnosticEngine };
 
 extern("C") usize strlen(u8* s);
 extern("C") rawptr malloc(usize size);
@@ -175,6 +179,13 @@ pub struct Codegen
     u32* declCacheIds;
     u32* declCacheTags;
     u32 declCacheLen;
+
+    /* names bound in the current function (params, locals, loop/pattern
+     * binds) — Ident refs to these stay raw, everything else goes
+     * through cgResolveRef → cgMangle */
+    Str* localNames;
+    u32 localNamesLen;
+    u32 localNamesCap;
 
     Slice* regNames;
     u32 regLen;
@@ -328,6 +339,443 @@ Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
     return stTail(&cg.tybuf, st);
 }
 
+/* ── name mangling (coral-docs/mangle_asm.md; C keeps the `__
+ *      separator instead of asm's `$`) ───────────────────────────
+ *
+ *   crl__<scope>__<seg…>[__<alias>]__<name>
+ *
+ * scope: `lib` for files under a lib/ tree, `loc` otherwise.
+ * segs: lib → the path under lib/ (package root first); loc → the
+ * parent-directory name, then the file stem. extern decls, `main`,
+ * and CRT passthrough names emit raw. */
+
+/* one path segment restricted to [A-Za-z0-9_]; a leading digit gets
+ * a `_` prefix so every piece stays a valid C identifier fragment */
+void cgMangleSeg(Stream* s, u8* p, usize len)
+{
+    if (p == null || len == 0) return;
+    usize i = 0;
+    while (i < len)
+    {
+        u8 c = p[i];
+        bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                  (c >= 48 && c <= 57) || c == 95;
+        if (!ok) c = 95;
+        if (i == 0 && c >= 48 && c <= 57) stCh(s, 95);
+        stCh(s, c);
+        i = i + 1;
+    }
+}
+
+/* declaring name of a decl — 0 for nameless kinds (Import, Extend, …) */
+Str cgDeclOwnName(Decl* dd)
+{
+    Str dn = 0;
+    switch (dd.kind.tag)
+    {
+        DeclKind::Func => { dn = dd.kind.payload.Func.name; },
+        DeclKind::Struct => { dn = dd.kind.payload.Struct.name; },
+        DeclKind::Enum => { dn = dd.kind.payload.Enum.name; },
+        DeclKind::Variant => { dn = dd.kind.payload.Variant.name; },
+        DeclKind::Union => { dn = dd.kind.payload.Union.name; },
+        DeclKind::TypeAlias => { dn = dd.kind.payload.TypeAlias.name; },
+        DeclKind::Distinct => { dn = dd.kind.payload.Distinct.name; },
+        DeclKind::Constant => { dn = dd.kind.payload.Constant.name; },
+        else => {},
+    }
+    return dn;
+}
+
+/* extern decls, `main`, and CRT passthrough names keep their raw C
+ * spelling (externs bind system symbols; main is the entry point) */
+bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
+{
+    if (name.ptr == null || name.len == 0) return true;
+    if (slEqU8(name, (u8*)"main", 4)) return true;
+    if (cgIsCrtFn(0, name)) return true;
+    if (declId.index != 0)
+    {
+        Node* n = cgNode(cg, declId);
+        if (n.kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &n.kind.payload.Decl.value;
+            if (dd.kind.tag == DeclKind::Func && (dd.kind.payload.Func.flags & 2) != 0) return true;
+            if (dd.kind.tag == DeclKind::Constant && (dd.kind.payload.Constant.flags & 2) != 0) return true;
+        }
+    }
+    return false;
+}
+
+/* mangled spelling: path segments from the declaring file, then an
+ * optional import alias, then the declaring name — built into a fresh
+ * arena stream so nested calls never clobber each other's tails */
+Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
+{
+    if (cgMangleExempt(cg, declId, name)) return name;
+    u8* path = null;
+    usize pathLen = 0;
+    if (declId.index != 0 && cg.sema != null && cg.sema.diag != null)
+    {
+        Node* n = cgNode(cg, declId);
+        u32 fid = locFile(n->loc);
+        if (fid < cg.sema.diag.fileCount && cg.sema.diag.filePaths[fid] != null)
+        {
+            path = cg.sema.diag.filePaths[fid];
+            pathLen = cg.sema.diag.filePathLens[fid];
+        }
+    }
+    /* drop a trailing ".crl" */
+    if (pathLen >= 4 && path[pathLen - 4] == 46 && path[pathLen - 3] == 99 &&
+        path[pathLen - 2] == 114 && path[pathLen - 1] == 108)
+        pathLen = pathLen - 4;
+    Stream s = stNew(cg.arena, 96);
+    stP(&s, "crl__");
+    /* a "/lib/" anywhere (or a leading "lib/") → lib + path under lib/ */
+    bool isLib = false;
+    usize libPos = 0;
+    if (pathLen >= 4 && path[0] == 108 && path[1] == 105 && path[2] == 98 && path[3] == 47)
+    {
+        isLib = true;
+        libPos = 4;
+    }
+    usize q = 0;
+    while (!isLib && q + 5 <= pathLen)
+    {
+        if (path[q] == 47 && path[q + 1] == 108 && path[q + 2] == 105 &&
+            path[q + 3] == 98 && path[q + 4] == 47)
+        {
+            isLib = true;
+            libPos = q + 5;
+        }
+        q = q + 1;
+    }
+    if (isLib)
+    {
+        stP(&s, "lib__");
+        usize i = libPos;
+        usize segStart = i;
+        bool firstSeg = true;
+        while (i <= pathLen)
+        {
+            if (i == pathLen || path[i] == 47)
+            {
+                if (i > segStart)
+                {
+                    if (!firstSeg) { stCh(&s, 95); stCh(&s, 95); }
+                    cgMangleSeg(&s, path + segStart, i - segStart);
+                    firstSeg = false;
+                }
+                segStart = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+    else
+    {
+        stP(&s, "loc__");
+        /* the last '/' splits the parent dir from the file stem */
+        usize lastSlash = pathLen;
+        usize i = 0;
+        while (i < pathLen)
+        {
+            if (path[i] == 47) lastSlash = i;
+            i = i + 1;
+        }
+        usize prevSlash = 0;
+        i = 0;
+        while (i < lastSlash)
+        {
+            if (path[i] == 47) prevSlash = i + 1;
+            i = i + 1;
+        }
+        bool firstSeg = true;
+        if (lastSlash < pathLen && lastSlash > prevSlash)
+        {
+            cgMangleSeg(&s, path + prevSlash, lastSlash - prevSlash);
+            firstSeg = false;
+        }
+        usize stemStart = pathLen;
+        if (lastSlash < pathLen) stemStart = lastSlash + 1;
+        if (pathLen > stemStart)
+        {
+            if (!firstSeg) { stCh(&s, 95); stCh(&s, 95); }
+            cgMangleSeg(&s, path + stemStart, pathLen - stemStart);
+        }
+    }
+    if (alias != 0)
+    {
+        Slice a = cgIntern(cg, alias);
+        stCh(&s, 95);
+        stCh(&s, 95);
+        cgMangleSeg(&s, a.ptr, a.len);
+    }
+    stCh(&s, 95);
+    stCh(&s, 95);
+    cgMangleSeg(&s, name.ptr, name.len);
+    return stTail(&s, 0);
+}
+
+/* Str wrapper — exempt names keep the keyword escape */
+Slice cgMangle(Codegen* cg, NodeId declId, Str name, Str alias)
+{
+    if (name == 0) return cgIdent(cg, name);
+    if (cgMangleExempt(cg, declId, cgIntern(cg, name))) return cgIdent(cg, name);
+    return cgMangleS(cg, declId, cgIntern(cg, name), alias);
+}
+
+/* file-preferred decl lookup: match in refFile first, else the first
+ * candidate (cgFindDecl's unqualified behaviour when refFile == 0) */
+NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
+{
+    if (refFile == 0 || cg.file == null || name == 0) return cgFindDecl(cg, name, tag);
+    NodeId first;
+    first.index = 0;
+    u32 i = 0;
+    while (i < cg.file.declsLen)
+    {
+        Node* d = cg.ctx->nodes + cg.file.decls[i].index;
+        if (d.kind.tag == NodeKind::Decl && d.kind.payload.Decl.value.kind.tag == tag)
+        {
+            Decl* dd = &d.kind.payload.Decl.value;
+            if (cgDeclOwnName(dd) == name)
+            {
+                if (locFile(d->loc) == refFile) return cg.file.decls[i];
+                if (first.index == 0) first = cg.file.decls[i];
+            }
+        }
+        i = i + 1;
+    }
+    return first;
+}
+
+/* resolve a plain-name reference the way sema did: the innermost
+ * binding visible at refSite; *outAlias receives the use-site name when
+ * it differs from the declaration's own (import `as` rename). A found
+ * binding of the wrong kind shadows any outer decl → returns 0 (the
+ * caller then emits the raw local name). wantKind 0 = Func or Constant. */
+NodeId cgResolveRef(Codegen* cg, Str localName, u32 wantKind, NodeId refSite, Str* outAlias)
+{
+    NodeId none;
+    none.index = 0;
+    *outAlias = 0;
+    if (localName == 0) return none;
+    u32 refFile = 0;
+    if (refSite.index != 0)
+    {
+        Node* rn = cgNode(cg, refSite);
+        refFile = locFile(rn->loc);
+    }
+    if (cg.sema != null && cg.sema.scopes != null)
+    {
+        /* bind the receiver: a nested chain (`cg.sema.scopes.m(...)`)
+         * lowers as field access — single-level receivers are fine */
+        ScopeStack* scopes = cg.sema.scopes;
+        Symbol* sym = scopes.lookupFrom(localName, refFile);
+        if (sym != null)
+        {
+            if (sym->declaration.index == 0) return none;
+            Node* sn = cgNode(cg, sym->declaration);
+            if (sn.kind.tag != NodeKind::Decl) return none;
+            Decl* sd = &sn.kind.payload.Decl.value;
+            bool ok = false;
+            if (wantKind == 0)
+                ok = sd.kind.tag == DeclKind::Func || sd.kind.tag == DeclKind::Constant;
+            else if ((u32)sd.kind.tag == wantKind) ok = true;
+            if (!ok) return none;
+            Str own = cgDeclOwnName(sd);
+            if (own != 0 && localName != own) *outAlias = localName;
+            return sym->declaration;
+        }
+    }
+    /* no scope binding (or no sema): fall back to a file-preferred scan */
+    NodeId d = cgFindDeclFrom(cg, localName, wantKind == 0 ? (u32)DeclKind::Func : wantKind, refFile);
+    if (d.index == 0 && wantKind == 0)
+        d = cgFindDeclFrom(cg, localName, (u32)DeclKind::Constant, refFile);
+    return d;
+}
+
+/* ── the current function's bound names (locals stay raw) ────── */
+
+void cgAddLocal(Codegen* cg, Str name)
+{
+    if (name == 0) return;
+    u32 i = 0;
+    while (i < cg.localNamesLen)
+    {
+        if (cg.localNames[i] == name) return;
+        i = i + 1;
+    }
+    if (cg.localNamesLen >= cg.localNamesCap)
+    {
+        u32 nc = cg.localNamesCap == 0 ? 16 : cg.localNamesCap * 2;
+        Str* np = (Str*)realloc((rawptr)cg.localNames, (usize)nc * 4);
+        if (np == null) return;
+        cg.localNames = np;
+        cg.localNamesCap = nc;
+    }
+    cg.localNames[cg.localNamesLen] = name;
+    cg.localNamesLen = cg.localNamesLen + 1;
+}
+
+bool cgIsLocalName(Codegen* cg, Str name)
+{
+    u32 i = 0;
+    while (i < cg.localNamesLen)
+    {
+        if (cg.localNames[i] == name) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+/* ── method-decl resolution (owner_method → the method's own decl) ── */
+
+bool cgSliceEq(Slice a, Slice b)
+{
+    if (a.len != b.len) return false;
+    if (a.len == 0) return true;
+    if (a.ptr == null || b.ptr == null) return false;
+    usize i = 0;
+    while (i < a.len)
+    {
+        if (a.ptr[i] != b.ptr[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
+{
+    NodeId none;
+    none.index = 0;
+    if (methods == null || methName == 0) return none;
+    u32 m = 0;
+    while (m < mlen)
+    {
+        Node* mn = cgNode(cg, methods[m]);
+        if (mn.kind.tag == NodeKind::Decl && mn.kind.payload.Decl.value.kind.tag == DeclKind::Func &&
+            mn.kind.payload.Decl.value.kind.payload.Func.name == methName)
+            return methods[m];
+        m = m + 1;
+    }
+    return none;
+}
+
+/* the method's declaring node for an owner spelling — the type's own
+ * methods plus every extend whose owner text matches (cgEmitMethodSet /
+ * cgEmitInstMethodList compose the same `owner_method` base) */
+NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
+{
+    NodeId none;
+    none.index = 0;
+    if (owner.len == 0 || methName == 0 || cg.file == null) return none;
+    u32 i = 0;
+    while (i < cg.file.declsLen)
+    {
+        Node* d = cg.ctx->nodes + cg.file.decls[i].index;
+        if (d.kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d.kind.payload.Decl.value;
+            if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union ||
+                dd.kind.tag == DeclKind::Variant || dd.kind.tag == DeclKind::Extend ||
+                dd.kind.tag == DeclKind::ExtendTrait)
+            {
+                /* generic extends never match a concrete owner textually,
+                 * and cgDeclOwner would tyStr an unresolved TypeParam */
+                bool eligible = true;
+                if (dd.kind.tag == DeclKind::Extend || dd.kind.tag == DeclKind::ExtendTrait)
+                    if (cgOwnerGeneric(cg, dd)) eligible = false;
+                if (eligible && cgSliceEq(cgDeclOwner(cg, dd), owner))
+                {
+                    NodeId* methods = null;
+                    u32 mlen = 0;
+                    switch (dd.kind.tag)
+                    {
+                        DeclKind::Struct => { methods = dd.kind.payload.Struct.methods; mlen = dd.kind.payload.Struct.methodsLen; },
+                        DeclKind::Union => { methods = dd.kind.payload.Union.methods; mlen = dd.kind.payload.Union.methodsLen; },
+                        DeclKind::Variant => { methods = dd.kind.payload.Variant.methods; mlen = dd.kind.payload.Variant.methodsLen; },
+                        DeclKind::Extend => { methods = dd.kind.payload.Extend.methods; mlen = dd.kind.payload.Extend.methodsLen; },
+                        DeclKind::ExtendTrait => { methods = dd.kind.payload.ExtendTrait.methods; mlen = dd.kind.payload.ExtendTrait.methodsLen; },
+                        else => {},
+                    }
+                    NodeId hit = cgMethodsContain(cg, methods, mlen, methName);
+                    if (hit.index != 0) return hit;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    /* monomorphised owner (`Foo_int32_t`): the instance's type decl plus
+     * every extend its self type matches — mirrors cgEmitInstanceMethods */
+    if (cg.mono != null)
+    {
+        i = 0;
+        while (i < cg.mono.instancesLen)
+        {
+            MonoInstance* inst = cg.mono.instances + i;
+            if (inst.kind == MonoInstanceKind::TypeInstance &&
+                cgSliceEq(cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), owner))
+            {
+                Node* dn = cgNode(cg, inst.declaration);
+                if (dn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* td = &dn.kind.payload.Decl.value;
+                    NodeId* methods = null;
+                    u32 mlen = 0;
+                    switch (td.kind.tag)
+                    {
+                        DeclKind::Struct => { methods = td.kind.payload.Struct.methods; mlen = td.kind.payload.Struct.methodsLen; },
+                        DeclKind::Union => { methods = td.kind.payload.Union.methods; mlen = td.kind.payload.Union.methodsLen; },
+                        DeclKind::Variant => { methods = td.kind.payload.Variant.methods; mlen = td.kind.payload.Variant.methodsLen; },
+                        else => {},
+                    }
+                    NodeId hit = cgMethodsContain(cg, methods, mlen, methName);
+                    if (hit.index != 0) return hit;
+                }
+                u32 d = 0;
+                while (d < cg.file.declsLen)
+                {
+                    Node* dn2 = cgNode(cg, cg.file.decls[d]);
+                    if (dn2.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* xd = &dn2.kind.payload.Decl.value;
+                        bool matches = false;
+                        if (xd.kind.tag == DeclKind::Extend)
+                            matches = cgSelfTyMatches(cg, xd.kind.payload.Extend.selfType, inst.name, inst.arguments, inst.argumentsLen);
+                        else if (xd.kind.tag == DeclKind::ExtendTrait)
+                            matches = cgSelfTyMatches(cg, xd.kind.payload.ExtendTrait.selfType, inst.name, inst.arguments, inst.argumentsLen);
+                        if (matches)
+                        {
+                            NodeId* em = null;
+                            u32 eml = 0;
+                            if (xd.kind.tag == DeclKind::Extend) { em = xd.kind.payload.Extend.methods; eml = xd.kind.payload.Extend.methodsLen; }
+                            else { em = xd.kind.payload.ExtendTrait.methods; eml = xd.kind.payload.ExtendTrait.methodsLen; }
+                            NodeId hit2 = cgMethodsContain(cg, em, eml, methName);
+                            if (hit2.index != 0) return hit2;
+                        }
+                    }
+                    d = d + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return none;
+}
+
+/* the method's declaring node for a receiver type (unwraps ptr/const) */
+NodeId cgFindMethodDecl(Codegen* cg, Ty recvTy, Str methName)
+{
+    NodeId none;
+    none.index = 0;
+    if (recvTy == 0 || methName == 0) return none;
+    Ty t = cgTyUnwrap(cg, cgSubstTy(cg, recvTy));
+    if (t != 0 && (cg.ctx->types + t)->kind.tag == TypeKind::Pointer)
+        t = cgTyUnwrap(cg, (cg.ctx->types + t)->kind.payload.Pointer.base);
+    if (t == 0) return none;
+    return cgFindMethodDeclOwner(cg, cgOwnerName(cg, t), methName);
+}
+
 /* true when a value expression has type str */
 bool cgIsStrTy(Codegen* cg, NodeId id)
 {
@@ -472,18 +920,21 @@ NodeId cgFindVariantOfTy(Codegen* cg, Ty t, Str variantName, u32* outIdx)
 /* Resolve the callee of a call: plain name for non-generic functions,
  * mangled instance name for generic ones. Sets *outRet to the concrete
  * return type. Returns null slice when the declaration is unknown. */
-Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet, bool* found)
+Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 argsLen,
+                     Ty* outRet, bool* found, NodeId* outDecl)
 {
     *found = false;
     *outRet = 0;
-    NodeId declId = cgFindDecl(cg, name, (u32)DeclKind::Func);
+    if (outDecl != null) { outDecl->index = 0; }
     if (declId.index == 0) return Slice::from(null, 0);
     Node* ddn = cgNode(cg, declId);
     Decl* dd = &ddn.kind.payload.Decl.value;
+    if (ddn.kind.tag != NodeKind::Decl || dd.kind.tag != DeclKind::Func) return Slice::from(null, 0);
+    if (outDecl != null) *outDecl = declId;
     if (cg.mono == null || cg.mono.genericCount(declId) == 0) {
         *found = true;
         *outRet = dd.kind.payload.Func.returnType;
-        return cgIdent(cg, name);
+        return cgMangle(cg, declId, dd.kind.payload.Func.name, alias);
     }
     /* generic: pick the mono instance whose collected argument types match */
     u32 total = 0;
@@ -529,13 +980,88 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     MonoInstance* p = cg.mono.instances + pick;
     *found = true;
     *outRet = p.returnType;
-    return cgInstanceName(cg, p.name, p.arguments, p.argumentsLen);
+    return cgMangleS(cg, p.declaration,
+                     cgInstanceName(cg, p.name, p.arguments, p.argumentsLen), alias);
+}
+
+Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet, bool* found, NodeId refSite, NodeId* outDecl)
+{
+    *found = false;
+    *outRet = 0;
+    if (outDecl != null) { outDecl->index = 0; }
+    Str alias = 0;
+    NodeId declId = cgResolveRef(cg, name, (u32)DeclKind::Func, refSite, &alias);
+    Slice r = cgCallFromDecl(cg, declId, alias, args, argsLen, outRet, found, outDecl);
+    if (*found) return r;
+    /* the scope binding (or file preference) pointed at a generic
+     * template with no usable instance — any non-generic decl of the
+     * same name still emits (matches the pre-mangling decl-order pick) */
+    if (cg.file != null && name != 0)
+    {
+        u32 q = 0;
+        while (q < cg.file.declsLen)
+        {
+            NodeId qid = cg.file.decls[q];
+            Node* dnq = cg.ctx->nodes + qid.index;
+            if (dnq.kind.tag == NodeKind::Decl)
+            {
+                Decl* ddq = &dnq.kind.payload.Decl.value;
+                if (ddq.kind.tag == DeclKind::Func && ddq.kind.payload.Func.name == name &&
+                    !cgDeclIsGeneric(cg, qid))
+                {
+                    return cgCallFromDecl(cg, qid, 0, args, argsLen, outRet, found, outDecl);
+                }
+            }
+            q = q + 1;
+        }
+    }
+    return r;
+}
+
+/* fileId of the file a module import path points at — the path joined
+ * with '/' (+ ".crl") must be a suffix of the file's own path (lib files
+ * carry extra platform segments in between) */
+u32 cgFileForModulePath(Codegen* cg, Str path)
+{
+    if (path == 0 || cg.sema == null || cg.sema.diag == null) return 0;
+    Slice p = cgIntern(cg, path);
+    if (p.len == 0 || cg.sema.diag.fileCount == 0) return 0;
+    Stream s = stNew(cg.arena, 64);
+    usize i = 0;
+    while (i < p.len)
+    {
+        if (i + 1 < p.len && p.ptr[i] == 58 && p.ptr[i + 1] == 58) { stCh(&s, '/'); i = i + 2; }
+        else { stCh(&s, p.ptr[i]); i = i + 1; }
+    }
+    bool hasCrl = s.len >= 4 && s.p[s.len - 4] == 46 && s.p[s.len - 3] == 99 &&
+                  s.p[s.len - 2] == 114 && s.p[s.len - 1] == 108;
+    if (!hasCrl) stP(&s, ".crl");
+    if (s.len == 0) return 0;
+    u32 f = 0;
+    while (f < cg.sema.diag.fileCount)
+    {
+        u8* fp = cg.sema.diag.filePaths[f];
+        usize fl = cg.sema.diag.filePathLens[f];
+        if (fp != null && fl >= s.len)
+        {
+            bool ok = true;
+            usize j = 0;
+            while (j < s.len)
+            {
+                if (fp[fl - s.len + j] != s.p[j]) { ok = false; break; }
+                j = j + 1;
+            }
+            if (ok) return f;
+        }
+        f = f + 1;
+    }
+    return 0;
 }
 
 /* Name for an explicit-generic call `f<T>(...)`: the mono instance bound to
  * the callee's generic arguments. Null slice when no instance matches;
  * *outDecl always receives the callee's declaration when found. */
-Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool* found, NodeId* outDecl)
+Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool* found, NodeId* outDecl, NodeId refSite)
 {
     *found = false;
     *outRet = 0;
@@ -551,9 +1077,40 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
             glen = ne->kind.payload.Named.genericArgsLen;
         }
     }
-    /* match mono instances by NAME + arguments first: the name may be
-     * ambiguous across merged files (libc's extern realloc vs mman's
-     * realloc<T>), and only the declaring file's decl owns the instance */
+    /* the declaring file's decl owns the instance (the name may be
+     * ambiguous across merged files: libc's extern realloc vs mman's
+     * realloc<T>) — resolve through sema like every other reference */
+    Str alias = 0;
+    NodeId declId = cgResolveRef(cg, fname, (u32)DeclKind::Func, refSite, &alias);
+    if (declId.index != 0 && cg.mono != null && cg.sema != null && glen > 0)
+    {
+        u32 i = 0;
+        while (i < cg.mono.instancesLen)
+        {
+            MonoInstance* inst = cg.mono.instances + i;
+            if (inst.kind == MonoInstanceKind::FunctionInstance && inst.declaration.index == declId.index &&
+                inst.argumentsLen == glen)
+            {
+                bool ok = true;
+                u32 k = 0;
+                while (k < glen)
+                {
+                    if (!cg.sema.sameType(inst.arguments[k], gargs[k])) { ok = false; break; }
+                    k = k + 1;
+                }
+                if (ok)
+                {
+                    *found = true;
+                    *outRet = inst.returnType;
+                    if (outDecl != null) *outDecl = inst.declaration;
+                    return cgMangleS(cg, inst.declaration,
+                                     cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), alias);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    /* unresolved decl: fall back to a name+args instance scan (no alias) */
     if (cg.mono != null && cg.sema != null && glen > 0)
     {
         u32 i = 0;
@@ -575,40 +1132,14 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
                     *found = true;
                     *outRet = inst.returnType;
                     if (outDecl != null) *outDecl = inst.declaration;
-                    return cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                    return cgMangleS(cg, inst.declaration,
+                                     cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
                 }
             }
             i = i + 1;
         }
     }
-    NodeId declId = cgFindDecl(cg, fname, (u32)DeclKind::Func);
-    if (outDecl != null) *outDecl = declId;
-    if (cg.mono != null && cg.sema != null && declId.index != 0 && glen > 0)
-    {
-        u32 i = 0;
-        while (i < cg.mono.instancesLen)
-        {
-            MonoInstance* inst = cg.mono.instances + i;
-            if (inst.kind == MonoInstanceKind::FunctionInstance && inst.declaration.index == declId.index &&
-                inst.argumentsLen == glen)
-            {
-                bool ok = true;
-                u32 k = 0;
-                while (k < glen)
-                {
-                    if (!cg.sema.sameType(inst.arguments[k], gargs[k])) { ok = false; break; }
-                    k = k + 1;
-                }
-                if (ok)
-                {
-                    *found = true;
-                    *outRet = inst.returnType;
-                    return cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
-                }
-            }
-            i = i + 1;
-        }
-    }
+    if (declId.index != 0 && outDecl != null) *outDecl = declId;
     return Slice::from(null, 0);
 }
 
@@ -1291,7 +1822,30 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Ident => {
-            stPS(&cg.ebuf, cgIdent(cg, e.kind.payload.Ident.name));
+            Str nm = e.kind.payload.Ident.name;
+            if (!cgIsLocalName(cg, nm))
+            {
+                Str alias = 0;
+                NodeId rd = cgResolveRef(cg, nm, 0, id, &alias);
+                if (rd.index != 0)
+                {
+                    Node* rn = cgNode(cg, rd);
+                    if (rn.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* rdd = &rn.kind.payload.Decl.value;
+                        if (rdd.kind.tag == DeclKind::Func || rdd.kind.tag == DeclKind::Constant)
+                        {
+                            Str own = cgDeclOwnName(rdd);
+                            if (own != 0)
+                            {
+                                stPS(&cg.ebuf, cgMangle(cg, rd, own, alias));
+                                return stTail(&cg.ebuf, es);
+                            }
+                        }
+                    }
+                }
+            }
+            stPS(&cg.ebuf, cgIdent(cg, nm));
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Path => {
@@ -1598,8 +2152,47 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     /* resolve through the declaration: the C name is the
                        function's own name (flat), not `module_fn` */
                     Str s1name = s1->kind.payload.Expr.value.kind.payload.Ident.name;
-                    fdecl = cgFindDecl(cg, s1name, (u32)DeclKind::Func);
-                    calleeText = cgResolveCall(cg, s1name, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
+                    if (!resolved)
+                    {
+                        /* qualified member: try the module's own file first —
+                         * lookupFrom prefers the reference site's file, which
+                         * for `libc::realloc` points at the wrong (generic)
+                         * decl */
+                        Str root = s0->kind.payload.Expr.value.kind.payload.Ident.name;
+                        if (cg.sema != null && cg.sema.scopes != null)
+                        {
+                            u32 refF = 0;
+                            if (id.index != 0)
+                            {
+                                Node* rn2 = cgNode(cg, id);
+                                refF = locFile(rn2->loc);
+                            }
+                            ScopeStack* scopes2 = cg.sema.scopes;
+                            Symbol* rsym = scopes2.lookupFrom(root, refF);
+                            if (rsym != null && rsym->kind == 5 && rsym->declaration.index != 0)
+                            {
+                                Node* imn = cgNode(cg, rsym->declaration);
+                                if (imn.kind.tag == NodeKind::Decl)
+                                {
+                                    Decl* imd = &imn.kind.payload.Decl.value;
+                                    Str mpath = 0;
+                                    if (imd.kind.tag == DeclKind::Import) mpath = imd.kind.payload.Import.path;
+                                    else if (imd.kind.tag == DeclKind::ModReexport) mpath = imd.kind.payload.ModReexport.path;
+                                    u32 mf = cgFileForModulePath(cg, mpath);
+                                    if (mf != 0)
+                                    {
+                                        NodeId md = cgFindDeclFrom(cg, s1name, (u32)DeclKind::Func, mf);
+                                        if (md.index != 0)
+                                            calleeText = cgCallFromDecl(cg, md, 0, e.kind.payload.Call.args,
+                                                                        e.kind.payload.Call.argsLen,
+                                                                        &rty, &resolved, &fdecl);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!resolved)
+                        calleeText = cgResolveCall(cg, s1name, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved, id, &fdecl);
                     if (resolved) {
                         retTy = tyStr(cg, cgSubstTy(cg, rty));
                     } else {
@@ -1617,7 +2210,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     /* `mod::f<T>(...)` — explicit generic args on the last segment */
                     calleeText = cgResolveGenericCall(cg, s1->kind.payload.Expr.value.kind.payload.TypeRef.name,
                                                       s1->kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
-                                                      &rty, &resolved, &fdecl);
+                                                      &rty, &resolved, &fdecl, id);
                     if (resolved) {
                         retTy = tyStr(cg, cgSubstTy(cg, rty));
                     } else {
@@ -1631,12 +2224,17 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     /* static method on a generic instance: `Foo<i32>::new(...)` —
                        <instance>_<method>, matching cgEmitInstMethodList */
                     Ty ownerTy = s0->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
+                    Str s1name2 = s1->kind.payload.Expr.value.kind.payload.Ident.name;
                     Slice owner = cgOwnerName(cg, ownerTy);
                     usize cs2 = cg.ebuf.len;
                     stPS(&cg.ebuf, owner);
                     stCh(&cg.ebuf, '_');
-                    stPS(&cg.ebuf, cgIntern(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name));
-                    calleeText = stTail(&cg.ebuf, cs2);
+                    stPS(&cg.ebuf, cgIntern(cg, s1name2));
+                    Slice rawCallee = stTail(&cg.ebuf, cs2);
+                    NodeId mdecl = cgFindMethodDeclOwner(cg, owner, s1name2);
+                    if (mdecl.index != 0) calleeText = cgMangleS(cg, mdecl, rawCallee, 0);
+                    else calleeText = rawCallee;
+                    fdecl = mdecl;
                     retTy = cgResultTy(cg, id, e);
                 }
                 else
@@ -1650,7 +2248,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                    instance for the callee's generic arguments */
                 calleeText = cgResolveGenericCall(cg, cn.kind.payload.Expr.value.kind.payload.TypeRef.name,
                                                   cn.kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
-                                                  &rty, &resolved, &fdecl);
+                                                  &rty, &resolved, &fdecl, id);
                 if (resolved) {
                     retTy = tyStr(cg, cgSubstTy(cg, rty));
                 } else {
@@ -1660,8 +2258,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             }
             else if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                 Str fname = cn.kind.payload.Expr.value.kind.payload.Ident.name;
-                fdecl = cgFindDecl(cg, fname, (u32)DeclKind::Func);
-                calleeText = cgResolveCall(cg, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved);
+                calleeText = cgResolveCall(cg, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved, id, &fdecl);
                 if (resolved) {
                     retTy = tyStr(cg, cgSubstTy(cg, rty));
                 } else {
@@ -1780,7 +2377,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&cg.ebuf, owner);
                 stCh(&cg.ebuf, '_');
                 stPS(&cg.ebuf, cgIntern(cg, methName));
-                callee = stTail(&cg.ebuf, cs);
+                Slice rawCallee = stTail(&cg.ebuf, cs);
+                /* resolve the method's own decl for file-correct mangling
+                   (def side: cgEmitMethodSet composes the same base) */
+                NodeId mdecl = cgFindMethodDecl(cg, rawRecvTy, methName);
+                if (mdecl.index != 0) callee = cgMangleS(cg, mdecl, rawCallee, 0);
+                else callee = rawCallee;
             }
 
             Slice argTexts = Slice::from(null, 0);
@@ -1842,7 +2444,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.StaticCall.typeName));
             stCh(&cg.ebuf, '_');
             stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.StaticCall.method));
-            Slice callee = stTail(&cg.ebuf, cs);
+            Slice rawCallee = stTail(&cg.ebuf, cs);
+            NodeId smdecl = cgFindMethodDeclOwner(cg, cgIntern(cg, e.kind.payload.StaticCall.typeName),
+                                                  e.kind.payload.StaticCall.method);
+            Slice callee;
+            if (smdecl.index != 0) callee = cgMangleS(cg, smdecl, rawCallee, 0);
+            else callee = rawCallee;
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
@@ -2309,6 +2916,28 @@ Slice cgLvalue(Codegen* cg, NodeId id)
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, es);
             }
+            if (!cgIsLocalName(cg, iname))
+            {
+                Str alias = 0;
+                NodeId rd = cgResolveRef(cg, iname, 0, id, &alias);
+                if (rd.index != 0)
+                {
+                    Node* rn = cgNode(cg, rd);
+                    if (rn.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* rdd = &rn.kind.payload.Decl.value;
+                        if (rdd.kind.tag == DeclKind::Func || rdd.kind.tag == DeclKind::Constant)
+                        {
+                            Str own = cgDeclOwnName(rdd);
+                            if (own != 0)
+                            {
+                                stPS(&cg.ebuf, cgMangle(cg, rd, own, alias));
+                                return stTail(&cg.ebuf, es);
+                            }
+                        }
+                    }
+                }
+            }
             stPS(&cg.ebuf, cgIdent(cg, iname));
             return stTail(&cg.ebuf, es);
         },
@@ -2650,6 +3279,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
                                         stCh(&cg.body, ';');
                                         bindNames[bindCount] = fname;
                                         bindCount = bindCount + 1;
+                                        cgAddLocal(cg, fname);
                                     }
                                     ff = ff + 1;
                                 }
@@ -2882,6 +3512,7 @@ void cgStmt(Codegen* cg, NodeId id)
             Str name = s.kind.payload.VarDecl.name;
             Ty ty = s.kind.payload.VarDecl.typeNode;
             NodeId init = s.kind.payload.VarDecl.init;
+            cgAddLocal(cg, name);
             Slice tyText;
             if (ty != 0) tyText = tyStr(cg, ty);
             else if (init.index != 0) {
@@ -3141,6 +3772,7 @@ void cgStmt(Codegen* cg, NodeId id)
             stCh(&cg.body, ';');
 
             /* bind */
+            cgAddLocal(cg, s.kind.payload.ForIn.bindName);
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, elemTy);
             stCh(&cg.body, ' ');
@@ -3472,6 +4104,23 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     cg.tempsLen = 0;
     cg.loopDepth = 0;
     cg.ind = 1;
+    /* bound names: fresh set per function — params and `self` are
+     * locals (Ident refs to them stay raw) */
+    cg.localNamesLen = 0;
+    if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern((u8*)"self", 4));
+    {
+        u32 pi = 0;
+        while (pi < dd.kind.payload.Func.paramsLen)
+        {
+            Node* pn = cgNode(cg, dd.kind.payload.Func.params[pi]);
+            if (pn.kind.tag == NodeKind::Param)
+            {
+                Param* p = &pn.kind.payload.Param.value;
+                cgAddLocal(cg, p->name);
+            }
+            pi = pi + 1;
+        }
+    }
     NodeId bodyId = dd.kind.payload.Func.body;
     Node* bn = cgNode(cg, bodyId);
     if (bn.kind.tag == NodeKind::Stmt && bn.kind.payload.Stmt.value.kind.tag == StmtKind::Block)
@@ -3597,6 +4246,62 @@ void cgEmitFwd(Codegen* cg)
     }
 }
 
+/* import `as` alias refs mangle as `path__alias__name` — map each one
+ * back to the canonical `path__name` definition. Exempt names (main,
+ * CRT, extern) never carry the alias segment at the use site, and types
+ * are not mangled yet, so only Func/Constant pairs (plus their
+ * monomorphised instances) need a bridge. */
+void cgEmitAliasBridges(Codegen* cg)
+{
+    if (cg.sema == null) return;
+    u32 i = 0;
+    while (i < cg.sema.aliasLen)
+    {
+        Str alias = cg.sema.aliasNames[i];
+        NodeId declId = cg.sema.aliasDecls[i];
+        i = i + 1;
+        if (alias == 0 || declId.index == 0) continue;
+        Node* n = cgNode(cg, declId);
+        if (n.kind.tag != NodeKind::Decl) continue;
+        Decl* dd = &n.kind.payload.Decl.value;
+        if (dd.kind.tag != DeclKind::Func && dd.kind.tag != DeclKind::Constant) continue;
+        Str own = cgDeclOwnName(dd);
+        if (own == 0) continue;
+        if (cgMangleExempt(cg, declId, cgIntern(cg, own))) continue;
+        if (dd.kind.tag == DeclKind::Func && cgDeclIsGeneric(cg, declId))
+        {
+            if (cg.mono == null) continue;
+            u32 j = 0;
+            while (j < cg.mono.instancesLen)
+            {
+                MonoInstance* inst = cg.mono.instances + j;
+                if (inst.kind == MonoInstanceKind::FunctionInstance &&
+                    inst.declaration.index == declId.index)
+                {
+                    Slice inm = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                    if (!cgMangleExempt(cg, declId, inm))
+                    {
+                        stP(&cg.fwd, "#define ");
+                        stPS(&cg.fwd, cgMangleS(cg, declId, inm, alias));
+                        stP(&cg.fwd, " ");
+                        stPS(&cg.fwd, cgMangleS(cg, declId, inm, 0));
+                        stP(&cg.fwd, "\n");
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        else
+        {
+            stP(&cg.fwd, "#define ");
+            stPS(&cg.fwd, cgMangle(cg, declId, own, alias));
+            stP(&cg.fwd, " ");
+            stPS(&cg.fwd, cgMangle(cg, declId, own, 0));
+            stP(&cg.fwd, "\n");
+        }
+    }
+}
+
 void cgEmitEnumDef(Codegen* cg, Decl* dd)
 {
     stP(&cg.defs, "typedef enum {\n");
@@ -3668,7 +4373,7 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
 }
 
 /* `T name` / `T name[len]` at file scope (C puts array bounds after the name) */
-void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
+void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Slice name)
 {
     if (cty != 0 && (cg.ctx->types + cty)->kind.tag == TypeKind::Array)
     {
@@ -3677,7 +4382,7 @@ void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
             et = (cg.ctx->types + et)->kind.payload.Array.base;
         stPS(&cg.defs, tyStr(cg, et));
         stCh(&cg.defs, ' ');
-        stPS(&cg.defs, cgIdent(cg, name));
+        stPS(&cg.defs, name);
         Ty w = cty;
         while ((cg.ctx->types + w)->kind.tag == TypeKind::Array)
         {
@@ -3690,7 +4395,7 @@ void cgEmitGlobalDeclarator(Codegen* cg, Ty cty, Str name)
     }
     stPS(&cg.defs, tyStr(cg, cty));
     stCh(&cg.defs, ' ');
-    stPS(&cg.defs, cgIdent(cg, name));
+    stPS(&cg.defs, name);
 }
 
 /* file-scope initializer value: brace literals stay inline (temp
@@ -3965,13 +4670,13 @@ void cgEmitGlobals(Codegen* cg)
                 {
                     /* extern variable: declaration only */
                     stP(&cg.defs, "extern ");
-                    cgEmitGlobalDeclarator(cg, cty, cname);
+                    cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg.file.decls[i], cname, 0));
                     stP(&cg.defs, ";\n");
                 }
                 else
                 {
                     if ((cflags & 4) != 0) stP(&cg.defs, "static ");
-                    cgEmitGlobalDeclarator(cg, cty, cname);
+                    cgEmitGlobalDeclarator(cg, cty, cgMangle(cg, cg.file.decls[i], cname, 0));
                     if (cval.index != 0)
                     {
                         bool isArray = cty != 0 &&
@@ -4176,7 +4881,7 @@ void cgEmitMethodSet(Codegen* cg, Decl* dd, bool withBodies)
                 stPS(&cg.tybuf, owner);
                 stCh(&cg.tybuf, '_');
                 stPS(&cg.tybuf, cgIntern(cg, md.kind.payload.Func.name));
-                Slice cname = stTail(&cg.tybuf, ns);
+                Slice cname = cgMangleS(cg, mid, stTail(&cg.tybuf, ns), 0);
                 u8 flags = md.kind.payload.Func.flags;
                 if (withBodies)
                 {
@@ -4231,7 +4936,7 @@ void cgEmitInstMethodList(Codegen* cg, NodeId* methods, u32 mlen, Slice m, MonoI
                 stPS(&cg.tybuf, m);
                 stCh(&cg.tybuf, '_');
                 stPS(&cg.tybuf, cgIntern(cg, md.kind.payload.Func.name));
-                Slice cname = stTail(&cg.tybuf, ns);
+                Slice cname = cgMangleS(cg, mid, stTail(&cg.tybuf, ns), 0);
                 u8 flags = md.kind.payload.Func.flags;
                 if (withBodies)
                 {
@@ -4303,7 +5008,7 @@ void cgEmitProtos(Codegen* cg)
                 if (cgDeclIsGeneric(cg, id)) { i = i + 1; continue; }
                 /* emit prototypes for ALL extern fns too — the system
                  * headers are gone, so coral's own decl is the only one */
-                cgEmitProto(cg, id, cgIdent(cg, dd.kind.payload.Func.name),
+                cgEmitProto(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),
                             dd.kind.payload.Func.returnType, null, null, 0, Slice::from(null, 0));
             }
             else if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union ||
@@ -4323,7 +5028,8 @@ void cgEmitProtos(Codegen* cg)
             MonoInstance* inst = cg.mono.instances + i;
             if (inst.kind == MonoInstanceKind::FunctionInstance)
             {
-                Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                Slice m = cgMangleS(cg, inst.declaration,
+                                    cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
                 cgEmitProto(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
                             inst.substitutions, inst.substitutionsLen, Slice::from(null, 0));
             }
@@ -4356,7 +5062,7 @@ void cgEmitBodies(Codegen* cg)
             {
                 u8 flags = dd.kind.payload.Func.flags;
                 if ((flags & 8) != 0 && (flags & 2) == 0 && !cgDeclIsGeneric(cg, id))
-                    cgEmitFuncCommon(cg, id, cgIdent(cg, dd.kind.payload.Func.name),
+                    cgEmitFuncCommon(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),
                                      dd.kind.payload.Func.returnType, null, null, 0,
                                      Slice::from(null, 0), (flags & 4) != 0 ? 1 : 0);
             }
@@ -4381,7 +5087,8 @@ void cgEmitBodies(Codegen* cg)
                 Decl* dd = &idn.kind.payload.Decl.value;
                 if ((dd.kind.payload.Func.flags & 8) != 0 && (dd.kind.payload.Func.flags & 2) == 0)
                 {
-                    Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                    Slice m = cgMangleS(cg, inst.declaration,
+                                        cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
                     cgEmitFuncCommon(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
                                      inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0);
                 }
@@ -4435,6 +5142,9 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     }
     cg.labelSeq = 0;
     cg.tempSeq = 0;
+    cg.localNames = null;
+    cg.localNamesLen = 0;
+    cg.localNamesCap = 0;
     cg.tempsCap = 4096;
     cg.tempsLen = 0;
     cg.tempTys = (Slice*)arena.alloc(4096 * @sizeof(Slice), 8);
@@ -4456,6 +5166,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     }
 
     cgEmitFwd(&cg);
+    cgEmitAliasBridges(&cg);
     cgEmitTypeDefs(&cg);
     cgEmitProtos(&cg);
     {

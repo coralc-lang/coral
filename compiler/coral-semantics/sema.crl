@@ -35,6 +35,12 @@ pub struct Sema
     u32* directFiles;
     u32 directLen;
     u32 directCap;
+    /* import `as` renames: local alias → the aliased declaration, so the
+     * backend can bridge `path__alias__name` refs to `path__name` */
+    Str* aliasNames;
+    NodeId* aliasDecls;
+    u32 aliasLen;
+    u32 aliasCap;
 }
 
 pub extend Sema
@@ -69,6 +75,10 @@ pub extend Sema
         self.directFiles = null;
         self.directLen = 0;
         self.directCap = 0;
+        self.aliasNames = null;
+        self.aliasDecls = null;
+        self.aliasLen = 0;
+        self.aliasCap = 0;
     }
 
     void deinit()
@@ -81,18 +91,22 @@ pub extend Sema
         if (self.extends != null) free((rawptr)self.extends);
         if (self.directNames != null) free((rawptr)self.directNames);
         if (self.directFiles != null) free((rawptr)self.directFiles);
+        if (self.aliasNames != null) free((rawptr)self.aliasNames);
+        if (self.aliasDecls != null) free((rawptr)self.aliasDecls);
         self.scopes = null;
         self.ctx = null;
         self.currentReturnType = 0;
         self.errors = 0;
         self.extends = null;
-        self.extendsLen = 0;
-        self.extendsCap = 0;
         self.diag = null;
         self.directNames = null;
         self.directFiles = null;
         self.directLen = 0;
         self.directCap = 0;
+        self.aliasNames = null;
+        self.aliasDecls = null;
+        self.aliasLen = 0;
+        self.aliasCap = 0;
     }
 
     /* record a direct (unqualified) import binding — false if this file
@@ -121,6 +135,33 @@ pub extend Sema
         self.directFiles[self.directLen] = fileId;
         self.directLen = self.directLen + 1;
         return true;
+    }
+
+    /* record an import `as` rename — dedup by (alias, decl) */
+    void addAliasPair(Str alias, NodeId declId)
+    {
+        if (alias == 0 || declId.index == 0) return;
+        u32 i = 0;
+        while (i < self.aliasLen)
+        {
+            if (self.aliasNames[i] == alias && self.aliasDecls[i].index == declId.index) return;
+            i = i + 1;
+        }
+        if (self.aliasLen >= self.aliasCap)
+        {
+            u32 newCap = 16;
+            if (self.aliasCap != 0) newCap = self.aliasCap * 2;
+            Str* n1 = (Str*)realloc((rawptr)self.aliasNames, (usize)newCap * 4);
+            if (n1 == null) return;
+            self.aliasNames = n1;
+            NodeId* n2 = (NodeId*)realloc((rawptr)self.aliasDecls, (usize)newCap * 4);
+            if (n2 == null) return;
+            self.aliasDecls = n2;
+            self.aliasCap = newCap;
+        }
+        self.aliasNames[self.aliasLen] = alias;
+        self.aliasDecls[self.aliasLen] = declId;
+        self.aliasLen = self.aliasLen + 1;
     }
 
     void addExtend(NodeId id)
