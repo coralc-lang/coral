@@ -8,7 +8,7 @@ mod arena_mod = import "../coral-build/arena" { Arena };
 mod slice_mod = import "../coral-common/slice" { Slice };
 mod crlb_mod = import "../coral-build/parser" { CrlbParser };
 mod cfg_ast = import "../coral-build/ast" { CrlbNode, CrlbNodeKind, CrlbField };
-mod builder_mod = import "../coral-build/builder" { builderRun, Builder };
+mod builder_mod = import "../coral-build/builder" { builderRunEx, Builder };
 mod args_mod = import "args" { Options, Command, parseArgs, usage };
 mod io_mod = import "io" { readFile, sliceCStr };
 mod map_mod = import "map" { runMap };
@@ -16,6 +16,8 @@ mod compile_mod = import "compile" { compileFile };
 mod explain_mod = import "../coral-diagnostics/explain" { explain };
 
 extern("C") i32 printf(u8* fmt, ...);
+extern("C") i32 write(i32 fd, u8* buf, usize len);
+extern("C") usize strlen(u8* s);
 
 pub i32 main()
 {
@@ -26,6 +28,10 @@ pub i32 main()
     }
     if (opts.help) {
         usage();
+        return 0;
+    }
+    if (opts.version) {
+        printf("coralc 0.1.0-d2 (coral compiler; build driver: known-incomplete)\n");
         return 0;
     }
     if (opts.explainSet) {
@@ -211,7 +217,20 @@ pub i32 main()
     }
 
     Builder b;
-    i32 errs = builderRun(root, &a, opts.force, opts.mapOnly, &b);
-    if (errs == 0) return 0;
-    return 3;
+    b.compilePhaseReached = false;
+    i32 errs = builderRunEx(root, &a, opts.force, opts.mapOnly, opts.dryRun, &b);
+    if (errs != 0) return 3;
+
+    /* honest failure: the builder stops after module discovery + staleness
+     * reporting. If the compile phase never ran, a zero exit would make a
+     * total no-op indistinguishable from a successful build (defect D2). */
+    if (!opts.mapOnly && !b.compilePhaseReached)
+    {
+        u8* msg = "coralc build: build did not reach the compile phase — nothing was compiled (known-incomplete builder)\n";
+        if (opts.force) msg = "coralc build --force: build did not reach the compile phase — nothing was compiled (known-incomplete builder)\n";
+        if (opts.dryRun) msg = "coralc build --dry-run: dry run — the build did not reach the compile phase, nothing was compiled (known-incomplete builder)\n";
+        write(2, msg, strlen(msg));
+        return 5;
+    }
+    return 0;
 }

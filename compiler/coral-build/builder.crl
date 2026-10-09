@@ -381,7 +381,11 @@ pub struct Builder
     u32* topoOrder;
     u32 errors;
     bool force;
+    bool dryRun;
     bool emitMapOnly;
+    /* false until the compile phase actually compiles modules. coralc.crl
+     * refuses to report build success while this is false. */
+    bool compilePhaseReached;
 }
 
 void bError(Builder* b, u8* code, u8* msg, u8* k1, u8* v1, u8* k2, u8* v2, u8* hint)
@@ -400,7 +404,9 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
     b.build = null;
     b.errors = 0;
     b.force = forceIn;
+    b.dryRun = false;
     b.emitMapOnly = emitMapOnlyIn;
+    b.compilePhaseReached = false;
     b.rootDir = Slice::from("", 0);  // root comes from the build file's root field
     b.entry = Slice::from(null, 0);
     b.output = Slice::from(null, 0);
@@ -989,10 +995,11 @@ bool bCheckFp(Builder* b, u32 modIdx)
     return false;
 }
 
-pub i32 builderRun(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn, Builder* out)
+pub i32 builderRunEx(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn, bool dryRunIn, Builder* out)
 {
     Builder b;
     if (!bInit(&b, a, cfgRoot, forceIn, emitMapOnlyIn)) return b.errors;
+    b.dryRun = dryRunIn;
 
     u32 m = 0;
     while (m < b.modulesLen)
@@ -1007,35 +1014,47 @@ pub i32 builderRun(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn
     if (b.errors > 0) return b.errors;
 
     if (!bValidateAliases(&b)) return b.errors;
-    if (!bWriteMap(&b)) return b.errors;
+    /* a dry run writes nothing: no modules.map, no graph, no cache */
+    if (!dryRunIn && !bWriteMap(&b)) return b.errors;
     if (emitMapOnlyIn)
     {
-        printf("modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+        if (dryRunIn) printf("dry run: modules.map not written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+        else printf("modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
         if (out != null) out[0] = b;
         return b.errors;
     }
-    if (!bFingerprint(&b)) return b.errors;
+    if (forceIn)
+    {
+        /* --force bypasses the fingerprint/staleness computation entirely:
+         * no source walk, no cache read — every module is forced stale. */
+        printf("--force: fingerprint/staleness checks skipped (%d modules forced stale, 0 fresh)\n", (i32)b.modulesLen);
+    }
+    else if (!bFingerprint(&b)) return b.errors;
     if (!bLoadGraph(&b)) return b.errors;
     if (!bTopo(&b)) return b.errors;
-    if (!bWriteGraph(&b)) return b.errors;
+    if (!dryRunIn && !bWriteGraph(&b)) return b.errors;
 
-    // fingerprint pass: fold dep fps into module fps (reverse topo = deps first)
+    // staleness pass: fold dep fps into module fps (reverse topo = deps first)
     u32 i = 0;
     while (i < b.topoLen)
     {
         u32 idx = b.topoOrder[i];
-        u32 d = 0;
-        while (d < b.mods[idx].depsLen)
+        if (!forceIn)
         {
-            u32 dep = b.mods[idx].deps[d];
-            b.mods[idx].fingerprint = bFnv(b.mods[idx].fingerprint, (u8*)&b.mods[dep].fingerprint, 8);
-            d = d + 1;
+            u32 d = 0;
+            while (d < b.mods[idx].depsLen)
+            {
+                u32 dep = b.mods[idx].deps[d];
+                b.mods[idx].fingerprint = bFnv(b.mods[idx].fingerprint, (u8*)&b.mods[dep].fingerprint, 8);
+                d = d + 1;
+            }
+            b.mods[idx].stale = bCheckFp(&b, idx);
         }
-        b.mods[idx].stale = bCheckFp(&b, idx);
         i = i + 1;
     }
 
-    printf("modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+    if (dryRunIn) printf("dry run: modules.map not written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+    else printf("modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
     if (!emitMapOnlyIn)
     {
         i = 0;
@@ -1044,11 +1063,23 @@ pub i32 builderRun(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn
             u32 idx = b.topoOrder[i];
             usize n = 0;
             while (n < b.mods[idx].name.len) { printf("%c", b.mods[idx].name.ptr[n]); n = n + 1; }
-            if (b.mods[idx].stale) printf("  stale\n");
+            if (b.force) printf("  forced-stale\n");
+            else if (b.mods[idx].stale) printf("  stale\n");
             else printf("  fresh\n");
             i = i + 1;
         }
     }
+
+    /* COMPILE PHASE — not implemented (see coral-docs/builder_incomplete.md).
+     * Discovery/staleness reporting is where this run stops: no module is
+     * compiled and no artifact is produced, so compilePhaseReached stays
+     * false and coralc.crl must report the build as failed, not as success. */
     if (out != null) *out = b;
     return b.errors;
+}
+
+// signature kept for `coralc map`; forwards with dryRunIn = false
+pub i32 builderRun(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnlyIn, Builder* out)
+{
+    return builderRunEx(cfgRoot, a, forceIn, emitMapOnlyIn, false, out);
 }
