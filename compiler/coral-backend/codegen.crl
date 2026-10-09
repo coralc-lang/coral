@@ -38,7 +38,6 @@ mod diag_engine_mod = import "../coral-diagnostics/engine";
 import diag_engine_mod { DiagnosticEngine };
 
 extern("C") usize strlen(u8* s);
-extern("C") i64 write(i32 fd, rawptr buf, usize count);
 extern("C") rawptr malloc(usize size);
 extern("C") rawptr realloc(rawptr p, usize size);
 extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
@@ -663,11 +662,25 @@ NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
 /* the method's declaring node for an owner spelling — the type's own
  * methods plus every extend whose owner text matches (cgEmitMethodSet /
  * cgEmitInstMethodList compose the same `owner_method` base) */
+
+/* owner text as the definition side spells it: builtin `str` mangles by
+ * its C typedef name (`_coral_str`), everything else by its ident */
+Slice cgOwnerSpelling(Codegen* cg, Slice owner)
+{
+    if (cgSliceEq(owner, Slice::from((u8*)"str", 3)))
+        return Slice::from((u8*)"_coral_str", 10);
+    return owner;
+}
+
 NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
 {
     NodeId none;
     none.index = 0;
     if (owner.len == 0 || methName == 0 || cg.file == null) return none;
+    /* the builtin `str` type is declared as `extend str` but its methods
+     * mangle by the C typedef name — match the spelling the call site
+     * produced (the coral type name) */
+    owner = cgOwnerSpelling(cg, owner);
     u32 i = 0;
     while (i < cg.file.declsLen)
     {
@@ -1099,56 +1112,6 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
      * realloc<T>) — resolve through sema like every other reference */
     Str alias = 0;
     NodeId declId = cgResolveRef(cg, fname, (u32)DeclKind::Func, refSite, &alias);
-    {
-        write(2, (u8*)"RD", 2);
-        u32 v = declId.index;
-        if (v == 0) { u8 z0 = 48; write(2, &z0, 1); }
-        while (v > 0) { u8 d0 = (u8)(48 + (v % 10)); write(2, &d0, 1); v = v / 10; }
-        write(2, (u8*)"/", 1);
-        u32 cnt = 0;
-        if (cg.mono != null)
-        {
-            u32 zi = 0;
-            while (zi < cg.mono.instancesLen)
-            {
-                if (cg.mono.instances[zi].kind == (u8)MonoInstanceKind::FunctionInstance) cnt = cnt + 1;
-                zi = zi + 1;
-            }
-        }
-        v = cnt;
-        if (v == 0) { u8 z1 = 48; write(2, &z1, 1); }
-        while (v > 0) { u8 d1 = (u8)(48 + (v % 10)); write(2, &d1, 1); v = v / 10; }
-        write(2, (u8*)"\n", 1);
-    }
-    if (glen > 0)
-    {
-        write(2, (u8*)"G", 1);
-        u32 vg = declId.index;
-        if (vg == 0) { u8 zg = 48; write(2, &zg, 1); }
-        while (vg > 0) { u8 dg = (u8)(48 + (vg % 10)); write(2, &dg, 1); vg = vg / 10; }
-        write(2, (u8*)":", 1);
-        u32 ka = 0;
-        while (ka < glen)
-        {
-            if (ka > 0) { write(2, (u8*)",", 1); }
-            u32 va = gargs[ka];
-            if (va == 0) { u8 za = 48; write(2, &za, 1); }
-            while (va > 0) { u8 da = (u8)(48 + (va % 10)); write(2, &da, 1); va = va / 10; }
-            write(2, (u8*)".", 1);
-            TypeEntry* gte = cg.ctx->types + gargs[ka];
-            u32 kt2 = (u32)gte->kind.tag;
-            u8 kd3 = (u8)(48 + (kt2 % 10)); write(2, &kd3, 1);
-            if (kt2 >= 10) { u8 kd4 = (u8)(48 + (kt2 / 10)); write(2, &kd4, 1); }
-            if (gte->kind.tag == TypeKind::Named)
-            {
-                write(2, (u8*)":", 1);
-                Slice nms = cgIntern(cg, gte->kind.payload.Named.name);
-                write(2, nms.ptr, nms.len);
-            }
-            ka = ka + 1;
-        }
-        write(2, (u8*)"\n", 1);
-    }
     if (declId.index != 0 && cg.mono != null && cg.sema != null && glen > 0)
     {
         u32 i = 0;
@@ -1167,17 +1130,6 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
                 }
                 if (ok)
                 {
-                    write(2, (u8*)"OR", 2);
-                    u32 vr = inst.returnType;
-                    if (vr == 0) { u8 zr = 48; write(2, &zr, 1); }
-                    while (vr > 0) { u8 dr = (u8)(48 + (vr % 10)); write(2, &dr, 1); vr = vr / 10; }
-                    write(2, (u8*)".", 1);
-                    if (inst.returnType != 0) {
-                        u32 kt = (u32)(cg.ctx->types + inst.returnType)->kind.tag;
-                        u8 kd = (u8)(48 + (kt % 10)); write(2, &kd, 1);
-                        if (kt >= 10) { u8 kd2 = (u8)(48 + (kt / 10)); write(2, &kd2, 1); }
-                    } else { u8 zq = 48; write(2, &zq, 1); }
-                    write(2, (u8*)"\n", 1);
                     *found = true;
                     *outRet = inst.returnType;
                     if (outDecl != null) *outDecl = inst.declaration;
@@ -1330,12 +1282,6 @@ Slice tyStr(Codegen* cg, Ty t)
         TypeKind::TypeParam => {
             Ty sub = cgSubstTy(cg, t);
             if (sub != t) return tyStr(cg, sub);
-            {
-                Slice pn = cgIntern(cg, k.payload.TypeParam.name);
-                write(2, (u8*)"TP:", 3);
-                write(2, pn.ptr, pn.len);
-                write(2, (u8*)"\n", 1);
-            }
             cgError(cg, (u8*)"unresolved type param in codegen");
             return tyStrPut(cg, Slice::from((u8*)"void*", 5), start);
         },
@@ -1500,31 +1446,6 @@ Slice cgValExprTy(Codegen* cg, NodeId id)
 
 Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
 {
-    if (e.kind.tag == ExprKind::Call)
-    {
-        write(2, (u8*)"CY", 2);
-        u32 v = e.resolvedType;
-        if (v == 0) { u8 z = 48; write(2, &z, 1); }
-        while (v > 0) { u8 dd = (u8)(48 + (v % 10)); write(2, &dd, 1); v = v / 10; }
-        write(2, (u8*)".", 1);
-        Ty rt = e.resolvedType;
-        if (rt != 0) {
-            TypeEntry* te = cg.ctx->types + rt;
-            u32 k = (u32)te->kind.tag;
-            u8 k1 = (u8)(48 + (k % 10)); write(2, &k1, 1);
-            if (k >= 10) { u8 k2 = (u8)(48 + (k / 10)); write(2, &k2, 1); }
-            Ty b = 0;
-            if (te->kind.tag == TypeKind::Pointer) b = te->kind.payload.Pointer.base;
-            else if (te->kind.tag == TypeKind::Const) b = te->kind.payload.Const.base;
-            if (b != 0) {
-                TypeEntry* be = cg.ctx->types + b;
-                u32 bk = (u32)be->kind.tag;
-                u8 b1 = (u8)(48 + (bk % 10)); write(2, &b1, 1);
-                if (bk >= 10) { u8 b2 = (u8)(48 + (bk / 10)); write(2, &b2, 1); }
-            }
-        }
-        write(2, (u8*)"\n", 1);
-    }
     if (e.resolvedType != 0) return tyStr(cg, cgSubstTy(cg, e.resolvedType));
     switch (e.kind.tag)
     {
@@ -1826,6 +1747,7 @@ extern("C") Slice cgExpr(Codegen* cg, NodeId id);
 extern("C") Slice cgLvalue(Codegen* cg, NodeId id);
 extern("C") Slice cgValBody(Codegen* cg, NodeId id);
 extern("C") void cgStmt(Codegen* cg, NodeId id);
+extern("C") Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext);
 
 Slice cgExpr(Codegen* cg, NodeId id)
 {
@@ -2055,12 +1977,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, rs);
         },
         ExprKind::AddressOf => {
-            Slice c = cgLvalue(cg, e.kind.payload.AddressOf.expr);
-            usize rs = cg.ebuf.len;
-            stP(&cg.ebuf, "(&(");
-            stPS(&cg.ebuf, c);
-            stP(&cg.ebuf, "))");
-            return stTail(&cg.ebuf, rs);
+            NodeId oid = e.kind.payload.AddressOf.expr;
+            Slice vt = cgExpr(cg, oid);
+            return cgAddrOfValue(cg, oid, vt);
         },
         ExprKind::Deref => {
             Slice c = cgExpr(cg, e.kind.payload.Deref.expr);
@@ -2241,39 +2160,37 @@ Slice cgExpr(Codegen* cg, NodeId id)
                         }
                     }
                     if (!resolved)
+                    {
+                        /* `Type::method(...)` / `str::fromParts(...)` — the
+                         * head is a struct/extend owner, not a module:
+                         * resolve the method decl through the owner text */
+                        Str rootT = s0->kind.payload.Expr.value.kind.payload.Ident.name;
+                        NodeId sdecl = cgFindMethodDeclOwner(cg, cgIntern(cg, rootT), s1name);
+                        if (sdecl.index != 0 && !cgDeclIsGeneric(cg, sdecl))
+                        {
+                            Node* sdn = cgNode(cg, sdecl);
+                            Decl* sdd = &sdn.kind.payload.Decl.value;
+                            if (sdn.kind.tag == NodeKind::Decl)
+                            {
+                                /* suffix = the same owner+name the def side
+                                 * composes (the C spelling for builtin owners
+                                 * like str → `_coral_str`) */
+                                usize rcs = cg.ebuf.len;
+                                stPS(&cg.ebuf, cgOwnerSpelling(cg, cgIdent(cg, rootT)));
+                                stCh(&cg.ebuf, '_');
+                                stPS(&cg.ebuf, cgIntern(cg, s1name));
+                                calleeText = cgMangleS(cg, sdecl, stTail(&cg.ebuf, rcs), 0);
+                                fdecl = sdecl;
+                                if (sdd.kind.tag == DeclKind::Func)
+                                    rty = sdd.kind.payload.Func.returnType;
+                                resolved = true;
+                            }
+                        }
+                    }
+                    if (!resolved)
                         calleeText = cgResolveCall(cg, s1name, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved, id, &fdecl);
                     if (resolved) {
-                        {
-                                                write(2, (u8*)"RR", 2);
-                                                u32 vr2 = rty;
-                                                if (vr2 == 0) { u8 zr2 = 48; write(2, &zr2, 1); }
-                                                while (vr2 > 0) { u8 dr2 = (u8)(48 + (vr2 % 10)); write(2, &dr2, 1); vr2 = vr2 / 10; }
-                                                write(2, (u8*)".", 1);
-                                                if (rty != 0) {
-                                                    TypeEntry* rr = cg.ctx->types + rty;
-                                                    u32 rk = (u32)rr->kind.tag;
-                                                    u8 r1 = (u8)(48 + (rk % 10)); write(2, &r1, 1);
-                                                    if (rk >= 10) { u8 r2 = (u8)(48 + (rk / 10)); write(2, &r2, 1); }
-                                                    if (rr->kind.tag == TypeKind::Pointer) {
-                                                        TypeEntry* rb = cg.ctx->types + rr->kind.payload.Pointer.base;
-                                                        u32 sbk = (u32)rb->kind.tag;
-                                                        u8 q1 = (u8)(48 + (sbk % 10)); write(2, &q1, 1);
-                                                        if (sbk >= 10) { u8 q2 = (u8)(48 + (sbk / 10)); write(2, &q2, 1); }
-                                                        if (rb->kind.tag == TypeKind::Named) {
-                                                            write(2, (u8*)"[", 1);
-                                                            Slice bn = cgIntern(cg, rb->kind.payload.Named.name);
-                                                            write(2, bn.ptr, bn.len);
-                                                            u32 gl = rb->kind.payload.Named.genericArgsLen;
-                                                            u8 g1 = (u8)(48 + (gl % 10)); write(2, &g1, 1);
-                                                            if (gl >= 10) { u8 g2 = (u8)(48 + (gl / 10)); write(2, &g2, 1); }
-                                                            write(2, (u8*)"]", 1);
-                                                        }
-                                                    }
-                                                }
-                                                write(2, (u8*)"\n", 1);
-                                            }
                                             retTy = tyStr(cg, cgSubstTy(cg, rty));
-                                            write(2, (u8*)"RT\n", 3);
                     } else {
                         usize cs = cg.ebuf.len;
                         stPS(&cg.ebuf, cgIntern(cg, s0->kind.payload.Expr.value.kind.payload.Ident.name));
@@ -2291,37 +2208,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                                                       s1->kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
                                                       &rty, &resolved, &fdecl, id);
                     if (resolved) {
-                        {
-                                                write(2, (u8*)"RR", 2);
-                                                u32 vr2 = rty;
-                                                if (vr2 == 0) { u8 zr2 = 48; write(2, &zr2, 1); }
-                                                while (vr2 > 0) { u8 dr2 = (u8)(48 + (vr2 % 10)); write(2, &dr2, 1); vr2 = vr2 / 10; }
-                                                write(2, (u8*)".", 1);
-                                                if (rty != 0) {
-                                                    TypeEntry* rr = cg.ctx->types + rty;
-                                                    u32 rk = (u32)rr->kind.tag;
-                                                    u8 r1 = (u8)(48 + (rk % 10)); write(2, &r1, 1);
-                                                    if (rk >= 10) { u8 r2 = (u8)(48 + (rk / 10)); write(2, &r2, 1); }
-                                                    if (rr->kind.tag == TypeKind::Pointer) {
-                                                        TypeEntry* rb = cg.ctx->types + rr->kind.payload.Pointer.base;
-                                                        u32 sbk = (u32)rb->kind.tag;
-                                                        u8 q1 = (u8)(48 + (sbk % 10)); write(2, &q1, 1);
-                                                        if (sbk >= 10) { u8 q2 = (u8)(48 + (sbk / 10)); write(2, &q2, 1); }
-                                                        if (rb->kind.tag == TypeKind::Named) {
-                                                            write(2, (u8*)"[", 1);
-                                                            Slice bn = cgIntern(cg, rb->kind.payload.Named.name);
-                                                            write(2, bn.ptr, bn.len);
-                                                            u32 gl = rb->kind.payload.Named.genericArgsLen;
-                                                            u8 g1 = (u8)(48 + (gl % 10)); write(2, &g1, 1);
-                                                            if (gl >= 10) { u8 g2 = (u8)(48 + (gl / 10)); write(2, &g2, 1); }
-                                                            write(2, (u8*)"]", 1);
-                                                        }
-                                                    }
-                                                }
-                                                write(2, (u8*)"\n", 1);
-                                            }
                                             retTy = tyStr(cg, cgSubstTy(cg, rty));
-                                            write(2, (u8*)"RT\n", 3);
                     } else {
                         calleeText = cgExpr(cg, calleeId);
                         retTy = cgResultTy(cg, id, e);
@@ -2359,38 +2246,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                                                   cn.kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
                                                   &rty, &resolved, &fdecl, id);
                 if (resolved) {
-                    {
-                                            write(2, (u8*)"RR", 2);
-                                            u32 vr2 = rty;
-                                            if (vr2 == 0) { u8 zr2 = 48; write(2, &zr2, 1); }
-                                            while (vr2 > 0) { u8 dr2 = (u8)(48 + (vr2 % 10)); write(2, &dr2, 1); vr2 = vr2 / 10; }
-                                            write(2, (u8*)".", 1);
-                                            if (rty != 0) {
-                                                TypeEntry* rr = cg.ctx->types + rty;
-                                                u32 rk = (u32)rr->kind.tag;
-                                                u8 r1 = (u8)(48 + (rk % 10)); write(2, &r1, 1);
-                                                if (rk >= 10) { u8 r2 = (u8)(48 + (rk / 10)); write(2, &r2, 1); }
-                                                if (rr->kind.tag == TypeKind::Pointer) {
-                                                    TypeEntry* rb = cg.ctx->types + rr->kind.payload.Pointer.base;
-                                                    u32 sbk = (u32)rb->kind.tag;
-                                                    u8 q1 = (u8)(48 + (sbk % 10)); write(2, &q1, 1);
-                                                    if (sbk >= 10) { u8 q2 = (u8)(48 + (sbk / 10)); write(2, &q2, 1); }
-
-                                                    if (rb->kind.tag == TypeKind::Named) {
-                                                        write(2, (u8*)"[", 1);
-                                                        Slice bn = cgIntern(cg, rb->kind.payload.Named.name);
-                                                        write(2, bn.ptr, bn.len);
-                                                        u32 gl = rb->kind.payload.Named.genericArgsLen;
-                                                        u8 g1 = (u8)(48 + (gl % 10)); write(2, &g1, 1);
-                                                        if (gl >= 10) { u8 g2 = (u8)(48 + (gl / 10)); write(2, &g2, 1); }
-                                                        write(2, (u8*)"]", 1);
-                                                    }
-                                                }
-                                            }
-                                            write(2, (u8*)"\n", 1);
-                                        }
                                         retTy = tyStr(cg, cgSubstTy(cg, rty));
-                                        write(2, (u8*)"RT\n", 3);
                 } else {
                     calleeText = cgExpr(cg, calleeId);
                     retTy = cgResultTy(cg, id, e);
@@ -2400,38 +2256,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Str fname = cn.kind.payload.Expr.value.kind.payload.Ident.name;
                 calleeText = cgResolveCall(cg, fname, e.kind.payload.Call.args, e.kind.payload.Call.argsLen, &rty, &resolved, id, &fdecl);
                 if (resolved) {
-                    {
-                                            write(2, (u8*)"RR", 2);
-                                            u32 vr2 = rty;
-                                            if (vr2 == 0) { u8 zr2 = 48; write(2, &zr2, 1); }
-                                            while (vr2 > 0) { u8 dr2 = (u8)(48 + (vr2 % 10)); write(2, &dr2, 1); vr2 = vr2 / 10; }
-                                            write(2, (u8*)".", 1);
-                                            if (rty != 0) {
-                                                TypeEntry* rr = cg.ctx->types + rty;
-                                                u32 rk = (u32)rr->kind.tag;
-                                                u8 r1 = (u8)(48 + (rk % 10)); write(2, &r1, 1);
-                                                if (rk >= 10) { u8 r2 = (u8)(48 + (rk / 10)); write(2, &r2, 1); }
-                                                if (rr->kind.tag == TypeKind::Pointer) {
-                                                    TypeEntry* rb = cg.ctx->types + rr->kind.payload.Pointer.base;
-                                                    u32 sbk = (u32)rb->kind.tag;
-                                                    u8 q1 = (u8)(48 + (sbk % 10)); write(2, &q1, 1);
-                                                    if (sbk >= 10) { u8 q2 = (u8)(48 + (sbk / 10)); write(2, &q2, 1); }
-
-                                                    if (rb->kind.tag == TypeKind::Named) {
-                                                        write(2, (u8*)"[", 1);
-                                                        Slice bn = cgIntern(cg, rb->kind.payload.Named.name);
-                                                        write(2, bn.ptr, bn.len);
-                                                        u32 gl = rb->kind.payload.Named.genericArgsLen;
-                                                        u8 g1 = (u8)(48 + (gl % 10)); write(2, &g1, 1);
-                                                        if (gl >= 10) { u8 g2 = (u8)(48 + (gl / 10)); write(2, &g2, 1); }
-                                                        write(2, (u8*)"]", 1);
-                                                    }
-                                                }
-                                            }
-                                            write(2, (u8*)"\n", 1);
-                                        }
                                         retTy = tyStr(cg, cgSubstTy(cg, rty));
-                                        write(2, (u8*)"RT\n", 3);
                 } else {
                     calleeText = cgExpr(cg, calleeId);
                     retTy = cgResultTy(cg, id, e);
@@ -2445,16 +2270,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
-                write(2, (u8*)"AL\n", 3);
                 Stream abuf = stNew(cg.arena, 64);
                 bool first = true;
                 NodeId* args = e.kind.payload.Call.args;
                 u32 argsLen = e.kind.payload.Call.argsLen;
                 u32 i = 0;
                 while (i < argsLen && i < 16) {
-                    u8 am = (u8)(48 + i);
-                    write(2, &am, 1);
-                    write(2, (u8*)"<", 1);
                     bool skip = false;
                     bool dec = false;
                     if (fdecl.index != 0) {
@@ -2473,16 +2294,14 @@ Slice cgExpr(Codegen* cg, NodeId id)
                         if (first) first = false;
                         else stP(&abuf, ", ");
                         stPS(&abuf, cgExpr(cg, args[i]));
-                        write(2, (u8*)">", 1);
                         if (dec) stP(&abuf, ".ptr");
                         n = n + 1;
-                    } else { write(2, (u8*)">", 1); }
+                    }
                     i = i + 1;
                 }
                 if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
-            write(2, (u8*)"Z1\n", 3);
             usize ccs = cg.ebuf.len;
             stPS(&cg.ebuf, calleeText);
             stCh(&cg.ebuf, '(');
@@ -2555,11 +2374,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 bool passRecv = recvKind != 0 && !fieldCall;
                 if (passRecv) {
                     /* self is a pointer in C — pass the address of a value
-                     * receiver, or the receiver itself when already a pointer */
+                     * receiver (materialized when the receiver is a
+                     * temporary), or the receiver itself when already a
+                     * pointer */
                     if (!recvIsPtr) {
-                        stP(&abuf, "&(");
-                        stPS(&abuf, recvText);
-                        stCh(&abuf, ')');
+                        Slice rt = cgAddrOfValue(cg, recv, recvText);
+                        stPS(&abuf, rt);
                     } else {
                         stPS(&abuf, recvText);
                     }
@@ -2597,7 +2417,21 @@ Slice cgExpr(Codegen* cg, NodeId id)
             NodeId smdecl = cgFindMethodDeclOwner(cg, cgIntern(cg, e.kind.payload.StaticCall.typeName),
                                                   e.kind.payload.StaticCall.method);
             Slice callee;
-            if (smdecl.index != 0) callee = cgMangleS(cg, smdecl, rawCallee, 0);
+            if (smdecl.index != 0)
+            {
+                Node* sdn = cgNode(cg, smdecl);
+                if (sdn.kind.tag == NodeKind::Decl)
+                {
+                    /* suffix = def-side owner+method (C spelling of builtin
+                     * owners: str → `_coral_str`) */
+                    usize rcs = cg.ebuf.len;
+                    stPS(&cg.ebuf, cgOwnerSpelling(cg, cgIdent(cg, e.kind.payload.StaticCall.typeName)));
+                    stCh(&cg.ebuf, '_');
+                    stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.StaticCall.method));
+                    callee = cgMangleS(cg, smdecl, stTail(&cg.ebuf, rcs), 0);
+                }
+                else callee = rawCallee;
+            }
             else callee = rawCallee;
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
@@ -2979,12 +2813,6 @@ Slice cgExpr(Codegen* cg, NodeId id)
         },
 
         ExprKind::TypeRef => {
-            {
-                Slice tn2 = cgIntern(cg, e.kind.payload.TypeRef.name);
-                write(2, (u8*)"TR:", 3);
-                write(2, tn2.ptr, tn2.len);
-                write(2, (u8*)"\n", 1);
-            }
             cgError(cg, (u8*)"unresolved TypeRef");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
@@ -3004,9 +2832,47 @@ Slice cgExpr(Codegen* cg, NodeId id)
     return stTail(&cg.ebuf, es);
 }
 
+/* `&expr` — C cannot take the address of a temporary, so a non-lvalue
+ * operand is materialized into a hidden local first. vtext is the
+ * already-lowered operand text. */
+Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext)
+{
+    Node* on = cgNode(cg, oid);
+    bool lv = false;
+    if (on.kind.tag == NodeKind::Expr) {
+        u32 ok = on.kind.payload.Expr.value.kind.tag;
+        lv = ok == ExprKind::Ident || ok == ExprKind::Field || ok == ExprKind::DerefField ||
+             ok == ExprKind::Deref || ok == ExprKind::Index || ok == ExprKind::TupleField;
+    }
+    Slice c = vtext;
+    if (!lv) {
+        Slice oty;
+        if (on.kind.tag == NodeKind::Expr && on.kind.payload.Expr.value.resolvedType != 0) {
+            Ty ot = cgSubstTy(cg, on.kind.payload.Expr.value.resolvedType);
+            oty = tyStr(cg, cgTyUnwrap(cg, ot));
+        } else if (on.kind.tag == NodeKind::Expr) {
+            oty = cgResultTy(cg, oid, &on.kind.payload.Expr.value);
+        } else {
+            oty = Slice::from((u8*)"void*", 5);
+        }
+        u32 t = cgNewTemp(cg, oty, 0);
+        Slice tn = cgTempName(cg, t);
+        stNL(&cg.body, cg.ind);
+        stPS(&cg.body, tn);
+        stP(&cg.body, " = ");
+        stPS(&cg.body, c);
+        stCh(&cg.body, ';');
+        c = tn;
+    }
+    usize rs = cg.ebuf.len;
+    stP(&cg.ebuf, "(&(");
+    stPS(&cg.ebuf, c);
+    stP(&cg.ebuf, "))");
+    return stTail(&cg.ebuf, rs);
+}
+
 Slice cgLvalue(Codegen* cg, NodeId id)
 {
-    write(2, (u8*)"lv\n", 3);
     if (id.index == 0) {
         stP(&cg.ebuf, "0");
         return stTail(&cg.ebuf, cg.ebuf.len - 1);
@@ -3730,11 +3596,8 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Assign => {
-            write(2, (u8*)"AS\n", 3);
             Slice lv = cgLvalue(cg, s.kind.payload.Assign.target);
-            write(2, (u8*)"LV\n", 3);
             Slice rv = cgExpr(cg, s.kind.payload.Assign.value);
-            write(2, (u8*)"RV\n", 3);
             Slice op = cgIntern(cg, s.kind.payload.Assign.op);
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, lv);
@@ -4261,15 +4124,6 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
 {
     Node* ddn = cgNode(cg, declId);
     Decl* dd = &ddn.kind.payload.Decl.value;
-    {
-        write(2, (u8*)"FN", 2);
-        Slice fnm = cgIntern(cg, dd.kind.payload.Func.name);
-        write(2, fnm.ptr, fnm.len);
-        write(2, (u8*)"|", 1);
-        Slice cn2 = cname;
-        write(2, cn2.ptr, cn2.len);
-        write(2, (u8*)"\n", 1);
-    }
 
     MonoSubstitution* oldSubs = cg.subs;
     u32 oldSubsLen = cg.subsLen;
