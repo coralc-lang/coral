@@ -345,7 +345,7 @@ pub extend Sema
         return t;
     }
 
-    bool checkBinary(NodeId id, NodeId left, NodeId right)
+    bool checkBinary(NodeId id, NodeId left, NodeId right, bool isSub)
     {
         if (!self.checkExpr(left)) return false;
         if (!self.checkExpr(right)) return false;
@@ -353,6 +353,13 @@ pub extend Sema
         Ty rightType = self.exprType(right);
         if (leftType == 0) leftType = rightType;
         if (rightType == 0) rightType = leftType;
+        /* `p - q` with both sides pointers — byte distance (usize); the
+         * pointer-preserving rule below only covers `p - i` */
+        if (isSub && self.pointerLike(leftType) && self.pointerLike(rightType))
+        {
+            self.setExprType(id, self.usizeType());
+            return true;
+        }
         // a particular rule makes ths possible, but will throw an error. 
         // with -fcast casts will be forced. and compilation will be terminated.
         // /* C-like rule: int+int promotes to the wider int (the smaller
@@ -465,7 +472,7 @@ pub extend Sema
 
     bool checkBinaryBool(NodeId id, NodeId left, NodeId right)
     {
-        if (!self.checkBinary(id, left, right)) return false;
+        if (!self.checkBinary(id, left, right, false)) return false;
         self.setExprType(id, self.boolType());
         return true;
     }
@@ -556,6 +563,54 @@ pub extend Sema
                     NodeId* segs = calleeNode->kind.payload.Expr.value.kind.payload.Path.segments;
                     Node* s0n = self.ctx.nodes + segs[0].index;
                     Node* s1n = self.ctx.nodes + segs[1].index;
+                    if (s0n->kind.tag == NodeKind::Expr &&
+                        s0n->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef &&
+                        s1n->kind.tag == NodeKind::Expr &&
+                        s1n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    {
+                        /* static method on an instantiated generic type:
+                         * `Foo<i32>::new(3)` — the head segment is a TypeRef,
+                         * not an Ident, so the ident/module branch below never
+                         * matches. Resolve the static member on that type and
+                         * substitute the method's generic params through it. */
+                        Str mn = s1n->kind.payload.Expr.value.kind.payload.Ident.name;
+                        Ty ownerTy = s0n->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
+                        MemberInfo m = self.findMethod(ownerTy, mn);
+                        if (m.declaration.index == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                            return false;
+                        }
+                        Node* methodNode = self.ctx.nodes + m.declaration.index;
+                        Decl* md = &methodNode->kind.payload.Decl.value;
+                        if ((md->kind.payload.Func.flags & 4) == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static");
+                            return false;
+                        }
+                        u32 pLen = md->kind.payload.Func.paramsLen;
+                        if (pLen != expr->kind.payload.Call.argsLen)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                            return false;
+                        }
+                        u32 kk = 0;
+                        while (kk < pLen)
+                        {
+                            NodeId ppid = md->kind.payload.Func.params[kk];
+                            Node* pn = self.ctx.nodes + ppid.index;
+                            if (pn->kind.tag == NodeKind::Param)
+                            {
+                                Param* pp = &pn->kind.payload.Param.value;
+                                Ty want = self.substituteFieldTy(pp->typeNode, ownerTy);
+                                if (!self.assignCompatible(expr->kind.payload.Call.args[kk], self.exprType(expr->kind.payload.Call.args[kk]), want))
+                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
+                            }
+                            kk = kk + 1;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(md->kind.payload.Func.returnType, ownerTy));
+                        return true;
+                    }
                     if (s0n->kind.tag == NodeKind::Expr && s0n->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
                         s1n->kind.tag == NodeKind::Expr && s1n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
                     {
@@ -578,7 +633,22 @@ pub extend Sema
                                     }
                                 }
                             }
-                            return self.checkCall(id, mn, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                            /* nested module path `platform::libc::malloc` — the
+                             * function is the LAST segment, not s1 (a module) */
+                            Str fname = mn;
+                            u32 segCount = calleeNode->kind.payload.Expr.value.kind.payload.Path.segmentsLen;
+                            if (segCount >= 3)
+                            {
+                                Symbol* s1Sym = self.lookupAt(mn, id);
+                                Node* s2n = self.ctx.nodes + segs[2].index;
+                                if (s1Sym != null && s1Sym->kind == 5 &&
+                                    s2n->kind.tag == NodeKind::Expr &&
+                                    s2n->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                                {
+                                    fname = s2n->kind.payload.Expr.value.kind.payload.Ident.name;
+                                }
+                            }
+                            return self.checkCall(id, fname, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
                         }
                         Ty ownerTy = self.namedType(tn);
                         MemberInfo m = self.findMethod(ownerTy, mn);
@@ -622,6 +692,10 @@ pub extend Sema
                     Expr* callee = &calleeNode->kind.payload.Expr.value;
                     if (callee->kind.tag == ExprKind::Ident)
                         return self.checkCall(id, callee->kind.payload.Ident.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, callee->resolvedType);
+                    /* explicit generic call `realloc<i32>(p, n)` — validate
+                     * the call against the named function, not as a fn-ptr */
+                    if (callee->kind.tag == ExprKind::TypeRef)
+                        return self.checkCall(id, callee->kind.payload.TypeRef.name, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, callee->resolvedType);
                     return self.checkFnPtrCall(id, callee->resolvedType, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen);
                 }
                 return true;
@@ -713,6 +787,16 @@ pub extend Sema
                 if (!self.checkExpr(expr->kind.payload.Index.obj)) return false;
                 Ty objectType = self.exprType(expr->kind.payload.Index.obj);
                 if (objectType == 0) return false;
+                /* `const u8* buf` wraps as Const{Pointer} — look through
+                 * Const/Comptime first, like the Deref arm does */
+                while (objectType != 0)
+                {
+                    TypeEntry* oe = self.ctx.types + objectType;
+                    if (oe->kind.tag == TypeKind::Const) objectType = oe->kind.payload.Const.base;
+                    else if (oe->kind.tag == TypeKind::Comptime) objectType = oe->kind.payload.Comptime.base;
+                    else break;
+                }
+                if (objectType == 0) return false;
                 TypeEntry* objectEntry = self.ctx.types + objectType;
                 if (objectEntry->kind.tag == TypeKind::Array) self.setExprType(id, objectEntry->kind.payload.Array.base);
                 else if (objectEntry->kind.tag == TypeKind::Slice) self.setExprType(id, objectEntry->kind.payload.Slice.base);
@@ -735,8 +819,8 @@ pub extend Sema
                     self.setExprType(id, expr->kind.payload.Cast.targetType);
                 return true;
             },
-            ExprKind::Sizeof => { return true; },
-            ExprKind::Alignof => { return true; },
+            ExprKind::Sizeof => { self.setExprType(id, self.usizeType()); return true; },
+            ExprKind::Alignof => { self.setExprType(id, self.usizeType()); return true; },
             ExprKind::Typeof => { return self.checkExpr(expr->kind.payload.Typeof.expr); },
             ExprKind::AddressOf => {
                 if (!self.checkExpr(expr->kind.payload.AddressOf.expr)) return false;
@@ -805,11 +889,11 @@ pub extend Sema
                 self.setExprType(id, self.boolType());
                 return true;
             },
-            ExprKind::Add => { return self.checkBinary(id, expr->kind.payload.Add.left, expr->kind.payload.Add.right); },
-            ExprKind::Sub => { return self.checkBinary(id, expr->kind.payload.Sub.left, expr->kind.payload.Sub.right); },
-            ExprKind::Mul => { return self.checkBinary(id, expr->kind.payload.Mul.left, expr->kind.payload.Mul.right); },
-            ExprKind::Div => { return self.checkBinary(id, expr->kind.payload.Div.left, expr->kind.payload.Div.right); },
-            ExprKind::Mod => { return self.checkBinary(id, expr->kind.payload.Mod.left, expr->kind.payload.Mod.right); },
+            ExprKind::Add => { return self.checkBinary(id, expr->kind.payload.Add.left, expr->kind.payload.Add.right, false); },
+            ExprKind::Sub => { return self.checkBinary(id, expr->kind.payload.Sub.left, expr->kind.payload.Sub.right, true); },
+            ExprKind::Mul => { return self.checkBinary(id, expr->kind.payload.Mul.left, expr->kind.payload.Mul.right, false); },
+            ExprKind::Div => { return self.checkBinary(id, expr->kind.payload.Div.left, expr->kind.payload.Div.right, false); },
+            ExprKind::Mod => { return self.checkBinary(id, expr->kind.payload.Mod.left, expr->kind.payload.Mod.right, false); },
             ExprKind::Eq => { return self.checkBinaryBool(id, expr->kind.payload.Eq.left, expr->kind.payload.Eq.right); },
             ExprKind::Ne => { return self.checkBinaryBool(id, expr->kind.payload.Ne.left, expr->kind.payload.Ne.right); },
             ExprKind::Lt => { return self.checkBinaryBool(id, expr->kind.payload.Lt.left, expr->kind.payload.Lt.right); },
@@ -818,11 +902,11 @@ pub extend Sema
             ExprKind::Ge => { return self.checkBinaryBool(id, expr->kind.payload.Ge.left, expr->kind.payload.Ge.right); },
             ExprKind::And => { return self.checkCondBinary(id, expr->kind.payload.And.left, expr->kind.payload.And.right); },
             ExprKind::Or => { return self.checkCondBinary(id, expr->kind.payload.Or.left, expr->kind.payload.Or.right); },
-            ExprKind::BitAnd => { return self.checkBinary(id, expr->kind.payload.BitAnd.left, expr->kind.payload.BitAnd.right); },
-            ExprKind::BitOr => { return self.checkBinary(id, expr->kind.payload.BitOr.left, expr->kind.payload.BitOr.right); },
-            ExprKind::BitXor => { return self.checkBinary(id, expr->kind.payload.BitXor.left, expr->kind.payload.BitXor.right); },
-            ExprKind::Shl => { return self.checkBinary(id, expr->kind.payload.Shl.left, expr->kind.payload.Shl.right); },
-            ExprKind::Shr => { return self.checkBinary(id, expr->kind.payload.Shr.left, expr->kind.payload.Shr.right); },
+            ExprKind::BitAnd => { return self.checkBinary(id, expr->kind.payload.BitAnd.left, expr->kind.payload.BitAnd.right, false); },
+            ExprKind::BitOr => { return self.checkBinary(id, expr->kind.payload.BitOr.left, expr->kind.payload.BitOr.right, false); },
+            ExprKind::BitXor => { return self.checkBinary(id, expr->kind.payload.BitXor.left, expr->kind.payload.BitXor.right, false); },
+            ExprKind::Shl => { return self.checkBinary(id, expr->kind.payload.Shl.left, expr->kind.payload.Shl.right, false); },
+            ExprKind::Shr => { return self.checkBinary(id, expr->kind.payload.Shr.left, expr->kind.payload.Shr.right, false); },
             ExprKind::Assign => {
                 if (!self.assignExpr(expr->kind.payload.Assign.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.Assign.value)) return false;
@@ -1131,6 +1215,30 @@ pub extend Sema
                 {
                     if (!self.checkExpr(expr->kind.payload.TupleExpr.elems[i])) return false;
                     i = i + 1;
+                }
+                /* type the literal as a tuple of the element types */
+                u32 n = expr->kind.payload.TupleExpr.elemsLen;
+                if (n > 0)
+                {
+                    Ty* elems = (Ty*)malloc((usize)n * @sizeof(Ty));
+                    if (elems != null)
+                    {
+                        u32 j = 0;
+                        bool allTyped = true;
+                        while (j < n)
+                        {
+                            Ty et = self.exprType(expr->kind.payload.TupleExpr.elems[j]);
+                            if (et == 0) allTyped = false;
+                            elems[j] = et;
+                            j = j + 1;
+                        }
+                        if (allTyped)
+                        {
+                            TypeKind k;
+                            k = TypeKind::Tuple{ .elems = elems, .elemsLen = n };
+                            self.setExprType(id, self.allocType(k));
+                        }
+                    }
                 }
                 return true;
             },

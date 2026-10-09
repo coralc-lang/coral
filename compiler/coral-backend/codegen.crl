@@ -275,18 +275,38 @@ Ty cgSubstTy(Codegen* cg, Ty t)
     return t;
 }
 
-/* Sanitize a C type spelling into a mangled identifier fragment. */
+/* Sanitize a C type spelling into a mangled identifier fragment.
+ * tyStr almost always returns a slice of tybuf — in that case rewrite
+ * in place (each input char maps to exactly one output char), so an
+ * enclosing mangled name (cgInstanceName) sees only sanitized chars
+ * and never the raw spelling. External slices (tyStr(0) returns a
+ * literal) are sanitized into tybuf after the raw text. */
 Slice cgMangleTy(Codegen* cg, Ty t)
 {
     Slice s = tyStr(cg, t);
-    usize st = cg.tybuf.len;
+    bool inBuf = s.len > 0 && s.ptr >= cg.tybuf.p &&
+                 (s.ptr + s.len) <= (cg.tybuf.p + cg.tybuf.len);
     usize i = 0;
+    if (inBuf)
+    {
+        while (i < s.len)
+        {
+            u8 c = s.ptr[i];
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+            if (ok) { }
+            else if (c == 42) s.ptr[i] = 112;
+            else s.ptr[i] = 95;
+            i = i + 1;
+        }
+        return s;
+    }
+    usize st = cg.tybuf.len;
     while (i < s.len)
     {
         u8 c = s.ptr[i];
         bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
         if (ok) stCh(&cg.tybuf, c);
-        else if (c == 42) stP(&cg.tybuf, "p");
+        else if (c == 42) stCh(&cg.tybuf, 112);
         else stCh(&cg.tybuf, 95);
         i = i + 1;
     }
@@ -519,8 +539,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
 {
     *found = false;
     *outRet = 0;
-    NodeId declId = cgFindDecl(cg, fname, (u32)DeclKind::Func);
-    if (outDecl != null) *outDecl = declId;
+    if (outDecl != null) { outDecl->index = 0; }
     Ty* gargs = null;
     u32 glen = 0;
     if (namedTy != 0)
@@ -532,6 +551,38 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
             glen = ne->kind.payload.Named.genericArgsLen;
         }
     }
+    /* match mono instances by NAME + arguments first: the name may be
+     * ambiguous across merged files (libc's extern realloc vs mman's
+     * realloc<T>), and only the declaring file's decl owns the instance */
+    if (cg.mono != null && cg.sema != null && glen > 0)
+    {
+        u32 i = 0;
+        while (i < cg.mono.instancesLen)
+        {
+            MonoInstance* inst = cg.mono.instances + i;
+            if (inst.kind == MonoInstanceKind::FunctionInstance && inst.name == fname &&
+                inst.argumentsLen == glen)
+            {
+                bool ok = true;
+                u32 k = 0;
+                while (k < glen)
+                {
+                    if (!cg.sema.sameType(inst.arguments[k], gargs[k])) { ok = false; break; }
+                    k = k + 1;
+                }
+                if (ok)
+                {
+                    *found = true;
+                    *outRet = inst.returnType;
+                    if (outDecl != null) *outDecl = inst.declaration;
+                    return cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                }
+            }
+            i = i + 1;
+        }
+    }
+    NodeId declId = cgFindDecl(cg, fname, (u32)DeclKind::Func);
+    if (outDecl != null) *outDecl = declId;
     if (cg.mono != null && cg.sema != null && declId.index != 0 && glen > 0)
     {
         u32 i = 0;
@@ -559,6 +610,14 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
         }
     }
     return Slice::from(null, 0);
+}
+
+/* StringLit token text keeps its surrounding quotes (cgExpr strips them
+   on emission) — asm pieces/constraints are stored raw, so unquote here */
+Slice cgUnquote(Codegen* cg, Slice s)
+{
+    if (s.len >= 2 && s.ptr[0] == '"') return Slice::from(s.ptr + 1, s.len - 2);
+    return s;
 }
 
 /* ── C type emission ─────────────────────────────────────────── */
@@ -785,7 +844,7 @@ Slice cgRegName(Codegen* cg, Ty t)
             stP(&cg.tdecl, "    ");
             stPS(&cg.tdecl, tyStr(cg, k.payload.Tuple.elems[i]));
             stP(&cg.tdecl, " _");
-            stU64(&cg.tdecl, (u64)i);
+            stU64(&cg.tdecl, (u64)(i + 1));
             stP(&cg.tdecl, ";\n");
             i = i + 1;
         }
@@ -1006,10 +1065,47 @@ Slice cgOwnerName(Codegen* cg, Ty selfTy)
     return tyStr(cg, selfTy);
 }
 
-/* receiver for a method call: 0 = none (static), 1 = by value,
- * 2 = explicit `self` parameter (pointer) */
-u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method)
+/* does the receiver's named struct/union declare field `name`? — used to
+ * spot fn-pointer field calls (`p->alloc(ctx, size)` parses as a method) */
+bool cgHasField(Codegen* cg, Ty t, Str name)
 {
+    Ty u = cgTyUnwrap(cg, t);
+    if (u != 0 && (cg.ctx->types + u)->kind.tag == TypeKind::Pointer)
+        u = cgTyUnwrap(cg, (cg.ctx->types + u)->kind.payload.Pointer.base);
+    if (u == 0 || (cg.ctx->types + u)->kind.tag != TypeKind::Named) return false;
+    Str tn = (cg.ctx->types + u)->kind.payload.Named.name;
+    NodeId d = cgFindDecl(cg, tn, (u32)DeclKind::Struct);
+    if (d.index == 0) d = cgFindDecl(cg, tn, (u32)DeclKind::Union);
+    if (d.index == 0) return false;
+    Node* dn = cgNode(cg, d);
+    if (dn.kind.tag != NodeKind::Decl) return false;
+    Decl* dd = &dn.kind.payload.Decl.value;
+    NodeId* fields = null;
+    u32 flen = 0;
+    if (dd.kind.tag == DeclKind::Struct) {
+        fields = dd.kind.payload.Struct.fields;
+        flen = dd.kind.payload.Struct.fieldsLen;
+    } else if (dd.kind.tag == DeclKind::Union) {
+        fields = dd.kind.payload.Union.fields;
+        flen = dd.kind.payload.Union.fieldsLen;
+    } else return false;
+    u32 i = 0;
+    while (i < flen)
+    {
+        Node* fn = cgNode(cg, fields[i]);
+        if (fn.kind.tag == NodeKind::Field && fn.kind.payload.Field.value.name == name) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+/* receiver for a method call: 0 = none (static), 1 = by value,
+ * 2 = explicit `self` parameter (pointer); *found = the method exists
+ * on the receiver type (false = not a real method, e.g. a fn-pointer
+ * field call like `alloc->fallback->alloc(...)`) */
+u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method, bool* found)
+{
+    *found = false;
     if (recvTy == 0 || cg.file == null) return 1;
     TypeEntry* e = cg.ctx->types + recvTy;
     while (e.kind.tag == TypeKind::Pointer || e.kind.tag == TypeKind::Const || e.kind.tag == TypeKind::Comptime)
@@ -1062,6 +1158,7 @@ u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method)
                         Decl* md = &mn.kind.payload.Decl.value;
                         if (md.kind.payload.Func.name == method)
                         {
+                            *found = true;
                             if ((md.kind.payload.Func.flags & 4) != 0) return 0;
                             if (md.kind.payload.Func.paramsLen > 0)
                             {
@@ -1528,6 +1625,20 @@ Slice cgExpr(Codegen* cg, NodeId id)
                         retTy = cgResultTy(cg, id, e);
                     }
                 }
+                else if (s0->kind.tag == NodeKind::Expr && s0->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef &&
+                         s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    /* static method on a generic instance: `Foo<i32>::new(...)` —
+                       <instance>_<method>, matching cgEmitInstMethodList */
+                    Ty ownerTy = s0->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
+                    Slice owner = cgOwnerName(cg, ownerTy);
+                    usize cs2 = cg.ebuf.len;
+                    stPS(&cg.ebuf, owner);
+                    stCh(&cg.ebuf, '_');
+                    stPS(&cg.ebuf, cgIntern(cg, s1->kind.payload.Expr.value.kind.payload.Ident.name));
+                    calleeText = stTail(&cg.ebuf, cs2);
+                    retTy = cgResultTy(cg, id, e);
+                }
                 else
                 {
                     calleeText = cgExpr(cg, calleeId);
@@ -1628,34 +1739,57 @@ Slice cgExpr(Codegen* cg, NodeId id)
             if (rn.kind.tag == NodeKind::Expr) recvTy = rn.kind.payload.Expr.value.resolvedType;
             Slice owner;
             if (recvTy != 0) {
-                TypeEntry* re = cg.ctx->types + recvTy;
-                if (re.kind.tag == TypeKind::Pointer) recvTy = re.kind.payload.Pointer.base;
-                owner = cgOwnerName(cg, recvTy);
+                /* `const self*` receivers wrap Pointer in Const — unwrap
+                 * both so the owner name matches the definition side */
+                recvTy = cgTyUnwrap(cg, recvTy);
+                if (recvTy != 0 && (cg.ctx->types + recvTy)->kind.tag == TypeKind::Pointer)
+                    recvTy = cgTyUnwrap(cg, (cg.ctx->types + recvTy)->kind.payload.Pointer.base);
+                if (recvTy != 0) owner = cgOwnerName(cg, recvTy);
+                else owner = Slice::from((u8*)"Unknown", 7);
             } else {
                 owner = Slice::from((u8*)"Unknown", 7);
             }
             Slice recvText = cgExpr(cg, recv);
             bool recvIsPtr = false;
+            Ty rawRecvTy = 0;
             if (rn.kind.tag == NodeKind::Expr) {
-                Ty rt = rn.kind.payload.Expr.value.resolvedType;
-                if (rt != 0 && (cg.ctx->types + rt)->kind.tag == TypeKind::Pointer) recvIsPtr = true;
+                rawRecvTy = rn.kind.payload.Expr.value.resolvedType;
+                if (rawRecvTy != 0 && cgTyIsPtr(cg, rawRecvTy)) recvIsPtr = true;
             }
-            /* method name */
-            usize cs = cg.ebuf.len;
-            stPS(&cg.ebuf, owner);
-            stCh(&cg.ebuf, '_');
-            stPS(&cg.ebuf, cgIntern(cg, e.kind.payload.MethodCall.method));
-            Slice callee = stTail(&cg.ebuf, cs);
+            Str methName = e.kind.payload.MethodCall.method;
+            bool mFound = false;
+            u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, methName, &mFound);
+            /* `p->alloc(ctx, size)` parses as a method call but names a
+             * fn-pointer field — lower to `(p->alloc)(ctx, size)` */
+            bool fieldCall = !mFound && cgHasField(cg, rawRecvTy, methName);
+            Slice callee;
+            if (fieldCall)
+            {
+                usize cfs = cg.ebuf.len;
+                stP(&cg.ebuf, "(");
+                stPS(&cg.ebuf, recvText);
+                if (recvIsPtr) stP(&cg.ebuf, "->");
+                else stCh(&cg.ebuf, '.');
+                stPS(&cg.ebuf, cgIdent(cg, methName));
+                stCh(&cg.ebuf, ')');
+                callee = stTail(&cg.ebuf, cfs);
+            }
+            else
+            {
+                usize cs = cg.ebuf.len;
+                stPS(&cg.ebuf, owner);
+                stCh(&cg.ebuf, '_');
+                stPS(&cg.ebuf, cgIntern(cg, methName));
+                callee = stTail(&cg.ebuf, cs);
+            }
 
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
                 Stream abuf = stNew(cg.arena, 64);
                 bool first = true;
-                Ty rawRecvTy = 0;
-                if (rn.kind.tag == NodeKind::Expr) rawRecvTy = rn.kind.payload.Expr.value.resolvedType;
-                u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, e.kind.payload.MethodCall.method);
-                if (recvKind != 0) {
+                bool passRecv = recvKind != 0 && !fieldCall;
+                if (passRecv) {
                     /* self is a pointer in C — pass the address of a value
                      * receiver, or the receiver itself when already a pointer */
                     if (!recvIsPtr) {
@@ -1678,7 +1812,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen + (recvKind != 0 ? 1 : 0) > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen + (passRecv ? 1 : 0) > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             Slice methResTy = cgResultTy(cg, id, e);
@@ -1764,7 +1898,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
-                if (ot != 0 && (cg.ctx->types + ot)->kind.tag == TypeKind::Pointer) isPtr = true;
+                if (ot != 0 && cgTyIsPtr(cg, ot)) isPtr = true;
             }
             usize cs = cg.ebuf.len;
             stPS(&cg.ebuf, o);
@@ -1772,6 +1906,10 @@ Slice cgExpr(Codegen* cg, NodeId id)
             else stCh(&cg.ebuf, '.');
             stPS(&cg.ebuf, cgIdent(cg, field));
             Slice fieldText = stTail(&cg.ebuf, cs);
+            /* arrays are not assignable in C — return the field text
+             * directly instead of copying it into a temp */
+            Ty fty = cgTyUnwrap(cg, cgSubstTy(cg, e.resolvedType));
+            if (fty != 0 && (cg.ctx->types + fty)->kind.tag == TypeKind::Array) return fieldText;
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
@@ -1793,6 +1931,10 @@ Slice cgExpr(Codegen* cg, NodeId id)
             stPS(&cg.ebuf, ix);
             stCh(&cg.ebuf, ']');
             Slice idxText = stTail(&cg.ebuf, cs);
+            /* an array element (a 2-D row) is not assignable in C —
+             * return the index text directly instead of a temp copy */
+            Ty ity = cgTyUnwrap(cg, cgSubstTy(cg, e.resolvedType));
+            if (ity != 0 && (cg.ctx->types + ity)->kind.tag == TypeKind::Array) return idxText;
             u32 t = cgNewTemp(cg, cgResultTy(cg, id, e), 0);
             Slice tn = cgTempName(cg, t);
             stNL(&cg.body, cg.ind);
@@ -2192,7 +2334,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
-                if (ot != 0 && (cg.ctx->types + ot)->kind.tag == TypeKind::Pointer) isPtr = true;
+                if (ot != 0 && cgTyIsPtr(cg, ot)) isPtr = true;
             }
             /* `base->field` — the base is a pointer *value*, so take the
              * value form (an lvalue deref like `*(self)` would bind as
@@ -2269,6 +2411,19 @@ Slice cgValBody(Codegen* cg, NodeId id)
 }
 
 /* ── switch lowering: compare chains + labels ────────────────── */
+
+/* strip Const/Comptime wrappers — `const T*` receivers carry the const
+ * on the outside, so Pointer/Array checks must look through it */
+Ty cgTyUnwrap(Codegen* cg, Ty t)
+{
+    while (t != 0 && ((cg.ctx->types + t)->kind.tag == TypeKind::Const ||
+                      (cg.ctx->types + t)->kind.tag == TypeKind::Comptime))
+    {
+        if ((cg.ctx->types + t)->kind.tag == TypeKind::Const) t = (cg.ctx->types + t)->kind.payload.Const.base;
+        else t = (cg.ctx->types + t)->kind.payload.Comptime.base;
+    }
+    return t;
+}
 
 bool cgTyIsPtr(Codegen* cg, Ty t)
 {
@@ -2901,6 +3056,10 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::For => {
+            /* own scope: init/var decls must not collide with other loops */
+            stNL(&cg.body, cg.ind);
+            stCh(&cg.body, '{');
+            cg.ind = cg.ind + 1;
             if (s.kind.payload.For.flags & 1) cgStmt(cg, s.kind.payload.For.init);
             else if (s.kind.payload.For.init.index != 0) cgStmt(cg, s.kind.payload.For.init);
             u32 ltop = cgLabel(cg);
@@ -2932,10 +3091,17 @@ void cgStmt(Codegen* cg, NodeId id)
             }
             cgEmitGoto(cg, ltop);
             cgEmitLabel(cg, lbrk);
+            cg.ind = cg.ind - 1;
+            stNL(&cg.body, cg.ind);
+            stCh(&cg.body, '}');
             return;
         },
 
         StmtKind::ForIn => {
+            /* own scope: index temp + bind name must not collide */
+            stNL(&cg.body, cg.ind);
+            stCh(&cg.body, '{');
+            cg.ind = cg.ind + 1;
             NodeId iter = s.kind.payload.ForIn.iterExpr;
             Slice it = cgExpr(cg, iter);
             Node* in = cgNode(cg, iter);
@@ -3008,6 +3174,9 @@ void cgStmt(Codegen* cg, NodeId id)
             stP(&cg.body, " + 1;");
             cgEmitGoto(cg, ltop);
             cgEmitLabel(cg, lbrk);
+            cg.ind = cg.ind - 1;
+            stNL(&cg.body, cg.ind);
+            stCh(&cg.body, '}');
             return;
         },
 
@@ -3052,7 +3221,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 NodeId tnid = s.kind.payload.Asm.template[i];
                 Node* tn = cgNode(cg, tnid);
                 if (tn.kind.tag == NodeKind::Expr && tn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit) {
-                    Slice piece = cgIntern(cg, tn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                    Slice piece = cgUnquote(cg, cgIntern(cg, tn.kind.payload.Expr.value.kind.payload.StringLit.value));
                     u8* nb = (u8*)cg.arena.alloc(blen + piece.len + 1, 1);
                     if (nb != null) {
                         memcpy(nb, built, blen);
@@ -3081,7 +3250,7 @@ void cgStmt(Codegen* cg, NodeId id)
                         Node* cn = cgNode(cg, s.kind.payload.Asm.outputs[oi]);
                         if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
                         {
-                            Slice cs = cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            Slice cs = cgUnquote(cg, cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value));
                             stCh(&cg.body, '"');
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
@@ -3107,7 +3276,7 @@ void cgStmt(Codegen* cg, NodeId id)
                         Node* cn = cgNode(cg, s.kind.payload.Asm.inputs[ii]);
                         if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
                         {
-                            Slice cs = cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            Slice cs = cgUnquote(cg, cgIntern(cg, cn.kind.payload.Expr.value.kind.payload.StringLit.value));
                             stCh(&cg.body, '"');
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
@@ -3133,7 +3302,7 @@ void cgStmt(Codegen* cg, NodeId id)
                         Node* cbn = cgNode(cg, s.kind.payload.Asm.clobbers[ci]);
                         if (cbn.kind.tag == NodeKind::Expr && cbn.kind.payload.Expr.value.kind.tag == ExprKind::StringLit)
                         {
-                            Slice cs = cgIntern(cg, cbn.kind.payload.Expr.value.kind.payload.StringLit.value);
+                            Slice cs = cgUnquote(cg, cgIntern(cg, cbn.kind.payload.Expr.value.kind.payload.StringLit.value));
                             stCh(&cg.body, '"');
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
@@ -3334,10 +3503,28 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     while (t < cg.tempsLen)
     {
         stP(&cg.bodies, "\n    ");
-        stPS(&cg.bodies, cg.tempTys[t]);
-        stCh(&cg.bodies, ' ');
-        stPS(&cg.bodies, cgTempName(cg, t));
-        stP(&cg.bodies, ";");
+        Slice tty = cg.tempTys[t];
+        /* an array type spells as `T[N]` — in a declaration the suffix
+         * must follow the name: split at the first '[' */
+        usize bi = 0;
+        while (bi < tty.len && tty.ptr[bi] != 91) bi = bi + 1;
+        if (bi < tty.len)
+        {
+            usize j = 0;
+            while (j < bi) { stCh(&cg.bodies, tty.ptr[j]); j = j + 1; }
+            stCh(&cg.bodies, ' ');
+            stPS(&cg.bodies, cgTempName(cg, t));
+            j = bi;
+            while (j < tty.len) { stCh(&cg.bodies, tty.ptr[j]); j = j + 1; }
+            stP(&cg.bodies, ";");
+        }
+        else
+        {
+            stPS(&cg.bodies, tty);
+            stCh(&cg.bodies, ' ');
+            stPS(&cg.bodies, cgTempName(cg, t));
+            stP(&cg.bodies, ";");
+        }
         t = t + 1;
     }
     stPS(&cg.bodies, bodyText);
@@ -3549,6 +3736,9 @@ void cgEmitInitValue(Codegen* cg, NodeId v)
         stCh(&cg.defs, '}');
         return;
     }
+    /* const-shaped exprs lower inline — cgExpr would emit statement
+     * temps, which are illegal at file scope */
+    if (cgConstAtom(cg, v)) { cgConstExpr(cg, v); return; }
     Slice ev = cgExpr(cg, v);
     stPS(&cg.defs, ev);
 }
@@ -3672,6 +3862,136 @@ bool cgConstAtom(Codegen* cg, NodeId id)
     return false;
 }
 
+/* emit a cgConstAtom expression as inline C into cg.defs — literals go
+ * through cgExpr (they emit no statements); operators recurse so file
+ * scope never sees a statement temp */
+void cgConstExpr(Codegen* cg, NodeId id)
+{
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) { stPS(&cg.defs, cgExpr(cg, id)); return; }
+    Expr* e = &n.kind.payload.Expr.value;
+    u32 k = e->kind.tag;
+    if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
+        k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit ||
+        k == ExprKind::Ident || k == ExprKind::Path)
+    {
+        stPS(&cg.defs, cgExpr(cg, id));
+        return;
+    }
+    if (k == ExprKind::Neg) { stP(&cg.defs, "-("); cgConstExpr(cg, e->kind.payload.Neg.expr); stP(&cg.defs, ")"); return; }
+    if (k == ExprKind::Not) { stP(&cg.defs, "!("); cgConstExpr(cg, e->kind.payload.Not.expr); stP(&cg.defs, ")"); return; }
+    if (k == ExprKind::BitNot) { stP(&cg.defs, "~("); cgConstExpr(cg, e->kind.payload.BitNot.expr); stP(&cg.defs, ")"); return; }
+    if (k == ExprKind::AddressOf) { stP(&cg.defs, "&("); cgConstExpr(cg, e->kind.payload.AddressOf.expr); stP(&cg.defs, ")"); return; }
+    if (k == ExprKind::Cast)
+    {
+        stP(&cg.defs, "(");
+        stPS(&cg.defs, cgResultTy(cg, id, e));
+        stP(&cg.defs, ")(");
+        cgConstExpr(cg, e->kind.payload.Cast.expr);
+        stP(&cg.defs, ")");
+        return;
+    }
+    if (k == ExprKind::Ternary)
+    {
+        stP(&cg.defs, "(");
+        cgConstExpr(cg, e->kind.payload.Ternary.cond);
+        stP(&cg.defs, " ? ");
+        cgConstExpr(cg, e->kind.payload.Ternary.thenExpr);
+        stP(&cg.defs, " : ");
+        cgConstExpr(cg, e->kind.payload.Ternary.elseExpr);
+        stP(&cg.defs, ")");
+        return;
+    }
+    u8* op = (u8*)"+";
+    switch (k)
+    {
+        ExprKind::Add, ExprKind::Sub, ExprKind::Mul, ExprKind::Div, ExprKind::Mod,
+        ExprKind::Eq, ExprKind::Ne, ExprKind::Lt, ExprKind::Le, ExprKind::Gt, ExprKind::Ge,
+        ExprKind::And, ExprKind::Or,
+        ExprKind::BitAnd, ExprKind::BitOr, ExprKind::BitXor, ExprKind::Shl, ExprKind::Shr => {
+            switch (k)
+            {
+                ExprKind::Add => { op = (u8*)"+"; },
+                ExprKind::Sub => { op = (u8*)"-"; },
+                ExprKind::Mul => { op = (u8*)"*"; },
+                ExprKind::Div => { op = (u8*)"/"; },
+                ExprKind::Mod => { op = (u8*)"%"; },
+                ExprKind::Eq => { op = (u8*)"=="; },
+                ExprKind::Ne => { op = (u8*)"!="; },
+                ExprKind::Lt => { op = (u8*)"<"; },
+                ExprKind::Le => { op = (u8*)"<="; },
+                ExprKind::Gt => { op = (u8*)">"; },
+                ExprKind::Ge => { op = (u8*)">="; },
+                ExprKind::And => { op = (u8*)"&&"; },
+                ExprKind::Or => { op = (u8*)"||"; },
+                ExprKind::BitAnd => { op = (u8*)"&"; },
+                ExprKind::BitOr => { op = (u8*)"|"; },
+                ExprKind::BitXor => { op = (u8*)"^"; },
+                ExprKind::Shl => { op = (u8*)"<<"; },
+                ExprKind::Shr => { op = (u8*)">>"; },
+                else => {},
+            }
+            stCh(&cg.defs, '(');
+            cgConstExpr(cg, e->kind.payload.Add.left);
+            stP(&cg.defs, op);
+            cgConstExpr(cg, e->kind.payload.Add.right);
+            stCh(&cg.defs, ')');
+            return;
+        },
+        else => {},
+    }
+    stPS(&cg.defs, cgExpr(cg, id));
+}
+
+/* file-scope constants and variables — emitted after the prototypes so
+ * fn-pointer initializers (`const A = { .alloc = f }`) see a prior
+ * declaration of f */
+void cgEmitGlobals(Codegen* cg)
+{
+    u32 i = 0;
+    while (i < cg.file.declsLen)
+    {
+        Node* d = cgNode(cg, cg.file.decls[i]);
+        if (d.kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d.kind.payload.Decl.value;
+            if (dd.kind.tag == DeclKind::Constant)
+            {
+                u8 cflags = dd.kind.payload.Constant.flags;
+                NodeId cval = dd.kind.payload.Constant.value;
+                Ty cty = dd.kind.payload.Constant.typeNode;
+                Str cname = dd.kind.payload.Constant.name;
+                if ((cflags & 2) != 0)
+                {
+                    /* extern variable: declaration only */
+                    stP(&cg.defs, "extern ");
+                    cgEmitGlobalDeclarator(cg, cty, cname);
+                    stP(&cg.defs, ";\n");
+                }
+                else
+                {
+                    if ((cflags & 4) != 0) stP(&cg.defs, "static ");
+                    cgEmitGlobalDeclarator(cg, cty, cname);
+                    if (cval.index != 0)
+                    {
+                        bool isArray = cty != 0 &&
+                            (cg.ctx->types + cty)->kind.tag == TypeKind::Array;
+                        Node* inn = cgNode(cg, cval);
+                        bool isArrLit = inn.kind.tag == NodeKind::Expr &&
+                            inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
+                        if (isArray && !isArrLit)
+                            cgError(cg, (u8*)"array constant needs an array-literal initializer");
+                        stP(&cg.defs, " = ");
+                        cgEmitInitValue(cg, cval);
+                    }
+                    stP(&cg.defs, ";\n");
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
 void cgEmitTypeDefs(Codegen* cg)
 {
     u32 i = 0;
@@ -3749,49 +4069,9 @@ void cgEmitTypeDefs(Codegen* cg)
         }
         i = i + 1;
     }
-    /* sweep 4: file-scope constants and variables */
-    i = 0;
-    while (i < cg.file.declsLen)
-    {
-        Node* d = cgNode(cg, cg.file.decls[i]);
-        if (d.kind.tag == NodeKind::Decl)
-        {
-            Decl* dd = &d.kind.payload.Decl.value;
-            if (dd.kind.tag == DeclKind::Constant)
-            {
-                u8 cflags = dd.kind.payload.Constant.flags;
-                NodeId cval = dd.kind.payload.Constant.value;
-                Ty cty = dd.kind.payload.Constant.typeNode;
-                Str cname = dd.kind.payload.Constant.name;
-                if ((cflags & 2) != 0)
-                {
-                    /* extern variable: declaration only */
-                    stP(&cg.defs, "extern ");
-                    cgEmitGlobalDeclarator(cg, cty, cname);
-                    stP(&cg.defs, ";\n");
-                }
-                else
-                {
-                    if ((cflags & 4) != 0) stP(&cg.defs, "static ");
-                    cgEmitGlobalDeclarator(cg, cty, cname);
-                    if (cval.index != 0)
-                    {
-                        bool isArray = cty != 0 &&
-                            (cg.ctx->types + cty)->kind.tag == TypeKind::Array;
-                        Node* inn = cgNode(cg, cval);
-                        bool isArrLit = inn.kind.tag == NodeKind::Expr &&
-                            inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
-                        if (isArray && !isArrLit)
-                            cgError(cg, (u8*)"array constant needs an array-literal initializer");
-                        stP(&cg.defs, " = ");
-                        cgEmitInitValue(cg, cval);
-                    }
-                    stP(&cg.defs, ";\n");
-                }
-            }
-        }
-        i = i + 1;
-    }
+    /* sweep 4 (file-scope constants) moved to cgEmitGlobals — it runs
+     * after the prototypes so fn-pointer initializers see a prior
+     * declaration of the function */
     /* sweep 5: monomorphised type instances */
     if (cg.mono != null)
     {
@@ -4178,6 +4458,16 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cgEmitFwd(&cg);
     cgEmitTypeDefs(&cg);
     cgEmitProtos(&cg);
+    {
+        /* file-scope globals land after the prototypes: their initializers
+         * may name functions (`const A = { .alloc = f }`). Re-bind the
+         * stream after emission — growth reallocates the buffer. */
+        Stream defsSaved = cg.defs;
+        cg.defs = cg.protos;
+        cgEmitGlobals(&cg);
+        cg.protos = cg.defs;
+        cg.defs = defsSaved;
+    }
     cgEmitBodies(&cg);
 
     /* assemble: preamble | fwd typedefs | registry typedefs | defs | protos | bodies */

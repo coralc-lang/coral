@@ -411,40 +411,6 @@ pub extend Sema
         }
     }
 
-    u8* arityDbg(Str name, u32 expected, u32 actual)
-    {
-        InternEntry* ie = self.ctx.interns + name;
-        u8* m = (u8*)malloc(ie->len + 40);
-        if (m == null) return (u8*)"wrong number of generic arguments";
-        usize p = 0;
-        usize i = 0;
-        while (i < ie->len) { m[p] = ie->ptr[i]; p = p + 1; i = i + 1; }
-        m[p] = 32; p = p + 1;
-        m[p] = 101; p = p + 1; m[p] = 120; p = p + 1; m[p] = 112; p = p + 1; m[p] = 61; p = p + 1;
-        p = self.dbgDigits(m, p, expected);
-        m[p] = 32; p = p + 1;
-        m[p] = 97; p = p + 1; m[p] = 99; p = p + 1; m[p] = 116; p = p + 1; m[p] = 61; p = p + 1;
-        p = self.dbgDigits(m, p, actual);
-        m[p] = 0;
-        return m;
-    }
-
-    usize dbgDigits(u8* m, usize p, u32 v)
-    {
-        if (v == 0) { m[p] = 48; return p + 1; }
-        u32 pow = 1;
-        while (v / pow >= 10 && pow <= 429496729) pow = pow * 10;
-        while (pow > 0)
-        {
-            u32 d = v / pow;
-            m[p] = (u8)(48 + d);
-            p = p + 1;
-            v = v - d * pow;
-            pow = pow / 10;
-        }
-        return p;
-    }
-
     bool checkType(Ty typeNode)
     {
         if (typeNode == 0) return true;
@@ -452,14 +418,39 @@ pub extend Sema
         switch (entry->kind.tag)
         {
             TypeKind::Named => {
-                Symbol* symbol = self.scopes.lookup(entry->kind.payload.Named.name);
+                Str tn = entry->kind.payload.Named.name;
+                Symbol* symbol = self.scopes.lookup(tn);
                 if (symbol == null) {
-                    self.semaError(ErrorCode::SemaUndeclaredIdent, entry->loc, self.nameMsg((u8*)"unknown type name: ", entry->kind.payload.Named.name));
+                    self.semaError(ErrorCode::SemaUndeclaredIdent, entry->loc, self.nameMsg((u8*)"unknown type name: ", tn));
                     return false;
                 }
+                u32 want = entry->kind.payload.Named.genericArgsLen;
                 u32 expected = self.genericCount(symbol->declaration);
-                if (expected != entry->kind.payload.Named.genericArgsLen) {
-                    self.semaError(ErrorCode::SemaArityMismatch, entry->loc, self.arityDbg(entry->kind.payload.Named.name, expected, entry->kind.payload.Named.genericArgsLen));
+                if (expected != want)
+                {
+                    /* merged files may declare the same name (libc's extern
+                     * realloc vs mman's realloc<T>) — prefer a decl whose
+                     * generic arity matches the explicit arguments */
+                    Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                    if (cands != null)
+                    {
+                        u32 n = self.scopes.lookupAll(tn, cands, 16);
+                        u32 a = 0;
+                        while (a < n)
+                        {
+                            if (self.genericCount(cands[a]->declaration) == want)
+                            {
+                                symbol = cands[a];
+                                break;
+                            }
+                            a = a + 1;
+                        }
+                        free((rawptr)cands);
+                    }
+                    expected = self.genericCount(symbol->declaration);
+                }
+                if (expected != want) {
+                    self.semaError(ErrorCode::SemaArityMismatch, entry->loc, "wrong number of generic arguments");
                     return false;
                 }
                 u32 i = 0;

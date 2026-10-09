@@ -53,6 +53,27 @@ usize appendSlice(u8* buf, usize cap, usize len, Slice s)
     return appendStr(buf, cap, len, s.ptr, s.len);
 }
 
+bool codeHasMain(Slice code)
+{
+    u8* pat = (u8*)"int32_t main(";
+    usize pl = 13;
+    if (code.ptr == null || code.len < pl) return false;
+    usize i = 0;
+    while (i + pl <= code.len)
+    {
+        bool m = true;
+        usize j = 0;
+        while (j < pl)
+        {
+            if (code.ptr[i + j] != pat[j]) { m = false; break; }
+            j = j + 1;
+        }
+        if (m) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
 pub i32 compileFile(Options* opts)
 {
     u8* inC = sliceCStr(opts.input);
@@ -156,8 +177,10 @@ pub i32 compileFile(Options* opts)
     Arena a;
     a.init(4194304);
     CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
-    HirModule* hir = build(unit.ctx, unit.file, unit.mono, unit.ctx.intern(opts.input.ptr, opts.input.len));
-    if (opts.emitHir) printHir(unit.ctx, hir);
+    if (opts.emitHir) {
+        HirModule* hir = build(unit.ctx, unit.file, unit.mono, unit.ctx.intern(opts.input.ptr, opts.input.len));
+        printHir(unit.ctx, hir);
+    }
     if (cg.errors > 0 || cg.cCode.ptr == null) {
         printf("coral: codegen failed, errors=%d\n", (i32)cg.errors);
         a.freeAll();
@@ -177,14 +200,23 @@ pub i32 compileFile(Options* opts)
     if (opts.dryRun) {
         printf("coral: dry run, would link %s\n", outC);
     } else {
+        /* helper/library files emit no main — compile to an object instead
+         * of linking an executable (which would fail with undefined main) */
+        bool hasMain = codeHasMain(cg.cCode);
         u8* cmd = (u8*)malloc(out.len + 4096);
         if (cmd == null) { rc = 3; }
         else {
             usize cl = 0;
             cl = appendStr(cmd, out.len + 4096, cl, (u8*)"gcc -std=gnu11 ", 15);
             cl = appendSlice(cmd, out.len + 4096, cl, Slice::from(cPath, out.len + 2));
-            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -o ", 4);
-            cl = appendSlice(cmd, out.len + 4096, cl, out);
+            if (hasMain) {
+                cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -o ", 4);
+                cl = appendSlice(cmd, out.len + 4096, cl, out);
+            } else {
+                cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -c -o ", 7);
+                cl = appendSlice(cmd, out.len + 4096, cl, out);
+            }
+            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -lm", 4);
             cl = appendStr(cmd, out.len + 4096, cl, (u8*)" 2>&1", 5);
             i32 st = system((char*)cmd);
             if (st != 0) {

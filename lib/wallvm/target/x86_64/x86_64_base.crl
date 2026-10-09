@@ -165,6 +165,21 @@ static void u32ToStr(u32 val, cchar* out)
     out[i] = 0;
 }
 
+// Full-width immediates print as hex: every u64 fits in 16 digits and
+// gas never balks at a 0x-prefixed value the way it can at an
+// out-of-range unsigned decimal.
+static void u64ToHex(u64 val, cchar* out)
+{
+    out[0] = '0';
+    out[1] = 'x';
+    for (u32 i = 0; i < 16; i++)
+    {
+        u32 nib = (u32)((val >> ((15 - i) * 4)) & 0xF);
+        out[2 + i] = nib < 10 ? ('0' + nib) : ('a' + (nib - 10));
+    }
+    out[18] = 0;
+}
+
 static cchar _r32buf[2][16];
 static int _r32i = 0;
 
@@ -281,6 +296,9 @@ pub struct X86_64CodeGen
     u32 spillSlotCount;
     u32 spillFrameBytes;
     bool spillRbpPushed;
+    IrFunc* currentFunc;
+    u32 allocaBase;
+    u32 allocaBytes;
 
     void init(IrContext* ctx,
               IrModule* modd,
@@ -291,6 +309,9 @@ pub struct X86_64CodeGen
         self.modd = modd;
         self.isWindows = isWindows;
         self.omitFramePointer = true;
+        self.currentFunc = null;
+        self.allocaBase = 0;
+        self.allocaBytes = 0;
         self.emitter.init(ctx, modd, useAtt, feats);
     }
 
@@ -431,6 +452,94 @@ pub struct X86_64CodeGen
         self.emitter.emitLine(".section .text");
     }
 
+    // One alloca's frame footprint. The allocated type is compile-time
+    // known (the instruction carries no count operand), so the size is
+    // static and the whole region can be reserved in the prologue.
+    // Rounded to 16 so the reservation cannot disturb the frame's
+    // 16-byte alignment.
+    u32 allocaSlotSize(IrInst* inst)
+    {
+        u32 sz = 0;
+        if (inst->base.type != null && inst->base.type->elem != null)
+            sz = self.ctx->irTypeSizeOf(inst->base.type->elem);
+        if (sz == 0) sz = 16;
+        if ((sz % 16) != 0) sz = (sz / 16 + 1) * 16;
+        return sz;
+    }
+
+    // The prologue's total alloca reservation: scanAllocas and
+    // allocaSlotOf replay the same walk, so the lea each emitAlloca
+    // emits always lands inside the frame the prologue cut out.
+    u32 scanAllocas(IrFunc* func)
+    {
+        u32 total = 0;
+        if (func == null) return 0;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode == IrOpcode::Alloca)
+                    total += self.allocaSlotSize(inst);
+            }
+        }
+        return total;
+    }
+
+    // The rbp-relative offset of one alloca: walk the same sequence
+    // scanAllocas summed, stop at the wanted value, and add the base
+    // the reservation started from. No side table, so there is nothing
+    // to keep alive across emitRet's mid-function epilogue.
+    bool allocaSlotOf(IrFunc* func, IrValue* target, u32* outOff)
+    {
+        u32 cum = 0;
+        if (func == null || target == null) return false;
+        for (u32 bi = 0; bi < func->nblocks; bi++)
+        {
+            IrBlock* bb = func->blocks[bi];
+            for (u32 ii = 0; ii < bb->ninsts; ii++)
+            {
+                IrInst* inst = bb->insts[ii];
+                if (inst->opcode != IrOpcode::Alloca) continue;
+                cum += self.allocaSlotSize(inst);
+                if (&inst->base == target)
+                {
+                    *outOff = self.allocaBase + cum;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // True when any parameter can land on the stack: the banks are
+    // counted exactly the way classifyCallArg assigns them, so an
+    // integer word past the int bank or an fp word past the fp bank
+    // ends up at 16(%rbp) and forces a frame. Called only for the
+    // frame gates, so a false positive merely costs a frame.
+    bool funcHasStackParams(IrFunc* func)
+    {
+        if (func == null || func->base.type == null) return false;
+        IrType* ft = func->base.type;
+        u32 maxInt = self.isWindows ? 4 : 6;
+        u32 maxFp = self.isWindows ? 4 : 8;
+        u32 intWords = 0;
+        u32 fpWords = 0;
+        for (u32 i = 0; i < ft->nparams; i++)
+        {
+            IrType* p = ft->params[i];
+            if (p == null) continue;
+            if (p->kind == IrTypeKind::Float || p->kind == IrTypeKind::Vector)
+                fpWords += p->width > 64 ? 2 : 1;
+            else if (p->kind == IrTypeKind::Struct)
+                intWords += (p->width > 8 && p->width <= 16) ? 2 : 1;
+            else
+                intWords += 1;
+        }
+        return intWords > maxInt || fpWords > maxFp;
+    }
+
     void emitPrologue(IrFunc* func, ElfMetadata* meta)
     {
         if (meta != null && meta->isGlobal)
@@ -466,17 +575,27 @@ pub struct X86_64CodeGen
         self.spillSlotCount = countSpillSlots(func);
         self.spillFrameBytes = self.spillSlotCount * 16;
         self.spillRbpPushed = false;
+        self.currentFunc = func;
+        self.allocaBase = 0;
+        self.allocaBytes = self.scanAllocas(func);
 
         bool isLeaf = func->isLeaf();
         bool isVararg = func->base.type != null && func->base.type->isVararg;
+        bool hasStackParams = self.funcHasStackParams(func);
 
         if (isVararg)
             isLeaf = false;
 
-        if (isLeaf && !self.isWindows && self.spillSlotCount == 0)
+        // The red zone is only safe when nothing needs a frame: no
+        // spills (they address rbp-relative), no allocas (their region
+        // lives in the frame) and no stack parameters (they are read
+        // through rbp too).
+        if (isLeaf && !self.isWindows && self.spillSlotCount == 0 &&
+            self.allocaBytes == 0 && !hasStackParams)
         {
             self.currentFuncHasFrame = false;
             self.useRedZone = true;
+            self.emitParamSeeding(func);
             return;
         }
 
@@ -594,15 +713,21 @@ pub struct X86_64CodeGen
         // Spill slots are addressed rbp-relative, so a frame is
         // mandatory whenever the allocator spilled anything — a leaf
         // or an omitFramePointer path cannot use spill slots safely.
-        bool needFrame = !isLeaf || self.spillSlotCount > 0;
-        bool canShrinkWrap = !isVararg && usesAnyCalleeSave && !hasFrame && self.spillSlotCount == 0;
+        // The alloca region hangs off rbp the same way, and stack
+        // parameters are read through rbp too, so both force a frame
+        // even in a leaf.
+        bool needFrame = !isLeaf || self.spillSlotCount > 0 ||
+                         self.allocaBytes > 0 || hasStackParams;
+        bool canShrinkWrap = !isVararg && usesAnyCalleeSave && !hasFrame && self.spillSlotCount == 0 &&
+                             self.allocaBytes == 0 && !hasStackParams;
         if (canShrinkWrap)
         {
             self.currentFuncHasFrame = false;
             if (self.isWindows)
                 self.shadowAllocSize = 32;
         }
-        else if (!isLeaf && self.omitFramePointer && self.spillSlotCount == 0)
+        else if (!isLeaf && self.omitFramePointer && self.spillSlotCount == 0 &&
+                 self.allocaBytes == 0 && !hasStackParams)
         {
             self.currentFuncHasFrame = false;
             if (self.isWindows)
@@ -635,19 +760,33 @@ pub struct X86_64CodeGen
                 if (self.savedCalleeSaves[i])
                     self.emitPushCalleeSave(calleeSaveRegs[i]);
             }
+
+            // Without a frame nothing else adjusts rsp: the entry value
+            // was 8 mod 16, so an even save count leaves the body
+            // misaligned at every call site. Take exactly one word —
+            // after the pushes, so the epilogue's spill-area addq (which
+            // runs before the pops) undoes it in the right order.
+            if (!self.currentFuncHasFrame && (self.numCalleeSaves % 2) == 0)
+            {
+                self.spillFrameBytes = 8;
+                self.emitter.emitLine("\tsubq $8, %rsp");
+            }
         }
 
         if (self.currentFuncHasFrame)
         {
-            // Reserve the spill area below the saved callee saves;
-            // slots address it rbp-relative, so the reservation only
-            // has to exist as a stable offset source. Padding to an
-            // odd 8 keeps the call instruction's stack 16-byte aligned.
+            // Reserve the spill slots and the alloca region below the
+            // saved callee saves; slots address it rbp-relative, and
+            // allocas find their base in allocaBase. Padding to an odd
+            // 8 keeps the call instruction's stack 16-byte aligned —
+            // allocaBytes is a multiple of 16, so it cannot disturb
+            // that.
             u32 n = self.spillSlotCount;
-            if (n > 0 || ((self.numCalleeSaves % 2) == 1))
+            u32 pad = (self.numCalleeSaves % 2) == 1 ? 8 : 0;
+            self.allocaBase = n * 16 + pad;
+            self.spillFrameBytes = self.allocaBase + self.allocaBytes;
+            if (self.spillFrameBytes > 0)
             {
-                u32 pad = (self.numCalleeSaves % 2) == 1 ? 8 : 0;
-                self.spillFrameBytes = n * 16 + pad;
                 cchar buf2[16];
                 u32ToStr(self.spillFrameBytes, buf2);
                 self.emitter.emit("\tsubq $");
@@ -656,125 +795,227 @@ pub struct X86_64CodeGen
             }
         }
 
-        if (!isVararg && func->nblocks > 0 && func->base.type != null && func->base.type->nparams > 0)
+        self.emitParamSeeding(func);
+    }
+
+    // Move the ABI's incoming parameter registers into the homes lsra
+    // chose, walking the entry block's parameter stores in order — the
+    // same walk the caller makes over its arguments, so register banks
+    // and stack slots stay in lockstep on both sides of every call.
+    // Called from every non-vararg path; the gate that picked the path
+    // already ruled out the cases this walk cannot serve (stack params
+    // and allocas without a frame).
+    void emitParamSeeding(IrFunc* func)
+    {
+        if (func == null || func->base.type == null) return;
+        if (func->base.type->isVararg) return;
+        if (func->nblocks == 0 || func->base.type->nparams == 0) return;
+
+        const cchar* sysvIntRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        const cchar* win64IntRegs[4] = {"rcx", "rdx", "r8", "r9"};
+        const cchar* sysvFpRegs[8] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
+        const cchar* win64FpRegs[4] = {"xmm0", "xmm1", "xmm2", "xmm3"};
+        const cchar** intRegs = self.isWindows ? win64IntRegs : sysvIntRegs;
+        const cchar** fpRegs = self.isWindows ? win64FpRegs : sysvFpRegs;
+
+        u32 intIdx = 0;
+        u32 fpIdx = 0;
+        u32 stackOff = self.isWindows ? 32 : 0;
+        u32 found = 0;
+        IrBlock* eb = func->blocks[0];
+        for (u32 i = 0; i < eb->ninsts && found < func->base.type->nparams; i++)
         {
-            const cchar* sysvIntRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
-            const cchar* win64IntRegs[4] = {"rcx", "rdx", "r8", "r9"};
-            const cchar* sysvFpRegs[8] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
-            const cchar* win64FpRegs[4] = {"xmm0", "xmm1", "xmm2", "xmm3"};
+            IrInst* inst = eb->insts[i];
+            if (inst->opcode != IrOpcode::Store || inst->nops < 1) continue;
+            IrValue* src = inst->ops[0];
+            if (src == null || src->kind != IrValueKind::Inst) continue;
 
-            u32 maxIntRegs = self.isWindows ? 4 : 6;
-            u32 maxFpRegs = self.isWindows ? 4 : 8;
-
-            const cchar** intRegs = self.isWindows ? win64IntRegs : sysvIntRegs;
-            const cchar** fpRegs = self.isWindows ? win64FpRegs : sysvFpRegs;
-
-            IrBlock* eb = func->blocks[0];
-            u32 intIdx = 0;
-            u32 fpIdx = 0;
-
-            for (u32 i = 0; i < eb->ninsts && (intIdx < maxIntRegs || fpIdx < maxFpRegs); i++)
+            bool srcDefined = false;
+            for (u32 b = 0; b < func->nblocks && !srcDefined; b++)
             {
-                IrInst* inst = eb->insts[i];
-                if (inst->opcode != IrOpcode::Store || inst->nops < 1) continue;
-                IrValue* src = inst->ops[0];
-                if (src == null || src->kind != IrValueKind::Inst) continue;
-
-                bool srcDefined = false;
-                for (u32 b = 0; b < func->nblocks && !srcDefined; b++)
+                IrBlock* bb = func->blocks[b];
+                for (u32 j = 0; j < bb->ninsts && !srcDefined; j++)
                 {
-                    IrBlock* bb = func->blocks[b];
-                    for (u32 j = 0; j < bb->ninsts && !srcDefined; j++)
+                    if (b == 0 && j == i) continue;
+                    IrInst* other = bb->insts[j];
+                    if (other->base.id == src->id) srcDefined = true;
+                }
+            }
+            if (srcDefined) continue;
+            found++;
+
+            u32 outReg = 0;
+            u32 outOff = 0;
+            u32 outWords = 1;
+            u32 kind = self.classifyCallArg(src, &intIdx, &fpIdx, &stackOff,
+                                             &outReg, &outOff, &outWords);
+            IrValue* dstv = inst->nops > 1 ? inst->ops[1] : null;
+
+            if (kind == 2)
+            {
+                // xmm parameter — sinkFloat also covers the spill slot
+                self.sinkFloat(src, fpRegs[outReg]);
+            }
+            else if (kind == 1)
+            {
+                // integer parameter — the full 8 bytes the caller put
+                // in the register, spill slots included
+                const cchar* abiReg = intRegs[outReg];
+                if (valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(abiReg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                else
+                {
+                    const cchar* home = opFor(src);
+                    if (strcmp(abiReg, home) != 0)
                     {
-                        if (b == 0 && j == i) continue;
-                        IrInst* other = bb->insts[j];
-                        if (other->base.id == src->id) srcDefined = true;
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(abiReg);
+                        self.emitter.emit(", ");
+                        self.emitter.emitLine(home);
                     }
                 }
-                if (srcDefined) continue;
-
-                bool isFloat = src->type != null && src->type->kind == IrTypeKind::Float;
-                bool isStruct = src->type != null && src->type->kind == IrTypeKind::Struct;
-                u64 vd = src->valData;
-                bool assignedToReg = (vd != 0 && (vd & 0x80000000UL) == 0 && (vd & 0x40000000UL) == 0);
-                u32 assignedRegIdx = (u32)(vd & 0x3FFFFFFF);
-
-                if (isStruct && !isFloat)
+            }
+            else if (kind == 3)
+            {
+                // struct words in registers: word0 also lands in the
+                // value's home, because the body's store rewrites that
+                // word of the alloca from there, and every word lands
+                // in the alloca itself
+                const cchar* abiReg = intRegs[outReg];
+                if (valueIsSpill(src))
                 {
-                    u32 sz = src->type->width;
-
-                    IrValue* dst = inst->nops > 1 ? inst->ops[1] : null;
-                    const cchar* destAddr = dst != null ? getRegForValue(dst) : "rax";
-
-                    if (sz <= 8)
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(abiReg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                else
+                {
+                    const cchar* home = opFor(src);
+                    if (strcmp(abiReg, home) != 0)
                     {
-                        if (intIdx < maxIntRegs)
-                        {
-                            const cchar* srcReg = intRegs[intIdx];
-                            self.emitter.emit("\tmovq ");
-                            self.emitter.emit(srcReg);
-                            self.emitter.emit(", (");
-                            self.emitter.emit(destAddr);
-                            self.emitter.emitLine(")");
-                            intIdx++;
-                        }
-                    }
-                    else if (sz <= 16)
-                    {
-                        if (intIdx < maxIntRegs)
-                        {
-                            const cchar* srcReg = intRegs[intIdx];
-                            self.emitter.emit("\tmovq ");
-                            self.emitter.emit(srcReg);
-                            self.emitter.emit(", (");
-                            self.emitter.emit(destAddr);
-                            self.emitter.emitLine(")");
-                            intIdx++;
-                        }
-
-                        if (intIdx < maxIntRegs)
-                        {
-                            const cchar* srcReg = intRegs[intIdx];
-                            self.emitter.emit("\tmovq ");
-                            self.emitter.emit(srcReg);
-                            self.emitter.emit(", 8(");
-                            self.emitter.emit(destAddr);
-                            self.emitter.emitLine(")");
-                            intIdx++;
-                        }
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(abiReg);
+                        self.emitter.emit(", ");
+                        self.emitter.emitLine(home);
                     }
                 }
-                else if (isFloat && fpIdx < maxFpRegs)
+                u32 aoff = 0;
+                if (dstv != null && self.allocaSlotOf(func, dstv, &aoff))
                 {
-                    const cchar* abiReg = fpRegs[fpIdx];
-                    if (assignedToReg && assignedRegIdx < 6)
+                    self.emitter.emit("\tleaq -");
+                    self.emitter.emitU32(aoff);
+                    self.emitter.emitLine("(%rbp), r10");
+                    for (u32 w = 0; w < outWords; w++)
                     {
-                        const cchar* destReg = X86_64_FLOAT_REGS[assignedRegIdx].ptr;
-                        if (strcmp(abiReg, destReg) != 0)
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(intRegs[outReg + w]);
+                        if (w == 0)
                         {
-                            self.emitter.emit("\tmovsd ");
-                            self.emitter.emit(abiReg);
+                            self.emitter.emitLine(", (r10)");
+                        }
+                        else
+                        {
                             self.emitter.emit(", ");
-                            self.emitter.emitLine(destReg);
+                            self.emitter.emitU32(8 * w);
+                            self.emitter.emitLine("(r10)");
                         }
                     }
-                    fpIdx++;
                 }
-                else if (!isFloat && !isStruct && intIdx < maxIntRegs)
+            }
+            else if (kind == 4)
+            {
+                // struct words on the stack: word0 into the value's
+                // home, every word into the alloca
+                if (valueIsSpill(src))
                 {
-                    const cchar* abiReg = intRegs[intIdx];
-                    if (assignedToReg && assignedRegIdx < 7)
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                u32 aoff = 0;
+                if (dstv != null && self.allocaSlotOf(func, dstv, &aoff))
+                {
+                    self.emitter.emit("\tleaq -");
+                    self.emitter.emitU32(aoff);
+                    self.emitter.emitLine("(%rbp), r10");
+                    for (u32 w = 0; w < outWords; w++)
                     {
-                        const cchar* destReg = X86_64_INT_REGS[assignedRegIdx].ptr;
-                        if (strcmp(abiReg, destReg) != 0)
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emitU32(16 + outOff + 8 * w);
+                        self.emitter.emit("(%rbp), r11");
+                        self.emitter.emit("\tmovq r11, ");
+                        if (w == 0)
                         {
-                            self.emitter.emit("\tmovq ");
-                            self.emitter.emit(abiReg);
-                            self.emitter.emit(", ");
-                            self.emitter.emitLine(destReg);
+                            self.emitter.emitLine("(r10)");
+                        }
+                        else
+                        {
+                            self.emitter.emitU32(8 * w);
+                            self.emitter.emitLine("(r10)");
                         }
                     }
-                    intIdx++;
+                }
+            }
+            else
+            {
+                // stack-passed scalar: the first stack argument lives
+                // at 16(%rbp), the Win64 shadow reserves the first 32
+                bool isFp = src->type != null &&
+                            (src->type->kind == IrTypeKind::Float ||
+                             src->type->kind == IrTypeKind::Vector);
+                if (isFp)
+                {
+                    bool isV = src->type->kind == IrTypeKind::Vector;
+                    const cchar* mn = isV ? "movdqu " : (src->type->width == 64 ? "movsd " : "movss ");
+                    if (valueIsSpill(src))
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emitU32(16 + outOff);
+                        self.emitter.emitLine("(%rbp), xmm15");
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emit("xmm15, ");
+                        self.emitter.emitLine(opFor(src));
+                    }
+                    else
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emitU32(16 + outOff);
+                        self.emitter.emit("(%rbp), ");
+                        self.emitter.emitLine(opFor(src));
+                    }
+                }
+                else if (valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emitLine("(%rbp), r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emitU32(16 + outOff);
+                    self.emitter.emit("(%rbp), ");
+                    self.emitter.emitLine(opFor(src));
                 }
             }
         }
@@ -2511,10 +2752,37 @@ pub struct X86_64CodeGen
 
     void emitAlloca(IrInst* inst)
     {
-        const cchar* dst = getRegForValue(&inst->base);
-        self.emitter.emit("\tsubq $8, %rsp");
+        u32 off = 0;
+        if (self.currentFuncHasFrame &&
+            self.allocaSlotOf(self.currentFunc, &inst->base, &off))
+        {
+            // the prologue already cut the region out — just point at
+            // this alloca's slice of it
+            const cchar* dst = getRegForValue(&inst->base);
+            bool dstSpill = valueIsSpill(&inst->base);
+            const cchar* work = dstSpill ? "r10" : dst;
+            self.emitter.emit("\tleaq -");
+            self.emitter.emitU32(off);
+            self.emitter.emit("(%rbp), ");
+            self.emitter.emitLine(work);
+            if (dstSpill)
+            {
+                self.emitter.emit("\tmovq r10, ");
+                self.emitter.emitLine(dst);
+            }
+            return;
+        }
+        // nothing to hang the region on (no frame, or the walk did not
+        // find this alloca): take the bytes straight off rsp; the size
+        // is 16-aligned, so the stack stays aligned for calls
+        u32 sz = self.allocaSlotSize(inst);
+        cchar buf[16];
+        u32ToStr(sz, buf);
+        self.emitter.emit("\tsubq $");
+        self.emitter.emit(buf);
+        self.emitter.emitLine(", %rsp");
         self.emitter.emit("\tmovq %rsp, ");
-        self.emitter.emitLine(dst);
+        self.emitter.emitLine(getRegForValue(&inst->base));
     }
 
     void emitGep(IrInst* inst)
@@ -3068,191 +3336,516 @@ pub struct X86_64CodeGen
         self.emitter.emitLine(dst);
     }
 
-    void emitCallSetup(IrInst* inst)
+    // Which register class / stack slot one argument takes; advances
+    // the running indices exactly the way the callee's param seeding
+    // walks its stores, so both sides of a call agree word for word.
+    // kinds: 0 = stack slot (value itself), 1 = integer register
+    // (value itself), 2 = xmm register, 3 = integer register (struct
+    // words loaded through their address), 4 = stack slot (struct
+    // words loaded through their address).
+    u32 classifyCallArg(IrValue* arg, u32* intIdx, u32* fpIdx, u32* stackOff,
+                        u32* outReg, u32* outOff, u32* outWords)
     {
-        u32 nargs = (inst->nops > 1) ? inst->nops - 1 : 0;
-        if (nargs == 0) return;
+        u32 maxInt = self.isWindows ? 4 : 6;
+        u32 maxFp = self.isWindows ? 4 : 8;
+        *outReg = 0;
+        *outOff = 0;
+        *outWords = 1;
+        if (arg == null)
+        {
+            if (*intIdx < maxInt)
+            {
+                *outReg = *intIdx;
+                *intIdx += 1;
+                return 1;
+            }
+            *outOff = *stackOff;
+            *stackOff += 8;
+            return 0;
+        }
+        bool isFp = arg->type != null &&
+                    (arg->type->kind == IrTypeKind::Float ||
+                     arg->type->kind == IrTypeKind::Vector);
+        bool isStruct = arg->type != null && arg->type->kind == IrTypeKind::Struct;
+        if (isStruct && !isFp)
+        {
+            // a struct is passed all-in-registers or all-on-stack,
+            // never split across the boundary
+            u32 sz = arg->type->width;
+            u32 words = (sz > 8 && sz <= 16) ? 2 : 1;
+            bool byValue = sz <= 16;
+            u32 need = byValue ? words : 1;
+            *outWords = words;
+            if (*intIdx + need <= maxInt)
+            {
+                *outReg = *intIdx;
+                *intIdx += need;
+                return byValue ? 3 : 1;
+            }
+            *outOff = *stackOff;
+            *stackOff += 8 * words;
+            return byValue ? 4 : 0;
+        }
+        if (isFp)
+        {
+            u32 words = arg->type->width > 64 ? 2 : 1;
+            *outWords = words;
+            if (*fpIdx < maxFp)
+            {
+                *outReg = *fpIdx;
+                *fpIdx += 1;
+                return 2;
+            }
+            *outOff = *stackOff;
+            *stackOff += 8 * words;
+            return 0;
+        }
+        if (*intIdx < maxInt)
+        {
+            *outReg = *intIdx;
+            *intIdx += 1;
+            return 1;
+        }
+        *outOff = *stackOff;
+        *stackOff += 8;
+        return 0;
+    }
+
+    void emitCall(IrInst* inst)
+    {
+        if (inst->nops == 0 || inst->ops[0] == null) return;
+        IrValue* callee = inst->ops[0];
+        const cchar* calleeName = callee->name;
+
+        self.lastCallTarget = calleeName;
+        self.lastCallResult = &inst->base;
 
         const cchar* sysvIntRegs[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
         const cchar* win64IntRegs[4] = { "rcx", "rdx", "r8", "r9" };
         const cchar* sysvFpRegs[8] = { "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7" };
         const cchar* win64FpRegs[4] = { "xmm0", "xmm1", "xmm2", "xmm3" };
-
-        u32 maxIntRegs = self.isWindows ? 4 : 6;
-        u32 maxFpRegs = self.isWindows ? 4 : 8;
-
         const cchar** intRegs = self.isWindows ? win64IntRegs : sysvIntRegs;
         const cchar** fpRegs = self.isWindows ? win64FpRegs : sysvFpRegs;
 
+        u32 nargs = inst->nops - 1;
+
+        // pass A: classify every argument, collect the register moves.
+        // move kinds: 1 int value, 2 xmm value, 3 struct word,
+        // 4 immediate int, 5 immediate fp; 0/4 classify to the stack
+        // and are pass B's business
         u32 intIdx = 0;
         u32 fpIdx = 0;
-
-        for (u32 i = 1; i < inst->nops; i++)
+        u32 stackOff = self.isWindows ? 32 : 0;   // Win64 shadow first
+        u32 mvN = 0;
+        u8 mvKind[32];
+        u8 mvWord[32];
+        u32 mvReg[32];
+        IrValue* mvArg[32];
+        for (u32 i = 0; i < nargs; i++)
         {
-            IrValue* arg = inst->ops[i];
-            if (arg == null) continue;
-
-            bool isFloat = valueIsFloatClass(arg);
-            bool isStruct = arg->type != null && arg->type->kind == IrTypeKind::Struct;
-
-            if (isStruct && !isFloat)
+            IrValue* arg = inst->ops[1 + i];
+            u32 outReg = 0;
+            u32 outOff = 0;
+            u32 outWords = 1;
+            u32 kind = self.classifyCallArg(arg, &intIdx, &fpIdx, &stackOff,
+                                             &outReg, &outOff, &outWords);
+            if (arg != null && arg->kind == IrValueKind::ConstInt && kind == 1)
             {
-                u32 sz = arg->type->width;
-
-                if (sz <= 8)
+                mvKind[mvN] = 4; mvWord[mvN] = 0; mvReg[mvN] = outReg; mvArg[mvN] = arg;
+                mvN++;
+                continue;
+            }
+            if (arg != null && arg->kind == IrValueKind::ConstFloat && kind == 2)
+            {
+                mvKind[mvN] = 5; mvWord[mvN] = 0; mvReg[mvN] = outReg; mvArg[mvN] = arg;
+                mvN++;
+                continue;
+            }
+            if (kind == 3)
+            {
+                for (u32 w = 0; w < outWords; w++)
                 {
-                    if (intIdx < maxIntRegs)
+                    mvKind[mvN] = 3; mvWord[mvN] = (u8)w; mvReg[mvN] = outReg + w; mvArg[mvN] = arg;
+                    mvN++;
+                }
+            }
+            else if (kind == 1 || kind == 2)
+            {
+                mvKind[mvN] = (u8)kind; mvWord[mvN] = 0; mvReg[mvN] = outReg; mvArg[mvN] = arg;
+                mvN++;
+            }
+        }
+
+        // resolve the register moves as a parallel copy: a move waits
+        // while some pending move still has to read the register it
+        // would write, and a stalled move parks its source in a
+        // staging slot — memory blocks nobody
+        bool mvDone[32];
+        bool mvStaged[32];
+        u32 mvScratch[32];
+        for (u32 i = 0; i < 32; i++)
+        {
+            mvDone[i] = false;
+            mvStaged[i] = false;
+            mvScratch[i] = 0;
+        }
+        u32 planOp[32];     // 0 = stage, 1 = move
+        u32 planA[32];      // the move index
+        u32 planB[32];      // staging offset (stage only)
+        u32 planN = 0;
+        u32 stageN = 0;
+        u32 doneCount = 0;
+        while (doneCount < mvN)
+        {
+            bool progress = false;
+            for (u32 m = 0; m < mvN; m++)
+            {
+                if (mvDone[m]) continue;
+                const cchar* myDst = (mvKind[m] == 2 || mvKind[m] == 5)
+                                   ? fpRegs[mvReg[m]] : intRegs[mvReg[m]];
+                bool blocked = false;
+                for (u32 o = 0; o < mvN && !blocked; o++)
+                {
+                    if (o == m || mvDone[o] || mvStaged[o]) continue;
+                    if (mvKind[o] == 4 || mvKind[o] == 5) continue;
+                    IrValue* a = mvArg[o];
+                    if (a == null || valueIsSpill(a)) continue;
+                    if (strcmp(opFor(a), myDst) == 0) blocked = true;
+                }
+                if (!blocked)
+                {
+                    planOp[planN] = 1; planA[planN] = m; planN++;
+                    mvDone[m] = true;
+                    doneCount++;
+                    progress = true;
+                }
+            }
+            if (doneCount == mvN) break;
+            if (!progress)
+            {
+                u32 m = 0;
+                while (m < mvN && (mvDone[m] || mvStaged[m] || mvKind[m] == 4 ||
+                                   mvKind[m] == 5 || mvArg[m] == null ||
+                                   valueIsSpill(mvArg[m])))
+                    m++;
+                if (m >= mvN) break;
+                u32 off = stackOff + stageN * 16;
+                stageN++;
+                planOp[planN] = 0; planA[planN] = m; planB[planN] = off; planN++;
+                mvStaged[m] = true;
+                mvScratch[m] = off;
+                progress = true;
+            }
+        }
+
+        // one stack adjustment: Win64 shadow plus every stack
+        // argument plus the staging slots, rounded to 16
+        u32 total = stackOff + stageN * 16;
+        if ((total % 16) != 0) total = (total / 16 + 1) * 16;
+        if (total > 0)
+        {
+            self.emitter.emit("\tsubq $");
+            self.emitter.emitU32(total);
+            self.emitter.emitLine(", %rsp");
+        }
+
+        // pass B: the stack arguments at fixed offsets; none of this
+        // touches an argument register, so it runs before the copy
+        u32 sInt = 0;
+        u32 sFp = 0;
+        u32 sOff = self.isWindows ? 32 : 0;
+        for (u32 i = 0; i < nargs; i++)
+        {
+            IrValue* arg = inst->ops[1 + i];
+            u32 outReg = 0;
+            u32 outOff = 0;
+            u32 outWords = 1;
+            u32 kind = self.classifyCallArg(arg, &sInt, &sFp, &sOff,
+                                             &outReg, &outOff, &outWords);
+            if (kind == 4)
+            {
+                // struct words through their address into the slot
+                const cchar* addr = valueIsSpill(arg)
+                                  ? self.opForReg(arg, "r10") : opFor(arg);
+                for (u32 w = 0; w < outWords; w++)
+                {
+                    self.emitter.emit("\tmovq ");
+                    if (w > 0)
                     {
-                        const cchar* reg = intRegs[intIdx];
-                        self.emitter.emit("\tmovq (");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emit("), ");
-                        self.emitter.emitLine(reg);
-                        intIdx++;
+                        self.emitter.emitU32(8 * w);
+                        self.emitter.emit("(");
+                        self.emitter.emit(addr);
+                        self.emitter.emit("), r11");
                     }
                     else
                     {
-                        self.emitter.emit("\tpushq (");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emitLine(")");
+                        self.emitter.emit("(");
+                        self.emitter.emit(addr);
+                        self.emitter.emit("), r11");
+                    }
+                    self.emitter.emit("\n");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitU32(outOff + 8 * w);
+                    self.emitter.emitLine("(%rsp)");
+                }
+            }
+            else if (kind == 0)
+            {
+                if (arg != null && arg->kind == IrValueKind::ConstInt)
+                {
+                    cchar num[20];
+                    u64ToHex(arg->valData, num);
+                    self.emitter.emit("\tmovq $");
+                    self.emitter.emit(num);
+                    self.emitter.emit(", ");
+                    self.emitter.emitU32(outOff);
+                    self.emitter.emitLine("(%rsp)");
+                }
+                else if (arg != null && arg->kind == IrValueKind::ConstFloat)
+                {
+                    cchar num[20];
+                    u64ToHex(arg->valData, num);
+                    self.emitter.emit("\tmovabsq $");
+                    self.emitter.emit(num);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitU32(outOff);
+                    self.emitter.emitLine("(%rsp)");
+                }
+                else if (valueIsFloatClass(arg) || valueIsVec(arg))
+                {
+                    bool isV = valueIsVec(arg);
+                    const cchar* mn = isV ? "movdqu "
+                                          : (arg->type != null && arg->type->width == 64 ? "movsd " : "movss ");
+                    if (valueIsSpill(arg))
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emit(opFor(arg));
+                        self.emitter.emitLine(", xmm15");
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emit("xmm15, ");
+                        self.emitter.emitU32(outOff);
+                        self.emitter.emitLine("(%rsp)");
+                    }
+                    else
+                    {
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emit(opFor(arg));
+                        self.emitter.emit(", ");
+                        self.emitter.emitU32(outOff);
+                        self.emitter.emitLine("(%rsp)");
                     }
                 }
-                else if (sz <= 16)
+                else if (arg != null)
                 {
-                    bool firstIsInt = true;
-                    bool secondIsInt = true;
-
-                    if (intIdx < maxIntRegs)
+                    if (valueIsSpill(arg))
                     {
-                        const cchar* reg = intRegs[intIdx];
-                        self.emitter.emit("\tmovq (");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emit("), ");
-                        self.emitter.emitLine(reg);
-                        intIdx++;
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(opFor(arg));
+                        self.emitter.emitLine(", r11");
+                        self.emitter.emit("\tmovq r11, ");
+                        self.emitter.emitU32(outOff);
+                        self.emitter.emitLine("(%rsp)");
                     }
                     else
                     {
-                        self.emitter.emit("\tpushq (");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emitLine(")");
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(opFor(arg));
+                        self.emitter.emit(", ");
+                        self.emitter.emitU32(outOff);
+                        self.emitter.emitLine("(%rsp)");
                     }
+                }
+            }
+        }
 
-                    if (intIdx < maxIntRegs)
-                    {
-                        const cchar* reg = intRegs[intIdx];
-                        self.emitter.emit("\tmovq 8(");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emit("), ");
-                        self.emitter.emitLine(reg);
-                        intIdx++;
-                    }
-                    else
-                    {
-                        self.emitter.emit("\tpushq 8(");
-                        self.emitter.emit(getRegForValue(arg));
-                        self.emitter.emitLine(")");
-                    }
+        // the register copy itself
+        for (u32 p = 0; p < planN; p++)
+        {
+            u32 m = planA[p];
+            IrValue* arg = mvArg[m];
+            u32 w = mvWord[m];
+            if (planOp[p] == 0)
+            {
+                // park the source so its register stops blocking others
+                if (mvKind[m] == 2)
+                {
+                    bool isV = arg->type != null && arg->type->kind == IrTypeKind::Vector;
+                    const cchar* mn = isV ? "movdqu "
+                                          : (arg->type != null && arg->type->width == 64 ? "movsd " : "movss ");
+                    self.emitter.emit("\t");
+                    self.emitter.emit(mn);
+                    self.emitter.emit(opFor(arg));
+                    self.emitter.emit(", ");
+                    self.emitter.emitU32(planB[p]);
+                    self.emitter.emitLine("(%rsp)");
                 }
                 else
                 {
                     self.emitter.emit("\tmovq ");
-                    self.emitter.emit(getRegForValue(arg));
-                    self.emitter.emitLine(", %rdi");
-                }
-            }
-            else if (isFloat && fpIdx < maxFpRegs)
-            {
-                const cchar* reg = fpRegs[fpIdx];
-                const cchar* src = getRegForValue(arg);
-                if (strcmp(src, reg) != 0)
-                {
-                    self.emitter.emit("\tmovsd ");
-                    self.emitter.emit(src);
+                    self.emitter.emit(opFor(arg));
                     self.emitter.emit(", ");
-                    self.emitter.emitLine(reg);
+                    self.emitter.emitU32(planB[p]);
+                    self.emitter.emitLine("(%rsp)");
                 }
-                fpIdx++;
-            }
-            else if (!isFloat && !isStruct && intIdx < maxIntRegs)
-            {
-                const cchar* reg = intRegs[intIdx];
-                const cchar* src = getRegForValue(arg);
-                if (strcmp(src, reg) != 0)
-                {
-                    self.emitter.emit("\tmovq ");
-                    self.emitter.emit(src);
-                    self.emitter.emit(", ");
-                    self.emitter.emitLine(reg);
-                }
-                intIdx++;
             }
             else
             {
-                const cchar* src = getRegForValue(arg);
-                self.emitter.emit("\tpushq ");
-                self.emitter.emitLine(src);
+                const cchar* dst = (mvKind[m] == 2 || mvKind[m] == 5)
+                                 ? fpRegs[mvReg[m]] : intRegs[mvReg[m]];
+                if (mvKind[m] == 4)
+                {
+                    cchar num[20];
+                    u64ToHex(arg->valData, num);
+                    self.emitter.emit("\tmovq $");
+                    self.emitter.emit(num);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(dst);
+                }
+                else if (mvKind[m] == 5)
+                {
+                    cchar num[20];
+                    u64ToHex(arg->valData, num);
+                    self.emitter.emit("\tmovabsq $");
+                    self.emitter.emit(num);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(dst);
+                }
+                else if (mvKind[m] == 3)
+                {
+                    // the address, then the word through it
+                    const cchar* addr;
+                    if (mvStaged[m])
+                    {
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emitU32(mvScratch[m]);
+                        self.emitter.emitLine("(%rsp), r10");
+                        addr = "r10";
+                    }
+                    else if (valueIsSpill(arg))
+                    {
+                        addr = self.opForReg(arg, "r10");
+                    }
+                    else
+                    {
+                        addr = opFor(arg);
+                    }
+                    self.emitter.emit("\tmovq ");
+                    if (w > 0) self.emitter.emitU32(8 * w);
+                    self.emitter.emit("(");
+                    self.emitter.emit(addr);
+                    self.emitter.emit("), ");
+                    self.emitter.emitLine(dst);
+                }
+                else if (mvKind[m] == 2)
+                {
+                    if (mvStaged[m])
+                    {
+                        bool isV = arg->type != null && arg->type->kind == IrTypeKind::Vector;
+                        const cchar* mn = isV ? "movdqu "
+                                              : (arg->type != null && arg->type->width == 64 ? "movsd " : "movss ");
+                        self.emitter.emit("\t");
+                        self.emitter.emit(mn);
+                        self.emitter.emitU32(mvScratch[m]);
+                        self.emitter.emit("(%rsp), ");
+                        self.emitter.emitLine(dst);
+                    }
+                    else
+                    {
+                        self.opForRegF(arg, dst);
+                    }
+                }
+                else
+                {
+                    if (mvStaged[m])
+                    {
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emitU32(mvScratch[m]);
+                        self.emitter.emit("(%rsp), ");
+                        self.emitter.emitLine(dst);
+                    }
+                    else
+                    {
+                        self.opForReg(arg, dst);
+                    }
+                }
             }
         }
-    }
 
-    void emitCall(IrInst* inst)
-    {
-        if (inst->nops > 0 && inst->ops[0] != null)
+        // SysV varargs: the callee reads %al to decide whether to
+        // save the xmm registers into its register save area
+        if (!self.isWindows && callee->kind == IrValueKind::Func)
         {
-            IrValue* callee = inst->ops[0];
-            const cchar* calleeName = callee->name;
-
-            self.lastCallTarget = calleeName;
-            self.lastCallResult = &inst->base;
-
-            emitCallSetup(inst);
-
-            if (self.isWindows)
-                self.emitter.emitTab("subq $32, %rsp");
-            self.emitter.emit("\tcall ");
-            self.emitter.emit(calleeName);
-            if (!self.isWindows && callee->kind == IrValueKind::Func)
+            IrFunc* fn = (IrFunc*)callee;
+            if (fn->base.type != null && fn->base.type->isVararg)
             {
-                IrFunc* fn = (IrFunc*)callee;
-                if (fn.isExtern)
-                    self.emitter.emit("@PLT");
+                self.emitter.emit("\tmovb $");
+                self.emitter.emitU32(fpIdx);
+                self.emitter.emitLine(", %al");
             }
-            self.emitter.emit("\n");
-            if (self.isWindows)
-                self.emitter.emitTab("addq $32, %rsp");
+        }
 
-            u32 nargs = (inst->nops > 1) ? inst->nops - 1 : 0;
-            u32 maxIntRegs = self.isWindows ? 4 : 6;
-            u32 maxFpRegs = self.isWindows ? 4 : 8;
-            u32 stackArgs = nargs;
-            if (stackArgs > maxIntRegs + maxFpRegs)
-                stackArgs = stackArgs - maxIntRegs - maxFpRegs;
-            else
-                stackArgs = 0;
-            if (stackArgs > 0)
+        self.emitter.emit("\tcall ");
+        self.emitter.emit(calleeName);
+        if (!self.isWindows && callee->kind == IrValueKind::Func)
+        {
+            IrFunc* fn = (IrFunc*)callee;
+            if (fn.isExtern)
+                self.emitter.emit("@PLT");
+        }
+        self.emitter.emit("\n");
+
+        if (total > 0)
+        {
+            self.emitter.emit("\taddq $");
+            self.emitter.emitU32(total);
+            self.emitter.emitLine(", %rsp");
+        }
+
+        // the result arrives in rax / xmm0 — sink it into the home
+        // lsra picked for the call's value
+        if (inst->base.type != null)
+        {
+            const cchar* dst = opFor(&inst->base);
+            if (valueIsFloatClass(&inst->base) || valueIsVec(&inst->base))
             {
-                u32 cleanup = stackArgs * 8;
-                cchar cleanupBuf[16];
-                u32ToStr(cleanup, cleanupBuf);
-                self.emitter.emit("\taddq $");
-                self.emitter.emitLine(cleanupBuf);
-                self.emitter.emit(", %rsp\n");
+                u32 w = inst->base.type->width;
+                const cchar* mn;
+                if (valueIsVec(&inst->base))
+                    mn = w > 64 ? "movdqu " : "movq ";
+                else
+                    mn = w == 64 ? "movsd " : "movss ";
+                if (strcmp(dst, "xmm0") != 0)
+                {
+                    self.emitter.emit("\t");
+                    self.emitter.emit(mn);
+                    self.emitter.emit("xmm0, ");
+                    self.emitter.emitLine(dst);
+                }
+            }
+            else
+            {
+                if (strcmp(dst, "rax") != 0)
+                {
+                    self.emitter.emit("\tmovq rax, ");
+                    self.emitter.emitLine(dst);
+                }
             }
         }
     }
 
     bool isTailCall(IrInst* retInst)
     {
-        if (self.lastCallTarget == null || self.lastCallTarget[0] == 0) return false;
-        if (retInst->nops == 0 || retInst->ops[0] == null) return false;
-        if (self.lastCallResult != retInst->ops[0]) return false;
-        if (self.currentFuncHasFrame) return false;
-        if (self.numCalleeSaves > 0) return false;
-        if (self.varargAllocSize > 0) return false;
-        if (self.shadowAllocSize > 0) return false;
-        if (self.isWindows) return false;
-        return true;
+        // The call has already emitted its whole sequence (stack
+        // adjustment, register copy, result sink). Jumping to the
+        // target here would run all of it a second time with clobbered
+        // arguments, and skipping emitEpilogue would leave the frame
+        // allocated. Real tail calls stay open (G34).
+        return false;
     }
 
     void emitSelect(IrInst* inst)
