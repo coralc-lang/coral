@@ -12,22 +12,83 @@ mod stmt = import "../coral-ast/stmt";
 import stmt { Stmt, StmtKind };
 mod mono = import "mono";
 import mono { MonoContext, MonoDeclKind, MonoWorkItem };
+mod sema = import "../coral-semantics/sema";
+import sema { Sema };
+mod scope = import "../coral-semantics/scope";
+import scope { Symbol, ScopeStack };
+mod context = import "../coral-context/context";
+import context { AstContext, InternEntry };
+
+extern("C") i64 write(i32 fd, rawptr buf, usize count);
 
 pub extend MonoContext
 {
     NodeId findDeclaration(Str name)
     {
-        if (self.file == null)
+        if (self.file != null)
         {
-            NodeId none;
-            none.index = 0;
-            return none;
+            u32 i = 0;
+            while (i < self.file->declsLen)
+            {
+                if (self.declarationName(self.file->decls[i]) == name) return self.file->decls[i];
+                i = i + 1;
+            }
         }
-        u32 i = 0;
-        while (i < self.file->declsLen)
+        /* fallback: sema's merged scope — types like core's `cchar` may be
+         * visible to sema without being merged into this unit's file */
+        if (self.sema != null)
         {
-            if (self.declarationName(self.file->decls[i]) == name) return self.file->decls[i];
-            i = i + 1;
+            ScopeStack* scopes = self.sema.scopes;
+            if (scopes != null)
+            {
+                Symbol* sym = scopes.lookup(name);
+                if (sym != null && sym->declaration.index != 0) return sym->declaration;
+            }
+        }
+        NodeId none;
+        none.index = 0;
+        return none;
+    }
+
+    /* explicit generic args on a named type — prefer the decl whose generic
+     * arity matches (libc's extern realloc vs mman's realloc<T>) */
+    NodeId findGenericDeclaration(Str name, u32 want)
+    {
+        if (self.file != null)
+        {
+            u32 i = 0;
+            while (i < self.file->declsLen)
+            {
+                if (self.declarationName(self.file->decls[i]) == name &&
+                    self.genericCount(self.file->decls[i]) == want)
+                    return self.file->decls[i];
+                i = i + 1;
+            }
+        }
+        if (self.sema != null)
+        {
+            ScopeStack* scopes = self.sema.scopes;
+            if (scopes != null)
+            {
+                Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                if (cands != null)
+                {
+                    u32 n = scopes.lookupAll(name, cands, 16);
+                    u32 m = 0;
+                    while (m < n)
+                    {
+                        if (cands[m]->declaration.index != 0 &&
+                            self.genericCount(cands[m]->declaration) == want)
+                        {
+                            NodeId found = cands[m]->declaration;
+                            free((rawptr)cands);
+                            return found;
+                        }
+                        m = m + 1;
+                    }
+                    free((rawptr)cands);
+                }
+            }
         }
         NodeId none;
         none.index = 0;
@@ -69,6 +130,23 @@ pub extend MonoContext
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
+            u8 a = (u8)(48 + self.genericCount(declaration));
+            u8 b = (u8)(48 + argumentsLen);
+            u8 nl = 10;
+            write(2, (u8*)"E", 1);
+            write(2, &a, 1);
+            write(2, &b, 1);
+            write(2, (u8*)"[", 1);
+            {
+                Str dn = self.declarationName(declaration);
+                if (dn != 0)
+                {
+                    InternEntry* ne = self.ast.interns + dn;
+                    write(2, ne->ptr, ne->len);
+                }
+            }
+            write(2, (u8*)"]", 1);
+            write(2, &nl, 1);
             self.errors = self.errors + 1;
             return false;
         }
@@ -108,10 +186,35 @@ pub extend MonoContext
         if (entry->kind.tag == TypeKind::Named)
         {
             NodeId declId = self.findDeclaration(entry->kind.payload.Named.name);
+            if (entry->kind.payload.Named.genericArgsLen > 0)
+            {
+                NodeId pref = self.findGenericDeclaration(entry->kind.payload.Named.name,
+                                                          entry->kind.payload.Named.genericArgsLen);
+                if (pref.index != 0) declId = pref;
+            }
             if (declId.index == 0) return true;
             if (entry->kind.payload.Named.genericArgsLen > 0)
             {
-                if (!self.enqueue(MonoDeclKind::TypeDecl, declId, entry->kind.payload.Named.genericArgs, entry->kind.payload.Named.genericArgsLen)) return false;
+                u32 gaLen = entry->kind.payload.Named.genericArgsLen;
+                Ty* ga = entry->kind.payload.Named.genericArgs;
+                if (self.activeSubsLen > 0 && self.activeSubs != null)
+                {
+                    /* instance-body re-collection: `alloc<T>` becomes alloc<str> */
+                    Ty* subst = (Ty*)malloc((usize)gaLen * @sizeof(Ty));
+                    if (subst != null)
+                    {
+                        u32 q = 0;
+                        while (q < gaLen)
+                        {
+                            subst[q] = self.substituteType(ga[q], self.activeSubs, self.activeSubsLen);
+                            q = q + 1;
+                        }
+                        bool okE = self.enqueue(MonoDeclKind::TypeDecl, declId, subst, gaLen);
+                        free((rawptr)subst);
+                        if (!okE) return false;
+                    }
+                }
+                else if (!self.enqueue(MonoDeclKind::TypeDecl, declId, ga, gaLen)) return false;
             }
             u32 i = 0;
             while (i < entry->kind.payload.Named.genericArgsLen)
@@ -170,6 +273,8 @@ pub extend MonoContext
         while (i < call->kind.payload.Call.argsLen)
         {
             arguments[i] = self.sema.exprType(call->kind.payload.Call.args[i]);
+            if (self.activeSubsLen > 0 && self.activeSubs != null)
+                arguments[i] = self.substituteType(arguments[i], self.activeSubs, self.activeSubsLen);
             i = i + 1;
         }
         bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, call->kind.payload.Call.argsLen);

@@ -252,6 +252,9 @@ pub extend Sema
 
     Ty namedType(Str name)
     {
+        /* `str` is a builtin — `str::…` static calls route here via the
+         * type-static arm of checkCall, so it must map to the singleton */
+        if (name == self.ctx.intern((u8*)"str", 3)) return self.strType();
         u32 i = 1;
         while (i < self.ctx.typesLen) {
             TypeEntry* entry = self.ctx.types + i;
@@ -545,31 +548,83 @@ pub extend Sema
         return false;
     }
 
+    u32 declGenericParams(Decl* decl, NodeId** outParams)
+    {
+        *outParams = null;
+        if (decl == null) return 0;
+        if (decl->kind.tag == DeclKind::Struct) {
+            *outParams = decl->kind.payload.Struct.genericParams;
+            return decl->kind.payload.Struct.genericParamsLen;
+        }
+        if (decl->kind.tag == DeclKind::Func) {
+            *outParams = decl->kind.payload.Func.genericParams;
+            return decl->kind.payload.Func.genericParamsLen;
+        }
+        if (decl->kind.tag == DeclKind::Variant) {
+            *outParams = decl->kind.payload.Variant.genericParams;
+            return decl->kind.payload.Variant.genericParamsLen;
+        }
+        if (decl->kind.tag == DeclKind::Union) {
+            *outParams = decl->kind.payload.Union.genericParams;
+            return decl->kind.payload.Union.genericParamsLen;
+        }
+        if (decl->kind.tag == DeclKind::Trait) {
+            *outParams = decl->kind.payload.Trait.genericParams;
+            return decl->kind.payload.Trait.genericParamsLen;
+        }
+        return 0;
+    }
+
     Str structParamName(Ty objectType, u32 index)
     {
         if (objectType == 0) return 0;
         TypeEntry* obj = self.ctx.types + objectType;
         if (obj->kind.tag != TypeKind::Named) return 0;
-        Symbol* symbol = self.scopes.lookup(obj->kind.payload.Named.name);
-        if (symbol == null) return 0;
-        Node* declNode = self.ctx.nodes + symbol->declaration.index;
-        if (declNode->kind.tag != NodeKind::Decl) return 0;
-        Decl* decl = &declNode->kind.payload.Decl.value;
+        Str name = obj->kind.payload.Named.name;
+        Decl* decl = null;
+        Symbol* symbol = self.scopes.lookup(name);
+        if (symbol != null && symbol->declaration.index != 0)
+        {
+            Node* declNode = self.ctx.nodes + symbol->declaration.index;
+            if (declNode->kind.tag == NodeKind::Decl) decl = &declNode->kind.payload.Decl.value;
+        }
         NodeId* generics = null;
-        u32 count = 0;
-
-        if (decl->kind.tag == DeclKind::Struct) {
-            generics = decl->kind.payload.Struct.genericParams;
-            count = decl->kind.payload.Struct.genericParamsLen;
-        } else if (decl->kind.tag == DeclKind::Variant) {
-            generics = decl->kind.payload.Variant.genericParams;
-            count = decl->kind.payload.Variant.genericParamsLen;
-        } else if (decl->kind.tag == DeclKind::Union) {
-            generics = decl->kind.payload.Union.genericParams;
-            count = decl->kind.payload.Union.genericParamsLen;
-        } else if (decl->kind.tag == DeclKind::Trait) {
-            generics = decl->kind.payload.Trait.genericParams;
-            count = decl->kind.payload.Trait.genericParamsLen;
+        u32 count = self.declGenericParams(decl, &generics);
+        if (generics == null || index >= count)
+        {
+            /* the plain scope lookup can bind a same-named non-generic
+             * declaration (libc's extern realloc shadows mman's realloc<T>)
+             * — search all candidates for one with a generic param at index */
+            generics = null;
+            count = 0;
+            Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+            if (cands != null)
+            {
+                u32 n = self.scopes.lookupAll(name, cands, 16);
+                u32 m = 0;
+                while (m < n)
+                {
+                    if (cands[m]->declaration.index != 0)
+                    {
+                        Node* dn = self.ctx.nodes + cands[m]->declaration.index;
+                        if (dn->kind.tag == NodeKind::Decl)
+                        {
+                            NodeId* g2 = null;
+                            u32 c2 = self.declGenericParams(&dn->kind.payload.Decl.value, &g2);
+                            if (g2 != null && index < c2)
+                            {
+                                decl = &dn->kind.payload.Decl.value;
+                                generics = g2;
+                                count = c2;
+                                m = n;
+                                break;
+                            }
+                        }
+                    }
+                    m = m + 1;
+                }
+                free((rawptr)cands);
+            }
         }
         if (generics == null || index >= count) return 0;
         Node* genericNode = self.ctx.nodes + generics[index].index;

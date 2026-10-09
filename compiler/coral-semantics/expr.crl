@@ -1,4 +1,6 @@
 mod id = import "../coral-ast/id";
+mod context = import "../coral-context/context";
+import context { InternEntry };
 mod types = import "../coral-ast/types";
 mod node = import "../coral-ast/node";
 mod expr = import "../coral-ast/expr";
@@ -22,6 +24,7 @@ import diagnostics { ErrorCode };
 
 extern("C") rawptr malloc(usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") i64 write(i32 fd, rawptr buf, usize count);
 
 pub extend Sema
 {
@@ -200,7 +203,123 @@ pub extend Sema
             }
             i = i + 1;
         }
-        self.setExprType(callId, decl->kind.payload.Func.returnType);
+        /* explicit typeargs on the callee (`realloc<cchar>(p, n)`) — substitute
+         * the generic params in the return type so downstream sees the
+         * concrete pointer type instead of an unresolved `T*` */
+        Ty retTy = decl->kind.payload.Func.returnType;
+        {
+            write(2, (u8*)"SB", 2);
+            u32 sflag = 0;
+            if (decl->kind.payload.Func.genericParamsLen > 0 && calleeTy != 0)
+            {
+                TypeEntry* ce = self.ctx.types + calleeTy;
+                if (ce->kind.tag == TypeKind::Named && ce->kind.payload.Named.genericArgsLen == decl->kind.payload.Func.genericParamsLen)
+                {
+                    sflag = 1;
+                    if (ce->kind.payload.Named.genericArgsLen > 0) {
+                        Ty ga = ce->kind.payload.Named.genericArgs[0];
+                        TypeEntry* gte = self.ctx.types + ga;
+                        u32 gk = (u32)gte->kind.tag;
+                        u8 g1 = (u8)(48 + (gk % 10)); write(2, &g1, 1);
+                        if (gk >= 10) { u8 g2 = (u8)(48 + (gk / 10)); write(2, &g2, 1); }
+                        if (gte->kind.tag == TypeKind::Named) {
+                            write(2, (u8*)"n", 1);
+                            Str gn = gte->kind.payload.Named.name;
+                            if (gn != 0) { InternEntry* gie = self.ctx.interns + gn; if (gie->len > 0 && gie->len < 12) write(2, gie->ptr, gie->len); }
+                        }
+                        if (gte->kind.tag == TypeKind::TypeParam) {
+                            write(2, (u8*)"p", 1);
+                            Str pn2 = gte->kind.payload.TypeParam.name;
+                            if (pn2 != 0) { InternEntry* pie = self.ctx.interns + pn2; if (pie->len > 0 && pie->len < 12) write(2, pie->ptr, pie->len); }
+                        }
+                    }
+                    write(2, (u8*)"s", 1);
+                    {
+                        Str cnm = ce->kind.payload.Named.name;
+                        if (cnm != 0) { InternEntry* cie = self.ctx.interns + cnm; if (cie->len > 0 && cie->len < 14) write(2, cie->ptr, cie->len); write(2, (u8*)"/", 1); }
+                        Symbol* sy2 = self.scopes.lookup(cnm);
+                        if (sy2 == null) write(2, (u8*)"?", 1);
+                        else {
+                            Node* dn2 = self.ctx.nodes + sy2->declaration.index;
+                            if (dn2->kind.tag != NodeKind::Decl) write(2, (u8*)"#", 1);
+                            else {
+                                Decl* dc2 = &dn2->kind.payload.Decl.value;
+                                u32 dk = (u32)dc2->kind.tag;
+                                u8 y1 = (u8)(48 + (dk % 10)); write(2, &y1, 1);
+                                if (dk >= 10) { u8 y2 = (u8)(48 + (dk / 10)); write(2, &y2, 1); }
+                                write(2, (u8*)"/", 1);
+                                if (dc2->kind.tag == DeclKind::Func) {
+                                    u32 gc = dc2->kind.payload.Func.genericParamsLen;
+                                    u8 c1 = (u8)(48 + (gc % 10)); write(2, &c1, 1);
+                                }
+                            }
+                        }
+                    }
+                    Str spn = self.structParamName(calleeTy, 0);
+                    if (spn == 0) write(2, (u8*)"0", 1);
+                    else { InternEntry* sie = self.ctx.interns + spn; if (sie->len > 0 && sie->len < 12) write(2, sie->ptr, sie->len); }
+                }
+            }
+            u8 f1 = (u8)(48 + (sflag % 10)); write(2, &f1, 1);
+            write(2, (u8*)"\n", 1);
+            if (sflag == 1)
+                retTy = self.substituteFieldTy(retTy, calleeTy);
+        }
+        {
+            write(2, (u8*)"CC", 2);
+            u32 v = decl->kind.payload.Func.genericParamsLen;
+            u8 d1 = (u8)(48 + (v % 10)); write(2, &d1, 1);
+            write(2, (u8*)"/", 1);
+            v = symbol->declaration.index;
+            if (v == 0) { u8 z = 48; write(2, &z, 1); }
+            while (v > 0) { u8 dd = (u8)(48 + (v % 10)); write(2, &dd, 1); v = v / 10; }
+            write(2, (u8*)"/", 1);
+            v = calleeTy;
+            if (v == 0) { u8 z = 48; write(2, &z, 1); }
+            while (v > 0) { u8 dd = (u8)(48 + (v % 10)); write(2, &dd, 1); v = v / 10; }
+            if (calleeTy != 0) {
+                TypeEntry* ce = self.ctx.types + calleeTy;
+                u32 ck = (u32)ce->kind.tag;
+                u8 c1 = (u8)(48 + (ck % 10)); write(2, &c1, 1);
+                if (ck >= 10) { u8 c2 = (u8)(48 + (ck / 10)); write(2, &c2, 1); }
+                if (ce->kind.tag == TypeKind::Named) {
+                    u32 gl = ce->kind.payload.Named.genericArgsLen;
+                    u8 g1 = (u8)(48 + (gl % 10)); write(2, &g1, 1);
+                }
+            }
+            write(2, (u8*)":", 1);
+            v = retTy;
+            if (v == 0) { u8 z = 48; write(2, &z, 1); }
+            while (v > 0) { u8 dd = (u8)(48 + (v % 10)); write(2, &dd, 1); v = v / 10; }
+            write(2, (u8*)".", 1);
+            if (retTy != 0) {
+                TypeEntry* te = self.ctx.types + retTy;
+                u32 kk2 = (u32)te->kind.tag;
+                u8 k1 = (u8)(48 + (kk2 % 10)); write(2, &k1, 1);
+                if (kk2 >= 10) { u8 k2 = (u8)(48 + (kk2 / 10)); write(2, &k2, 1); }
+                Ty b = 0;
+                if (te->kind.tag == TypeKind::Pointer) b = te->kind.payload.Pointer.base;
+                else if (te->kind.tag == TypeKind::Const) b = te->kind.payload.Const.base;
+                if (b != 0) {
+                    write(2, (u8*)":", 1);
+                    TypeEntry* be = self.ctx.types + b;
+                    u32 bk = (u32)be->kind.tag;
+                    u8 b1 = (u8)(48 + (bk % 10)); write(2, &b1, 1);
+                    if (bk >= 10) { u8 b2 = (u8)(48 + (bk / 10)); write(2, &b2, 1); }
+                    if (be->kind.tag == TypeKind::TypeParam) {
+                        write(2, (u8*)".", 1);
+                        Str pn = be->kind.payload.TypeParam.name;
+                        u32* lenPtr = (u32*)((u8*)pn + 0);
+                        if (pn != 0) {
+                            InternEntry* ie = self.ctx.interns + pn;
+                            if (ie->len > 0) { write(2, ie->ptr, ie->len); }
+                        }
+                    }
+                }
+            }
+            write(2, (u8*)"\n", 1);
+        }
+        self.setExprType(callId, retTy);
         return true;
     }
 
@@ -274,6 +393,36 @@ pub extend Sema
     bool assignCompatible(NodeId value, Ty fromTy, Ty targetTy)
     {
         if (self.compatible(fromTy, targetTy)) return true;
+        /* tuple literals adopt the expected element types — `((u32)b0, 1)`
+         * in a `(u32, u32)` return can't be seen by compatible() alone */
+        if (fromTy != 0 && targetTy != 0 && value.index != 0)
+        {
+            TypeEntry* fte = self.ctx.types + fromTy;
+            TypeEntry* tte = self.ctx.types + targetTy;
+            if (fte->kind.tag == TypeKind::Tuple && tte->kind.tag == TypeKind::Tuple &&
+                fte->kind.payload.Tuple.elemsLen == tte->kind.payload.Tuple.elemsLen)
+            {
+                Node* vn = self.ctx.nodes + value.index;
+                if (vn->kind.tag == NodeKind::Expr && vn->kind.payload.Expr.value.kind.tag == ExprKind::TupleExpr)
+                {
+                    bool ok = true;
+                    u32 ti = 0;
+                    while (ti < tte->kind.payload.Tuple.elemsLen)
+                    {
+                        NodeId elemId = vn->kind.payload.Expr.value.kind.payload.TupleExpr.elems[ti];
+                        Ty want = tte->kind.payload.Tuple.elems[ti];
+                        if (!self.assignCompatible(elemId, self.exprType(elemId), want)) { ok = false; break; }
+                        self.setExprType(elemId, want);
+                        ti = ti + 1;
+                    }
+                    if (ok)
+                    {
+                        self.setExprType(value, targetTy);
+                        return true;
+                    }
+                }
+            }
+        }
         /* integer/float literal initializers convert when the value fits */
         if (value.index != 0)
         {
@@ -556,6 +705,61 @@ pub extend Sema
                     i = i + 1;
                 }
                 Node* calleeNode = self.ctx.nodes + expr->kind.payload.Call.callee.index;
+                {
+                    write(2, (u8*)"CK", 2);
+                    u32 v = (u32)calleeNode->kind.tag;
+                    u8 t1 = (u8)(48 + (v % 10)); write(2, &t1, 1);
+                    if (v >= 10) { u8 t2 = (u8)(48 + (v / 10)); write(2, &t2, 1); }
+                    if (calleeNode->kind.tag == NodeKind::Expr) {
+                        Expr* ce = &calleeNode->kind.payload.Expr.value;
+                        u32 ek = (u32)ce->kind.tag;
+                        u8 e1 = (u8)(48 + (ek % 10)); write(2, &e1, 1);
+                        if (ek >= 10) { u8 e2 = (u8)(48 + (ek / 10)); write(2, &e2, 1); }
+                        write(2, (u8*)".", 1);
+                        if (ce->kind.tag == ExprKind::TypeRef) {
+                            u32 tn = ce->kind.payload.TypeRef.typeNode;
+                            if (tn == 0) { u8 z = 48; write(2, &z, 1); }
+                            while (tn > 0) { u8 dd = (u8)(48 + (tn % 10)); write(2, &dd, 1); tn = tn / 10; }
+                        }
+                        write(2, (u8*)".", 1);
+                        u32 rv = ce->resolvedType;
+                        if (rv == 0) { u8 z = 48; write(2, &z, 1); }
+                        while (rv > 0) { u8 dd = (u8)(48 + (rv % 10)); write(2, &dd, 1); rv = rv / 10; }
+                        if (ce->kind.tag == ExprKind::Path) {
+                            write(2, (u8*)"|", 1);
+                            u32 sl = ce->kind.payload.Path.segmentsLen;
+                            u8 s1d = (u8)(48 + (sl % 10)); write(2, &s1d, 1);
+                            u32 si = 0;
+                            while (si < sl && si < 4) {
+                                Node* sn = self.ctx.nodes + ce->kind.payload.Path.segments[si].index;
+                                write(2, (u8*)"/", 1);
+                                if (sn->kind.tag == NodeKind::Expr) {
+                                    u32 sek = (u32)sn->kind.payload.Expr.value.kind.tag;
+                                    u8 q1 = (u8)(48 + (sek % 10)); write(2, &q1, 1);
+                                    if (sek >= 10) { u8 q2 = (u8)(48 + (sek / 10)); write(2, &q2, 1); }
+                                    if (sn->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef) {
+                                        write(2, (u8*)"T", 1);
+                                        u32 stn = sn->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
+                                        if (stn == 0) { u8 z = 48; write(2, &z, 1); }
+                                        while (stn > 0) { u8 dd = (u8)(48 + (stn % 10)); write(2, &dd, 1); stn = stn / 10; }
+                                    }
+                                    if (sn->kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
+                                        write(2, (u8*)"i", 1);
+                                        Str inm = sn->kind.payload.Expr.value.kind.payload.Ident.name;
+                                        if (inm != 0) {
+                                            InternEntry* ie = self.ctx.interns + inm;
+                                            if (ie->len > 0 && ie->len < 16) { write(2, ie->ptr, ie->len); }
+                                        }
+                                    }
+                                } else {
+                                    u8 n1 = (u8)(48 + ((u32)sn->kind.tag % 10)); write(2, &n1, 1);
+                                }
+                                si = si + 1;
+                            }
+                        }
+                    }
+                    write(2, (u8*)"\n", 1);
+                }
                 if (calleeNode->kind.tag == NodeKind::Expr &&
                     calleeNode->kind.payload.Expr.value.kind.tag == ExprKind::Path &&
                     calleeNode->kind.payload.Expr.value.kind.payload.Path.segmentsLen >= 2)

@@ -217,6 +217,83 @@ pub extend Sema
      * at the real declaration. Two direct pulls of the same local name in one
      * file conflict — alias one with `as` or use a qualified path; the same
      * name in different files stays legal (mangling keeps them apart). */
+    /* module path for one import symbol — the import path plus the symbol's
+     * module prefix (`std::text { string::{String} }` → `std::text::string`) */
+    Str importSymbolModulePath(Decl* decl, Str symbolName)
+    {
+        Str base = decl->kind.payload.Import.path;
+        if (base == 0 || symbolName == 0) return base;
+        InternEntry* se = self.ctx.interns + symbolName;
+        usize last = 0;
+        usize q = 0;
+        while (q + 1 < se->len)
+        {
+            if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) last = q;
+            q = q + 1;
+        }
+        if (last == 0) return base;
+        InternEntry* pe = self.ctx.interns + base;
+        usize n = pe->len + 2 + last;
+        u8* buf = (u8*)malloc(n);
+        if (buf == null) return base;
+        usize k = 0;
+        while (k < pe->len) { buf[k] = pe->ptr[k]; k = k + 1; }
+        buf[k] = 58; buf[k + 1] = 58;
+        usize m = 0;
+        while (m < last) { buf[k + 2 + m] = se->ptr[m]; m = m + 1; }
+        Str joined = self.ctx.intern(buf, n);
+        free((rawptr)buf);
+        return joined;
+    }
+
+    /* `path`'s `::` segments must each appear (in order) as a path component
+     * of `fileId`'s source path — e.g. `std::mman` matches
+     * lib/std/x86_64/linux/mman.crl (platform segments may sit between). */
+    bool importPathInFile(Str path, u32 fileId)
+    {
+        if (path == 0 || self.diag == null) return false;
+        if (fileId >= self.diag.fileCount) return false;
+        u8* fp = self.diag.filePaths[fileId];
+        usize fl = self.diag.filePathLens[fileId];
+        if (fp == null || fl == 0) return false;
+        InternEntry* pe = self.ctx.interns + path;
+        usize pi = 0;
+        usize start = 0;
+        while (pi < pe->len)
+        {
+            usize segLen = pe->len - pi;
+            usize q = pi;
+            while (q + 1 < pe->len)
+            {
+                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) { segLen = q - pi; break; }
+                q = q + 1;
+            }
+            if (segLen == 0)
+            {
+                pi = pi + 2;
+                continue;
+            }
+            bool found = false;
+            usize j = start;
+            while (j + segLen <= fl)
+            {
+                usize k = 0;
+                while (k < segLen && fp[j + k] == pe->ptr[pi + k]) k = k + 1;
+                if (k == segLen)
+                {
+                    bool leftOk = (j == 0) || fp[j - 1] == 47;
+                    usize end = j + segLen;
+                    bool rightOk = (end >= fl) || fp[end] == 47 || fp[end] == 46;
+                    if (leftOk && rightOk) { found = true; start = end; break; }
+                }
+                j = j + 1;
+            }
+            if (!found) return false;
+            pi = pi + segLen + 2;
+        }
+        return true;
+    }
+
     bool bindImportSymbols(NodeId id, Decl* decl, u8* notFoundMsg)
     {
         u32 fileId = self.fileOf(id);
@@ -240,7 +317,28 @@ pub extend Sema
                 }
                 if (lastCol > 0 && lastCol + 2 < sl)
                     lookupName = self.ctx.intern(sp + lastCol + 2, sl - (lastCol + 2));
-                Symbol* real = self.scopes.lookup(lookupName);
+                /* merged files may declare the same name (libc's extern
+                 * realloc vs mman's realloc<T>) — prefer the candidate whose
+                 * file path matches this import's module path; plain lookup
+                 * would take whichever was inserted first (libc). */
+                Symbol* real = null;
+                if (symbol->name != 0 && decl->kind.payload.Import.path != 0)
+                {
+                    Str modulePath = self.importSymbolModulePath(decl, symbol->name);
+                    Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                    if (cands != null)
+                    {
+                        u32 n = self.scopes.lookupAll(lookupName, cands, 16);
+                        u32 m = 0;
+                        while (m < n)
+                        {
+                            if (self.importPathInFile(modulePath, cands[m]->fileId)) { real = cands[m]; break; }
+                            m = m + 1;
+                        }
+                        free((rawptr)cands);
+                    }
+                }
+                if (real == null) real = self.scopes.lookup(lookupName);
                 if (real == null)
                 {
                     self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, notFoundMsg);
@@ -399,6 +497,16 @@ pub extend Sema
     void declareAll(File* file)
     {
         if (file == null) return;
+        /* builtin `str` namespace symbol — non-module kind so `str::…`
+         * path calls route through findMethod on the str type instead of
+         * the module-file resolution branch */
+        Str strName = self.ctx.intern((u8*)"str", 3);
+        if (self.scopes.lookup(strName) == null)
+        {
+            NodeId noneId;
+            noneId.index = 0;
+            self.scopes.declare(strName, 3, 0, noneId, 0, 0);
+        }
         u32 i = 0;
         while (i < file->declsLen)
         {

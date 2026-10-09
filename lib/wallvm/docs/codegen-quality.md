@@ -145,7 +145,7 @@ work), and a general "reuse incoming flags" is absent. | x86_64_base.crl:1570, 2
 | Redundant move elimination | **naive**: `emitBinOp`, `emitShift`, `emitDiv`, `emitCast`, `emitRet` all `movq` whenever `src != dst` string-compare says so — which is true after register allocation *for the copy of the operand into the op*, not a real coalescing pass; no peephole removes `movq %rax, %rax` sequences across isel folds (`movq rax; movq r10, rax; addq...` is common in generated code because every op copies its first operand). | x86_64_base.crl:2078-2096, 2152-2171, 2244-2265. |
 | Constant materialization | **partial**: immediates for ALU ops exist (`iselIsConstInt` gate at x86_64_base.crl:859); float constants via data section (good). But `ret 0`/generic zero paths have no `xor-zeroing` and constants loaded via `movq $` without a `movl $, %eax` 32-bit fast path anywhere in the generic emitter. | x86_64_base.crl:859, 1167-1170. |
 | memset-loop → memset call | **partial**: `idiom.crl` exists; `memset_like` would want a single `tail jmp memset` — no direct evidence the isel path emits it; the IR-level idiom pass may, but the emitter has no loop-idiom lowering of its own. | passes/idiom.crl (not reviewed line-by-line here); emitter has no equivalent. |
-| 32-bit shift/div clobber correctness | **naive, and worse than stated**: for width, the audit was right that `emitShift`/`emitDiv` use `movq`/`cqo`/`idivq` unconditionally. But the unsigned divide case is not merely an invariant that might not hold — `emitDiv(inst, false)` emits `cqo` and then `divq`, and `cqo` sign-extends `%rax` into `%rdx`, so an unsigned dividend with bit 63 set divides against an all-ones high word and returns a wrong quotient. The 32-bit port does this correctly (`cltd` if signed else `xorl %edx, %edx`). Tracked as A20/G42. | `emitDiv` — x86_64_base.crl:2625-2650; `emitRem` — :2652-2677; correct 32-bit sequence — x86_base.crl:670-674, :708-712. |
+| 32-bit shift/div clobber correctness | **div/rem fixed 2026-10-09**: `emitDiv`/`emitRem` branch on `isSigned` now — `cqo` only for signed, `xorl %edx, %edx` for unsigned — so the audit's "unconditional `cqo`" claim (and the wrong quotient it produced for any unsigned dividend with bit 63 set) no longer applies. The 32-bit port's sequence was the model. `emitShift`'s width handling is still naive (tracked as item 1). | fixed sites — `emitDiv`/`emitRem` (x86_64_base.crl, around the old :2625-2677 bodies); correct 32-bit sequence — x86_base.crl:670-674, :708-712. |
 | `imulq` clobbering for 64-bit mul | **partial, improved**: `Mul` falls back to three-operand `imulq src2, dst`, but the "no `lea` for powers of two" sub-claim is now **wrong** — `iselEmitMulConst` lowers small constant multiplies through `leaq`/`shl` for {2,3,4,5,6,7,8,9,10,12}, which is GCC-shaped strength reduction. What is still missing is width-correctness of those sequences (all `leaq`/`shlq`). | fallback — x86_64_base.crl:2265; `iselEmitMulConst` — :1218-1385. |
 
 ## Section 3 — Prioritized fix list
@@ -157,13 +157,12 @@ promoted to correctness-first that the original audit rated as quality:
 item 6's unsigned-divisor half is a wrong-answer bug (new item **0**), and
 item 9 (tail calls) regressed to "not implemented on 64-bit".
 
-0. **NEW — unsigned div/rem must zero `%rdx`, not `cqo`.**
-   `emitDiv`/`emitRem` emit `cqo` unconditionally then select `idivq`/`divq`,
-   but `cqo` sign-extends the dividend into `%rdx`; unsigned division
-   requires `xorl %edx, %edx`. A dividend with bit 63 set divides against an
-   all-ones high word and yields a wrong quotient. The 32-bit port already
-   has the correct two-line sequence — port it.
-   Win: correctness, immediate. Tracked as A20/G42.
+0. ~~**NEW — unsigned div/rem must zero `%rdx`, not `cqo`.**~~ **FIXED
+   2026-10-09** — `emitDiv`/`emitRem` now emit `cqo` only when `isSigned`
+   and `xorl %edx, %edx` otherwise, the two-line sequence the 32-bit port
+   already had. Before the fix a dividend with bit 63 set divided against
+   an all-ones high word and yielded a wrong quotient. (Retained as the
+   record; `pipeline-gaps.md` A20/G42.)
 
 1. **Width-aware mnemonic selection (i32/i16/i8) in all ALU paths.**
    Naive: every op copies with `movq`, always uses the 64-bit op (`addl` passed but ignored).

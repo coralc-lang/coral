@@ -8,86 +8,20 @@ mod decl_ast = import "../coral-ast/decl";
 import decl_ast { Decl, DeclKind, GenericParam };
 mod sema = import "../coral-semantics/sema";
 import sema { Sema };
+mod context = import "../coral-context/context";
+import context { InternEntry };
 mod mono = import "mono";
 import mono { MonoContext, MonoDeclKind, MonoInstance, MonoInstanceKind, MonoSubstitution };
+mod collect = import "collect";
+import collect;
 
 extern("C") rawptr calloc(usize count, usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
 extern("C") void free(rawptr ptr);
+extern("C") i64 write(i32 fd, rawptr buf, usize count);
 
 pub extend MonoContext
 {
-    Ty findSubstitution(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
-    {
-        TypeEntry* entry = self.typeEntryAt(typeNode);
-        if (entry == null || entry->kind.tag != TypeKind::TypeParam) return 0;
-        u32 i = 0;
-        while (i < substitutionsLen)
-        {
-            if (substitutions[i].index == entry->kind.payload.TypeParam.index ||
-                substitutions[i].parameter == entry->kind.payload.TypeParam.name)
-                return substitutions[i].typeNode;
-            i = i + 1;
-        }
-        return 0;
-    }
-
-    Ty substituteType(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
-    {
-        if (typeNode == 0) return 0;
-        TypeEntry* entry = self.typeEntryAt(typeNode);
-        if (entry == null) return 0;
-        switch (entry->kind.tag)
-        {
-            TypeKind::TypeParam => { return self.findSubstitution(typeNode, substitutions, substitutionsLen); },
-            TypeKind::Named => {
-                u32 i = 0;
-                while (i < substitutionsLen)
-                {
-                    if (substitutions[i].parameter == entry->kind.payload.Named.name && entry->kind.payload.Named.genericArgsLen == 0)
-                        return substitutions[i].typeNode;
-                    i = i + 1;
-                }
-                Ty* args = self.copyTypes(entry->kind.payload.Named.genericArgs, entry->kind.payload.Named.genericArgsLen);
-                self.ast.track((rawptr)args);
-                u32 j = 0;
-                while (j < entry->kind.payload.Named.genericArgsLen)
-                {
-                    args[j] = self.substituteType(args[j], substitutions, substitutionsLen);
-                    j = j + 1;
-                }
-                TypeKind kind = TypeKind::Named{ .name = entry->kind.payload.Named.name, .genericArgs = args, .genericArgsLen = entry->kind.payload.Named.genericArgsLen };
-                return self.sema.allocType(kind);
-            },
-            
-            TypeKind::Pointer => {
-                TypeKind kind = TypeKind::Pointer{ .base = self.substituteType(entry->kind.payload.Pointer.base, substitutions, substitutionsLen) };
-                return self.sema.allocType(kind);
-            },
-
-            TypeKind::Const => {
-                TypeKind kind = TypeKind::Const{ .base = self.substituteType(entry->kind.payload.Const.base, substitutions, substitutionsLen) };
-                return self.sema.allocType(kind);
-            },
-
-            TypeKind::Comptime => {
-                TypeKind kind = TypeKind::Comptime{ .base = self.substituteType(entry->kind.payload.Comptime.base, substitutions, substitutionsLen) };
-                return self.sema.allocType(kind);
-            },
-
-            TypeKind::Slice => {
-                TypeKind kind = TypeKind::Slice{ .base = self.substituteType(entry->kind.payload.Slice.base, substitutions, substitutionsLen) };
-                return self.sema.allocType(kind);
-            },
-
-            TypeKind::Array => {
-                TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry->kind.payload.Array.base, substitutions, substitutionsLen), .len = entry->kind.payload.Array.len };
-                return self.sema.allocType(kind);
-            },
-            else => { return typeNode; },
-        }
-    }
-
     MonoSubstitution* buildSubstitutions(NodeId declaration, Ty* arguments, u32 argumentsLen)
     {
         u32 count = self.genericCount(declaration);
@@ -232,6 +166,56 @@ pub extend MonoContext
         if (decl->kind.tag == DeclKind::Func)
         {
             instance.returnType = self.substituteType(decl->kind.payload.Func.returnType, instance.substitutions, instance.substitutionsLen);
+            {
+                write(2, (u8*)"AI", 2);
+                u32 v = declaration.index;
+                if (v == 0) { u8 z0 = 48; write(2, &z0, 1); }
+                while (v > 0) { u8 d0 = (u8)(48 + (v % 10)); write(2, &d0, 1); v = v / 10; }
+                write(2, (u8*)"s", 1);
+                v = instance.substitutionsLen;
+                if (v == 0) { u8 z1 = 48; write(2, &z1, 1); }
+                while (v > 0) { u8 d1 = (u8)(48 + (v % 10)); write(2, &d1, 1); v = v / 10; }
+                write(2, (u8*)"n", 1);
+                v = decl->kind.payload.Func.returnType;
+                if (v == 0) { u8 z2 = 48; write(2, &z2, 1); }
+                while (v > 0) { u8 d2 = (u8)(48 + (v % 10)); write(2, &d2, 1); v = v / 10; }
+                write(2, (u8*)"r", 1);
+                v = instance.returnType;
+                if (v == 0) { u8 z3 = 48; write(2, &z3, 1); }
+                while (v > 0) { u8 d3 = (u8)(48 + (v % 10)); write(2, &d3, 1); v = v / 10; }
+                write(2, (u8*)"k", 1);
+                {
+                    TypeEntry* re = self.typeEntryAt(instance.returnType);
+                    if (re != null) {
+                        u32 kk = (u32)re->kind.tag;
+                        u8 k1 = (u8)(48 + (kk % 10)); write(2, &k1, 1);
+                        if (kk >= 10) { u8 k2 = (u8)(48 + (kk / 10)); write(2, &k2, 1); }
+                        if (re->kind.tag == TypeKind::Pointer) {
+                            write(2, (u8*)"b", 1);
+                            TypeEntry* be = self.typeEntryAt(re->kind.payload.Pointer.base);
+                            if (be != null) {
+                                u32 bk = (u32)be->kind.tag;
+                                u8 b1 = (u8)(48 + (bk % 10)); write(2, &b1, 1);
+                                if (bk >= 10) { u8 b2 = (u8)(48 + (bk / 10)); write(2, &b2, 1); }
+                                if (be->kind.tag == TypeKind::TypeParam) {
+                                    InternEntry* pn = self.ast.interns + be->kind.payload.TypeParam.name;
+                                    write(2, pn->ptr, pn->len);
+                                }
+                            } else { write(2, (u8*)"nil", 3); }
+                        }
+                    } else { write(2, (u8*)"nil", 3); }
+                }
+                write(2, (u8*)"x", 1);
+                if (instance.substitutions != null && instance.substitutionsLen > 0) {
+                    TypeEntry* se = self.typeEntryAt(instance.substitutions[0].typeNode);
+                    if (se != null) {
+                        u32 sk = (u32)se->kind.tag;
+                        u8 s1 = (u8)(48 + (sk % 10)); write(2, &s1, 1);
+                        if (sk >= 10) { u8 s2 = (u8)(48 + (sk / 10)); write(2, &s2, 1); }
+                    } else { write(2, (u8*)"nil", 3); }
+                } else { write(2, (u8*)"z", 1); }
+                write(2, (u8*)"\n", 1);
+            }
             instance.paramTypesLen = decl->kind.payload.Func.paramsLen;
             if (instance.paramTypesLen > 0)
             {
@@ -287,8 +271,82 @@ pub extend MonoContext
         {
             if (!self.addInstance(self.work[i].declaration, self.work[i].arguments, self.work[i].argumentsLen)) return false;
             MonoInstance* instance = self.instances + self.instancesLen - 1;
-            if (!self.validateInstance(instance)) self.errors = self.errors + 1;
+            if (!self.validateInstance(instance))
+            {
+                write(2, (u8*)"V", 1);
+                u8 nl = 10;
+                write(2, &nl, 1);
+                self.errors = self.errors + 1;
+            }
+            /* re-collect the instance body with its substitutions active so
+             * nested generic calls (`dealloc<T>` inside realloc<cchar>,
+             * `alloc<T>` inside Vec<str>) enqueue concrete instances */
+            self.activeSubs = instance.substitutions;
+            self.activeSubsLen = instance.substitutionsLen;
+            if (instance.kind == MonoInstanceKind::FunctionInstance)
+            {
+                if (instance.body.index != 0) self.collectStmt(instance.body);
+            }
+            else if (instance.kind == MonoInstanceKind::TypeInstance)
+            {
+                Node* tdn = self.nodeAt(instance.declaration);
+                if (tdn != null && tdn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* td = &tdn.kind.payload.Decl.value;
+                    NodeId* methods = null;
+                    u32 methodsLen = 0;
+                    if (td->kind.tag == DeclKind::Struct)
+                    {
+                        methods = td->kind.payload.Struct.methods;
+                        methodsLen = td->kind.payload.Struct.methodsLen;
+                    }
+                    else if (td->kind.tag == DeclKind::Union)
+                    {
+                        methods = td->kind.payload.Union.methods;
+                        methodsLen = td->kind.payload.Union.methodsLen;
+                    }
+                    else if (td->kind.tag == DeclKind::Variant)
+                    {
+                        methods = td->kind.payload.Variant.methods;
+                        methodsLen = td->kind.payload.Variant.methodsLen;
+                    }
+                    u32 mi = 0;
+                    while (mi < methodsLen)
+                    {
+                        self.collectDecl(methods[mi]);
+                        mi = mi + 1;
+                    }
+                }
+            }
+            self.activeSubs = null;
+            self.activeSubsLen = 0;
             i = i + 1;
+        }
+        {
+            u32 zi = 0;
+            while (zi < self.instancesLen)
+            {
+                MonoInstance* inst2 = self.instances + zi;
+                if (inst2.kind == (u8)MonoInstanceKind::FunctionInstance)
+                {
+                    write(2, (u8*)"I", 1);
+                    u32 v = inst2.declaration.index;
+                    if (v == 0) { u8 z0 = 48; write(2, &z0, 1); }
+                    while (v > 0) { u8 d0 = (u8)(48 + (v % 10)); write(2, &d0, 1); v = v / 10; }
+                    write(2, (u8*)":", 1);
+                    if (inst2.argumentsLen > 0) { v = inst2.arguments[0]; if (v == 0) { u8 z2 = 48; write(2, &z2, 1); } while (v > 0) { u8 d2 = (u8)(48 + (v % 10)); write(2, &d2, 1); v = v / 10; } }
+                    else { u8 z3 = 48; write(2, &z3, 1); }
+                    write(2, (u8*)":", 1);
+                    v = inst2.argumentsLen;
+                    if (v == 0) { u8 z4 = 48; write(2, &z4, 1); }
+                    while (v > 0) { u8 d4 = (u8)(48 + (v % 10)); write(2, &d4, 1); v = v / 10; }
+                    write(2, (u8*)" ", 1);
+                    InternEntry* ne2 = self.ast.interns + inst2.name;
+                    write(2, ne2->ptr, ne2->len);
+                    write(2, (u8*)"\n", 1);
+                }
+                zi = zi + 1;
+            }
         }
         return self.errors == 0;
     }

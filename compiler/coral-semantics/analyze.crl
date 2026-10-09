@@ -485,6 +485,65 @@ bool libPushFile(LibLoader* L, File* f)
     return true;
 }
 
+/* resolve + load one import(lib)-style module — used for the builtin `str`
+ * prelude that every unit merges */
+void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
+{
+    u8* resolved = libResolve(L, nsPtr, nsLen);
+    if (resolved == null)
+    {
+        write(2, "coral: cannot resolve import(lib) ", 34);
+        write(2, nsPtr, nsLen);
+        write(2, "\n", 1);
+        L->errors = L->errors + 1;
+        return;
+    }
+    if (libHas(L, resolved))
+    {
+        free(resolved);
+        return;
+    }
+    if (!libPush(L, resolved))
+    {
+        L->errors = L->errors + 1;
+        return;
+    }
+    usize len = 0;
+    u8* buf = libRead(resolved, &len);
+    if (buf == null)
+    {
+        write(2, "coral: cannot read import(lib) file ", 36);
+        write(2, resolved, libLen(resolved));
+        write(2, "\n", 1);
+        L->errors = L->errors + 1;
+        return;
+    }
+    u32 fid = 0;
+    DiagnosticEngine* dg = L->diag;
+    if (dg != null) fid = dg.addFile(resolved, libLen(resolved), buf, buf + len);
+    if (L->bufsLen >= L->bufsCap)
+    {
+        u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+        rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * @sizeof(u8*));
+        if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+    }
+    if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
+    else free(buf);
+    L->bufsLen = L->bufsLen + 1;
+    File* lf = libParse(L, buf, len, resolved, dg, fid);
+    if (lf == null)
+    {
+        write(2, "coral: cannot read import(lib) file ", 36);
+        write(2, resolved, libLen(resolved));
+        write(2, "\n", 1);
+        L->errors = L->errors + 1;
+        return;
+    }
+    libLoadImports(L, lf);   /* dependencies first */
+    libLoadSiblingImports(L, lf);
+    if (!libPushFile(L, lf)) L->errors = L->errors + 1;
+}
+
  bool libIsRootSeg(u8* p, usize n)
  {
      if (n == 4 && p[0] == 102 && p[1] == 105 && p[2] == 108 && p[3] == 101) return true;
@@ -1186,6 +1245,9 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         else
         {
+            /* builtin `str` prelude — merged first so every unit sees
+             * `pub extend str` (fromCstr, fromParts, …) for findMethod */
+            libLoadModulePath(&loader, (u8*)"core::str", 9);
             libLoadImports(&loader, file);
             libLoadSiblingImports(&loader, file);
             if (loader.errors == 0 && !libMerge(&loader, file))
