@@ -546,6 +546,38 @@ NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
     return first;
 }
 
+/* the type-decl a Named type refers to (struct/union/variant/enum/
+ * alias/distinct): prefers a decl in the type's own file — TypeEntry.loc
+ * records where the name was spelled — else the first match by name */
+NodeId cgFindTypeDecl(Codegen* cg, Str name, u32 refFile)
+{
+    NodeId none;
+    none.index = 0;
+    if (cg.file == null || name == 0) return none;
+    NodeId first;
+    first.index = 0;
+    u32 i = 0;
+    while (i < cg.file.declsLen)
+    {
+        Node* d = cg.ctx->nodes + cg.file.decls[i].index;
+        if (d.kind.tag == NodeKind::Decl)
+        {
+            Decl* dd = &d.kind.payload.Decl.value;
+            u32 tag = dd.kind.tag;
+            bool isTy = tag == DeclKind::Struct || tag == DeclKind::Enum ||
+                        tag == DeclKind::Variant || tag == DeclKind::Union ||
+                        tag == DeclKind::TypeAlias || tag == DeclKind::Distinct;
+            if (isTy && cgDeclOwnName(dd) == name)
+            {
+                if (refFile != 0 && locFile(d->loc) == refFile) return cg.file.decls[i];
+                if (first.index == 0) first = cg.file.decls[i];
+            }
+        }
+        i = i + 1;
+    }
+    return first;
+}
+
 /* resolve a plain-name reference the way sema did: the innermost
  * binding visible at refSite; *outAlias receives the use-site name when
  * it differs from the declaration's own (import `as` rename). A found
@@ -1259,6 +1291,11 @@ Slice tyStr(Codegen* cg, Ty t)
                     i = i + 1;
                 }
             }
+            /* mangle through the declaring decl — the type's own file
+             * (TypeEntry.loc) picks the right one when several files
+             * declare the same type name */
+            NodeId td = cgFindTypeDecl(cg, name, locFile(e.loc));
+            if (td.index != 0) return tyStrPut(cg, cgMangle(cg, td, name, 0), start);
             return tyStrPut(cg, cgIdent(cg, name), start);
         },
         TypeKind::Pointer => {
@@ -1624,9 +1661,34 @@ bool cgIsCrtFn(Str name, Slice text)
 Slice cgOwnerName(Codegen* cg, Ty selfTy)
 {
     TypeEntry* e = cg.ctx->types + selfTy;
-    if (e.kind.tag == TypeKind::Pointer)
-        return tyStr(cg, e.kind.payload.Pointer.base);
-    return tyStr(cg, selfTy);
+    Ty u = selfTy;
+    if (e.kind.tag == TypeKind::Pointer) u = e.kind.payload.Pointer.base;
+    TypeEntry* ue = cg.ctx->types + u;
+    /* method symbol suffixes key off the bare coral owner name — def and
+     * call sides both compose `owner_method` from it — but tyStr now
+     * path-mangles type names, so a plain non-generic Named must not go
+     * through it (the self *parameter* uses cgOwnerTypeName instead) */
+    if (ue.kind.tag == TypeKind::Named && ue.kind.payload.Named.genericArgsLen == 0)
+    {
+        Ty sub = cgSubstTy(cg, u);
+        if (sub == u) return cgIdent(cg, ue.kind.payload.Named.name);
+        return tyStr(cg, sub);
+    }
+    return tyStr(cg, u);
+}
+
+/* the receiver's C type name for the self parameter: tyStr (path-mangled
+ * through the type's declaring decl), pointer level stripped like
+ * cgOwnerName — cgOwnerName stays bare because it also forms symbol
+ * suffixes */
+Slice cgOwnerTypeName(Codegen* cg, Ty selfTy)
+{
+    Ty u = selfTy;
+    TypeEntry* e = cg.ctx->types + selfTy;
+    if (e.kind.tag == TypeKind::Pointer) u = e.kind.payload.Pointer.base;
+    TypeEntry* e2 = cg.ctx->types + u;
+    if (e2.kind.tag == TypeKind::Const) u = e2.kind.payload.Const.base;
+    return tyStr(cg, u);
 }
 
 /* does the receiver's named struct/union declare field `name`? — used to
@@ -1890,10 +1952,11 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Node* seg0 = cgNode(cg, e.kind.payload.Path.segments[0]);
                 if (seg0.kind.tag == NodeKind::Expr && seg0.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
                     Str root = seg0.kind.payload.Expr.value.kind.payload.Ident.name;
-                    if (cgFindDecl(cg, root, (u32)DeclKind::Enum).index != 0) {
+                    NodeId ed = cgFindDecl(cg, root, (u32)DeclKind::Enum);
+                    if (ed.index != 0) {
                         Node* seg1 = cgNode(cg, e.kind.payload.Path.segments[1]);
                         if (seg1.kind.tag == NodeKind::Expr && seg1.kind.payload.Expr.value.kind.tag == ExprKind::Ident) {
-                            stPS(&cg.ebuf, cgIntern(cg, root));
+                            stPS(&cg.ebuf, cgMangle(cg, ed, root, 0));
                             stCh(&cg.ebuf, '_');
                             stPS(&cg.ebuf, cgIntern(cg, seg1.kind.payload.Expr.value.kind.payload.Ident.name));
                             return stTail(&cg.ebuf, es);
@@ -3079,13 +3142,14 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                     if (et != 0 && (cg.ctx->types + et)->kind.tag == TypeKind::Named)
                     {
                         Str root = (cg.ctx->types + et)->kind.payload.Named.name;
-                        if (cgFindDecl(cg, root, (u32)DeclKind::Enum).index != 0)
+                        NodeId ed = cgFindDecl(cg, root, (u32)DeclKind::Enum);
+                        if (ed.index != 0)
                         {
                             usize es = cg.ebuf.len;
                             stCh(&cg.ebuf, '(');
                             stPS(&cg.ebuf, scrut);
                             stP(&cg.ebuf, " == ");
-                            stPS(&cg.ebuf, cgIntern(cg, root));
+                            stPS(&cg.ebuf, cgMangle(cg, ed, root, 0));
                             stCh(&cg.ebuf, '_');
                             stPS(&cg.ebuf, cgIntern(cg, p.kind.payload.Variant.variantName));
                             stCh(&cg.ebuf, ')');
@@ -4231,25 +4295,25 @@ void cgEmitFwd(Codegen* cg)
                 DeclKind::Struct => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef struct ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Struct.name, 0));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Struct.name, 0));
                     stP(&cg.fwd, ";\n");
                 },
                 DeclKind::Union => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef union ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Union.name, 0));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Union.name, 0));
                     stP(&cg.fwd, ";\n");
                 },
                 DeclKind::Variant => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.fwd, "typedef struct ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Variant.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Variant.name, 0));
                     stP(&cg.fwd, " ");
-                    stPS(&cg.fwd, cgIdent(cg, dd.kind.payload.Variant.name));
+                    stPS(&cg.fwd, cgMangle(cg, id, dd.kind.payload.Variant.name, 0));
                     stP(&cg.fwd, ";\n");
                 },
                 else => {},
@@ -4280,8 +4344,9 @@ void cgEmitFwd(Codegen* cg)
 /* import `as` alias refs mangle as `path__alias__name` — map each one
  * back to the canonical `path__name` definition. Exempt names (main,
  * CRT, extern) never carry the alias segment at the use site, and types
- * are not mangled yet, so only Func/Constant pairs (plus their
- * monomorphised instances) need a bridge. */
+ * resolve through their declaring decl (TypeEntry.loc), so only
+ * Func/Constant pairs (plus their monomorphised instances) need a
+ * bridge. */
 void cgEmitAliasBridges(Codegen* cg)
 {
     if (cg.sema == null) return;
@@ -4333,7 +4398,7 @@ void cgEmitAliasBridges(Codegen* cg)
     }
 }
 
-void cgEmitEnumDef(Codegen* cg, Decl* dd)
+void cgEmitEnumDef(Codegen* cg, NodeId declId, Decl* dd)
 {
     stP(&cg.defs, "typedef enum {\n");
     u32 v = 0;
@@ -4345,7 +4410,7 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
         {
             EnumVariant* ev = &vn.kind.payload.EnumVariant.value;
             stP(&cg.defs, "    ");
-            stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Enum.name));
+            stPS(&cg.defs, cgMangle(cg, declId, dd.kind.payload.Enum.name, 0));
             stCh(&cg.defs, '_');
             stPS(&cg.defs, cgIdent(cg, ev.name));
             if ((ev.flags & 1) != 0 && ev.value.index != 0)
@@ -4399,7 +4464,7 @@ void cgEmitEnumDef(Codegen* cg, Decl* dd)
         v = v + 1;
     }
     stP(&cg.defs, "} ");
-    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Enum.name));
+    stPS(&cg.defs, cgMangle(cg, declId, dd.kind.payload.Enum.name, 0));
     stP(&cg.defs, ";\n");
 }
 
@@ -4743,7 +4808,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 stP(&cg.defs, "typedef ");
                 stPS(&cg.defs, tyStr(cg, dd.kind.payload.TypeAlias.target));
                 stCh(&cg.defs, ' ');
-                stPS(&cg.defs, cgIdent(cg, dd.kind.payload.TypeAlias.name));
+                stPS(&cg.defs, cgMangle(cg, cg.file.decls[i], dd.kind.payload.TypeAlias.name, 0));
                 stP(&cg.defs, ";\n");
             }
             else if (dd.kind.tag == DeclKind::Distinct)
@@ -4751,7 +4816,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 stP(&cg.defs, "typedef ");
                 stPS(&cg.defs, tyStr(cg, dd.kind.payload.Distinct.baseType));
                 stCh(&cg.defs, ' ');
-                stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Distinct.name));
+                stPS(&cg.defs, cgMangle(cg, cg.file.decls[i], dd.kind.payload.Distinct.name, 0));
                 stP(&cg.defs, ";\n");
             }
         }
@@ -4765,7 +4830,7 @@ void cgEmitTypeDefs(Codegen* cg)
         if (d.kind.tag == NodeKind::Decl)
         {
             Decl* dd = &d.kind.payload.Decl.value;
-            if (dd.kind.tag == DeclKind::Enum) cgEmitEnumDef(cg, dd);
+            if (dd.kind.tag == DeclKind::Enum) cgEmitEnumDef(cg, cg.file.decls[i], dd);
         }
         i = i + 1;
     }
@@ -4783,7 +4848,7 @@ void cgEmitTypeDefs(Codegen* cg)
                 DeclKind::Struct => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.defs, "struct ");
-                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Struct.name));
+                    stPS(&cg.defs, cgMangle(cg, id, dd.kind.payload.Struct.name, 0));
                     stP(&cg.defs, " {");
                     cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
                     stP(&cg.defs, "\n};\n");
@@ -4791,14 +4856,14 @@ void cgEmitTypeDefs(Codegen* cg)
                 DeclKind::Union => {
                     if (cgDeclIsGeneric(cg, id)) break;
                     stP(&cg.defs, "union ");
-                    stPS(&cg.defs, cgIdent(cg, dd.kind.payload.Union.name));
+                    stPS(&cg.defs, cgMangle(cg, id, dd.kind.payload.Union.name, 0));
                     stP(&cg.defs, " {");
                     cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
                     stP(&cg.defs, "\n};\n");
                 },
                 DeclKind::Variant => {
                     if (cgDeclIsGeneric(cg, id)) break;
-                    cgEmitVariantDef(cg, dd, cgIdent(cg, dd.kind.payload.Variant.name));
+                    cgEmitVariantDef(cg, dd, cgMangle(cg, id, dd.kind.payload.Variant.name, 0));
                 },
                 else => {},
             }
@@ -4883,10 +4948,23 @@ bool cgOwnerGeneric(Codegen* cg, Decl* dd)
     return false;
 }
 
-void cgEmitMethodSet(Codegen* cg, Decl* dd, bool withBodies)
+void cgEmitMethodSet(Codegen* cg, NodeId declId, bool withBodies)
 {
+    Node* od = cgNode(cg, declId);
+    if (od.kind.tag != NodeKind::Decl) return;
+    Decl* dd = &od.kind.payload.Decl.value;
     if (cgOwnerGeneric(cg, dd)) return;
+    /* `owner` = the bare coral name — it forms the `owner_method` symbol
+     * suffix both def and call sides agree on. `paramOwner` = the self
+     * parameter's C type, path-mangled like every other type reference. */
     Slice owner = cgDeclOwner(cg, dd);
+    Slice paramOwner = owner;
+    if (dd.kind.tag == DeclKind::Extend)
+        paramOwner = cgOwnerTypeName(cg, dd.kind.payload.Extend.selfType);
+    else if (dd.kind.tag == DeclKind::ExtendTrait)
+        paramOwner = cgOwnerTypeName(cg, dd.kind.payload.ExtendTrait.selfType);
+    else
+        paramOwner = cgMangle(cg, declId, cgDeclOwnName(dd), 0);
     NodeId* methods = null;
     u32 mlen = 0;
     switch (dd.kind.tag)
@@ -4917,13 +4995,13 @@ void cgEmitMethodSet(Codegen* cg, Decl* dd, bool withBodies)
                 if (withBodies)
                 {
                     if ((flags & 8) != 0 && (flags & 2) == 0)
-                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, owner, (flags & 4) != 0 ? 1 : 0);
+                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, paramOwner, (flags & 4) != 0 ? 1 : 0);
                 }
                 else
                 {
                     /* extern method: emit the prototype too — nothing
                        (system header) declares it for us anymore */
-                    cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, owner);
+                    cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, paramOwner);
                 }
             }
         }
@@ -5046,7 +5124,7 @@ void cgEmitProtos(Codegen* cg)
                      dd.kind.tag == DeclKind::Variant || dd.kind.tag == DeclKind::Extend ||
                      dd.kind.tag == DeclKind::ExtendTrait)
             {
-                cgEmitMethodSet(cg, dd, false);
+                cgEmitMethodSet(cg, id, false);
             }
         }
         i = i + 1;
@@ -5101,7 +5179,7 @@ void cgEmitBodies(Codegen* cg)
                      dd.kind.tag == DeclKind::Variant || dd.kind.tag == DeclKind::Extend ||
                      dd.kind.tag == DeclKind::ExtendTrait)
             {
-                cgEmitMethodSet(cg, dd, true);
+                cgEmitMethodSet(cg, id, true);
             }
         }
         i = i + 1;
