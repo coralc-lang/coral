@@ -4,13 +4,40 @@ Goal: measure our x86 backend (`lib/wallvm/target/x86_64/x86_64_base.crl`,
 `lib/wallvm/target/x86/x86_base.crl`) against what GCC actually emits, per
 construct, and turn the gap into a prioritized fix list.
 
+**Revalidated 2026-10-09 against the current tree.** The original audit is
+substantially stale in both directions: several rows are fixed, and the
+backend has gained optimizations no row mentions. Line numbers drifted by
+roughly +300 in `x86_64_base.crl` — cite function names, not the old lines.
+Changes in this revision:
+
+- **Fixed since the audit:** leaf/alloca frame handling (fix 10), and the
+  `lea`/shift strength-reduction for small constant multipliers (fix 11's
+  first half) — see "Optimizations the original audit missed".
+- **Regressed since the audit:** tail calls (fix 9). `isTailCall` is now
+  hardwired `return false`, so 64-bit tail calls are gone entirely.
+- **New miscompile, worse than the audit stated:** unsigned div/rem emits
+  `cqo` before `divq` instead of `xorl %edx, %edx`. The audit framed the
+  32-bit row as a possibly-unheld invariant; it is a plain wrong-answer bug
+  (`pipeline-gaps.md` G42/A20). **Fixed 2026-10-09** — `emitDiv`/`emitRem`
+  branch on `isSigned` now.
+- **Another new miscompile, found and fixed 2026-10-09:** parameter
+  seeding emitted `movq <abiReg>, <home>` per store in one pass, and a
+  home can be a register a later parameter arrives in (SysV homes start
+  at rcx/rdx/rsi/rdi; rdx is argument 2's) — so the walk could overwrite
+  an incoming argument before reading it. Now two-phase: stage every
+  bank word to the stack, then commit to homes (`pipeline-gaps.md`
+  G44/A21).
+- The 32-bit backend is *better* on width and div/remainder than the audit
+  credited; it is not "blind".
+
 Corpus: `/tmp/wallvm_corpus/corpus.c` (~60 tiny functions covering integer
 add/sub/mul/div/rem (signed+unsigned), shifts, compares, selects, i8/i16/i32/i64
 loads/stores, arrays + struct field access, float add/mul/div/compare, calls
 (leaf/non-leaf), loops (sum, memset-like), abs/min/max, constant materialization,
 pointer arithmetic, div by constant). Built with
 `gcc -O0/-O1/-O2/-O3 -S -masm=att` (GCC 16.1.1). Representative -O2 output is in
-`/tmp/wallvm_corpus/o2.s`.
+`/tmp/wallvm_corpus/o2.s`. **Note: `/tmp` does not survive a restart — the
+corpus and `o2.s` need regenerating before the comparison can be redone.**
 
 ## Section 1 — What GCC emits and why it is good
 
@@ -102,7 +129,7 @@ gated), **naive** (missing / always-64-bit / wrong-width).
 |---|---|---|
 | Width-correct mnemonics | **naive**: every arithmetic path copies with `movq` and uses the 64-bit op; the width-argument `lOp` is accepted but never emitted. | `emitBinOp` — x86_64_base.crl:2078 (always `movq`, always `qOp`; callers pass `"addl"` etc. but it is dropped). `emitDiv`/`emitRem` — x86_64_base.crl:2098/2125 (always `%rax`/`cqo`/`idivq`). `emitShift` — x86_64_base.crl:2152 (always `movq`, `%cl` op, 64-bit). `emitUnOp`, `Neg`, `Not`, `emitICmp` — x86_64_base.crl:2173, 1747-1768, 2244 (always `movq`/`notq`/`negq`/`cmpq`). |
 | `xor reg,reg` for zero | **partial**: only `x*0` gets `xorq dst,dst` (64-bit, wrong for 32-bit) and only when `src1`/`dst` aliases are handled; general `x^x`, zero-return, and `%edx`-zeroing before unsigned div are absent. | x86_64_base.crl:876-889 (`iselEmitMulConst` `c==0` → `xorq`), x86_64_base.crl:3109 (xor is only used to zero the vararg xmm count, i.e. by hand). |
-| `lea` for add/scale | **partial**: standalone `emitGep` uses `leaq` with base,index,scale — but emits scale 8 for anything it cannot classify and never uses `leaq` for plain `add`; no `lea` for `imul` by 1/2/3/5/9 by the ALU paths. | `emitGep` — x86_64_base.crl:2219-2243. |
+| `lea` for add/scale | **fixed, then some**: standalone `emitGep` uses `leaq` with base/index/scale and now derives the scale from the operand type rather than defaulting to 8; more importantly the ALU paths gained `leaq`/shift strength reduction that the original audit recorded as entirely absent (see "Optimizations the original audit missed"). | `iselEmitMulConst` — x86_64_base.crl:1218-1385 (×2 `leaq (r,r)`, pow2 `shlq`, and `lea` sequences for ×3/5/6/7/9/10/12). `iselEmitAddSelf` — :1445-1456 (`x+x` → `leaq (r,r)`). `emitGep` — :2788-2820 (scale from `ops[0]->type->width`). Remaining gap: all of it is 64-bit (`leaq`/`shlq`), and `emitGep` still ignores a constant index. |
 | Add folding into load/store address (op-with-memory-source) | **partial**: `iselTryFoldLoadOpStore` covers `load→op→store` same-address for add/sub/and/or/xor with widths 8/16/32/64 (x86_64_base.crl:1378-1446) — but there is no fold for "use memory operand as ALU source" (`addl (%rdi), %eax` where the value is used once), so arithmetic loads a register copy first. | `iselTryFoldLoadOpStore` gate `loadInst->ops[0] != addrVal` — x86_64_base.crl:1422; no equivalent for a bare Load+Op use. |
 | Store constant to memory | **naive**: `store i32 %c, p` copies the constant into a register first, then `movl` to memory. No `mov $c,(%r)` and no `add $c,(%r)` folding. | `emitStore` / `emitStoreWidth` — x86_64_base.crl:2200-2210, 1253-1296. |
 | GEP+load/store folding (disp + SIB) | **partial**: `iselTryFoldGepLoad`/`GepStore` exist (x86_64_base.crl:1447-1568) but only when the GEP has a *register* index with scale 1/2/4/8 and no constant displacement — a struct field `p->y` (constant offset) never folds to `movl 4(%rdi), %eax`; it still materializes a separate `leaq` + load. | x86_64_base.crl:1447-1506 (fold requires `addrInst->nops >= 3` and uses idx register + hard-coded scale 4 in `(base, idx, 4)` — no disp/literal index path). |
@@ -112,18 +139,31 @@ work), and a general "reuse incoming flags" is absent. | x86_64_base.crl:1570, 2
 | `cmov` for small selects | **partial**: `emitSelect` emits `testq cond,cond; cmovne src1; cmovz src2` (x86_64_base.crl:2955-2984) — correct skeleton but 64-bit unconditional (`dst` never truncated to 32-bit), and it forgets that both operands must be materialized; GCC's `cmp; mov; cmov` form avoids one partial-flag idiom. | `emitSelect` — x86_64_base.crl:2955; compare-driven cmov from an `icmp` predicate is not used (gcc maps max/min select to `cmp`+`cmov` directly). |
 | Sign/zero-extension folding into loads | **good**: `iselTryFoldExtLoad` emits `movzbl/movzwl/movsbl/movswl/movslq` directly from memory (x86_64_base.crl:1298-1377). | — |
 | Constant-divisor magic multiply | **partial**: pow-2 only (`iselEmitSDivPow2`/`iselEmitUDivPow2`, x86_64_base.crl:1085-1140) and divmod.crl fuses div+rem into mul/sub; general constant-divisor magic-multiply (GCC's `imul`+shift sequence for 7, etc.) is absent — non-pow2 constants fall to `idivq`. | divmod.crl:1-15 (fuse only); x86_64_base.crl:1085, 1118; generic `emitDiv` at 2098. |
-| Branch layout / inversion | **naive**: `emitCondBr` always jumps to the true target and falls through to an unconditional `jmp` of the false target (x86_64_base.crl:2327-2345); no hot/cold ordering, no flag reuse. Passes `branch_inversion.crl`, `branch_factoring.crl`, `branchprop.crl`, `tail_dup.crl` exist in `passes/` but there is no evidence of wiring into the x86 emitter's block ordering. | x86_64_base.crl:2327-2345; passes/branch_inversion.crl. |
-| Tail calls | **partial**: `isTailCall` exists and is *wired into* `emitRet` (x86_64_base.crl:788-840, 2927-2953), requiring no frame, no callee-saves, non-Windows, direct ret value; a `tco.crl` pass also exists. But it misses calls through values not kept in `lastCallTarget`/`lastCallResult` (e.g. any call in an earlier block of a function with multiple rets), so coverage is thin. | x86_64_base.crl:2927, 786; passes/tco.crl. |
-| Leaf-function frame avoidance | **unknown/partial**: prologue emission at x86_64_base.crl:403-730 sets `currentFuncHasFrame` — need to verify every function without allocas skips it; `emitAlloca` unconditionally does `subq $8, %rsp` *per alloca* with no dedicated slot (x86_64_base.crl:2211-2218), so any alloca forces a frame-ish stack walk. | x86_64_base.crl:2211-2218. |
+| Branch layout / inversion | **naive for layout, improved at IR**: `emitCondBr` still jumps to the true target and falls through to an unconditional `jmp` of the false target with both edges as jumps; no hot/cold ordering. But the original audit's claim that branch passes have "no evidence of wiring" is stale — `irPassBranchInversionFlat` is in the L1 and L3 pipelines and `macro_fusion` is in L3, hoisting `ICmp` next to its `CondBr`. Neither is block *layout*, so the layout half stands. | `emitCondBr` — x86_64_base.crl:2905-2922; blocks in IR order — linux.crl:38-48. Wiring — wallvm.crl:213, :273, :293; `passes/macro_fusion.crl:31-63`. |
+| Tail calls | **regressed**: `isTailCall` is now an unconditional `return false` with a comment explaining why (the call sequence has already emitted; jumping would re-run it with clobbered arguments and skipping the epilogue would leak the frame) and naming G34 as still-open, so `emitRet`'s tail branch is dead code. 64-bit tail calls are not implemented. The `tco.crl` accumulator pass and the still-live 32-bit `isTailCall` remain. | `isTailCall` — x86_64_base.crl:3841-3849; dead branch — :1147-1151; 32-bit — x86_base.crl:371-381; passes/tco.crl. |
+| Leaf-function frame avoidance | **fixed**: leaf + no spills + no allocas + no stack args takes a red-zone path with an early `return` and no `push %rbp`; `needFrame` requires a frame for any of those four conditions. `emitAlloca` no longer does a per-alloca `subq $8` — the prologue reserves `allocaBytes` once and each alloca gets a fixed `leaq -off(%rbp), dst`. Shrink-wrapping of callee saves is also present. | red zone — x86_64_base.crl:593-600; frame gate — :719-753; alloca sizing/placement — :460-514, :2753-2786; shrink-wrap — :406-448, :721-728. |
 | Redundant move elimination | **naive**: `emitBinOp`, `emitShift`, `emitDiv`, `emitCast`, `emitRet` all `movq` whenever `src != dst` string-compare says so — which is true after register allocation *for the copy of the operand into the op*, not a real coalescing pass; no peephole removes `movq %rax, %rax` sequences across isel folds (`movq rax; movq r10, rax; addq...` is common in generated code because every op copies its first operand). | x86_64_base.crl:2078-2096, 2152-2171, 2244-2265. |
 | Constant materialization | **partial**: immediates for ALU ops exist (`iselIsConstInt` gate at x86_64_base.crl:859); float constants via data section (good). But `ret 0`/generic zero paths have no `xor-zeroing` and constants loaded via `movq $` without a `movl $, %eax` 32-bit fast path anywhere in the generic emitter. | x86_64_base.crl:859, 1167-1170. |
 | memset-loop → memset call | **partial**: `idiom.crl` exists; `memset_like` would want a single `tail jmp memset` — no direct evidence the isel path emits it; the IR-level idiom pass may, but the emitter has no loop-idiom lowering of its own. | passes/idiom.crl (not reviewed line-by-line here); emitter has no equivalent. |
-| 32-bit shift/div clobber correctness | **naive (correctness-relevant)**: `emitShift` and `emitDiv` sign-extend through `%rax`/`cqo` unconditionally — for an i32 that still holds the old upper 32 bits cleared only if a 32-bit write zeroed them, but the emitter's own other paths don't guarantee that after `movq`-only copies; the type-safe thing is `cltd/idivl` with 32-bit registers. | x86_64_base.crl:2098-2150, 2152-2171. |
-| `imulq` clobbering for 64-bit mul | **partial**: `Mul` always assumes three-operand `imulq src2, dst` — good; but no `lea` form for `*2/*4/*8` (gcc does `leal` for powers of two — minor). | x86_64_base.crl:1754-1762. |
+| 32-bit shift/div clobber correctness | **naive, and worse than stated**: for width, the audit was right that `emitShift`/`emitDiv` use `movq`/`cqo`/`idivq` unconditionally. But the unsigned divide case is not merely an invariant that might not hold — `emitDiv(inst, false)` emits `cqo` and then `divq`, and `cqo` sign-extends `%rax` into `%rdx`, so an unsigned dividend with bit 63 set divides against an all-ones high word and returns a wrong quotient. The 32-bit port does this correctly (`cltd` if signed else `xorl %edx, %edx`). Tracked as A20/G42. | `emitDiv` — x86_64_base.crl:2625-2650; `emitRem` — :2652-2677; correct 32-bit sequence — x86_base.crl:670-674, :708-712. |
+| `imulq` clobbering for 64-bit mul | **partial, improved**: `Mul` falls back to three-operand `imulq src2, dst`, but the "no `lea` for powers of two" sub-claim is now **wrong** — `iselEmitMulConst` lowers small constant multiplies through `leaq`/`shl` for {2,3,4,5,6,7,8,9,10,12}, which is GCC-shaped strength reduction. What is still missing is width-correctness of those sequences (all `leaq`/`shlq`). | fallback — x86_64_base.crl:2265; `iselEmitMulConst` — :1218-1385. |
 
 ## Section 3 — Prioritized fix list
 
 Ordered by expected value (correctness first, then speed on typical code, then size).
+
+**Revalidated 2026-10-09.** Item order below is current. Two items were
+promoted to correctness-first that the original audit rated as quality:
+item 6's unsigned-divisor half is a wrong-answer bug (new item **0**), and
+item 9 (tail calls) regressed to "not implemented on 64-bit".
+
+0. **NEW — unsigned div/rem must zero `%rdx`, not `cqo`.**
+   `emitDiv`/`emitRem` emit `cqo` unconditionally then select `idivq`/`divq`,
+   but `cqo` sign-extends the dividend into `%rdx`; unsigned division
+   requires `xorl %edx, %edx`. A dividend with bit 63 set divides against an
+   all-ones high word and yields a wrong quotient. The 32-bit port already
+   has the correct two-line sequence — port it.
+   Win: correctness, immediate. Tracked as A20/G42.
 
 1. **Width-aware mnemonic selection (i32/i16/i8) in all ALU paths.**
    Naive: every op copies with `movq`, always uses the 64-bit op (`addl` passed but ignored).
@@ -175,13 +215,14 @@ Ordered by expected value (correctness first, then speed on typical code, then s
    code; medium-high on such loops.
 
 6. **xor-zeroing for 0-valued definitions and div/rem's `%edx`.**
-   Naive: `x*0` → `xorq` (64-bit; wrong width for i32); `emitDiv/emitRem` unsigned
-   paths never zero `%rdx` (they sign-extend blindly via `cqo`, which is only right
-   for signed).
-   Target: `ReturnInst(0)`/zero constants → `xorl %eax,%eax`; unsigned div/rem →
-   `xorl %edx,%edx`; width the xor with the op width.
-   Change: emitter const-materialization path + width-aware `emitDiv`/`emitRem`.
-   Win: correctness for unsigned div/rem on 32-bit; also a cycle or two less dep chain.
+   *(The correctness half moved to new item 0 — do it first.)*
+   Remaining: `x*0` → `xorq` is still 64-bit-only (wrong width for i32), and
+   there is no general `x^x` → zero-register xor idiom at the emitter level
+   (`peephole.crl:311` folds `x^x` to a *constant*, not to an xor
+   instruction), nor a `xorl %eax,%eax` fast path for `ret 0`/zero returns.
+   Target: width the existing xor with the op width; emit `xorl %eax,%eax` for
+   zero-valued definitions and results.
+   Win: smaller/faster zero materialization; subsumed by item 1's width work.
 
 7. **`cmov` directly from icmp; width-aware `emitSelect`.**
    Naive: `emitSelect` always `testq cond,cond; cmovne; cmovz` with 64-bit moves.
@@ -198,24 +239,27 @@ Ordered by expected value (correctness first, then speed on typical code, then s
    immediate form.
    Win: one fewer mov per store; small.
 
-9. **Tail-call coverage.**
-   Naive: `isTailCall` only catches `ret v` where `v` is the very last call's result
-   and the frame is empty (x86_64_base.crl:2927-2953). Any earlier-block calls or
-   a single stray alloca disable it.
-   Target: reuse the IR TCO pass to rewrite `ret call` → tail form before emission,
-   and make `isTailCall` walk through simple cleanup blocks.
-   Win: O(1) stack for recursive wrappers and memset-style thunks; small but free.
+9. **Tail-call coverage.** *(regressed since the original audit)*
+   `isTailCall` is now an unconditional `return false` with a comment
+   explaining why and naming G34 as still-open, so `emitRet`'s tail branch is
+   dead code and 64-bit tail calls are gone entirely — worse than the "thin
+   coverage" the audit found. Reinstating it requires a real lowering
+   (`ret call` → jump with moved argument registers and the frame already
+   released), not a peephole: the audit's target of "reuse the IR TCO pass"
+   would hit exactly the re-run hazard the new comment cites. The `tco.crl`
+   accumulator pass and the 32-bit `isTailCall` are unaffected.
 
-10. **Frame avoidance for alloca-less functions; one slot per alloca, not `subq $8` each.**
-    Naive: `emitAlloca` emits `subq $8, %rsp; movq %rsp, dst` per alloca (leaky — no
-    restore), forcing ad-hoc frame handling.
-    Target: compute frame size once in prologue from the stack_layout pass, give each
-    alloca a fixed `[-N](%rbp)` slot, leaf functions emit no frame.
-    Win: correctness of frames and 1–2 instrs per function; medium.
+10. ~~**Frame avoidance for alloca-less functions; one slot per alloca, not `subq $8` each.**~~
+     **DONE.** Leaf functions with no spills, allocas or stack args take a
+     red-zone path with no `push %rbp`; `scanAllocas` sums type-sized
+     (16-rounded) allocas once and the prologue reserves the region; each
+     alloca gets a fixed `leaq -off(%rbp), dst`. Shrink-wrapping also landed.
 
 11. **`lea` for constant-indexed adds instead of `imul`+add, and `negq`/`notq`/`movq` width fixes.**
-    Covered by fix 1 (width) and fix 3 (lea for gep). Additionally make `imul`-by-2/4/8
-    use `leaq`.
+     **Half done.** The `lea` half is done and beyond the ask:
+     `iselEmitMulConst` covers ×2/3/4/5/6/7/8/9/10/12 and `iselEmitAddSelf`
+     handles `x+x`. The width half (`negq`/`notq`/unconditional `movq`) is
+     not, and collapses into fix 1.
 
 12. **Loop-idiom lowering for memset/memcpy in the emitter or a guaranteed idiom pass.**
     Naive: byte-store loops compile as literal load/cmp/store blocks.
@@ -224,14 +268,54 @@ Ordered by expected value (correctness first, then speed on typical code, then s
     recognizable write-loops in the emitter pass through a helper.
     Win: large for such loops (vectorized memset vs byte loop).
 
+## Optimizations the original audit missed
+
+Present in the current tree, absent from every row of the original Section 2
+and fix list. Recorded 2026-10-09 so the audit is not read as a complete
+picture of the backend.
+
+- **Small-constant multiply strength reduction** — `leaq`/`shl` for
+  {2,3,4,5,6,7,8,9,10,12} (`iselEmitMulConst`, x86_64_base.crl:1218-1385)
+  and `x+x` → `leaq (r,r)` (`iselEmitAddSelf`, :1445-1456). The original
+  audit's `lea` row described this as missing.
+- **Identity and small-immediate folding** — `add x,0`, `sub x,0`,
+  `and x,-1`, `or x,0`, `shl x,0` fold to a bare copy; `+1`/`-1` → `incq`/
+  `decq`; `xor x,-1` → `notq`; `0 - x` → `negq`
+  (`iselTryFoldIncDec` :1918-1977, :1897-1914, :1981-1999).
+- **Signed div-by-power-of-two with bias correction** (`sarq $63` / `shrq` /
+  `addq` / `sarq`, :1389-1420) — GCC's exact sequence. The audit mentions
+  "pow-2 only" as a limitation without noting the form is already GCC's.
+- **Shrink-wrapping + deferred frame push** (`emitDeferredCalleeSaves`
+  :406-448, `canShrinkWrap` :721-728, gated on `blockUsesReg` :374-388).
+  `pipeline-gaps.md` B10 still says "no shrink-wrapping" — stale for 64-bit.
+- **Non-leaf frame-pointer omission** (`omitFramePointer` default true, :311;
+  gates :689, :729-735): a non-leaf function with no spills, allocas or
+  stack args emits no frame at all. Unmentioned anywhere.
+- **Single-instruction bit/popcount lowering** — `ctpop`/`ctlz`/`cttz`/`bswap`/
+  `rotl`/`rotr` with CPU-feature gates and software fallbacks (:4010-4113,
+  dispatched :2581-2587). The other docs mention these only as *idiom-pass*
+  patterns, never as backend lowering.
+- **`SMin`/`SMax`/`UMin`/`UMax` → single `cmp` + `cmov`** (`emitMinMax`
+  :4116-4146, dispatched :2588-2591) — GCC's §1.6 `cmov` shape. The audit's
+  `cmov` row only ever examined `emitSelect`.
+- **`abs` → `neg` + `cmovns`** (:3994-4008), i.e. GCC's `negl; cmovs` in
+  branchless form.
+
 ## Notes
 
 - All audit citations refer to `lib/wallvm/target/x86_64/x86_64_base.crl` unless
-  named; the 32-bit port `lib/wallvm/target/x86/x86_base.crl` already uses
-  32-bit mnemonics for binary ops (`Add => emitBinOp(inst, "addl")`, x86_base.crl:448-460)
-  but still routes through a 64-bit-style `movq`-free skeleton — its div/shift/icmp
-  paths mirror the 64-bit emitter's blind spots (x86_base.crl:508, 587, 630).
-- `divmod.crl` fuses div+rem into mul/sub and `tco.crl`, `branch_inversion.crl`,
-  `select_to_branch.crl` etc. exist at IR level; several are not currently fed into
-  the x86 emitter path, so the wins they represent (fix list items 5, 2, 7, 9) appear
-  to be unused in practice.
+  named. Line numbers drifted by roughly +300 during the 2026-09 revalidation;
+  prefer function names.
+- **The 32-bit port is better than the original Notes claimed.** It uses
+  `movl`/`cmpl`/`testl` throughout (x86_base.crl:621, :634, :657, :732, :842,
+  :897) — it is not width-blind — and it gets div/remainder *right*
+  (`cltd` if signed, else `xorl %edx, %edx`, :670-674, :708-712) where the
+  64-bit backend is wrong. It is the better-maintained of the two on these
+  points.
+- `divmod.crl` fuses div+rem into mul/sub; `tco.crl`, `branch_inversion.crl`,
+  `macro_fusion.crl`, `select_to_branch.crl` and `jump_thread.crl` exist at IR
+  level. More of them are wired now than when this was written
+  (`branch_inversion_flat` in L1/L3, `macro_fusion` and `sel2br` in L3,
+  `jump_thread` in L2/L3), so the original "several are not fed into the x86
+  emitter path" note is overstated — though the emitter-side fusions these
+  would enable (items 2, 7) still do not exist.

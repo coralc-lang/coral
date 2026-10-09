@@ -146,15 +146,32 @@ pub bool irPassStackLayout(IrFunc* func, rawptr userdata)
             entryAllocas++;
     }
 
+    // Only entry-block allocas are reordered, so with fewer than two of them
+    // there is nothing to sort.
     if (entryAllocas < 2)
     {
         dealloc<StackVarInfo>(vars);
         return false;
     }
 
-    // Build new instruction order, hot allocas first, then cold
+    // Build new instruction order, hot allocas first, then cold.
+    //
+    // Only allocas that actually live in the entry block may be reordered
+    // here. Allocas collected from other blocks are still in `vars` (the
+    // hotness ranking is function-wide), so they must be skipped: pushing
+    // them into the entry array would both overflow it — newCount would
+    // reach (entry->ninsts - entryAllocas) + nvars against a capacity of
+    // entry->ninsts — and leave the alloca parented to two blocks at once,
+    // since its original block still lists it. Allocas in non-entry blocks
+    // are left exactly where they are; the emitter sizes and places the
+    // whole function's frame anyway (x86_64_base.crl allocaSlotOf).
     u32 newCap = entry->ninsts;
     IrInst** newInsts = alloc<IrInst*>(newCap);
+    if (newInsts == null)
+    {
+        dealloc<StackVarInfo>(vars);
+        return false;
+    }
     u32 newCount = 0;
 
     // First, all non-alloca instructions (in order)
@@ -167,29 +184,39 @@ pub bool irPassStackLayout(IrFunc* func, rawptr userdata)
         }
     }
 
-    // Then, hot allocas in sorted order
-    // I push every collected alloca here, the old pass did too, including the
-    // ones that were gathered from blocks other than the entry block.
+    // Then, hot entry-block allocas in sorted order
     for (u32 vi = 0; vi < nvars; vi++)
     {
-        if (vars[vi].isHot)
+        if (vars[vi].isHot && vars[vi].alloca->parent == entry)
         {
             newInsts[newCount] = vars[vi].alloca;
             newCount++;
         }
     }
 
-    // Then, cold allocas in sorted order
+    // Then, cold entry-block allocas in sorted order
     for (u32 vi = 0; vi < nvars; vi++)
     {
-        if (!vars[vi].isHot)
+        if (!vars[vi].isHot && vars[vi].alloca->parent == entry)
         {
             newInsts[newCount] = vars[vi].alloca;
             newCount++;
         }
     }
 
-    // Replace entry block instructions
+    // The two loops above only relocate allocas that came out of this block,
+    // so newCount is exactly the number of instructions that remain — it can
+    // never exceed newCap. Assert the invariant anyway: a silent heap
+    // overrun is the failure mode this pass had.
+    if (newCount > newCap)
+    {
+        dealloc<IrInst*>(newInsts);
+        dealloc<StackVarInfo>(vars);
+        return false;
+    }
+
+    // Replace entry block instructions. Every retained instruction already
+    // has parent == entry, so no parent fixup is needed.
     dealloc<IrInst*>(entry->insts);
     entry->insts = newInsts;
     entry->ninsts = newCount;

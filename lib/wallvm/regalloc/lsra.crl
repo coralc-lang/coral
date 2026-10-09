@@ -388,25 +388,35 @@ pub struct LinearScanRegAlloc
 
     void computeIntervals(IrFunc* func)
     {
-        // Platform-specific parameter register assignments.
-        // These map parameter index (k) to the LSRA register index.
-        // Currently only x86-64 SystemV and Win64 are supported.
-        // To add a new platform —
-        // 1. Add its ABIRules to asm_rules.crl
-        // 2. Add a new CallingConvention enum value
-        // 3. Add the register index mapping arrays here
-        // 4. Add the platform detection in the isWin check below
-        u32 sysvIntRegs[6] = {5, 4, 2, 1, 6, 7};  // rdi,rsi,rdx,rcx,r8,r9 -> LSRA indices
-        u32 win64IntRegs[4] = {1, 2, 8, 9};       // rcx,rdx,r8,r9 -> LSRA indices
-        u32 sysvFpRegs[8] = {0, 1, 2, 3, 4, 5, 6, 7};  // xmm0-xmm7
-        u32 win64FpRegs[4] = {0, 1, 2, 3};        // xmm0-xmm3
-
-        // NOTE — LSRA currently only supports x86-64 (SystemV and Win64).
-        // Other architectures (ARM64, RISC-V, etc.) require —
-        // 1. New register index mapping arrays
-        // 2. Platform detection logic
-        // 3. Updated emitPrologue/emitEpilogue in the target backend
-        bool isWin = false;
+        // Incoming parameters get an interval of their own — start 0,
+        // end 0 — but no pre-pinned register. The scan hands each one a
+        // home from the free set like any other value, and the
+        // backend's emitParamSeeding moves the ABI's incoming argument
+        // registers into those homes, staging them through the stack
+        // first so that a home which happens to be a later argument's
+        // incoming register is safe to overwrite. Keeping the ABI walk
+        // out of this file is what lets SysV and Win64 — different
+        // argument banks, different register orders — share one
+        // allocator: the backend knows the platform (isWindows) and
+        // walks its own bank.
+        //
+        // A pre-pinned home was attempted here before, with per-ABI
+        // index tables and an isWin switch, and it could never have
+        // taken effect: linearScan assigns physReg for every interval
+        // it scans, overwriting the pin, and the tables numbered
+        // physical registers rather than the caller-save-minus-
+        // reserved order buildRegAlloc builds intRegNames in (so the
+        // Win64 table's indices 8/9 did not even exist — Win64's
+        // allocatable set is five registers wide). The pin and the
+        // tables are gone rather than corrected: emitParamSeeding no
+        // longer needs them for correctness, and the fp pins could
+        // never work at all — xmm0/xmm1 are reserved scratch, so a
+        // float parameter's incoming register is not in floatRegNames
+        // to be pinned to.
+        //
+        // A new architecture therefore needs nothing in this file:
+        // give it ABIRules in asm_rules.crl and teach the target
+        // backend's prologue/epilogue its argument walk.
         if (func->base.type != null && func->base.type->nparams > 0)
         {
             for (u32 k = 0; k < self.numParams; k++)
@@ -420,24 +430,17 @@ pub struct LinearScanRegAlloc
                 li->start = 0;
                 li->end = 0;
                 li->spillSlot = NO_SLOT;
+                li->physReg = NO_REG;
+                // Every field has to be seeded here. alloc<LiveInterval> does
+                // not zero its memory, and these intervals reach sortIntervals
+                // via spillWeight — an uninitialised double there can be NaN,
+                // which propagates into the ordering and into any spill choice
+                // made from it.
+                li->uses = 0;
+                li->defs = 0;
+                li->spillWeight = 0.0;
+                li->spansCall = false;
                 li->isFloat = pv2->type != null && (pv2->type->kind == IrTypeKind::Float || pv2->type->kind == IrTypeKind::Vector);
-
-                if (li->isFloat)
-                {
-                    if (k < 8)
-                        li->physReg = sysvFpRegs[k];
-                    else
-                        li->physReg = NO_REG;
-                }
-                else
-                {
-                    if (!isWin && k < 6)
-                        li->physReg = sysvIntRegs[k];
-                    else if (isWin && k < 4)
-                        li->physReg = win64IntRegs[k];
-                    else
-                        li->physReg = NO_REG;
-                }
             }
         }
 
@@ -454,6 +457,7 @@ pub struct LinearScanRegAlloc
                 li->physReg = NO_REG;
                 li->spillSlot = NO_SLOT;
                 li->isFloat = false;
+                li->spansCall = false;
                 li->uses = 0;
                 li->defs = 1;
                 li->spillWeight = 0.0;

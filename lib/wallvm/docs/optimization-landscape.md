@@ -384,19 +384,29 @@ correlated-range-elimination cousin).
 
 ### 5.3 `pipeline-gaps.md` claims re-verified this pass
 
+Revalidated again 2026-10-09 against the current tree. Most of the
+re-verification below was already done here; this pass closed the one item
+it had left open and added two new findings.
+
 | Claim | Status now |
 |---|---|
-| G1 validate returns true when valid | **stands** (`validate.crl:286,295` vs `wallvm.crl:144-155`; line refs in gaps doc stale) |
-| G2 mem2reg ↔ lower_phis ping-pong | **stands** (lane composition unchanged, `wallvm.crl:211,233`) |
-| G7 no module layer, ipa_cp unwired | **stands** (`ipa_cp.crl:281,288`) |
-| G10 mem2reg refuses loop allocas | **stands** (`mem2reg.crl:455-519`) |
-| G11 sroa use-list staleness | **fixed** — rewrites go through removeUser/addUser (`sroa.crl:133-144`); "not SROA" part stands |
-| G14 threaders orphan preds | **stands for jump_thread** (`jump_thread.crl:75` no npreds check); **fixed for tail_dup** (`tail_dup.crl:41-43`) |
-| G18 LICM speculation | **stands** (`licm.crl:379-400`) |
-| G20 unroll placement | **stands** (`wallvm.crl:318`) |
-| G21 spill contract | **substantially changed** — `valueIsSpill` is now called throughout the emitter and spill slots decode as `-(slot+1)*16(%rbp)` (`x86_64_base.crl:1787-1811,1837+`); whether the prologue reserves that frame area was **not** verified here |
-| G27 store operand order inverted | **fixed** — `emitStoreWidth` now reads ops[0]=value, ops[1]=address, width from the value type (`x86_64_base.crl:1316-1320`) |
-| G22 reserved-reg off-by-one | **fixed** — `X86_64_RESERVED_INT` has 4 entries with `numReservedIntRegs = 4`, float 3/3 (`x86_64_base.crl:13-19`, `wallvm.crl:392-395`) |
+| G1 validate returns true when valid | **stands** (`validate.crl:252,295` vs `wallvm.crl:158-163`) |
+| G2 mem2reg ↔ lower_phis ping-pong | **stands** (`lower_phis.crl:50-89` allocas pass mem2reg's screen at `mem2reg.crl:528-541`; lane order unchanged, `wallvm.crl:252,298`) |
+| G7 no module layer, ipa_cp unwired | **stands** (`passes/lib.crl:19` exports it; no pipeline references it) |
+| G10 mem2reg refuses loop allocas | **stands** (`mem2reg.crl:449-519`) |
+| G11 sroa use-list staleness | **fixed** — rewrites go through removeUser/addUser (`sroa.crl:135-137`, :143-144, :150-157); "not SROA" part stands |
+| G14 threaders orphan preds | **stands for jump_thread** (`jump_thread.crl:80`, no npreds check); **fixed for tail_dup** (`tail_dup.crl:43,98,131`). sel2br's unnamed blocks also still real (`select_to_branch.crl:24-28`) |
+| G18 LICM speculation | **stands** (`licm.crl:196-198`, :348-358, :379-399) |
+| G20 unroll placement | **stands** (`wallvm.crl:338-341`) |
+| G21 spill contract | **fixed — question closed.** The item this row left open is now settled: the prologue *does* reserve the frame area. `spillSlotCount = countSpillSlots(func)` and `spillFrameBytes = spillSlotCount * 16` (`x86_64_base.crl:575-576`, :2199-2231) and the region is reserved in the prologue (:775-796) and released in the epilogue (:1030-1037), with frame/red-zone/shrink-wrap all gated on `spillSlotCount == 0` (:593, :719-729). `valueIsSpill` has ~40 call sites. See A1 struck in `pipeline-gaps.md` |
+| G27 store operand order inverted | **fixed, and the original claim was wrong** — every emitter path reads `ops[0]`=value, `ops[1]`=address with width from the value type (`x86_64_base.crl:1557-1562`, :1687-1701, :1818-1824, :2742-2745; `x86_base.crl:783-786`), matching `irBuilder.store(val, ptr)` and the prologue seeding in the same file (:830, :852) |
+| G22 reserved-reg off-by-one | **fixed** — `X86_64_RESERVED_INT` has 4 entries with `numReservedIntRegs = 4`, float 3/3 (`x86_64_base.crl:13-19`, `wallvm.crl:413-416`). The **clobber** half of G22 stands |
+| G3 abi_lower userdata confusion | **fixed** — pass reads `func->parent` (`target/x86_64/linux/abi_lower.crl:906-916`); `addFunc` sets it (`irtypes.crl:547`) |
+| G30 alloca frame model | **fixed** — type-sized, 16-rounded, prologue-reserved, rbp-relative (`x86_64_base.crl:460-514`, :776-796, :2764-2772) |
+| G32 call-site ABI details | **fixed** — alignment, `%al` for varargs, single stack-arg pass, params past 6th/4th seeded (`x86_64_base.crl:3543-3550`, :3781-3790, :3552-3663, :808-1022) |
+| G34 tail calls | **regressed** — `isTailCall` is now an unconditional `return false` naming G34 as open (`x86_64_base.crl:3841-3849`); `emitRet`'s tail branch is dead. 64-bit tail calls gone |
+| **G42 unsigned div `cqo`** | **fixed 2026-10-09** — was **new — wrong answers**: `emitDiv`/`emitRem` emitted `cqo` then `divq` for the unsigned case; they now branch on `isSigned` (`cqo` vs `xorl %edx, %edx`), the sequence the 32-bit port already had (`x86_base.crl:672,710`) |
+| **G43 `stack_layout` overflow** | **fixed 2026-10-09** — was **new — heap corruption**: the gather now takes only allocas whose `parent` is the entry block, the rebuilt array is null-checked, and the append refuses to run past `newCap`; the dangling-`parent` double-parenting is gone with the gather restriction |
 
 ---
 

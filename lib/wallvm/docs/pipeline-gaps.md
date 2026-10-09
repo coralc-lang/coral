@@ -6,6 +6,43 @@ they exist today against a production optimizer/codegen pipeline (clang
 verified against the tree; suspected bugs are marked **[verify]** where the
 code is ambiguous or the convention split is systemic.
 
+**Revalidated 2026-10-09 against the current tree.** Several headline items
+have since been fixed and their rows are marked FIXED rather than deleted, so
+the audit trail stays readable. Line numbers in the original rows drifted by
+roughly +300 in `x86_64_base.crl` — cite function names, not old line numbers.
+Corrections in this revision:
+
+- **G21/A1 fixed** — the spill contract is now implemented end-to-end.
+- **G27/A5 fixed** — the emitter already used the builder's store convention;
+  the doc's claim of an inversion, and its "one side must be wrong" hedge,
+  were both wrong.
+- **G30/A4, G32/A8 fixed** — realoca/alloca frame model and call-site ABI
+  details landed.
+- **G3, A12 fixed** — abi_lower's userdata contract and sroa's use-list
+  maintenance.
+- **G22's array off-by-one fixed**; the clobber half is still real.
+- **G34 regressed** — `isTailCall` is now hardwired off.
+- **NEW, not in the original audit: unsigned div/rem emits `cqo` before
+  `divq`** (`emitDiv`/`emitRem`), which is a miscompile, not a quality gap.
+  See G42. **Fixed the same day** — `emitDiv`/`emitRem` branch on
+  `isSigned` now (`cqo` vs `xorl %edx, %edx`).
+- **G43 fixed** — `stack_layout` only gathers allocas whose `parent` is
+  the entry block, and the rebuild checks the new allocation for null and
+  refuses to write past it.
+- **G14 partly fixed** — `jump_thread` now requires
+  `target->parent == func && target->npreds == 1` before emptying a
+  block, and `select_to_branch.createBlock` names its blocks `sel2br<N>`
+  (snprintf), so the emitter's `.L` + name can no longer collide. The
+  broader simplifycfg pass is still absent.
+- **G23 fixed** — the emitter decodes LSRA indices through
+  `intRegNameFor`, which picks `X86_64_INT_REGS` or the new
+  `X86_64_INT_REGS_WIN64` off `isWindows`; on the lsra side the dead
+  pre-pin block (wrong index tables, `isWin` hardcoded false,
+  overwritten by the scan anyway) was removed rather than repaired.
+- **NEW, not in the original audit: parameter seeding could overwrite a
+  later argument's incoming register before reading it** — see G44.
+  Found and fixed the same day.
+
 Sources read: `wallvm.crl` (driver), all 41 passes in `passes/`,
 `regalloc/{lsra,graph}.crl`, `rules/asm_rules.crl`, `target/{x86,x86_64,wasm}`,
 `target/x86_64/linux/abi_lower.crl` (+ windows/x86 variants), `noret/`,
@@ -134,23 +171,24 @@ non-loop phi-alloca (they pass its promotability screen) and lower_phis
 re-lowers them — the pipeline cannot converge whenever a non-loop phi
 exists. Belongs to: driver ordering + `passes/lower_phis.crl` design.
 
-**G3 [C] — `irABILower` is registered as a function pass but its contract
-requires the IrModule as userdata** (abi_lower.crl:884-890: "`userdata` as
-the owning `IrModule*`"). The driver passes `IrContext*` to every pass
-(wallvm.crl:286). `IrModule` and `IrContext` share no layout prefix
-(irtypes.crl:516 vs 626), so unless the function was pre-marked
-`abi.lower` by an external module-level run, the pass walks garbage.
-**[verify]** against how `buildModule` pre-marks functions; as wired inside
-`irOptimize` this is type confusion. Belongs to: driver contract; the pass
-needs a module-pass slot, not a `PassFn` slot.
+**G3 — FIXED 2026-10-09 — `irABILower`'s userdata contract is no longer
+type confusion.** The audit flagged that the pass contractually required the
+`IrModule*` while the driver passed an `IrContext*` to every pass, so unless
+the function was pre-marked by an external module-level run the pass walked
+garbage. **[verify]** is now resolved: the SysV pass reads `func->parent` as
+the module of record and only falls back to `userdata` when `parent` is null
+(target/x86_64/linux/abi_lower.crl:906-916); the MS pass has the same shape.
+`IrModule.addFunc` sets `f->parent = self` (base/irtypes.crl:547) and the
+only construction site is the parser (text/irParser.crl:2169), so every
+module function has a valid parent before `irOptimize` runs. The "external
+module-level pre-marking" the doc speculated about does not exist.
 
-**G4 [C] — SysV `irABILower` runs for every calling convention.**
-wallvm.crl:52 imports only `x86_64::linux::abi_lower`; the Win64
-(`target/x86_64/windows/abi_lower.crl`) and i386
-(`target/x86/linux/abi_lower.crl`) variants exist but are referenced
-nowhere. Win64/x86 compilations get SysV eightbyte classification or, if
-never marked, nothing. Belongs to: driver — abi_lower must be selected per
-`cc` like `regallocConfigFor` already does for regalloc.
+**G4 [C] — SysV `irABILower` still runs for the wrong calling conventions.**
+abi_lower is now selected per-`cc` (wallvm.crl:190-198), so Win64 gets the MS
+pass — an improvement over the audit's "SysV for everything". But the i386
+pass (`target/x86/linux/abi_lower.crl`) is still referenced nowhere, so
+Cdecl/Stdcall/SyscallX86 still get SysV eightbyte classification. Belongs to:
+driver — add the i386 arm alongside the existing per-cc selection.
 
 **G5 [Q] — abi_lower placement is pipeline-head, not codegen-adjacent.**
 LLVM lowers the ABI at isel. Here it runs first, before mem2reg and before
@@ -195,14 +233,20 @@ loop form produced by mem2reg" (unroll.crl:3-6) — a form mem2reg never
 produces. The correct fix is in lsra/phi lowering (see G13, G24), not in
 mem2reg. Belongs to: `passes/mem2reg.crl` + `regalloc/lsra.crl`.
 
-**G11 [Q] — mem2reg runs before `sroa`, and "sroa" is not SROA.**
-sroa.crl is single-store forwarding that **bails on any GEP/atomic use**
-(sroa.crl:50-56); there is no aggregate splitting, so struct/array allocas
-are never scalarized and can never be promoted. Clang order is sroa →
+**G11 [Q] — mem2reg runs before `sroa`, and "sroa" is not SROA.** (The
+companion **[verify]** / A12 is FIXED: `sroa.crl` now maintains use lists
+properly — `removeUser`/`addUser` around the operand rewrite (:135-137),
+plus `removeUser` on the load's own operands (:143-144) and on the alloca and
+store (:150-157). It also gained safety checks the audit did not credit: an
+unhandled-opcode user makes the transform unsafe (:66-81), loads must be
+dominated by the single store (:94-116), and more than 16 loads bails rather
+than reading out of bounds (:88-89).)
+
+The main claim stands: `sroa.crl` is still single-store forwarding that bails
+on any GEP/atomic use (:53-59), so there is no aggregate splitting and
+struct/array allocas are never scalarized — they can never be promoted.
+mem2reg still precedes sroa (wallvm.crl:230-231); clang order is sroa →
 mem2reg. Belongs to: pipeline order + a real SROA in `passes/sroa.crl`.
-**[verify]** sroa.crl:73-80 rewrites operands by direct assignment without
-`addUser`/`removeUser` — use lists go stale, violating IR.md §5 invariant 4
-and poisoning every `nusers`-driven pass downstream (DCE included).
 
 **G12 [C] — no critical-edge splitting pass anywhere.** lower_phis dodges
 the classic miscompile by round-tripping through a private alloca per phi
@@ -221,14 +265,21 @@ Belongs to: `passes/lower_phis.crl` + `regalloc/lsra.crl`.
 
 **G14 [Q] — no simplifycfg.** No empty/merged block folding, no common-tail
 sinking/hoisting, no unconditional-branch-to-empty-block elimination.
-jump_thread (jump_thread.crl) and tail_dup (tail_dup.crl) cover only
-passthrough chains and **[verify]** both empty `target->ninsts = 0` without
-checking the target's other predecessors (jump_thread.crl:64,
-tail_dup.crl:57) — orphaned preds then reach a block with no terminator,
-and DCE must clean up. DCE's unreachable-block removal (dce.crl:50-132)
-leaves stale entries in successors' `preds` and nulls phi value operands
-(dce.crl:113-124), which later passes must tolerate. Belongs to: new
-`passes/simplifycfg.crl`; harden the two threaders.
+jump_thread and tail_dup cover only passthrough chains. There is no
+simplifycfg pass. **[verify]** partially resolved: `tail_dup` now requires
+`target->npreds == 1` (and `target->parent == func`) in all three patterns
+(tail_dup.crl:43, :98, :131), so it can no longer gut a
+multiply-predecessor block. **Fixed 2026-10-09:** `jump_thread`'s
+pattern 1 got the same guard — it now requires
+`target->parent == func && target->npreds == 1` before emptying a block
+and rewriting branches, so it can no longer leave a surviving predecessor
+aimed at a block with no terminator; and `select_to_branch.createBlock`
+no longer emits nameless blocks — it snprintfs a unique `sel2br<N>` name
+per conversion, so the emitter's `.L` + `name` + `:` cannot produce three
+identical `.L:` labels. DCE's unreachable-block removal (dce.crl:50-132)
+still leaves stale entries in successors' `preds` and nulls phi value
+operands (:113-124), which later passes must tolerate. Belongs to: new
+`passes/simplifycfg.crl` (still missing).
 
 **G15 [Q] — no reassociation pass.** lex_canon sorts operands within a
 commutative chain (lex_canon.crl) but there is no global reassociation for
@@ -273,45 +324,139 @@ cleanup after. Belongs to: driver.
 
 ### 3.4 Register allocation (`regalloc/`)
 
-**G21 [C] — the spill contract is broken end-to-end.** For every x86 target
-the driver sets `backendHandlesSpills = true` (wallvm.crl:344-360,
-362-398), so lsra skips IR-level spill rewriting (lsra.crl:911-916) and
-emits `SPILL_BIT|slot` in `valData` (lsra.crl:1061). The x86_64 backend's
-only decode is `getRegForValue`, which returns **"rax"** for any spilled
-value (x86_64_base.crl:1694-1709); `valueIsSpill` is defined but never
-called (1717-1721); no spill-slot frame exists (allocas are `subq $8`,
-see G30). Net effect: **any function whose live values exceed the
-allocatable set silently aliases every spilled value to rax.** This is the
-single largest correctness hole in the tree. Belongs to:
-`target/x86_64/x86_64_base.crl` (spill slot frame + operand
-materialization) or flip `backendHandlesSpills` to false until it exists.
+**G21 — FIXED 2026-10-09 — the spill contract now works end-to-end.**
+The original audit said spills were broken: every spilled value decoded to
+`rax`, `valueIsSpill` was "defined but never called", and no spill-slot
+frame existed. All three were true when written; none are now.
+
+The 64-bit backend now has a real spill frame:
+
+- `spillSlotCount` / `spillFrameBytes` emitter fields (x86_64_base.crl:296-297),
+  computed by `countSpillSlots` (:2199-2231), which walks every block and
+  every instruction looking for the spill bit.
+- `spillFrameBytes = spillSlotCount * 16`, reserved in the prologue
+  (:575-576, :775-796) and released in the epilogue (:1030-1037).
+- `slotText` (:2028-2043) turns a slot index into an rbp-relative operand,
+  and `opForReg` / `opForRegF` / `outForInt` / `sinkInt` / `sinkFloat`
+  (:2047-2197) decode spills at materialization time.
+- `valueIsSpill` is called from ~40 sites, not zero.
+- Frame, red-zone and shrink-wrap decisions are all gated on
+  `spillSlotCount == 0` (:593, :719-729), so a spilling function always gets
+  a real frame.
+
+The 32-bit backend has the equivalent (`x86_base.crl:436-451`, :247-248,
+:295-315). What remains here is a *quality* gap, not a correctness one, and
+it is tracked as G24 (one slot per vreg, no packing, no remat).
+
+**G42 — NEW (found 2026-10-09) — unsigned div/rem emits `cqo` before
+`divq`, a live miscompile.** `emitDiv` / `emitRem` emit `cqo`
+unconditionally, then select `idivq` vs `divq` on `isSigned`
+(x86_64_base.crl:2625-2650 for div, :2652-2677 for rem). `cqo` sign-extends
+`%rax` into `%rdx`; unsigned division requires `xorl %edx, %edx`. For an
+unsigned dividend with bit 63 set, `%rdx` becomes all-ones and `divq`
+returns a wrong quotient — not a slow one. The 32-bit port gets this right
+(`x86_base.crl:672`, :710: `cltd` if signed, else `xorl %edx, %edx`), so the
+fix is a port of a two-line sequence. Classified **[C]** because it
+produces wrong answers, and it is reachable from ordinary unsigned divide.
+**Fixed 2026-10-09:** `emitDiv`/`emitRem` now emit `cqo` only under
+`isSigned` and `xorl %edx, %edx` otherwise (the xorl form is also correct
+for 64-bit — 32-bit writes zero the upper half implicitly).
+
+**G43 — NEW (found 2026-10-09) — `stack_layout` can write past `newInsts`
+and double-parents allocas.** This is the surviving half of A18, escalated
+here because it is heap corruption inside the optimizer rather than a layout
+heuristic. `stack_layout.crl:156-157` sizes the rebuilt entry-block
+instruction array as `newCap = entry->ninsts`, then at :173-190 appends
+**all** `nvars` function-wide allocas — including ones gathered from
+non-entry blocks (the pass's own comment at :171-172 admits this). So
+`newCount = (entry->ninsts - entryAllocas) + nvars` exceeds `newCap` whenever
+any alloca lives outside the entry block: an unchecked write past the end of
+a fresh heap allocation. The moved allocas also keep `inst->parent`
+pointing at their original block while also appearing in `entry->insts`
+(:192-195), double-parenting them. Reachable at O3 (the pass is in L3,
+wallvm.crl:264). **Fixed 2026-10-09:** the gather loop accepts only
+allocas whose `parent` is the entry block (which is also what makes the
+move single-parented), the allocation is null-checked, and the append
+refuses to run if `newCount` would exceed `newCap`.
+
+**G44 — NEW (found 2026-10-09) — parameter seeding could overwrite a
+later argument's incoming register before reading it — FIXED the same
+day.** `emitParamSeeding` walked the entry stores one at a time: for
+each register parameter it emitted `movq <abiReg>, <home>` (floats went
+through `sinkFloat`: `movsd`/`movdqa <abiReg>, <home>`), where `<home>`
+is the register lsra assigned to that parameter's value. lsra picks
+homes from whatever the scan left free — the same bank the caller passes
+arguments in — so a home can be a register a LATER parameter arrives in.
+Concretely on SysV: allocatable is `rax,rcx,rdx,rsi,rdi,r8,r9` with rax
+usually held by the return value, so four integer parameters get homes
+`rcx,rdx,rsi,rdi`, while the incoming bank is `rdi,rsi,rdx,rcx,…` — the
+walk emits `movq %rdi,%rcx; movq %rsi,%rdx;` and then parameter 2's
+`movq %rdx,%rsi` reads the value parameter 1 just wrote into rdx. The
+same shape hits three-or-more float parameters (homes start at `xmm2`,
+because xmm0/xmm1 are reserved scratch, and xmm2 is argument 2's
+incoming register) and structs-in-registers (word0 can land in a home
+that is word1's incoming register, within one parameter). Which homes
+come out free is scan-dependent, so the bug is config-dependent, but
+nothing in the pipeline avoided it — the old lsra pre-pin that might
+have was dead (G23). Stack-sourced parameters (kinds 0/4) were never at
+risk — their source is memory. The fix runs the walk twice over the
+same stores: phase one moves every incoming bank word into a staging
+area on the function's own stack (`subq` sized by classifyCallArg's
+bank limits: at most 6 integer words + 8 fp words, 8/16 bytes each),
+phase two commits staging into homes and allocas. All ABI reads
+therefore happen before any home write, for every ordering and both
+ABIs; the commit pass routes spill-slot and alloca writes through the
+reserved `r11`/`xmm15` scratch where memory-to-memory moves are needed.
+`sinkFloat`, whose only caller was the old kind-2 arm, was removed.
+Belongs to: `target/x86_64/x86_64_base.crl`
+(`emitParamSeeding`/`walkParamSeeds`).
 
 **G22 [C] — no fixed-register / clobber modeling between isel and
-regalloc.** The emitter clobbers concrete registers that lsra happily
-allocates to unrelated live values: `emitDiv`/`emitRem` destroy rax+rdx
-(x86_64_base.crl:2098-2150), `emitShift` destroys rcx (2152-2171),
-`emitICmp`/`emitFCmp` write %al/%cl (2244-2313), `VecDiv` walks lanes
-through r10/r11/rax/rdx (1898-1926), `emitFcvt` UiToFp uses r10
-(2655-2671). Only rsp/rbp are reserved — and `numReservedIntRegs = 3` is
-set over a **2-element** array (wallvm.crl:381-385 vs
-x86_64_base.crl:7-9; same off-by-one for floats, 384/11-13) → OOB read in
-`isReservedName`. LLVM models these as tied operands/fixed-reg
-constraints/clobbers in the instruction descriptors. Belongs to:
+regalloc.** (The off-by-one sub-claim is FIXED: the reserved arrays are now
+4 and 3 elements with matching counts, x86_64_base.crl:13-19 /
+wallvm.crl:413-416. The clobber half below is still real.)
+
+The emitter clobbers concrete registers that lsra happily allocates to
+unrelated live values. Only `rsp`, `rbp`, `r10`, `r11` are reserved
+(`X86_64_RESERVED_INT`, x86_64_base.crl:13-15) — so `rax`, `rcx`, `rdx`,
+`rsi`, `rdi` are all allocatable (`X86_64_INT_REGS`, :25-27) — while
+`emitDiv`/`emitRem` destroy rax+rdx (:2625-2677), `emitShift` destroys rcx
+(:2679-2705), `emitICmp`/`emitFCmp` write %al/%cl (:2822-2891), and
+`VecDiv` walks lanes through r10/r11/rax/rdx (:2405-2445). Any function with
+a divide, shift or compare alongside an unrelated live value in one of those
+registers is silently miscompiled. LLVM models these as tied operands /
+fixed-reg constraints / clobbers in the instruction descriptors. Belongs to:
 `regalloc/lsra.crl` (constraint modeling) + the reserved-register tables.
 
-**G23 [C] — Win64 register tables disagree between lsra and the emitter.**
-lsra names registers from `abi.callerSaveRegs` — Win64: rax, rcx, rdx, r8,
-r9, r10, r11 (asm_rules.crl:137). The emitter decodes the same indices via
-`X86_64_INT_REGS` = rax, rcx, rdx, **rsi, rdi**, r8, r9, ...
-(x86_64_base.crl:15-17). Indices ≥ 3 name different registers on Win64 →
-systematically wrong code. Related: lsra's `isWin` is hardcoded `false`
-(lsra.crl:409), so the Win64 param mapping arrays are dead; and the
-param-interval pre-assignment it guards is itself overwritten by the scan
-(dead code), while `uses`/`defs`/`spillWeight` of param intervals are left
-**uninitialized** (lsra.crl:417-441) — including possible NaN weights
-feeding `sortIntervals`. Belongs to: `regalloc/lsra.crl` +
-`target/x86_64/x86_64_base.crl` (single source of truth for the register
-order).
+**G23 [C] — Win64 register tables disagree between lsra and the emitter —
+FIXED 2026-10-09 (both halves), with the lsra half resolved by deletion.**
+The original claim was accurate: lsra names registers from
+`abi.callerSaveRegs` minus reserved, so Win64 yields `rax, rcx, rdx, r8,
+r9…` (asm_rules.crl:137), while the emitter decoded LSRA index *i* as
+`X86_64_INT_REGS[i]` = `rax, rcx, rdx, rsi, rdi, …` — indices ≥ 3 named a
+different physical register on Win64. The emitter now decodes through
+`intRegNameFor`, which returns `X86_64_INT_REGS_WIN64` entries when
+`isWindows` and the SysV table otherwise, at both decode sites
+(`getRegName` and `opFor`).
+The compounding half was worse than stated and is now gone rather than
+repaired: `isWin` was hardcoded `false`, so the Win64 param-mapping arrays
+never ran; the whole pre-pin block was dead anyway because `linearScan`
+assigns `physReg` for every interval it scans, overwriting the pin before
+anything reads it; and the index tables did not even match the layout they
+claimed to decode (`{5,4,2,1,6,7}` for SysV and `{1,2,8,9}` for Win64
+number physical registers, not `callerSaveRegs`-minus-reserved — where
+Win64's whole allocatable set is five registers wide, so indices 8/9 did
+not exist). The fp pins could never work at all: `xmm0`/`xmm1` are
+reserved scratch, so a float parameter's incoming register is not in
+`floatRegNames` to be pinned to. The pin, `isWin` and both index tables
+were therefore deleted from `computeIntervals`, with the contract
+documented there: the scan assigns parameter homes, and the backend's
+`emitParamSeeding` walks the ABI bank — using `isWindows` — into those
+homes. Which is also what makes the seeding safe; see G44. (The separate
+`defs`/`spillWeight` initialisation claim from the audit was fixed
+earlier — every `LiveInterval` field is now seeded at creation.)
+Belongs to: `regalloc/lsra.crl` +
+`target/x86_64/x86_64_base.crl` (single source of truth for register order).
 
 **G24 [Q] — allocator feature set vs "gcc/clang quality":** no
 rematerialization (constants get spilled like any value), no live-range
@@ -342,89 +487,110 @@ value maps in the respective passes.
 
 ### 3.5 Frame, ABI, calls
 
-**G27 [C] — `store` operand order appears inverted in both native
-backends.** IR convention (irBuilder.crl:190-195, irPrinter.crl:512-521,
-irParser.crl:1500-1513, and every pass) is `store v, ptr` → ops[0]=value,
-ops[1]=address. `emitStoreWidth`/`emitStore`/`iselTryFoldLoadOpStore`/
-`iselTryFoldGepStore` all treat ops[0] as the address and ops[1] as the
-value (x86_64_base.crl:1253-1289, 1378-1438, 1507-1520, 2200-2209;
-x86_base.crl:619-628). The width is taken from ops[1] too, so it is always
-the pointer width (64). **[verify]** — the split is systemic (both
-backends, all paths), so this may be a legacy convention deliberately kept
-in the emitter; but the prologue param-seeding code in the *same file*
-uses the builder convention (x86_64_base.crl:624-727), so at least one
-side is wrong. Belongs to: `target/x86_64/x86_64_base.crl`,
-`target/x86/x86_base.crl`.
+**G27 — FIXED 2026-10-09 — store operand order already matches the IR.**
+The original audit claimed the emitter treated `ops[0]` as the address and
+`ops[1]` as the value, inverting `irBuilder.store(val, ptr)`, with the width
+taken from the pointer side. **[verify]** was flagged because the split was
+systemic across both backends, and the doc conceded "at least one side is
+wrong". Both halves of that are now false.
+
+The convention in force is the builder's: value in `ops[0]`, address in
+`ops[1]`, width from the value. Confirmed in every emitter path —
+`emitStoreWidth` reads `src = ops[0]`, `dst = ops[1]`, `width =
+ops[0]->type->width` (x86_64_base.crl:1557-1562); `iselTryFoldLoadOpStore`
+(`:1687-1701`); `iselTryFoldGepStore` (`:1818-1824`); `emitStore`
+(`:2742-2745`); 32-bit equivalents (`x86_base.crl:783-786`, :810, :824). The
+prologue param-seeding code in the same file agrees (`:830`, :852), and all
+IR passes agree (`mem2reg.crl:189`, `dse.crl:102`, `alias_analysis.crl:405`,
+`memory_ssa.crl:201`, `simd_vec.crl:650` — the last with an explicit
+`ops[0]=value, ops[1]=address` comment). No inversion exists.
 
 **G28 [C] — unhandled opcodes are emitted as comments.** `emitInst`'s
-`else` arm emits `# unhandled opcode` (x86_64_base.crl:2074): Phi,
-Noret, Unreachable, all four atomics, Fence, InlineAsm, ExtractValue,
-InsertValue, ExtractElement, InsertElement, GcRoot, GcWriteBarrier,
-GcSafepoint, LandingPad. Silent code omission; an `unreachable` terminator
-falls through into the next block's bytes. `noret/` and
+`else` arm emits a comment and nothing else (x86_64_base.crl:2592,
+x86_base.crl:606): Phi, Noret, Unreachable, all four atomics, Fence,
+InlineAsm, ExtractValue, InsertValue, ExtractElement, InsertElement,
+GcRoot, GcWriteBarrier, GcSafepoint, LandingPad. Because `Unreachable` and
+`Noret` are terminators, such a block ends with no terminator and execution
+falls into the next block's bytes — silent code omission. `noret/` and
 `noretTemplate` (asm_rules.crl:881-961) exist but are not called from the
-emitter. The wasm backend's loud `failOp` (wasm.crl:1714) is the correct
-behavior. Belongs to: `target/x86_64/x86_64_base.crl` (+ x86) — must trap
-or emit, never comment; wire `noret`.
+emitter. The wasm backend's loud `failOp` (wasm.crl:1240, :1722) is the
+correct behaviour. Belongs to: `target/x86_64/x86_64_base.crl` (+ x86) —
+must trap or emit, never comment; wire `noret`.
 
 **G29 [C] — no module data emission on native targets.** x86_64 emits only
-`.section .text` (x86_64_base.crl:403-406); x86 emits empty `.data` then
-`.text` (x86/linux/linux.crl:7-8); no backend except wasm emits globals,
-string constants, `.rodata`, `.bss`, `.align`, or `.size`. The emitter's
-`dataSection` buffer is **never flushed into the output**
-(x86_64_base.crl:78, 146), and `emitFabs` writes a fixed label
-`.Lfabs_mask` into it per use (2601-2607) — duplicate labels if `fabs`
+`.section .text`; x86 emits an empty `.data` then `.text`. No backend except
+wasm emits globals, string constants, `.rodata`, `.bss`, `.align`, or
+`.size`. The emitter's `dataSection` buffer accumulates (:139) but
+`getOutput()` returns only `self.output` (:153) — **the data section is never
+flushed into the output** — and `emitFabs` writes a fixed label
+`.Lfabs_mask:` into it per use (:3187-3192): duplicate labels if `fabs`
 appears twice, absolute (non-RIP-relative) addressing, and the definition
 never reaches the assembler anyway. Belongs to: backends — a module-level
 data/constant-pool emitter (per-section, with alignment and relocations).
 
-**G30 [C] — alloca lowering has no frame model.** `emitAlloca` emits
-`subq $8, %rsp` **at the alloca's execution point**, always 8 bytes
-(x86_64_base.crl:2211-2217): allocas inside loops grow the stack every
-iteration; aggregates/arrays get 8 bytes regardless of type; nothing is
-aligned; there is no frame size computation or fixed rbp/rsp-relative
-slot assignment. Production: static allocas are sized and placed in the
-prologue frame (and stack_layout.crl is only a reordering heuristic —
-which also **[verify]** moves non-entry allocas into the entry block while
-their original blocks still list them, double-parenting instructions and
-overflowing `newInsts` when nvars > entry->ninsts, stack_layout.crl:153-194).
-Belongs to: `target/x86_64/x86_64_base.crl` (frame layout) with alloca
-sizing from the IR type.
+**G30 — FIXED 2026-10-09 (A18 survives as G43) — allocas now have a real
+frame model.** The original claim was `subq $8, %rsp` at the alloca's
+execution point, always 8 bytes, no frame. All of that is gone:
 
-**G31 [Q] — no block placement / branch chaining.** Blocks are emitted in
-IR order; every `cond_br` becomes `test+jne+jmp` with both edges as jumps
-(x86_64_base.crl:2327-2345); no fall-through placement, no loop-aware
-layout, no branch relaxation. Interacts with G17 (rotation) and with
-lsra's layout sensitivity (G25). Belongs to: new `passes/block_layout.crl`
-(or a backend-side placement) consumed by the emitters.
+- `allocaSlotSize` reads `irTypeSizeOf(inst->base.type->elem)` and rounds to
+  16 (x86_64_base.crl:460-468), so aggregates and arrays are sized from the
+  IR type.
+- `scanAllocas` sums them function-wide (:473-488) and `allocaSlotOf` replays
+  the same walk to place each one (:494-513).
+- The prologue reserves `allocaBase + allocaBytes` with an odd-8 pad for call
+  alignment (:776-796), and `emitAlloca` emits `leaq -off(%rbp), reg`
+  (:2764-2772). The `subq $sz, %rsp` fallback (:2778-2785) is now
+  unreachable when `allocaBytes > 0`, because the frame gates at :593-594 and
+  :719-722 require a frame in exactly that case.
 
-**G32 [C] — call-site ABI details missing (SysV).** No 16-byte stack
-alignment tracking around `call` (allocas and arg pushes shift rsp by 8 at
-a time; `movaps` in the callee's vararg prologue can fault); **`%al` is
-never set to the vector-register count for vararg calls** while vararg
-callee prologues branch on it (x86_64_base.crl:490 vs 2881-2925);
-stack-arg cleanup counts each overflow arg as 8 bytes but struct args are
-pushed **twice** (2789-2837 vs 2915-2923) → rsp imbalance for >6-arg
-calls with aggregates; parameters beyond the 6th (SysV) / 4th (Win64) are
-never seeded from the caller's stack frame in the prologue (607-727);
-spilled params get no seeding at all (647). Belongs to:
-`target/x86_64/x86_64_base.crl`.
+Loop allocas no longer grow the stack, aggregates get their real size, and
+slots are aligned. The remaining problem in this area is `stack_layout`
+itself, which is now tracked as **G43** (heap write out of bounds).
+
+**G31 [Q] — no block placement / branch chaining.** Blocks are emitted in IR
+order (linux.crl:38-48); every `cond_br` becomes `testq` + `jne` + `jmp`
+with both edges as jumps (x86_64_base.crl:2905-2922); no fall-through
+placement, no loop-aware layout, no branch relaxation. Interacts with G17
+(rotation) and with lsra's layout sensitivity (G25). Note `branch_inversion`
+*is* now wired into L1/L3 (wallvm.crl:213, :273), but it inverts IR
+`CondBr` semantics — it does not reorder blocks. Belongs to: new
+`passes/block_layout.crl` (or a backend-side placement) consumed by the
+emitters.
+
+**G32 — FIXED 2026-10-09 — the call-site ABI details landed.** All four
+original sub-claims now hold: a single 16-rounded `subq` keeps the stack
+aligned (x86_64_base.crl:3543-3550, with `pad`/odd-count fixups at
+:769-773, :784-787); `%al` is set to the vector-register count for vararg
+calls (:3781-3790); stack arguments are written once at computed offsets with
+no double push (:3346-3412, :3552-3663); parameters past the 6th (SysV) /
+4th (Win64) are seeded from the caller's frame at `16+outOff(%rbp)`
+(:808-1022), including spilled params (:864-870, :890-895, :935-948,
+:985-1018). The double-push `rsp` imbalance is gone.
 
 **G33 [Q] — prologue/epilogue strategy.** `emitDeferredCalleeSaves` pushes
-callee saves at the first block that uses them (x86_64_base.crl:359-401) —
+callee saves at the first block that uses them (x86_64_base.crl:406-448) —
 if that block is in a loop the pushes repeat with no matching pops (stack
-blowup; reachable on 32-bit targets where `useCalleeSave=true`). Every
-`ret` duplicates the full epilogue and each function gets a trailing
-epilogue appended after its last block (linux.crl:50) — no epilogue
-merging. This is where shrink-wrapping belongs but isn't. Belongs to:
+blowup; reachable on 32-bit targets where `useCalleeSave=true`, since
+`X86_INT_REGS` includes ebx/esi/edi). The gating and the placement are
+otherwise sound on 64-bit: `canShrinkWrap` (:721-728) and `hasDeferredFrame`
+are honoured, and red-zone/shrink-wrap are disabled whenever a frame or
+spills exist (:593, :719-729). Every `ret` still duplicates the full
+epilogue and each function gets a trailing epilogue appended after its last
+block (linux.crl:52) — no epilogue merging. Belongs to:
 `target/x86_64/x86_64_base.crl` (+ PEI-style pass in `regalloc/`).
 
-**G34 [Q] — tail calls.** Two partial mechanisms: the accumulator-pattern
-`tco` pass (tco.crl) and an emitter peephole turning adjacent `call;ret`
-into `jmp target` guarded by frame state (x86_64_base.crl:786-852,
-2927-2938). There is no general sibling-call optimization (tail calls with
-moved argument registers, stack-arg cases, or through abi_lowered calls),
-and no guaranteed-TCO marker. Belongs to: `passes/tco.crl` + backends.
+**G34 [Q] — tail calls: REGRESSED since the audit.** The audit found two
+partial mechanisms: the accumulator-pattern `tco` pass, and an emitter
+peephole turning adjacent `call;ret` into `jmp target`. The second one has
+been **removed**: `isTailCall` is now an unconditional `return false` with a
+comment explaining why (jumping after the call sequence has already emitted
+would re-run it with clobbered arguments, and skipping the epilogue would
+leak the frame) and naming G34 as still-open (x86_64_base.crl:3841-3849).
+`emitRet`'s tail branch (:1147-1151) is now dead code. Only the `tco`
+accumulator pass (tco.crl) and the still-live 32-bit `isTailCall`
+(x86_base.crl:371-381) remain, so 64-bit tail calls are not implemented at
+all. There is still no general sibling-call optimization and no
+guaranteed-TCO marker. Belongs to: `passes/tco.crl` + backends.
 
 ### 3.6 Machine level
 
@@ -496,26 +662,34 @@ directives on functions. Belongs to: target drivers + emission.
 
 ### (a) Correctness / ABI blockers
 
-| # | Gap | Ref |
-|---|-----|-----|
-| A1 | Spilled values decode as `rax`; no spill slots exist (contract broken end-to-end) | G21 |
-| A2 | No fixed-reg/clobber modeling: div/shift/icmp/fcmp/vecdiv/uitofp destroy allocatable regs; reserved-array off-by-one OOB | G22 |
-| A3 | Unhandled opcodes (noret, unreachable, atomics, fence, extract/insert*, gc_*, inlineasm) emitted as comments; `unreachable` falls through | G28 |
-| A4 | alloca → `subq $8` at execution point; loop allocas grow stack; aggregates get 8 bytes; no frame | G30 |
-| A5 | Store operand order inverted vs IR convention (both native backends) **[verify]** | G27 |
-| A6 | abi_lower: IrModule*/IrContext* type confusion as wired; SysV pass applied to all CCs; Win64/x86 variants unwired | G3, G4 |
-| A7 | Win64 lsra↔emitter register-name mismatch; `isWin` hardcoded false; param intervals uninitialized | G23 |
-| A8 | No call-site stack alignment; no `%al` for varargs; stack-arg cleanup miscount; params >6 never seeded | G32 |
-| A9 | No globals/rodata/bss emission; `dataSection` never flushed; duplicate `.Lfabs_mask` labels; no relocations/PIC | G29, G37 |
-| A10 | LICM hoists possibly-trapping loads without dereferenceability/exit-domination checks | G18 |
-| A11 | lsra interval correctness depends on unenforced block layout | G25 |
-| A12 | sroa rewrites operands without use-list maintenance **[verify]** | G11 |
-| A13 | jump_thread/tail_dup orphan predecessors into emptied blocks; sel2br creates nameless blocks **[verify]** | G14 |
-| A14 | Frontend phis at L0/L1 reach codegen unlowered (no Phi case in emitter) | §1.2 |
-| A15 | Wasm64 and all non-x86 CCs silently dispatch to the x86-64 bare backend | §1.8 |
-| A16 | Deferred callee-save pushes can land in loops (32-bit targets) | G33 |
-| A17 | validate-as-changed forces maxIters; hides non-convergence and double work | G1, G2 |
-| A18 | stack_layout double-parents allocas and can overflow its scratch array **[verify]** | G30 |
+Revalidated 2026-10-09. Rows marked ~~struck~~ were fixed and are retained
+only to show what the audit originally claimed; do not re-file them. G42,
+G43 and G44 are new since the audit; all three were found and fixed the
+same day (A19–A21).
+
+| # | Gap | Ref | Status |
+|---|-----|-----|--------|
+| ~~A1~~ | ~~Spilled values decode as `rax`; no spill slots exist~~ | G21 | **FIXED** — real spill frame, `slotText`, ~40 decode sites |
+| A2 | No fixed-reg/clobber modeling: div/shift/icmp/fcmp/vecdiv destroy allocatable regs (rax, rcx, rdx, rsi, rdi are allocatable) | G22 | **REAL** (array off-by-one fixed) |
+| A3 | Unhandled opcodes (noret, unreachable, atomics, fence, extract/insert*, gc_*, inlineasm) emitted as comments; `unreachable` falls through | G28 | **REAL** |
+| ~~A4~~ | ~~alloca → `subq $8` at execution point; loop allocas grow stack; aggregates get 8 bytes~~ | G30 | **FIXED** — type-sized, prologue-reserved, rbp-relative |
+| ~~A5~~ | ~~Store operand order inverted vs IR convention (both native backends)~~ | G27 | **FIXED / claim was wrong** — `ops[0]`=value everywhere |
+| ~~A6a~~ | ~~abi_lower `IrModule*`/`IrContext*` type confusion~~ | G3 | **FIXED** — uses `func->parent` |
+| A6b | i386 abi_lower unwired; SysV pass still applied to Cdecl/Stdcall/SyscallX86 | G4 | **REAL** |
+| ~~A7~~ | ~~Win64 lsra↔emitter register-name mismatch (index ≥3); `isWin` hardcoded false; param intervals uninitialized (`defs` never set, `alloc` not zeroed)~~ | G23 | **FIXED** — emitter decodes through a Win64-aware `intRegNameFor`; the dead pre-pin/`isWin` block is removed; interval fields seeded |
+| ~~A8~~ | ~~No call-site stack alignment; no `%al` for varargs; stack-arg cleanup miscount; params >6 never seeded~~ | G32 | **FIXED** — all four sub-claims hold |
+| A9 | No globals/rodata/bss emission; `dataSection` never flushed; duplicate `.Lfabs_mask` labels; no relocations/PIC | G29, G37 | **REAL** |
+| A10 | LICM hoists possibly-trapping loads without dereferenceability/exit-domination checks | G18 | **REAL** |
+| A11 | lsra interval correctness depends on unenforced block layout | G25 | **REAL** |
+| ~~A12~~ | ~~sroa rewrites operands without use-list maintenance~~ | G11 | **FIXED** — `removeUser`/`addUser` present |
+| ~~A13~~ | ~~jump_thread still orphans predecessors into emptied blocks; sel2br creates nameless blocks (three per conversion, all labelled `.L:`)~~ | G14 | **FIXED** — `jump_thread` now requires `target->parent == func && target->npreds == 1`; sel2br blocks named `sel2br<N>` (tail_dup fixed earlier) |
+| A14 | Frontend phis at L0/L1 reach codegen unlowered (no Phi case in emitter) | §1.2 | **REAL** |
+| A15 | Wasm64 and all non-x86 CCs silently dispatch to the x86-64 bare backend | §1.8 | **REAL** |
+| A16 | Deferred callee-save pushes can land in loops (32-bit targets) | G33 | **REAL** |
+| A17 | validate-as-changed forces maxIters; hides non-convergence and double work | G1, G2 | **REAL** |
+| ~~A19~~ | ~~`stack_layout` writes past `newInsts` and double-parents allocas (heap corruption at O3)~~ | G43 | **FIXED** — entry-parent gather, null check, capacity guard |
+| ~~A20~~ | ~~Unsigned div/rem emits `cqo` before `divq` — wrong results~~ | G42 | **FIXED** — `cqo` only under `isSigned`, else `xorl %edx, %edx` |
+| **A21** | **Parameter seeding writes homes in one pass, so a home can be a later argument's incoming register — overwritten before it is read** | G44 | **FIXED** — two-phase staging walk |
 
 ### (b) Code-quality blockers (gcc/clang-quality goal)
 
@@ -530,7 +704,7 @@ directives on functions. Belongs to: target drivers + emission.
 | B7 | No CGSCC/module stage; ipa_cp unwired; no globalopt/globaldce/attr-inference | G7 |
 | B8 | Pipeline ordering: abi_lower at head; unroll post-optimizer (and twice); no cleanup after inline in-iteration | G5, G20, G6 |
 | B9 | L1 has no mem2reg/SROA; L2/L3 lack a late local CSE; borrowcheck after opts | §1.3, G8, G6 |
-| B10 | Epilogue duplication per ret; no shrink-wrapping; red-zone only for leaves | G33 |
+| B10 | Epilogue duplication per ret; deferred callee-save pushes can land in loops (32-bit) | G33 |
 | B11 | No general tail-call optimization | G34 |
 | B12 | Quadratic data structures in hot passes | G26 |
 
@@ -553,57 +727,69 @@ directives on functions. Belongs to: target drivers + emission.
 
 ## 5. The three most urgent items
 
-### 1. A1 — the spill contract (G21)
+**Revalidated 2026-10-09 — this section was rewritten.** The original top
+item (A1, the spill contract) is fixed, and the original second and third
+items were partly wrong (A5 was not a bug; A4 was fixed). The ordering below
+is the current one. Later the same day A20 and A19 — plus the newly found
+A21 — were fixed too; item 1 is kept as the record of what was wrong, and
+the live ordering starts at item 2.
 
-Every x86 target runs with `backendHandlesSpills = true`, which tells lsra
-*not* to rewrite spills into IR loads/stores because "the backend decodes
-SPILL_BIT/FLOAT_BIT itself" (wallvm.crl:341-343). No backend does.
-`getRegForValue` maps any spilled value to `"rax"` and moves on; there is no
-spill-slot frame for the slot index to even mean anything (allocas are
-`subq $8` at the execution point). The moment a function has more
-simultaneously-live values than the ~9 allocatable integer registers —
-i.e. any non-trivial function, and *guaranteed* for every call-spanning
-value under the caller-save-only policy — the output silently computes on
-rax instead of the spilled value. Until this is fixed (either teach the
-emitters a real spill frame, or flip `backendHandlesSpills` to false so
-lsra rewrites loads/stores), **all other optimization work is unverifiable
-by execution**, because any test large enough to exercise it can
-miscompile.
+### 1. A20 + A19 — two live miscompiles (G42, G43) — both fixed
 
-### 2. A5+A4+A3 — emitter conformance to the IR (G27, G30, G28)
+Both were wrong-answer bugs, not quality gaps, and both were small to
+fix; the fixes landed 2026-10-09:
 
-The emitter layer does not implement the IR it consumes. Stores appear
-operand-inverted against `irBuilder.store(val, ptr)` and every IR pass
-(ops[0] treated as address, ops[1] as value, width taken from the pointer
-side); allocas are a per-execution `subq $8` with no frame, so any alloca
-in a loop is an unbounded stack leak and any aggregate is truncated to 8
-bytes; and an entire tail of the opcode space — noret, unreachable, the
-atomics, fences, extract/insertvalue/element, gc ops, inline asm — falls
-into a comment arm that emits *nothing*, with `unreachable` falling through
-into the next block's bytes. Individually each is a miscompile; together
-they mean the pipeline's correctness floor is "programs the emitter
-happens to cover". Before pass ordering, before regalloc quality, before
-vectorization: the emitter needs a conformance sweep against IR.md §6 —
-every opcode either correctly emitted or loudly rejected (the wasm
-backend's `failOp` behavior), stores reconciled with the builder
-convention, and a prologue-computed frame for allocas and spill slots.
+- **A20**: `emitDiv`/`emitRem` now emit `cqo` only when `isSigned`, and
+  `xorl %edx, %edx` otherwise — the sequence the 32-bit backend already
+  used, ported. Before the fix, any unsigned divide/remainder whose
+  dividend had bit 63 set returned a wrong answer.
+- **A19**: `stack_layout` gathers only allocas whose `parent` is the
+  entry block (which also ends the double-parenting), null-checks the
+  rebuilt array, and refuses to append past `newCap`. Before the fix a
+  non-entry alloca wrote past a fresh heap allocation at O3.
 
-### 3. A2+A6+A7+A8 — the call/ABI boundary (G22, G3, G4, G23, G32)
+A third wrong-answer bug found the same day — **A21/G44**, parameter
+seeding overwriting an incoming argument register — is fixed too (see
+the tables above). The standing correctness items after these three are
+A2's clobber half (G22) and A3 (G28).
 
-Nothing about the function-call boundary is sound beyond trivial SysV leaf
-functions. The register allocator has no model of fixed-register
-constraints, so emitted sequences for div, shifts, compares, and
-conversions clobber rax/rcx/rdx/r10/r11 while lsra keeps live values there
-(and the reserved-register count overruns its own array by one). ABI
-lowering is wired as a function pass that contractually requires the
-module pointer it never receives, is the SysV implementation applied to
-every calling convention while the Win64 and i386 implementations sit
-unwired, and its own comment marks indirect calls as an IR gap. On Win64
-the allocator and the emitter disagree about which physical register
-indices 3-4 even *are*. Calls themselves don't maintain 16-byte stack
-alignment, never set `%al` for varargs (while vararg prologues read it),
-misaccount struct stack pushes in the cleanup, and never seed parameters
-past the sixth. This cluster is the difference between "compiles
-benchmarks" and "links against the world": any call with >6 arguments, any
-vararg, any float-heavy call, any Windows target, or any div/shift under
-register pressure is currently broken.
+### 2. A2 + A6b — the register and calling-convention boundary
+
+The allocator has no model of fixed-register constraints, so the emitter's
+`div`/`rem`/`shift`/`cmp` sequences clobber rax/rcx/rdx while lsra keeps live
+values there — and rax, rcx, rdx, rsi, rdi are all allocatable because only
+rsp/rbp/r10/r11 are reserved (x86_64_base.crl:13-27). The i386 ABI pass is
+still unwired, so 32-bit Cdecl/Stdcall/SyscallX86 get SysV eightbyte
+classification. (The Win64 half of this cluster that the audit also listed
+— the lsra↔emitter index mismatch, `isWin` hardcoded false, uninitialised
+param-interval fields — is fixed under G23, and G44 fixed the seeding
+hazard it exposed.) What separates "compiles benchmarks" from "links
+against the world" is now the clobber modeling and the 32-bit ABI wiring:
+any div/shift under register pressure, or any 32-bit non-Windows target,
+is currently wrong.
+
+### 3. A3 + A9 — emitter conformance to the IR (G28, G29, G37)
+
+The emitter still does not implement the IR it consumes. An entire tail of
+the opcode space — noret, unreachable, the atomics, fences,
+extract/insertvalue/element, gc ops, inline asm — falls into a comment arm
+that emits *nothing*, with `unreachable` falling through into the next
+block's bytes. And no native backend emits data at all: `dataSection`
+accumulates but `getOutput()` never flushes it, there are no globals,
+`.rodata`, `.bss`, or relocations, and `emitFabs` writes a duplicate
+`.Lfabs_mask:` label per use into that dead buffer. Any build that is not a
+self-contained leaf-function static binary cannot be produced or linked.
+
+Before pass ordering, before regalloc quality, before vectorization: every
+opcode must either be emitted correctly or loudly rejected (the wasm
+backend's `failOp` is the model), and there must be a module-level data
+emitter.
+
+### Also still open, just below the top three
+
+- **G2** — mem2reg ↔ lower_phis ping-pong: the pipeline cannot converge when
+  a non-loop phi exists, which combined with G1 hides real non-convergence.
+- **G18** — LICM hoists loads out of conditionals without a
+  dereferenceability proof, so a conditional load can be executed
+  unconditionally and fault.
+- **G25** — lsra interval ends depend on block order that nothing enforces.

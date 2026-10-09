@@ -1,6 +1,7 @@
 import(lib) wallvm::irtypes { IrContext, IrFunc, IrBlock, IrInst, IrValue, IrValueKind };
 import(lib) wallvm::irOps { IrOpcode };
 import(lib) std::mman { alloc };
+import(lib) platform::libc { snprintf };
 
 // Select-to-Branch conversion, converts select instructions into branching
 // when the selected value has side effects (calls, stores) or when branching
@@ -15,14 +16,25 @@ struct SelectToBranchPass
     {
         return SelectToBranchPass {
             .ctx = ctx,
-            .conversions = 0
+            .conversions = 0,
+            .unnamedCounter = 0
         };
     }
 
+    // Blocks created here must carry a distinct name: the emitter writes every
+    // block label as ".L" + bb->name + ":", so an unnamed (or identically
+    // named) block collapses onto an existing label and the assembler rejects
+    // the duplicate. ctx->createBlock copies the string and initialises the
+    // IrValue base, which the previous `*bb = IrBlock {}` also left unset.
+    u32 unnamedCounter = 0;
+
     IrBlock* createBlock(IrFunc* func)
     {
-        IrBlock* bb = alloc<IrBlock>(1);
-        *bb = IrBlock {};
+        char buf[32];
+        u32 n = (u32)snprintf((cchar*)buf, 32, C"sel2br%u", self.unnamedCounter++);
+        if (n < 0) n = 0;
+        if (n > 31) n = 31;
+        IrBlock* bb = self.ctx->createBlock(str::fromParts((const u8*)buf, n));
         func->addBlock(bb);
         return bb;
     }

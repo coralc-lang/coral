@@ -22,8 +22,22 @@ pub str X86_64_RESERVED_FLOAT[] = {
 // SystemV caller-save (rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11) minus the
 // reserved scratch set above. Must match the lsra filter order, since
 // LSRA reg index i decodes to X86_64_INT_REGS[i] / X86_64_FLOAT_REGS[i].
+//
+// The integer table must stay in exactly the order lsra built intRegNames
+// in, which is `abi->callerSaveRegs` minus the reserved scratch set
+// (lsra.crl buildRegAlloc: caller-save entries first, skipping reserved).
+// For SysV that is rax,rcx,rdx,rsi,rdi,r8,r9 (r10,r11 reserved) — matches.
+// Win64's caller-save list is rax,rcx,rdx,r8,r9,r10,r11, so after the same
+// reserved filter lsra emits rax,rcx,rdx,r8,r9: index 3 is r8 there but rsi
+// in the table above, and every index >= 3 names a different physical
+// register. So the Win64 list is spelled out separately below and picked by
+// `intRegNameFor`, rather than letting the two drift apart again.
 pub str X86_64_INT_REGS[] = {
     "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9"
+};
+
+pub str X86_64_INT_REGS_WIN64[] = {
+    "rax", "rcx", "rdx", "r8", "r9"
 };
 
 pub str X86_64_FLOAT_REGS[] = {
@@ -180,6 +194,22 @@ static void u64ToHex(u64 val, cchar* out)
     out[18] = 0;
 }
 
+// Parameter-seeding staging slot address: "0(%rsp)", "8(%rsp)", ... out
+// must have room for the digits plus the six-character suffix.
+static void stageText(u32 off, cchar* out)
+{
+    u32ToStr(off, out);
+    u32 i = 0;
+    while (out[i] != 0) i++;
+    const cchar* tail = "(%rsp)";
+    u32 k = 0;
+    while (tail[k] != 0)
+    {
+        out[i++] = tail[k++];
+    }
+    out[i] = 0;
+}
+
 static cchar _r32buf[2][16];
 static int _r32i = 0;
 
@@ -331,6 +361,17 @@ pub struct X86_64CodeGen
         return false;
     }
 
+    str intRegNameFor(u32 reg)
+    {
+        if (self.isWindows)
+        {
+            if (reg < 5) return X86_64_INT_REGS_WIN64[reg];
+            return "";
+        }
+        if (reg < 7) return X86_64_INT_REGS[reg];
+        return "";
+    }
+
     // Register name for a non-spilled value, slot text for a spill,
     // empty string only for out-of-range. Emission sites must go
     // through opFor/opForReg/opForRegF instead of reading this.
@@ -347,8 +388,7 @@ pub struct X86_64CodeGen
             return "";
         }
         u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 7) return X86_64_INT_REGS[reg].ptr;
-        return "";
+        return self.intRegNameFor(reg).ptr;
     }
 
     bool funcUsesReg(IrFunc* func, const cchar* reg)
@@ -805,12 +845,58 @@ pub struct X86_64CodeGen
     // Called from every non-vararg path; the gate that picked the path
     // already ruled out the cases this walk cannot serve (stack params
     // and allocas without a frame).
+    //
+    // The walk runs twice over the same stores. Phase one moves every
+    // incoming bank word into a staging area on this function's own
+    // stack; phase two commits staging into homes and allocas. The
+    // split is required for correctness, not tidiness: lsra gives each
+    // parameter a home from whatever the scan left free, and that set
+    // is drawn from the same bank the caller passes arguments in —
+    // SysV's first free homes tend to be rcx/rdx/rsi/rdi, and rdx is
+    // argument 2's incoming register, so a one-pass walk can store one
+    // parameter over the top of another before it has been read.
+    // Reading every bank word before writing any home makes every
+    // ordering safe, for either ABI, and also covers a struct whose
+    // word0 lands in a home that a later word of the same struct
+    // arrives in. Stack parameters read from memory (16(%rbp) upward,
+    // past the Win64 shadow), which no home write can clobber, so they
+    // commit directly from there.
     void emitParamSeeding(IrFunc* func)
     {
         if (func == null || func->base.type == null) return;
         if (func->base.type->isVararg) return;
         if (func->nblocks == 0 || func->base.type->nparams == 0) return;
 
+        // classifyCallArg never hands out more than maxInt integer
+        // words or maxFp fp words from registers, and each word stages
+        // in at most 8 (integer) or 16 (fp, vectors included) bytes,
+        // so this bound covers every slot the staging phase can emit.
+        // The pair is balanced before any call or return; the only
+        // path that touches the red zone is the frameless one, where
+        // the gates above guarantee the zone is still empty.
+        u32 maxInt = self.isWindows ? 4 : 6;
+        u32 maxFp = self.isWindows ? 4 : 8;
+        cchar stageBuf[16];
+        u32ToStr(maxInt * 8 + maxFp * 16, stageBuf);
+        self.emitter.emit("\tsubq $");
+        self.emitter.emit(stageBuf);
+        self.emitter.emitLine(", %rsp");
+
+        self.walkParamSeeds(func, true);
+        self.walkParamSeeds(func, false);
+
+        self.emitter.emit("\taddq $");
+        self.emitter.emit(stageBuf);
+        self.emitter.emitLine(", %rsp");
+    }
+
+    // One pass of emitParamSeeding. stagePhase collects incoming bank
+    // words into the staging area sized by the caller; the commit pass
+    // reads them back out into homes and allocas. Both passes run the
+    // same store filter and the same classify state machine, so every
+    // stage slot lines up word for word between them.
+    void walkParamSeeds(IrFunc* func, bool stagePhase)
+    {
         const cchar* sysvIntRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
         const cchar* win64IntRegs[4] = {"rcx", "rdx", "r8", "r9"};
         const cchar* sysvFpRegs[8] = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"};
@@ -822,6 +908,7 @@ pub struct X86_64CodeGen
         u32 fpIdx = 0;
         u32 stackOff = self.isWindows ? 32 : 0;
         u32 found = 0;
+        u32 stageOff = 0;
         IrBlock* eb = func->blocks[0];
         for (u32 i = 0; i < eb->ninsts && found < func->base.type->nparams; i++)
         {
@@ -851,59 +938,116 @@ pub struct X86_64CodeGen
                                              &outReg, &outOff, &outWords);
             IrValue* dstv = inst->nops > 1 ? inst->ops[1] : null;
 
+            if (stagePhase)
+            {
+                cchar stg[16];
+                if (kind == 2)
+                {
+                    stageText(stageOff, stg);
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(fpRegs[outReg]);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(stg);
+                    stageOff += 16;
+                }
+                else if (kind == 1)
+                {
+                    stageText(stageOff, stg);
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(intRegs[outReg]);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(stg);
+                    stageOff += 8;
+                }
+                else if (kind == 3)
+                {
+                    for (u32 w = 0; w < outWords; w++)
+                    {
+                        stageText(stageOff, stg);
+                        self.emitter.emit("\tmovq ");
+                        self.emitter.emit(intRegs[outReg + w]);
+                        self.emitter.emit(", ");
+                        self.emitter.emitLine(stg);
+                        stageOff += 8;
+                    }
+                }
+                // kinds 0 and 4 read from memory — nothing to stage
+                continue;
+            }
+            cchar stg[16];
+
             if (kind == 2)
             {
-                // xmm parameter — sinkFloat also covers the spill slot
-                self.sinkFloat(src, fpRegs[outReg]);
-            }
-            else if (kind == 1)
-            {
-                // integer parameter — the full 8 bytes the caller put
-                // in the register, spill slots included
-                const cchar* abiReg = intRegs[outReg];
+                // xmm parameter, committed from staging. movdqu carries
+                // the whole register either way; its 16-byte transfer
+                // fits a spill slot exactly (slots are 16 apart), and
+                // only the bits the type asks for are ever read back.
+                stageText(stageOff, stg);
                 if (valueIsSpill(src))
                 {
-                    self.emitter.emit("\tmovq ");
-                    self.emitter.emit(abiReg);
-                    self.emitter.emit(", ");
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", xmm15");
+                    self.emitter.emit("\tmovdqu xmm15, ");
                     self.emitter.emitLine(opFor(src));
                 }
                 else
                 {
-                    const cchar* home = opFor(src);
-                    if (strcmp(abiReg, home) != 0)
-                    {
-                        self.emitter.emit("\tmovq ");
-                        self.emitter.emit(abiReg);
-                        self.emitter.emit(", ");
-                        self.emitter.emitLine(home);
-                    }
+                    self.emitter.emit("\tmovdqu ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(opFor(src));
                 }
+                stageOff += 16;
+            }
+            else if (kind == 1)
+            {
+                // integer parameter — the full 8 bytes the caller put
+                // in the register, spill slots included, read back out
+                // of staging (the incoming register may already have
+                // been consumed as an earlier parameter's home)
+                stageText(stageOff, stg);
+                if (valueIsSpill(src))
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                else
+                {
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(opFor(src));
+                }
+                stageOff += 8;
             }
             else if (kind == 3)
             {
                 // struct words in registers: word0 also lands in the
                 // value's home, because the body's store rewrites that
                 // word of the alloca from there, and every word lands
-                // in the alloca itself
-                const cchar* abiReg = intRegs[outReg];
+                // in the alloca itself. All words come out of staging,
+                // so word0 sitting in a home that a later word arrives
+                // in can no longer eat that word.
+                u32 baseOff = stageOff;
+                stageText(stageOff, stg);
                 if (valueIsSpill(src))
                 {
                     self.emitter.emit("\tmovq ");
-                    self.emitter.emit(abiReg);
-                    self.emitter.emit(", ");
+                    self.emitter.emit(stg);
+                    self.emitter.emitLine(", r11");
+                    self.emitter.emit("\tmovq r11, ");
                     self.emitter.emitLine(opFor(src));
                 }
                 else
                 {
-                    const cchar* home = opFor(src);
-                    if (strcmp(abiReg, home) != 0)
-                    {
-                        self.emitter.emit("\tmovq ");
-                        self.emitter.emit(abiReg);
-                        self.emitter.emit(", ");
-                        self.emitter.emitLine(home);
-                    }
+                    self.emitter.emit("\tmovq ");
+                    self.emitter.emit(stg);
+                    self.emitter.emit(", ");
+                    self.emitter.emitLine(opFor(src));
                 }
                 u32 aoff = 0;
                 if (dstv != null && self.allocaSlotOf(func, dstv, &aoff))
@@ -913,20 +1057,23 @@ pub struct X86_64CodeGen
                     self.emitter.emitLine("(%rbp), r10");
                     for (u32 w = 0; w < outWords; w++)
                     {
+                        stageText(baseOff + 8 * w, stg);
                         self.emitter.emit("\tmovq ");
-                        self.emitter.emit(intRegs[outReg + w]);
+                        self.emitter.emit(stg);
+                        self.emitter.emitLine(", r11");
+                        self.emitter.emit("\tmovq r11, ");
                         if (w == 0)
                         {
-                            self.emitter.emitLine(", (r10)");
+                            self.emitter.emitLine("(r10)");
                         }
                         else
                         {
-                            self.emitter.emit(", ");
                             self.emitter.emitU32(8 * w);
                             self.emitter.emitLine("(r10)");
                         }
                     }
                 }
+                stageOff = baseOff + 8 * outWords;
             }
             else if (kind == 4)
             {
@@ -2057,7 +2204,8 @@ pub struct X86_64CodeGen
             return "xmm0";
         }
         u32 reg = (u32)(vd & 0x3FFFFFFF);
-        if (reg < 7) return X86_64_INT_REGS[reg].ptr;
+        str name = self.intRegNameFor(reg);
+        if (name.len > 0) return name.ptr;
         return "rax";
     }
 
@@ -2166,33 +2314,6 @@ pub struct X86_64CodeGen
             self.emitter.emit(r);
             self.emitter.emit(", ");
             self.emitter.emitLine(h);
-        }
-    }
-
-    void sinkFloat(IrValue* v, const cchar* xr)
-    {
-        if (v == null) return;
-        if (valueIsSpill(v))
-        {
-            bool isVec = valueIsVec(v);
-            bool dbl = v->type != null && v->type->width == 64;
-            self.emitter.emit("\t");
-            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
-            self.emitter.emit(xr);
-            self.emitter.emit(", ");
-            self.emitter.emitLine(slotText((u32)(v->valData & 0x3FFFFFFF)));
-            return;
-        }
-        const cchar* home = opFor(v);
-        if (strcmp(home, xr) != 0)
-        {
-            bool isVec = valueIsVec(v);
-            bool dbl = v->type != null && v->type->width == 64;
-            self.emitter.emit("\t");
-            self.emitter.emit(isVec ? "movdqa " : (dbl ? "movsd " : "movss "));
-            self.emitter.emit(xr);
-            self.emitter.emit(", ");
-            self.emitter.emitLine(home);
         }
     }
 
@@ -2640,7 +2761,15 @@ pub struct X86_64CodeGen
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src1);
         self.emitter.emitLine(", %rax");
-        self.emitter.emitTab("cqo");
+        // Set up rdx:eax. Signed divides sign-extend the dividend into rdx
+        // (cqo); unsigned needs rdx zeroed — cqo there would feed an all-ones
+        // high word to divq and produce a wrong quotient for any dividend
+        // with bit 63 set. xorl is 32-bit and implicitly clears the upper
+        // half, so it is the correct form for a 64-bit unsigned divide too.
+        if (isSigned)
+            self.emitter.emitTab("cqo");
+        else
+            self.emitter.emitTab("xorl %edx, %edx");
         self.emitter.emit("\t");
         self.emitter.emit(isSigned ? "idivq" : "divq");
         self.emitter.emit(" ");
@@ -2667,7 +2796,11 @@ pub struct X86_64CodeGen
         self.emitter.emit("\tmovq ");
         self.emitter.emit(src1);
         self.emitter.emitLine(", %rax");
-        self.emitter.emitTab("cqo");
+        // See emitDiv: cqo is the signed form only; unsigned must zero rdx.
+        if (isSigned)
+            self.emitter.emitTab("cqo");
+        else
+            self.emitter.emitTab("xorl %edx, %edx");
         self.emitter.emit("\t");
         self.emitter.emit(isSigned ? "idivq" : "divq");
         self.emitter.emit(" ");
