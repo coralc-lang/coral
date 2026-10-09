@@ -45,7 +45,11 @@ pub extend Parser
     /* suffixes on a base type: fn-pointer, pointer, slice, array */
     Ty parseTypeSuffix(Ty base)
     {
-        if (base != 0 && self.fnTypeAhead())
+        /* a split `>>` (nested generics, e.g. `zero<E<i32, i32>>(a, b)`)
+         * leaves pendingGreater set with the cursor already past BOTH
+         * closers — a following `(` is the call's argument list, never a
+         * fn-pointer type suffix, so it must not be absorbed as types */
+        if (base != 0 && !self.pendingGreater && self.fnTypeAhead())
         {
             /* fn-pointer type over a keyword base: `void(i32)`,
              * `rawptr(rawptr)`, `u32(rawptr)` — RET(params) */
@@ -458,12 +462,21 @@ pub extend Parser
             Token nameTok = self.advance();
             Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
             while (self.match(TokenKind::ColonColon)) {
-                self.expectName(); }
+                Token seg = self.expectName();
+                /* qualified type paths keep the final segment — sibling
+                 * imports merge their symbols flat, the same rule qualified
+                 * calls use for fn names (`fios::fileOpen` resolves by
+                 * `fileOpen`), so `fios::FileHandle` binds `FileHandle` */
+                name = self.ctx.intern(seg.data.ptr, seg.data.len);
+            }
     
             Ty* genericArgs = null;
             u32 genericArgsLen = 0;
             self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
-            if (self.fnTypeAhead())
+            /* pendingGreater means a split `>>` already closed the generic
+             * list and the cursor sits at what follows it — `zero<E<i32, i32>>(a, b)`
+             * has a call's `(` there, not a fn-type suffix */
+            if (!self.pendingGreater && self.fnTypeAhead())
             {
                 self.advance();
                 TyListBuilder params;

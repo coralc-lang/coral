@@ -14,6 +14,8 @@ mod types = import "../coral-ast/types";
 mod expr = import "../coral-ast/expr";
 mod stmt = import "../coral-ast/stmt";
 mod node = import "../coral-ast/node";
+mod escape = import "../coral-lexer/escape";
+mod ident = import "../coral-lexer/ident";
 
 import diagnostics { ErrorCode };
 import base { Parser, ParserMark };
@@ -25,6 +27,8 @@ import types { Ty, TypeEntry };
 import expr { Expr, ExprKind };
 import stmt { SwitchCase };
 import node { Node, NodeKind };
+import escape { EscapeResult, decodeEscapeSequence };
+import ident { decodeUtf8 };
 
 pub extend Parser
 {
@@ -449,7 +453,27 @@ pub extend Parser
             TokenKind::CharLit => {
                 Token tok = self.advance();
                 u32 value = 0;
-                if (tok.data.len > 0) value = tok.data.ptr[0];
+                /* the token span includes both quotes — decode the content
+                 * (`'a'` → 97, `'\n'` → 10; a bare `ptr[0]` would read the
+                 * opening quote and make every literal 39) */
+                if (tok.data.len >= 3)
+                {
+                    u8* p = tok.data.ptr + 1;
+                    u8* end = tok.data.ptr + tok.data.len - 1;
+                    if (p[0] == 92 && end - p >= 2)
+                    {
+                        EscapeResult esc = EscapeResult::decodeEscapeSequence(p, end);
+                        if (esc.isValid && esc.bytesConsumed > 0) value = esc.codepoint;
+                        else value = p[1];
+                    }
+                    else
+                    {
+                        usize len = 0;
+                        u32 cp = decodeUtf8(p, end, &len);
+                        if (len > 0) value = cp;
+                        else value = p[0];
+                    }
+                }
                 return self.storeExpr(ExprKind::CharLit{ .value = value });
             },
             
