@@ -791,6 +791,45 @@ pub extend Sema
         }
     }
 
+    Ty unqualTy(Ty t)
+    {
+        u32 guard = 0;
+        while (t != 0 && guard < 8)
+        {
+            guard = guard + 1;
+            TypeEntry* e = self.ctx.types + t;
+            if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+            else if (e->kind.tag == TypeKind::Comptime) t = e->kind.payload.Comptime.base;
+            else if (e->kind.tag == TypeKind::Named && e->kind.payload.Named.genericArgsLen == 0)
+            {
+                /* `cchar` and friends stay Named in the parse-time param
+                 * types — resolve through the symbol to the primitive so
+                 * char-sign mixing can see it (aliases are chains, hence
+                 * the guard) */
+                Symbol* sym = self.lookupType(e->kind.payload.Named.name, e->loc);
+                if (sym == null || sym->typeNode == 0 || sym->typeNode == t) break;
+                t = sym->typeNode;
+            }
+            else break;
+        }
+        return t;
+    }
+
+    /* the three C char types (char/signed/unsigned char — `cchar` is i8
+     * on x86_64): clang and gcc accept mixed char-signedness pointers
+     * with only -Wpointer-sign, so `u8*` fits a `const cchar*` param */
+    bool charFamily(Ty t)
+    {
+        t = self.unqualTy(t);
+        if (t == 0) return false;
+        return self.ctx.types[t].kind.tag == TypeKind::I8 || self.ctx.types[t].kind.tag == TypeKind::U8 || self.ctx.types[t].kind.tag == TypeKind::Char;
+    }
+
+    bool charSignMix(Ty a, Ty b)
+    {
+        return self.charFamily(a) && self.charFamily(b);
+    }
+
     bool compatible(Ty from, Ty to)
     {
         if (from == 0 || to == 0) return true;
@@ -821,6 +860,7 @@ pub extend Sema
                 else break;
             }
             if (self.sameType(sb, tb)) return true;
+            if (self.charSignMix(sb, tb)) return true;
         }
         if (source->kind.tag == TypeKind::Pointer && target->kind.tag == TypeKind::Rawptr)
             return true;
@@ -838,9 +878,15 @@ pub extend Sema
                 else break;
             }
             if (self.sameType(source->kind.payload.Array.base, tb2)) return true;
+            if (self.charSignMix(source->kind.payload.Array.base, tb2)) return true;
         }
         if (source->kind.tag == TypeKind::Array && target->kind.tag == TypeKind::Rawptr)
             return true;
+
+        /* string literals decay to `const char*` like in C —
+         * `write(1, "ok\n", 12)` against `const cchar*` */
+        if (source->kind.tag == TypeKind::Str && target->kind.tag == TypeKind::Pointer &&
+            self.charFamily(target->kind.payload.Pointer.base)) return true;
 
         /* Integer conversion only when it cannot narrow (C-style
          * integer promotion): same signedness widening is fine; narrowing

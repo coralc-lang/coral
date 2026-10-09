@@ -157,6 +157,15 @@ pub extend Sema
             self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, callId, "call to undeclared function");
             return false;
         }
+        return self.checkCallResolved(callId, symbol, args, argsLen, calleeTy);
+    }
+
+    /* checkCall with the callee already resolved — qualified calls
+     * (`fios::fileOpen`) resolve the symbol in the module's file first,
+     * which bare name lookup cannot do when this file declares the same
+     * name (`fs.crl` has its own `fileOpen`) */
+    bool checkCallResolved(NodeId callId, Symbol* symbol, NodeId* args, u32 argsLen, Ty calleeTy)
+    {
         Node* declNode = self.ctx.nodes + symbol->declaration.index;
         if (declNode->kind.tag != NodeKind::Decl) return self.checkFnPtrCall(callId, calleeTy, args, argsLen);
         Decl* decl = &declNode->kind.payload.Decl.value;
@@ -182,6 +191,20 @@ pub extend Sema
             self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, "wrong number of arguments in call");
             return false;
         }
+        /* C++/clang template rule: explicit typeargs on the callee
+         * (`zero<E<i32, i32>>(p, n)`) bind the generic params once, then
+         * arguments are checked against the SUBSTITUTED parameter types —
+         * concrete sameType compares, no dependent-vs-dependent shape
+         * walking. Bound once here and reused for the args and retTy. */
+        u32 sflag = 0;
+        if (decl->kind.payload.Func.genericParamsLen > 0 && calleeTy != 0)
+        {
+            TypeEntry* ce = self.ctx.types + calleeTy;
+            if (ce->kind.tag == TypeKind::Named && ce->kind.payload.Named.genericArgsLen == decl->kind.payload.Func.genericParamsLen)
+            {
+                sflag = 1;
+            }
+        }
         u32 i = 0;
         while (i < argsLen)
         {
@@ -194,7 +217,9 @@ pub extend Sema
                     Param* param = &paramNode->kind.payload.Param.value;
                     if (!self.genericArgParam(decl, param))
                     {
-                        if (!self.assignCompatible(args[i], self.exprType(args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+                        Ty want = param->typeNode;
+                        if (sflag == 1) want = self.substituteFieldTy(want, calleeTy);
+                        if (!self.assignCompatible(args[i], self.exprType(args[i]), want)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
                     }
                 }
             }
@@ -204,21 +229,45 @@ pub extend Sema
          * the generic params in the return type so downstream sees the
          * concrete pointer type instead of an unresolved `T*` */
         Ty retTy = decl->kind.payload.Func.returnType;
-        {
-            u32 sflag = 0;
-            if (decl->kind.payload.Func.genericParamsLen > 0 && calleeTy != 0)
-            {
-                TypeEntry* ce = self.ctx.types + calleeTy;
-                if (ce->kind.tag == TypeKind::Named && ce->kind.payload.Named.genericArgsLen == decl->kind.payload.Func.genericParamsLen)
-                {
-                    sflag = 1;
-                }
-            }
-            if (sflag == 1)
-                retTy = self.substituteFieldTy(retTy, calleeTy);
-        }
+        if (sflag == 1)
+            retTy = self.substituteFieldTy(retTy, calleeTy);
         self.setExprType(callId, retTy);
         return true;
+    }
+
+    /* `a::b::c` path minus the last segment, joined back with `::` —
+     * the module path an import-path match is tested against */
+    Str modulePathPrefix(NodeId* segs, u32 segCount)
+    {
+        if (segs == null || segCount < 2) return 0;
+        u32 keep = segCount - 1;
+        usize totalLen = 0;
+        u32 i = 0;
+        while (i < keep)
+        {
+            Node* n = self.ctx.nodes + segs[i].index;
+            if (n->kind.tag != NodeKind::Expr || n->kind.payload.Expr.value.kind.tag != ExprKind::Ident) return 0;
+            InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
+            if (i > 0) totalLen = totalLen + 2;
+            totalLen = totalLen + e->len;
+            i = i + 1;
+        }
+        u8* buf = (u8*)malloc(totalLen);
+        if (buf == null) return 0;
+        usize w = 0;
+        i = 0;
+        while (i < keep)
+        {
+            Node* n = self.ctx.nodes + segs[i].index;
+            InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
+            if (i > 0) { buf[w] = 58; buf[w + 1] = 58; w = w + 2; }
+            usize k = 0;
+            while (k < e->len) { buf[w] = e->ptr[k]; w = w + 1; k = k + 1; }
+            i = i + 1;
+        }
+        Str out = self.ctx.intern(buf, w);
+        free((rawptr)buf);
+        return out;
     }
 
     bool checkPath(NodeId id)
@@ -328,6 +377,23 @@ pub extend Sema
             if (vn->kind.tag == NodeKind::Expr)
             {
                 Expr* ev = &vn->kind.payload.Expr.value;
+                /* `-1` parses as Neg{ IntLit } — unwrap the sign so
+                 * negated literals get the same literal leniency, with
+                 * signed range limits (magnitude, sign-aware) */
+                bool negated = false;
+                if (ev->kind.tag == ExprKind::Neg)
+                {
+                    NodeId negIn = ev->kind.payload.Neg.expr;
+                    if (negIn.index != 0)
+                    {
+                        Node* nin = self.ctx.nodes + negIn.index;
+                        if (nin->kind.tag == NodeKind::Expr)
+                        {
+                            ev = &nin->kind.payload.Expr.value;
+                            negated = true;
+                        }
+                    }
+                }
                 if (ev->kind.tag == ExprKind::IntLit)
                 {
                     u64 v = ev->kind.payload.IntLit.value;
@@ -336,13 +402,13 @@ pub extend Sema
                     {
                         switch (te->kind.tag)
                         {
-                            TypeKind::U8 => { return v <= 255; },
-                            TypeKind::I8 => { return v <= 127; },
-                            TypeKind::Char => { return true; },
-                            TypeKind::U16 => { return v <= 65535; },
-                            TypeKind::I16 => { return v <= 32767; },
-                            TypeKind::U32 => { return v <= 4294967295; },
-                            TypeKind::I32 => { return v <= 2147483647; },
+                            TypeKind::U8 => { return !negated && v <= 255; },
+                            TypeKind::I8 => { return negated ? (v <= 128) : (v <= 127); },
+                            TypeKind::Char => { return !negated; },
+                            TypeKind::U16 => { return !negated && v <= 65535; },
+                            TypeKind::I16 => { return negated ? (v <= 32768) : (v <= 32767); },
+                            TypeKind::U32 => { return !negated && v <= 4294967295; },
+                            TypeKind::I32 => { return negated ? (v <= 2147483648) : (v <= 2147483647); },
                             else => { return true; },
                         }
                     }
@@ -695,7 +761,29 @@ pub extend Sema
                                     fname = s2n->kind.payload.Expr.value.kind.payload.Ident.name;
                                 }
                             }
-                            return self.checkCall(id, fname, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                            /* resolve the callee in the MODULE's file, not
+                             * the local scope — `fios::fileOpen` must not
+                             * pick up this file's own `fileOpen` */
+                            Symbol* fsym = null;
+                            Str modPath = self.modulePathPrefix(segs, segCount);
+                            if (modPath != 0)
+                            {
+                                Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                                if (cands != null)
+                                {
+                                    u32 n = self.scopes.lookupAll(fname, cands, 16);
+                                    u32 m = 0;
+                                    while (m < n)
+                                    {
+                                        if (self.importPathInFile(modPath, cands[m]->fileId)) { fsym = cands[m]; break; }
+                                        m = m + 1;
+                                    }
+                                    free((rawptr)cands);
+                                }
+                            }
+                            if (fsym == null) fsym = self.lookupAt(fname, id);
+                            if (fsym == null) return self.checkCall(id, fname, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
+                            return self.checkCallResolved(id, fsym, expr->kind.payload.Call.args, expr->kind.payload.Call.argsLen, 0);
                         }
                         Ty ownerTy = self.namedType(tn);
                         MemberInfo m = self.findMethod(ownerTy, mn);
@@ -792,6 +880,10 @@ pub extend Sema
                     self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to method");
                     return false;
                 }
+                /* the receiver carries the generic binding (`Vec<K>` binds
+                 * push's T := K) — substitute params through it just like
+                 * the return type below, then compare bound types */
+                Ty recvTy = self.exprType(expr->kind.payload.MethodCall.receiver);
                 u32 i = 0;
                 while (i < expr->kind.payload.MethodCall.argsLen)
                 {
@@ -801,11 +893,12 @@ pub extend Sema
                     if (paramNode->kind.tag == NodeKind::Param)
                     {
                         Param* param = &paramNode->kind.payload.Param.value;
-                        if (!self.compatible(self.exprType(expr->kind.payload.MethodCall.args[i]), param->typeNode)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method argument type does not match parameter type");
+                        Ty want = self.substituteFieldTy(param->typeNode, recvTy);
+                        if (!self.assignCompatible(expr->kind.payload.MethodCall.args[i], self.exprType(expr->kind.payload.MethodCall.args[i]), want)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method argument type does not match parameter type");
                     }
                     i = i + 1;
                 }
-                self.setExprType(id, self.substituteFieldTy(methodDecl->kind.payload.Func.returnType, self.exprType(expr->kind.payload.MethodCall.receiver)));
+                self.setExprType(id, self.substituteFieldTy(methodDecl->kind.payload.Func.returnType, recvTy));
                 return true;
             },
             ExprKind::Field => {
