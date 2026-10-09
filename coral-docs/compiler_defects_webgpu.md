@@ -13,9 +13,15 @@ for the build-system one and the max-file limit for the driver one. The
 report exists to record what a porter hits, not to propose root-cause
 analysis of known work.
 
+For D1 specifically: semantic checking is **not** broken. Duplicate
+declarations are reported correctly (`TC-0004`), and the only problem is
+that files over the max-file limit never reach the semantic stage, so their
+semantic errors go unreported. Duplicate detection must not be filed as a
+defect.
+
 | ID | Area | Symptom | Status |
 |----|------|---------|--------|
-| D1 | driver | Max source-file limit truncates input | **known** |
+| D1 | driver | Max source-file limit halts error reporting (semantic stage never runs) | **known** |
 | D2 | build driver | `coralc build` compiles nothing, exits 0 | **known** |
 | D3 | parser | `import(lib) a::b { c::d }` rejected | **open** |
 
@@ -73,15 +79,13 @@ All three reproduce unchanged.
 
 | Check | Expected | Result |
 |-------|----------|--------|
-| D1 `type.crl` (5 lines) duplicate typedef | `TC-0004` | `TC-0004` — correct, no limit involved |
-| D1 distinct typedef at offset 65,636 | compiles | dropped, exit 0, 1 of 2 in generated C |
-| D1 control, both decls under the limit | compiles | both present |
+| D1 `compiler/coral-test/type.crl` (90 B) duplicate typedef | `TC-0004` | `TC-0004` — correct; under the limit, sema runs |
+| D1 `webgpu.crl` (91,788 B) | compile + full diagnostics | `PAR-0006` at **1636:53**; sema stage never reached |
 | D2 `coralc build` in `Mu_engine` | compile + artifacts | 18 modules `stale`, exit 0, no `build/muengine` |
 | D2 `--force` | differ from default | identical output |
 | D2 `.coral/graph` | dependency edges | header comment only, no edges |
 | D2 `.coral/cache` | created per `cache_dir` | absent |
 | D3 `import(lib) std::io { ios::println }` | parses | `PAR-0001 expected '}', found '::'` |
-| Port file `webgpu.crl` (91,788 B) | compiles | `PAR-0006` at **1636:53**, identical to previous run |
 
 The D1 failure position is unchanged to the exact column, confirming the
 limit is still in force and was not moved by the rebuild.
@@ -90,23 +94,22 @@ limit is still in force and was not moved by the rebuild.
 
 `coralc` uses **queue-based passes**: a work queue feeds each stage, so
 circular imports resolve without infinite loops and dependency ordering is
-settled by the queue rather than by file order. A consequence here is that
-when input is cut short by the file limit, the compile never reaches the
-stage that fills semantic entities. Reporting therefore stops at whatever
-the parse stage had already queued:
+settled by the queue rather than by file order. Exceeding the file limit
+halts that pipeline before the semantic-entity stage, which is why
+reporting stops at parse:
 
 - parse errors (`PAR-0006` on the truncated construct) are reported,
 - undeclared-name / undeclared-symbol errors (`TC-0001` and friends) are
-  **not**, because sema never ran to populate entities.
+  **not**, because the stage that populates entities never ran.
 
-So a file rejected purely for exceeding the limit shows a parse symptom
-and suppresses the sema diagnostics that would otherwise explain it. Do
-not read the absence of `TC-` errors as "the remainder of the file is
-clean".
+So a file over the limit shows a parse symptom and suppresses the semantic
+diagnostics that would otherwise explain it. Do not read the absence of
+`TC-` errors as "the remainder of the file is clean" — it means the limit
+was hit before sema could look.
 
-The separate error limit compounds this: `-ferror-limit=0` was tried on
-`webgpu.crl` and did not change the outcome (still `errors=5
-(parse=4 sema=1 mono=0)`), because the limit is not what stopped it.
+`-ferror-limit=0` was tried on `webgpu.crl` and changed nothing (still
+`errors=5 (parse=4 sema=1 mono=0)`): the error limit is not what stopped
+reporting, the missing semantic stage is.
 
 ### Note on the D3 control
 
@@ -118,63 +121,90 @@ mistaken for one later.
 
 ---
 
-## D1 — max source-file limit truncates input (known)
+## D1 — max source-file limit halts error reporting (known)
 
 **Status:** known limitation, tracked, will be resolved
-**Component:** driver — max-file limit, interacting with the error limit
+**Component:** driver — max-file limit
 
-**Not a source-reader defect.** The compiler stops reading a source file
-at the current max-file limit (observed at exactly **byte 65,536**) and
-discards the remainder without a dedicated diagnostic. The root cause is
-the max-file limit in the driver, which is already known and being
-resolved; this entry records only the observable consequence for porting
-large API surfaces, not a new finding.
+**The only issue is the file limit.** Semantic checking is fine: a
+duplicate declaration is detected and reported correctly. What breaks is
+the *reporting* for files above the limit, and it breaks as a direct
+consequence of the limit — not as a separate defect.
 
-The limit does not corrupt declarations below the cutoff. `type.crl` at the
-repo root (90 bytes, two typedefs, `foo` deliberately declared twice)
-reports `TC-0004 duplicate declaration of this name` exactly as expected —
-semantic checking is unaffected when the file fits.
+### Mechanism
 
-### Reproduction
+`coralc` runs as a queue-based pipeline: parse feeds sema, and sema is what
+populates semantic entities. When a file exceeds the max-file limit, the
+input is cut short and the compile never reaches the semantic-entity
+stage. Reporting therefore stops at whatever parse had already queued:
 
-A *distinct, valid* declaration placed past the limit, with no duplicates
-and no syntax errors anywhere, so nothing about the input is itself wrong:
+- **above the limit** — parse errors only; undeclared-name and other
+  semantic errors are never reported, because the stage that would emit
+  them never runs;
+- **below the limit** — full reporting, parse and semantic alike.
+
+This is the asymmetry to keep in mind: the absence of `TC-` errors in a
+large file is **not** evidence that the unreported remainder is clean. It
+only means the limit was hit first.
+
+### Control: reporting below the limit is correct
+
+`compiler/coral-test/type.crl` — 5 lines, two typedefs, `foo` declared
+twice:
 
 ```coral
-pub typedef Before = u32;   // ...padded so the next decl starts past the limit...
-pub typedef After  = u32;   // valid, distinct — dropped
+pub typedef foo = u8;
+pub typedef foo = u16;
+
+pub typedef moo = i8;
+pub typedef hoo = i8;
 ```
 
-Actual:
+Actual, and correct:
 
 ```
-coral: wrote distinct2.c (370 bytes)
-coral: dry run, would link distinct2
+error[TC-0004]: duplicate declaration of this name
+  ┌─► compiler/coral-test/type.crl:2:22
+  │
+  │  1 │ pub typedef foo = u8;
+  │  2 │ pub typedef foo = u16;
+  |                           ▲
+  │                           ╰─ rename one of the duplicate declarations
+  │                           ╰─ try `coralc --explain TC-0004` for more information
+coral: compile failed, errors=1 (parse=0 sema=1 mono=0)
 ```
 
-Exit code 0, no error. Generated C contains only the first declaration:
+So duplicate detection is **not** a bug and should not be filed as one.
+This file exists only as the below-the-limit control for D1.
 
-```c
-typedef uint32_t Before;
-```
+### Reporting asymmetry in practice
 
-The same file with both declarations under the limit emits both typedefs.
-```
+Same kind of content, one file under the limit and one over it:
 
-### Confirmed properties
+| File | Size | Result |
+|------|------|--------|
+| `compiler/coral-test/type.crl` | 90 B | `TC-0004` reported — sema ran |
+| `Mu_engine/src/webgpu/webgpu.crl` | 91,788 B | `parse=4 sema=1 mono=0` — sema never ran |
 
-- The cutoff is exact. Byte 65,536 of `webgpu.crl` falls at line 1636,
-  column 53, mid-identifier.
-- The failure position is content-dependent in the *file* but fixed in the
-  *byte*: the diagnostic always lands at whichever construct straddles
-  offset 65,536.
-- Comment-only files beyond 64 KiB do not always trip this, so the cap
-  interacts with lexing rather than being a plain read-buffer limit.
+On the oversized file, the single `sema=1` (`TC-0001 unknown type name:
+WGPURend`) is a *consequence* of the truncated parse, not an independent
+semantic finding. Running with `-ferror-limit=0` changes nothing — still
+`parse=4 sema=1 mono=0` — so the error limit is not what halts reporting;
+the missing semantic stage is.
+
+### Observed limit position
+
+- The cutoff sits at byte 65,536, which in `webgpu.crl` falls at line
+  1636, column 53, mid-identifier.
+- The reported position varies with file contents only through where that
+  byte lands — it always falls on whichever construct straddles the limit.
+- Comment-only files past the limit do not always trip it, so the limit is
+  not simply "first N bytes of the file".
 
 ### Misleading diagnostic
 
-When the cutoff lands mid-construct, the parser emits a fabricated error
-naming the end of file instead of the real cause:
+Because reporting stops at parse, a file rejected for being too large
+shows a parse symptom that names the wrong cause:
 
 ```
 error[PAR-0006]: unexpected end of file
@@ -185,10 +215,10 @@ error[PAR-0006]: unexpected end of file
     |                                                            ╰─ the file ended before this construct was closed
 ```
 
-The message blames EOF and never mentions the file limit. Anyone chasing
-this will look for a missing brace in a file that is actually fine.
-Worth emitting an explicit "file exceeds max size" diagnostic when the
-limit is hit, so the symptom is not misattributed.
+The message blames EOF and never mentions the file limit, so a porter ends
+up hunting a missing brace in a file that is fine. An explicit "file
+exceeds max size" diagnostic would keep the symptom from being
+misattributed.
 
 ### Impact on the WebGPU port
 
@@ -254,14 +284,13 @@ indistinguishable from a successful build.
 The `jolt` phase in `coral.crlb` is supposed to drive cmake and produce
 `build/native/libmualibs.a`, `build/native/joltc/libJoltC.a` and
 `libJolt.a`. It does not run, and none of those archives exist. Linking
-could not succeed even once D2 is fixed.
+could not succeed even once D2 is resolved.
 
-This is adjacent to the known builder gap in
-[builder_incomplete.md](builder_incomplete.md), which records that `.crlb`
-fields (`phases`, `deps`, `link`, `target`, …) are parsed but never acted
-upon. D2 appears to be the same gap seen end-to-end from the command line:
-field-level findings there, whole-driver no-op here. They should be fixed
-together or at minimum tracked as one issue.
+This falls under the same known builder gap recorded in
+[builder_incomplete.md](builder_incomplete.md), where `.crlb` fields
+(`phases`, `deps`, `link`, `target`, …) are parsed but not acted upon.
+D2 is that gap seen end-to-end from the command line, so it is already
+tracked; no separate root-cause work is implied here.
 
 ### Suggested first steps
 
@@ -323,8 +352,8 @@ explicitly.
 
 ## Verification status of the WebGPU port
 
-Independently of the three defects above, the port was verified
-**statically against the headers only**:
+Independently of the three items above, the port was verified **statically
+against the headers only**:
 
 ```
 structs checked: 114, fns checked: 228 — RESULT: ALL-MATCH
@@ -332,32 +361,33 @@ structs checked: 114, fns checked: 228 — RESULT: ALL-MATCH
 
 That is conformance of declarations to the C ABI (field-for-field and
 parameter-for-parameter after type mapping). It is **not** a compile: the
-compiler has never accepted this code, due to D1. Treat the port as
-unverified by the toolchain until D1 and D2 are resolved.
+compiler has never accepted this code, because the file exceeds the
+max-file limit (D1). Treat the port as unverified by the toolchain until
+D1 and D2 are resolved.
 
 ---
 
 ## Reproducing all three
 
-From this directory's parent (`coralc/`):
+D1 is a *reporting* asymmetry, so the reproduction must contrast the same
+kind of content above and below the limit. Run from the `coralc/` repo
+root.
 
 ```sh
-# D1 — duplicate decl placed past byte 65536 should be TC-0004
-python3 - <<'EOF'
-head = 'pub typedef MyThing = u32;\n'
-pad  = '//' + 'z' * 78 + '\n'
-body = head
-while len(body.encode()) < 65536 + 40 - len(head):
-    body += pad
-body += 'pub typedef MyThing = u64;\n'
-open('/tmp/cap6.crl', 'w').write(body)
-EOF
-coralc /tmp/cap6.crl --dry-run   # expect: error; actual: success
+# D1a — under the limit: semantic errors ARE reported (duplicate typedef)
+printf 'pub typedef foo = u8;\npub typedef foo = u16;\n' > /tmp/d1a.crl
+coralc /tmp/d1a.crl --dry-run        # expect: TC-0004, parse=0 sema=1
+
+# D1b — over the limit: parse errors only, sema stage never reached
+cd ../Mu
+coralc src/webgpu/webgpu.crl --dry-run
+# actual: PAR-0006 at 1636:53; errors=5 (parse=4 sema=1 mono=0)
+# the file is 91,788 B, over the 65,536 limit
 
 # D2 — build driver
-cd ../Mu/Mu_engine && coralc build; echo "exit=$?"   # exit=0, no artifacts
+cd ./Mu_engine && coralc build; echo "exit=$?"   # exit=0, no artifacts
 
 # D3 — nested symbol import
-printf 'import(lib) std::io { ios::println };\nfn t() { }\n' > /tmp/imp.crl
-coralc /tmp/imp.crl --dry-run   # expect: ok; actual: PAR-0001
+printf 'import(lib) std::io { ios::println };\nfn t() { }\n' > /tmp/d3.crl
+coralc /tmp/d3.crl --dry-run        # expect: ok; actual: PAR-0001
 ```
