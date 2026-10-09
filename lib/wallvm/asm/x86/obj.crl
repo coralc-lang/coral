@@ -198,8 +198,9 @@ pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
     if (!elfZeroRelocs(&text, o, 1)) { err.msg = "reloc offset past end of .text"; return false; }
     if (!elfZeroRelocs(&data, o, 2)) { err.msg = "reloc offset past end of .data"; return false; }
 
-    // symtab order: null, locals (defined non-global), then globals +
-    // undefined; map name → symtab index for the rela writers
+    // symtab order: null, locals (defined non-global non-weak), then
+    // globals + weak + undefined; map name → symtab index for the rela
+    // writers
     i32 map[ASM_MAX_SYMS];
     for (u32 i = 0; i < ASM_MAX_SYMS; i++) map[i] = -1;
     // emitted order recorded by walking twice
@@ -207,14 +208,14 @@ pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
     // pass 1: locals
     for (u32 i = 0; i < o.nsyms; i++)
     {
-        if (!o.syms[i].global && o.syms[i].defined) { map[i] = (i32)(++emitted); }
+        if (!o.syms[i].global && !o.syms[i].weak && o.syms[i].defined) { map[i] = (i32)(++emitted); }
     }
     u32 firstGlobal = emitted + 1; // +1 for the null symbol
-    // pass 2: globals + undefined
+    // pass 2: globals + weak + undefined
     for (u32 i = 0; i < o.nsyms; i++)
     {
         AsmSymbol* s = &o.syms[i];
-        if (s->global || !s->defined) { map[i] = (i32)(++emitted); }
+        if (s->global || s->weak || !s->defined) { map[i] = (i32)(++emitted); }
     }
     u32 nsymsTotal = emitted + 1; // null symbol
 
@@ -232,12 +233,12 @@ pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
     u32 oi = 1;
     for (u32 i = 0; i < o.nsyms; i++)
     {
-        if (!o.syms[i].global && o.syms[i].defined) { order[oi++] = i; }
+        if (!o.syms[i].global && !o.syms[i].weak && o.syms[i].defined) { order[oi++] = i; }
     }
     for (u32 i = 0; i < o.nsyms; i++)
     {
         AsmSymbol* s = &o.syms[i];
-        if (s->global || !s->defined) { order[oi++] = i; }
+        if (s->global || s->weak || !s->defined) { order[oi++] = i; }
     }
     for (u32 si = 1; si < nsymsTotal; si++)
     {
@@ -339,13 +340,13 @@ pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
     for (u32 si = 1; si < nsymsTotal; si++)
     {
         AsmSymbol* s = &o.syms[order[si]];
-        u8 bind = s.global ? 1 : 0;
+        u8 bind = s.weak ? 2 : (s.global ? 1 : 0);
         u8 typ = s.isFunc ? 2 : (s.defined ? 1 : 0);
         u16 shndx = 0;
         if (s.defined) shndx = s.section == 2 ? 2 : 1;
         if (!out.u32b(nameOff[order[si]])) return false;
         if (!out.u8b((u8)((bind << 4) | typ))) return false;
-        if (!out.u8b(0)) return false;
+        if (!out.u8b(s.vis)) return false;
         if (!out.u16b(shndx)) return false;
         if (!out.u64b(s.defined ? s.value : 0)) return false;
         if (!out.u64b(0)) return false;
