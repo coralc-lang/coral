@@ -361,6 +361,7 @@ pub struct X86_64CodeGen
     u32 redZoneSpillOffset;
     const cchar* lastCallTarget;
     IrValue* lastCallResult;
+    IrInst* tailJmpCall;   // the call that already emitted a tail jmp, its Ret emits nothing
     bool omitFramePointer;
     u32 varargAllocSize;
     u32 shadowAllocSize;
@@ -654,6 +655,7 @@ pub struct X86_64CodeGen
         self.redZoneSpillOffset = 0;
         self.lastCallTarget = "";
         self.lastCallResult = null;
+        self.tailJmpCall = null;
         self.varargAllocSize = 0;
         self.shadowAllocSize = 0;
         self.spillSlotCount = countSpillSlots(func);
@@ -1280,7 +1282,14 @@ pub struct X86_64CodeGen
 
     void emitRet(IrInst* inst)
     {
-        bool isTail = isTailCall(inst);
+        // G34: a tail-position call already jumped to the callee, so this
+        // ret emits nothing — no value sink (the callee's own ret returns
+        // to our caller with the result in rax/xmm0), no epilogue
+        if (self.tailJmpCall != null && inst->nops > 0 && inst->ops[0] == &self.tailJmpCall->base)
+        {
+            self.emitter.emitLine("\t;; tail call, the jump returns to our caller");
+            return true;
+        }
 
         if (inst->nops > 0 && inst->ops[0] != null)
         {
@@ -1335,15 +1344,7 @@ pub struct X86_64CodeGen
                 }
             }
         }
-        if (isTail)
-        {
-            self.emitter.emit("\tjmp ");
-            self.emitter.emitLine(self.lastCallTarget);
-        }
-        else
-        {
-            emitEpilogue();
-        }
+        emitEpilogue();
     }
 
     // Instruction Selection (ISEL)
@@ -2930,6 +2931,7 @@ pub struct X86_64CodeGen
     {
         self.lastCallTarget = "";
         self.lastCallResult = null;
+        self.tailJmpCall = null;
         if (inst->nops > 0 && inst->ops[0] != null)
         {
             const cchar* target = inst->ops[0].name;
@@ -2942,6 +2944,7 @@ pub struct X86_64CodeGen
     {
         self.lastCallTarget = "";
         self.lastCallResult = null;
+        self.tailJmpCall = null;
         if (inst->nops >= 3)
         {
             const cchar* cond = getRegForValue(inst->ops[0]);
@@ -3455,6 +3458,9 @@ pub struct X86_64CodeGen
 
         self.lastCallTarget = calleeName;
         self.lastCallResult = &inst->base;
+        // G34: a call in tail position emits a jmp instead, the stack
+        // dance below only makes sense for the ordinary call shape
+        bool tail = self.inTailPosition(inst);
 
         const cchar* sysvIntRegs[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
         const cchar* win64IntRegs[4] = { "rcx", "rdx", "r8", "r9" };
@@ -3575,15 +3581,20 @@ pub struct X86_64CodeGen
         }
 
         // one stack adjustment: Win64 shadow plus every stack
-        // argument plus the staging slots, rounded to 16
+        // argument plus the staging slots, rounded to 16. A tail jump
+        // keeps our own entry rsp, staging would need a restore we
+        // will not emit, so it gives up the tail shape here; the outer
+        // caller's shadow already covers a Win64 callee.
+        if (tail && stageN > 0) tail = false;
         u32 total = stackOff + stageN * 16;
         if ((total % 16) != 0) total = (total / 16 + 1) * 16;
-        if (total > 0)
+        if (!tail && total > 0)
         {
             self.emitter.emit("\tsubq $");
             self.emitter.emitU32(total);
             self.emitter.emitLine(", %rsp");
         }
+        if (tail) self.tailJmpCall = inst;
 
         // pass B: the stack arguments at fixed offsets; none of this
         // touches an argument register, so it runs before the copy
@@ -3825,7 +3836,7 @@ pub struct X86_64CodeGen
             }
         }
 
-        self.emitter.emit("\tcall ");
+        self.emitter.emit(tail ? "\tjmp " : "\tcall ");
         self.emitter.emit(calleeName);
         if (!self.isWindows && callee->kind == IrValueKind::Func)
         {
@@ -3835,12 +3846,16 @@ pub struct X86_64CodeGen
         }
         self.emitter.emit("\n");
 
-        if (total > 0)
+        if (!tail && total > 0)
         {
             self.emitter.emit("\taddq $");
             self.emitter.emitU32(total);
             self.emitter.emitLine(", %rsp");
         }
+
+        // a tail jump hands the result straight to the Ret after us,
+        // which emits nothing, so there is no home to sink it into
+        if (tail) return;
 
         // the result arrives in rax / xmm0 — sink it into the home
         // lsra picked for the call's value
@@ -3874,14 +3889,47 @@ pub struct X86_64CodeGen
         }
     }
 
-    bool isTailCall(IrInst* retInst)
+    // G34: a direct call whose result feeds only the Ret right behind it
+    // can jump instead of calling, so the callee's ret returns straight to
+    // our caller. Only the shape that needs no epilogue work and no stack
+    // shuffle qualifies: register-only arguments, no frame, no
+    // callee-saves, no spill area, no vararg window. The call emits its
+    // register moves as usual and a jmp in place of the call; the Ret after
+    // it emits nothing (see emitRet).
+    bool tailShapeOk(IrInst* inst)
     {
-        // The call has already emitted its whole sequence (stack
-        // adjustment, register copy, result sink). Jumping to the
-        // target here would run all of it a second time with clobbered
-        // arguments, and skipping emitEpilogue would leave the frame
-        // allocated. Real tail calls stay open (G34).
-        return false;
+        if (inst->base.nusers != 1) return false;
+        IrInst* ret = inst->base.users[0];
+        if (ret == null || ret->opcode != IrOpcode::Ret) return false;
+        if (ret->nops < 1 || ret->ops[0] != &inst->base) return false;
+        IrBlock* bb = inst->parent;
+        if (bb == null || bb->ninsts < 2) return false;
+        if (bb->insts[bb->ninsts - 1] != ret) return false;
+        if (bb->insts[bb->ninsts - 2] != inst) return false;
+        if (inst->nops < 1 || inst->ops[0] == null) return false;
+        if (inst->ops[0]->kind != IrValueKind::Func) return false;
+        if (inst->ops[0]->name == null) return false;
+        // a stack argument would have to be shuffled under the return
+        // address we are about to inherit, register args need nothing
+        u32 tInt = 0, tFp = 0, tStack = self.isWindows ? 32 : 0;
+        for (u32 i = 1; i < inst->nops; i++)
+        {
+            u32 outReg = 0, outOff = 0, outWords = 1;
+            u32 kind = self.classifyCallArg(inst->ops[i], &tInt, &tFp, &tStack,
+                                            &outReg, &outOff, &outWords);
+            if (kind == 0 || kind == 4) return false;
+        }
+        return true;
+    }
+
+    bool inTailPosition(IrInst* inst)
+    {
+        if (!self.tailShapeOk(inst)) return false;
+        if (self.currentFuncHasFrame) return false;
+        if (self.numCalleeSaves > 0) return false;
+        if (self.spillSlotCount > 0) return false;
+        if (self.varargAllocSize > 0) return false;
+        return true;
     }
 
     void emitSelect(IrInst* inst)

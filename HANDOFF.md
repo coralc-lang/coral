@@ -396,20 +396,23 @@ import(lib) std::text {
 - `self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "allocTypeSlot failed (type table full)");` type table being ull is a result of bad management and naivety. dooes it ever happpen in cpp or c?
 - the addition of an @default() function, to set the default vals for a type.
 - implementation od #[[generator(debug, cmp, ..)]] 
--
--
+
+### Accessing a member of a struct from a function returning it's type
 ```crl
-  struct this
-  {
+  struct this { // `this` is not a coral keyword, no need to worry
     i32 goo, moo;
 
-    this new(i32 a, i32 b) { return this { .goo = a, .moo = b };
+    this new(i32 a, i32 b) { return this { .goo = a, .moo = b }; }
+    i32 add() { return self.goo + self.moo; }
+    i32 sub() { return self.goo - self.moo };
   }
 
   pub i32 main()
   {
       // c is an i32 here from type inference
       var c = this::new(2, 3).goo; // where we access the item from the static method or something
+      var d = this::new(c, 3).add().sub(); // the login in this chained mthod call might be incorrect,
+                                           //fix it, but it should be a chained call
   }
-
 ```
+- This allows for what it should allow.

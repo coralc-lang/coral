@@ -21,7 +21,7 @@ Corrections in this revision:
 - **G3, A12 fixed** — abi_lower's userdata contract and sroa's use-list
   maintenance.
 - **G22's array off-by-one fixed**; the clobber half is still real.
-- **G34 regressed** — `isTailCall` is now hardwired off.
+- **G34 fixed** — real tail calls on x86_64 (see the row below).
 - **NEW, not in the original audit: unsigned div/rem emits `cqo` before
   `divq`** (`emitDiv`/`emitRem`), which is a miscompile, not a quality gap.
   See G42. **Fixed the same day** — `emitDiv`/`emitRem` branch on
@@ -579,18 +579,29 @@ epilogue and each function gets a trailing epilogue appended after its last
 block (linux.crl:52) — no epilogue merging. Belongs to:
 `target/x86_64/x86_64_base.crl` (+ PEI-style pass in `regalloc/`).
 
-**G34 [Q] — tail calls: REGRESSED since the audit.** The audit found two
-partial mechanisms: the accumulator-pattern `tco` pass, and an emitter
-peephole turning adjacent `call;ret` into `jmp target`. The second one has
-been **removed**: `isTailCall` is now an unconditional `return false` with a
-comment explaining why (jumping after the call sequence has already emitted
-would re-run it with clobbered arguments, and skipping the epilogue would
-leak the frame) and naming G34 as still-open (x86_64_base.crl:3841-3849).
-`emitRet`'s tail branch (:1147-1151) is now dead code. Only the `tco`
-accumulator pass (tco.crl) and the still-live 32-bit `isTailCall`
-(x86_base.crl:371-381) remain, so 64-bit tail calls are not implemented at
-all. There is still no general sibling-call optimization and no
-guaranteed-TCO marker. Belongs to: `passes/tco.crl` + backends.
+**G34 [Q] — tail calls: FIXED on x86_64 (2026-10-09).** The old mechanism
+was a broken heuristic: `isTailCall` fired *after* the call's whole
+sequence (stack adjustment, register copy, result sink) had already been
+emitted, so the `jmp` in `emitRet` re-ran the callee with clobbered
+arguments and skipping the epilogue leaked the frame; it was hardwired
+off. The fix moves the decision into `emitCall`, where the shape is known
+before anything is emitted. `tailShapeOk` requires a direct named callee,
+register-only arguments (classified before the stack adjustment), the
+call as the block's second-to-last instruction, its result feeding only
+the immediately following `Ret`, and `inTailPosition` additionally
+requires a frameless function with no callee-saves, no spill area, and no
+vararg window. A staged parallel copy or a Win64 shadow that would need a
+restore we will not emit drops the tail shape before the stack
+adjustment; the ordinary path then runs unchanged. On success the
+argument moves emit as usual, `jmp target[@PLT]` replaces `call`, the
+result-sink is skipped (the callee's own `ret` returns to our caller), and
+the following `Ret` emits nothing because `tailJmpCall` matches it. The
+32-bit `isTailCall` (which had the same already-emitted flaw plus an
+always-taken stack-arg problem) is removed. Still open: sibling calls with
+stack arguments or a non-trivial frame (needs epilogue-before-jump and
+signature-aware arg shifting), cross-block call/ret pairs, and a
+guaranteed-TCO marker. `tco.crl` (accumulator recursion → loop) is
+unaffected and orthogonal. Belongs to: backends.
 
 ### 3.6 Machine level
 
