@@ -424,9 +424,9 @@ bool encodeVector(AsmLine* line, VecRow* row, EncodeCtx* ctx, AsmParseError* err
             X86Reg* index = null;
             if (!rmOp.rip)
             {
+                if (rmOp.hasSym) { tail.deinit(); err.msg = "symbolic displacement needs %rip"; return false; }
                 if (!rmOp.base.isEmpty())
                 {
-                    if (rmOp.hasSym) { tail.deinit(); err.msg = "symbol base needs %rip"; return false; }
                     base = lookupReg(rmOp.base);
                     if (base == null) { tail.deinit(); err.msg = "bad base register"; return false; }
                 }
@@ -438,8 +438,12 @@ bool encodeVector(AsmLine* line, VecRow* row, EncodeCtx* ctx, AsmParseError* err
             }
             u8 xb = 0;
             u8 xx = 0;
+            // rip+sym: the in-place disp holds the addend (disp-4); the
+            // ELF writer zeroes the field, COFF keeps it
+            i64 wdisp = rmOp.disp;
+            if (rmOp.hasSym && rmOp.rip) wdisp = rmOp.disp - 4;
             if (!encodeMem(&tail, base, index, rmOp.scale, rmOp.hasDisp || rmOp.hasSym,
-                           rmOp.disp, rmOp.rip, regField, &xb, &xx))
+                           wdisp, rmOp.rip, regField, &xb, &xx))
             {
                 tail.deinit();
                 return false;
@@ -510,17 +514,10 @@ bool encodeVector(AsmLine* line, VecRow* row, EncodeCtx* ctx, AsmParseError* err
     tail.deinit();
 
     // rip-relative symbol displacement: the disp is the last 4 bytes
-    if (rmOp != null && rmOp.kind == AsmOpKind::Mem && rmOp.hasSym && ctx.obj != null)
+    if (rmOp != null && rmOp.kind == AsmOpKind::Mem && rmOp.hasSym && rmOp.rip && ctx.obj != null)
     {
         u64 at = out.len >= 4 ? out.len - 4 : 0;
-        if (rmOp.rip)
-        {
-            if (!asmAddReloc(ctx.obj, at, rmOp.sym, AsmRelocKind::RelPc32, rmOp.disp - 4, ctx.sec)) return false;
-        }
-        else
-        {
-            if (!asmAddReloc(ctx.obj, at, rmOp.sym, AsmRelocKind::RelAbs32, rmOp.disp, ctx.sec)) return false;
-        }
+        if (!asmAddReloc(ctx.obj, at, rmOp.sym, AsmRelocKind::RelPc32, rmOp.disp - 4, ctx.sec)) return false;
     }
 
     if (immOp != null && row.immW != 0)

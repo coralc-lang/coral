@@ -44,6 +44,14 @@ pub struct AsmLine
     str label;           // label defined on this line, empty if none
     bool hasLabel;
     str dargs;           // directive: raw argument text after the name
+    // instruction prefixes captured instead of discarded: lock F0,
+    // rep/repz F3, repne F2, data16 66, data32/addr32 67
+    bool pfxLock;
+    bool pfxRep;
+    bool pfxRepne;
+    bool pfxData16;
+    bool pfxData32;
+    bool pfxAddr32;
 }
 
 pub struct AsmParseError
@@ -162,6 +170,90 @@ pub struct AsmLexer
         }
         *out = neg ? -(i64)v : (i64)v;
         return true;
+    }
+
+    // quoted string literal: "..." with C escapes (\n \t \r \0 \\ \" \a
+    // \b \f \v \xHH and 1-3 digit octal). Returns the decoded bytes as a
+    // malloc'd str (no trailing NUL); the caller frees. Unquoted input or
+    // an unterminated literal sets err and returns false.
+    bool lexQuoted(str* out, AsmParseError* err)
+    {
+        self.skipSpace();
+        if (self.pos >= self.src.len || self.src.ptr[self.pos] != (u8)'"')
+        {
+            err.msg = "expected string literal";
+            err.lineNo = self.lineNo;
+            return false;
+        }
+        self.pos++;
+        usize cap = self.src.len - self.pos;
+        u8* buf = (u8*)malloc(cap > 0 ? cap : 1);
+        if (buf == null)
+        {
+            err.msg = "out of memory";
+            err.lineNo = self.lineNo;
+            return false;
+        }
+        usize n = 0;
+        while (self.pos < self.src.len)
+        {
+            u8 c = self.src.ptr[self.pos];
+            if (c == (u8)'"')
+            {
+                self.pos++;
+                *out = str::fromParts(buf, n);
+                return true;
+            }
+            if (c == (u8)'\\')
+            {
+                self.pos++;
+                if (self.pos >= self.src.len) break;
+                u8 e = self.src.ptr[self.pos];
+                self.pos++;
+                u8 v = e;
+                if (e == (u8)'n') v = (u8)'\n';
+                else if (e == (u8)'t') v = (u8)'\t';
+                else if (e == (u8)'r') v = (u8)'\r';
+                else if (e == (u8)'0') v = 0;
+                else if (e == (u8)'a') v = 7;
+                else if (e == (u8)'b') v = 8;
+                else if (e == (u8)'f') v = 12;
+                else if (e == (u8)'v') v = 11;
+                else if (e == (u8)'x')
+                {
+                    u32 hv = 0;
+                    u32 nd = 0;
+                    while (nd < 2 && self.pos < self.src.len && isHexDigit(self.src.ptr[self.pos]))
+                    {
+                        hv = hv * 16 + (u32)digitValue(self.src.ptr[self.pos]);
+                        self.pos++;
+                        nd++;
+                    }
+                    v = (u8)hv;
+                }
+                else if (e >= (u8)'0' && e <= (u8)'7')
+                {
+                    u32 ov = (u32)(e - (u8)'0');
+                    u32 nd = 1;
+                    while (nd < 3 && self.pos < self.src.len &&
+                           self.src.ptr[self.pos] >= (u8)'0' && self.src.ptr[self.pos] <= (u8)'7')
+                    {
+                        ov = ov * 8 + (u32)(self.src.ptr[self.pos] - (u8)'0');
+                        self.pos++;
+                        nd++;
+                    }
+                    v = (u8)ov;
+                }
+                buf[n++] = v;
+                continue;
+            }
+            buf[n++] = c;
+            self.pos++;
+        }
+        free(buf);
+        err.msg = "unterminated string";
+        err.lineNo = self.lineNo;
+        return false;
     }
 }
 
@@ -409,6 +501,12 @@ bool parseAttLine(str src, u32 lineNo, AsmLine* out, AsmParseError* err)
     out.label = str::empty();
     out.hasLabel = false;
     out.dargs = str::empty();
+    out.pfxLock = false;
+    out.pfxRep = false;
+    out.pfxRepne = false;
+    out.pfxData16 = false;
+    out.pfxData32 = false;
+    out.pfxAddr32 = false;
 
     AsmLexer lx = AsmLexer::new(src, lineNo);
     lx.skipSpace();
@@ -447,18 +545,18 @@ bool parseAttLine(str src, u32 lineNo, AsmLine* out, AsmParseError* err)
     }
 
     // prefix words (lock, rep, repz, repnz, data16, data32, addr32) are
-    // skipped for P1; encoders that need them come with the atomics table
+    // recorded on the line so the encoder can emit them; prefixes must
+    // precede the mnemonic
     while (!lx.done())
     {
         usize before = lx.pos;
         str w = lx.lexIdent();
-        if (w.equals("lock") || w.equals("rep") ||
-            w.equals("repz") || w.equals("repnz") ||
-            w.equals("repne") || w.equals("data16") ||
-            w.equals("data32") || w.equals("addr32"))
-        {
-            continue;
-        }
+        if (w.equals("lock")) { out.pfxLock = true; continue; }
+        if (w.equals("rep") || w.equals("repz")) { out.pfxRep = true; continue; }
+        if (w.equals("repnz") || w.equals("repne")) { out.pfxRepne = true; continue; }
+        if (w.equals("data16")) { out.pfxData16 = true; continue; }
+        if (w.equals("data32")) { out.pfxData32 = true; continue; }
+        if (w.equals("addr32")) { out.pfxAddr32 = true; continue; }
         lx.pos = before;
         break;
     }

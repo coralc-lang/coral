@@ -1,15 +1,20 @@
 /* layout.crl for linker
- * M1: static non-PIE ET_EXEC. Input sections merge into eight
- * canonical output sections (.text .rodata .eh_frame .note
- * .init_array .fini_array .data .bss), classes ordered
- * TEXT, RO, DATA, BSS. File-backed sections keep the invariant
- * vma = imageBase + fileOff so segment math stays trivial.
+ * Input sections merge into eight canonical output sections
+ * (.text .rodata .eh_frame .note .init_array .fini_array .data .bss),
+ * classes ordered TEXT, RO, DATA, BSS. File-backed sections keep the
+ * invariant vma = imageBase + fileOff for ELF and PE canonical
+ * sections; PE/ELF-DYN tail regions (imports, exports, base relocs,
+ * dynamic metadata) get their own raw/virtual placements past the
+ * canonical end. Output format is parameterized: ELF exec, ELF dyn,
+ * PE exe/dll, raw flat image.
  */
 
 import(lib) std::vec { Vec };
 import(lib) std::text::string { String };
-import elf { SHT_NULL, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL, SHT_NOBITS, SHT_PROGBITS, SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHN_ABS, OUT_NONE, EM_X86_64, alignUp, pushHex };
-import object { ObjFile, Section, Sym };
+import elf { SHT_NULL, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL, SHT_NOBITS, SHT_PROGBITS, SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHN_ABS, OUT_NONE, EM_X86_64, EM_386, FMT_ELF_EXE, FMT_ELF_DYN, FMT_PE_EXE, FMT_PE_DLL, FMT_RAW, R_X86_64_64, R_X86_64_32, R_X86_64_32S, R_386_32, alignUp, pushHex };
+import coff { IMAGE_REL_AMD64_ADDR64, IMAGE_REL_AMD64_ADDR32, IMAGE_REL_I386_DIR32 };
+import imports { Imports, ImportRec, sizeIdata };
+import object { ObjFile, Section, Sym, Reloc };
 import resolve { GlobalDef, findDef };
 
 pub struct Piece
@@ -45,6 +50,26 @@ pub struct Layout
     u64 rwMemsz;
     u64 fileEnd;
     i32 bssIdx;
+    u64 thunkOff;
+    u64 idataAddr;
+    u64 idataOff;
+    u64 idataSize;
+    u64 edataAddr;
+    u64 edataOff;
+    u64 edataSize;
+    u64 relocAddr;
+    u64 relocOff;
+    u64 relocSize;
+    u64 imageEnd;
+    u64 rawEnd;
+    u64 dynMetaOff;
+    u64 dynstrSz;
+    u64 dynsymSz;
+    u64 hashSz;
+    u64 relOff;
+    u64 relSize;
+    u64 dynOff;
+    u64 dynSize;
 
     static Layout empty()
     {
@@ -59,7 +84,27 @@ pub struct Layout
             .rwFilesz = 0,
             .rwMemsz = 0,
             .fileEnd = 0,
-            .bssIdx = -1
+            .bssIdx = -1,
+            .thunkOff = 0,
+            .idataAddr = 0,
+            .idataOff = 0,
+            .idataSize = 0,
+            .edataAddr = 0,
+            .edataOff = 0,
+            .edataSize = 0,
+            .relocAddr = 0,
+            .relocOff = 0,
+            .relocSize = 0,
+            .imageEnd = 0,
+            .rawEnd = 0,
+            .dynMetaOff = 0,
+            .dynstrSz = 0,
+            .dynsymSz = 0,
+            .hashSz = 0,
+            .relOff = 0,
+            .relSize = 0,
+            .dynOff = 0,
+            .dynSize = 0
         };
     }
 
@@ -117,6 +162,11 @@ pub bool defAddress(Vec<ObjFile>* objs, Layout* L, GlobalDef* def, u64* out, Str
         *out = L->secs.atPtr((usize)L->bssIdx)->addr + def->commonOff;
         return true;
     }
+    if (def->import)
+    {
+        *out = def->viaImp ? def->iatAddr : def->value;
+        return true;
+    }
     if (def->shndx == SHN_ABS)
     {
         *out = def->value;
@@ -165,11 +215,77 @@ pub bool localAddress(Vec<ObjFile>* objs, Layout* L, usize objIdx, usize symIdx,
     return true;
 }
 
-pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, String* err)
+/* Counts absolute relocations that need base fixups (PE) or RELATIVE
+ * entries (ELF dyn). Only counts relocations in sections that survive
+ * layout, so the ELF-dyn rela size is exact. x86 PE thunks are added
+ * by the caller (their fixups are created at emit time).
+ */
+static usize _countAbs(u16 machine, u8 outFmt, Vec<ObjFile>* objs)
 {
     bool is64 = machine == EM_X86_64;
+    bool pe = outFmt == FMT_PE_EXE || outFmt == FMT_PE_DLL;
+    bool dyn = outFmt == FMT_ELF_DYN;
+    if (!pe && !dyn) return 0;
+    usize n = 0;
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        for (usize si = 0; si < obj->secs.count(); si++)
+        {
+            Section* sec = obj->secs.atPtr(si);
+            if (sec->outIdx == OUT_NONE) continue;
+            if (sec->type == SHT_NOBITS) continue;
+            Vec<Reloc>* bucket = obj->rels.atPtr(si);
+            for (usize k = 0; k < bucket->count(); k++)
+            {
+                Reloc* r = bucket->atPtr(k);
+                bool abs8 = false;
+                bool abs4 = false;
+                if (r->fmt == 1)
+                {
+                    if (is64)
+                    {
+                        if (r->type == IMAGE_REL_AMD64_ADDR64) abs8 = true;
+                        if (r->type == IMAGE_REL_AMD64_ADDR32) abs4 = true;
+                    }
+                    else
+                    {
+                        if (r->type == IMAGE_REL_I386_DIR32) abs4 = true;
+                    }
+                }
+                else
+                {
+                    if (is64)
+                    {
+                        if (r->type == R_X86_64_64) abs8 = true;
+                        if (r->type == R_X86_64_32 || r->type == R_X86_64_32S) abs4 = true;
+                    }
+                    else
+                    {
+                        if (r->type == R_386_32) abs4 = true;
+                    }
+                }
+                if (pe && (abs8 || abs4)) n++;
+                if (dyn && is64 && abs8) n++;
+                if (dyn && !is64 && abs4) n++;
+            }
+        }
+    }
+    return n;
+}
+
+pub bool computeLayout(u16 machine, u8 outFmt, u64 imageBase, str entry, usize edataSz, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Imports* imps, Layout* L, String* err)
+{
+    bool is64 = machine == EM_X86_64;
+    bool isPE = outFmt == FMT_PE_EXE || outFmt == FMT_PE_DLL;
     u64 base = imageBase;
-    if (base == 0) base = is64 ? 0x400000 : 0x08048000;
+    if (base == 0)
+    {
+        if (outFmt == FMT_RAW) base = 0;
+        else if (isPE) base = is64 ? 0x140000000 : 0x400000;
+        else if (outFmt == FMT_ELF_DYN) base = 0;
+        else base = is64 ? 0x400000 : 0x08048000;
+    }
     L->imageBase = base;
 
     _addOut(L, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
@@ -250,8 +366,73 @@ pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs
         out->size = off;
     }
 
+    usize nImp = imps == null ? 0 : imps->count();
+
+    /* PE: jump thunks appended to .text for every import record */
+    if (isPE && nImp > 0)
+    {
+        OutSec* text = L->secs.atPtr(0);
+        u64 t = alignUp(text->size, 8);
+        L->thunkOff = t;
+        text->size = t + (u64)nImp * 8;
+    }
+
+    /* ELF dyn: reserve dynamic metadata inside .rodata and .dynamic
+     * inside .data so both end up covered by the LOAD segments.
+     */
+    if (outFmt == FMT_ELF_DYN)
+    {
+        needRW = true; /* .dynamic lives in .data */
+        OutSec* ro = L->secs.atPtr(1);
+        OutSec* rw = L->secs.atPtr(6);
+        usize nDyn = defs->count() + 1;
+        u64 dynstrSz = 1;
+        for (usize d = 0; d < defs->count(); d++)
+            dynstrSz += (u64)defs->at(d).name.len + 1;
+        u64 dynsymEnt = is64 ? 24 : 16;
+        u64 dynsymSz = (u64)nDyn * dynsymEnt;
+        u64 nbucket = (u64)nDyn;
+        u64 hashSz = (nbucket + 1 + (u64)nDyn) * 4;
+        u64 relEnt = is64 ? 24 : 8;
+        u64 relSz = (u64)_countAbs(machine, outFmt, objs) * relEnt;
+
+        u64 m = alignUp(ro->size, 8);
+        L->dynMetaOff = m;
+        u64 dynsymRel = alignUp(m + dynstrSz, 8);
+        u64 hashRel = alignUp(dynsymRel + dynsymSz, 8);
+        u64 relRel = alignUp(hashRel + hashSz, 8);
+        ro->size = relRel + relSz;
+        L->dynstrSz = dynstrSz;
+        L->dynsymSz = dynsymSz;
+        L->hashSz = hashSz;
+        L->relOff = relRel;
+        L->relSize = relSz;
+
+        u64 dynEnt = is64 ? 16 : 8;
+        u64 nDt = 9;
+        u64 d = alignUp(rw->size, 8);
+        L->dynOff = d;
+        rw->size = d + nDt * dynEnt;
+        L->dynSize = nDt * dynEnt;
+    }
+
     u32 phnum = needRW ? 3 : 2;
-    u64 phdrEnd = is64 ? (64 + (u64)phnum * 56) : (52 + (u64)phnum * 32);
+    u64 phdrEnd;
+    if (outFmt == FMT_RAW)
+    {
+        phnum = 0;
+        phdrEnd = 0;
+    }
+    else if (isPE)
+    {
+        phnum = 0;
+        phdrEnd = 0x1000;
+    }
+    else
+    {
+        if (outFmt == FMT_ELF_DYN) phnum = needRW ? 4 : 3;
+        phdrEnd = is64 ? (64 + (u64)phnum * 56) : (52 + (u64)phnum * 32);
+    }
     L->phdrEnd = phdrEnd;
 
     u64 cur = phdrEnd;
@@ -259,6 +440,7 @@ pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs
     {
         OutSec* out = L->secs.atPtr(i);
         cur = alignUp(cur, out->align);
+        if (isPE) cur = alignUp(cur, 0x1000);
         out->offset = cur;
         out->addr = base + cur;
         cur += out->size;
@@ -275,6 +457,7 @@ pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs
         {
             OutSec* out = L->secs.atPtr(i);
             cur = alignUp(cur, out->align);
+            if (isPE) cur = alignUp(cur, 0x1000);
             out->offset = cur;
             out->addr = base + cur;
             cur += out->size;
@@ -282,6 +465,7 @@ pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs
         u64 dataEnd = cur;
         OutSec* bss = L->secs.atPtr(7);
         cur = alignUp(cur, bss->align);
+        if (isPE) cur = alignUp(cur, 0x1000);
         bss->offset = cur;
         bss->addr = base + cur;
         cur += bss->size;
@@ -308,8 +492,53 @@ pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs
     {
         L->fileEnd = L->rxEnd;
     }
+    L->rawEnd = L->fileEnd;
 
-    if (entry.len > 0)
+    if (isPE)
+    {
+        u32 idataSz = sizeIdata(is64, imps);
+        L->idataSize = idataSz;
+        L->edataSize = (u64)edataSz;
+        usize nabs = _countAbs(machine, outFmt, objs);
+        if (!is64) nabs = nabs + nImp;
+        u64 relocUpper = (u64)nabs * 12 + 32;
+        L->relocSize = relocUpper;
+
+        /* raw placement past the canonical file end (bss has no bytes) */
+        L->idataOff = alignUp(L->fileEnd, 0x1000);
+        L->edataOff = alignUp(L->idataOff + L->idataSize, 0x1000);
+        L->relocOff = alignUp(L->edataOff + L->edataSize, 0x1000);
+        L->rawEnd = L->relocOff + relocUpper;
+
+        /* virtual placement past the bss memory end */
+        u64 memEnd = L->hasRW ? (L->secs.at(7).addr + L->secs.at(7).size) : L->rxEnd;
+        L->idataAddr = alignUp(memEnd, 0x1000);
+        L->edataAddr = alignUp(L->idataAddr + L->idataSize, 0x1000);
+        L->relocAddr = alignUp(L->edataAddr + L->edataSize, 0x1000);
+        L->imageEnd = alignUp(L->relocAddr + relocUpper, 0x1000);
+
+        /* resolve import record addresses now that both regions exist */
+        if (imps != null)
+        {
+            for (usize i = 0; i < imps->recs.count(); i++)
+            {
+                ImportRec* r = imps->recs.atPtr(i);
+                r->iatAddr = L->idataAddr + r->iatAddr;
+                r->thunkAddr = L->secs.at(0).addr + L->thunkOff + (u64)i * 8;
+            }
+            for (usize d = 0; d < defs->count(); d++)
+            {
+                GlobalDef* def = defs->atPtr(d);
+                if (!def->import) continue;
+                ImportRec* r = imps->recs.atPtr((usize)def->impIdx);
+                def->value = r->thunkAddr;
+                def->iatAddr = r->iatAddr;
+                def->size = 0;
+            }
+        }
+    }
+
+    if (entry.len > 0 && outFmt != FMT_RAW)
     {
         i64 idx = findDef(defs, entry);
         if (idx < 0)

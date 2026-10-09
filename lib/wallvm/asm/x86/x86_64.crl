@@ -655,4 +655,747 @@ bool encodeWithRow(AsmLine* line, FormRow* row, u8 size, EncodeCtx* ctx, AsmPars
     return true;
 }
 
-// __PART2__
+// strip an @PLT/@GOTPCREL tail from a symbol name for reloc purposes
+static str stripAt(str s)
+{
+    for (usize i = 0; i < s.len; i++)
+    {
+        if (s.ptr[i] == (u8)'@') return str::fromParts(s.ptr, i);
+    }
+    return s;
+}
+
+// record a PC-relative reloc for a symbolic branch target at the current
+// output position, or resolve a backward local reference directly. The
+// in-place field holds the -4 addend (reloc is from the disp field, the
+// CPU reads from the end of the instruction).
+static bool emitSymRel(EncodeCtx* ctx, str symName, u8 kind, AsmParseError* err)
+{
+    AsmBytes* out = ctx.out;
+    if (ctx.obj == null)
+    {
+        err.msg = "symbolic branch needs an object";
+        return false;
+    }
+    i32 si = asmFindSym(ctx.obj, symName);
+    if (si >= 0)
+    {
+        AsmSymbol* s = &ctx.obj.syms[si];
+        if (s.defined && s.section == ctx.sec)
+        {
+            i64 disp = (i64)s.value - (i64)(out.len + 4);
+            return out.immv(disp, 4);
+        }
+    }
+    u64 at = out.len;
+    if (!asmAddReloc(ctx.obj, at, symName, kind, -4, ctx.sec))
+    {
+        err.msg = "too many relocations";
+        return false;
+    }
+    return out.immv(-4, 4);
+}
+
+// match a parsed line against the tables; returns false with err set
+pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
+{
+    AsmBytes* out = ctx.out;
+
+    // vector encodings match full mnemonics (vaddpd must not split into
+    // vaddp + d) — try the AVX table before any suffix handling
+    i32 vr = tryVecTable(line, line.mnem, ctx, err);
+    if (vr == 1) return true;
+    if (vr == -1) return false;
+
+    str base;
+    u8 size = 0;
+    if (!splitMnemonic(line.mnem, &base, &size, err)) return false;
+
+    // jcc / setcc / cmovcc via the condition table
+    i32 cc = -1;
+    bool isJcc = false, isSetcc = false, isCmovcc = false;
+    str ccBase = base;
+    if (base.len > 1 && base.ptr[0] == (u8)'j')
+    {
+        cc = ccOfName(str::fromParts(base.ptr + 1, base.len - 1));
+        if (cc >= 0) isJcc = true;
+    }
+    if (!isJcc && base.len > 3 && base.ptr[0] == (u8)'s' && base.ptr[1] == (u8)'e' && base.ptr[2] == (u8)'t')
+    {
+        cc = ccOfName(str::fromParts(base.ptr + 3, base.len - 3));
+        if (cc >= 0) isSetcc = true;
+    }
+    if (!isJcc && !isSetcc && base.len > 4 && base.ptr[0] == (u8)'c' && base.ptr[1] == (u8)'m' &&
+        base.ptr[2] == (u8)'o' && base.ptr[3] == (u8)'v')
+    {
+        cc = ccOfName(str::fromParts(base.ptr + 4, base.len - 4));
+        if (cc >= 0) isCmovcc = true;
+    }
+
+    if (isJcc)
+    {
+        if (line.nops != 1 || line.ops[0].kind != AsmOpKind::Rel)
+        {
+            err.msg = "jcc needs a relative target";
+            return false;
+        }
+        AsmOperand* t = &line.ops[0];
+        if (!t.text.isEmpty())
+        {
+            // symbolic target: near form only, PC32 reloc
+            if (!out.u8b(0x0F)) return false;
+            if (!out.u8b((u8)(0x80 + cc))) return false;
+            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPc32, err);
+        }
+        i64 target = t.imm;
+        // short form is 2 bytes, near form 6
+        i64 shortRel = target - 2;
+        if (shortRel >= -128 && shortRel <= 127)
+        {
+            if (!out.u8b((u8)(0x70 + cc))) return false;
+            return out.u8b((u8)(i8)shortRel);
+        }
+        if (!out.u8b(0x0F)) return false;
+        if (!out.u8b((u8)(0x80 + cc))) return false;
+        return out.immv(target - 6, 4);
+    }
+
+    if (isSetcc)
+    {
+        if (line.nops != 1)
+        {
+            err.msg = "setcc needs one operand";
+            return false;
+        }
+        AsmOperand* op = &line.ops[0];
+        AsmBytes tmp = AsmBytes::new();
+        EncodeCtx tctx = ctxNew(&tmp, ctx.obj, ctx.sec);
+        if (op.kind == AsmOpKind::Mem)
+        {
+            X86Reg* base2 = null;
+            X86Reg* index2 = null;
+            if (!op.rip)
+            {
+                if (op.hasSym) { tmp.deinit(); err.msg = "symbolic displacement needs %rip"; return false; }
+                if (!op.base.isEmpty())
+                {
+                    base2 = lookupReg(op.base);
+                    if (base2 != null && (base2.num & 8) != 0) tctx.rex.b = true;
+                }
+                if (!op.index.isEmpty())
+                {
+                    index2 = lookupReg(op.index);
+                    if (index2 != null && (index2.num & 8) != 0) tctx.rex.x = true;
+                }
+            }
+            if (tctx.rex.any())
+            {
+                if (!tmp.u8b(tctx.rex.byte())) { tmp.deinit(); return false; }
+            }
+            if (!tmp.u8b(0x0F) || !tmp.u8b((u8)(0x90 + cc)))
+            {
+                tmp.deinit();
+                return false;
+            }
+            i64 wdisp = op.disp;
+            if (op.hasSym && op.rip) wdisp = op.disp - 4;
+            if (!encodeMem(&tmp, base2, index2, op.scale, op.hasDisp || op.hasSym,
+                           wdisp, op.rip, 0, null, null))
+            {
+                tmp.deinit();
+                return false;
+            }
+            if (op.hasSym && tctx.obj != null)
+            {
+                u64 at = tmp.len >= 4 ? tmp.len - 4 : 0;
+                if (!asmAddReloc(tctx.obj, at, op.sym, AsmRelocKind::RelPc32, op.disp - 4, tctx.sec))
+                {
+                    tmp.deinit();
+                    err.msg = "too many relocations";
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            X86Reg* r = lookupReg(op.text);
+            if (r == null || r.cls != X86RegClass::RcGpr || r.size != 1)
+            {
+                err.msg = "setcc wants a byte register or memory";
+                tmp.deinit();
+                return false;
+            }
+            if ((r.num & 8) != 0) tctx.rex.b = true;
+            if (r.needsRex) tctx.rex.force = true;
+            if (tctx.rex.any())
+            {
+                if (!tmp.u8b(tctx.rex.byte())) { tmp.deinit(); return false; }
+            }
+            if (!tmp.u8b(0x0F) || !tmp.u8b((u8)(0x90 + cc)) || !tmp.u8b(encodeRegReg(0, r.num)))
+            {
+                tmp.deinit();
+                return false;
+            }
+        }
+        for (u32 i = 0; i < tmp.len; i++)
+        {
+            if (!out.u8b(tmp.data[i])) { tmp.deinit(); return false; }
+        }
+        tmp.deinit();
+        return true;
+    }
+
+    if (isCmovcc)
+    {
+        // 0F 40+cc /r — always 16/32/64, never byte
+        if (size == 1 || size == 0) size = 4;
+        FormRow row = FormRow { .base = ccBase, .sizeMask = SZ248, .sig = FS_R_RM,
+                                .op = 0x0F, .op2 = (u8)(0x40 + cc), .ext = NOREG,
+                                .immW = 0, .signExtIb = false, .forceW = false, .noW = false, .pfx = 0 };
+        if (size == 8) row.forceW = true;
+        return encodeWithRow(line, &row, size, ctx, err);
+    }
+
+    // call to a label or a relative target
+    if (base.equals("call") && line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel)
+    {
+        AsmOperand* t = &line.ops[0];
+        if (!out.u8b(0xE8)) return false;
+        if (!t.text.isEmpty())
+        {
+            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPlt32, err);
+        }
+        // instruction-start-relative target; the disp is from the end
+        return out.immv(t.imm - 5, 4);
+    }
+
+    // jmp: symbol → near + PC32; numeric → short EB when it fits
+    if (base.equals("jmp") && line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel)
+    {
+        AsmOperand* t = &line.ops[0];
+        if (!t.text.isEmpty())
+        {
+            if (!out.u8b(0xE9)) return false;
+            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPc32, err);
+        }
+        i64 shortRel = t.imm - 2;
+        if (shortRel >= -128 && shortRel <= 127)
+        {
+            if (!out.u8b(0xEB)) return false;
+            return out.u8b((u8)(i8)shortRel);
+        }
+        if (!out.u8b(0xE9)) return false;
+        return out.immv(t.imm - 5, 4);
+    }
+
+    // jmp with a plain rm operand (indirect)
+    if (base.equals("jmp") && line.nops == 1 && line.ops[0].kind != AsmOpKind::Rel)
+    {
+        FormRow row = FormRow { .base = base, .sizeMask = SZ1248, .sig = FS_RM,
+                                .op = 0xFF, .op2 = 0, .ext = 4,
+                                .immW = 0, .signExtIb = false, .forceW = false, .noW = true, .pfx = 0 };
+        return encodeWithRow(line, &row, 8, ctx, err);
+    }
+
+    // jrcxz/jecxz/jcxz: E3, rel8 only, no near form
+    if ((base.equals("jrcxz") || base.equals("jecxz") || base.equals("jcxz")) &&
+        line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel && line.ops[0].text.isEmpty())
+    {
+        i64 shortRel = line.ops[0].imm - 2;
+        if (shortRel < -128 || shortRel > 127)
+        {
+            err.msg = "jrcxz target out of range";
+            return false;
+        }
+        if (!out.u8b(0xE3)) return false;
+        return out.u8b((u8)(i8)shortRel);
+    }
+
+    // shld/shrd by cl: 0F A5 / 0F AD — reg field is the src, rm the dst
+    if ((base.equals("shld") || base.equals("shrd")) && line.nops == 3 &&
+        line.ops[0].kind == AsmOpKind::Reg && line.ops[0].text.equals("cl"))
+    {
+        FormRow row = FormRow { .base = base, .sizeMask = SZ248, .sig = FS_RM_R,
+                                .op = 0x0F, .op2 = base.equals("shld") ? (u8)0xA5 : (u8)0xAD,
+                                .ext = NOREG, .immW = 0, .signExtIb = false,
+                                .forceW = false, .noW = false, .pfx = 0 };
+        AsmLine tmp = *line;
+        tmp.ops[0] = line.ops[1];
+        tmp.ops[1] = line.ops[2];
+        tmp.nops = 2;
+        return encodeWithRow(&tmp, &row, size, ctx, err);
+    }
+
+    // shift by cl / by one: FS_RM rows of shl etc. split on operand.
+    // D3 is the by-cl group (D2 is byte-only); D1 by-one, D0 byte by-one
+    if (isShiftMnem(base) && line.nops == 2 && line.ops[0].kind == AsmOpKind::Reg &&
+        line.ops[0].text.equals("cl"))
+    {
+        u8 ext = shiftExtOf(base);
+        FormRow row = FormRow { .base = base, .sizeMask = SZ1248, .sig = FS_RM,
+                                .op = 0xD3, .op2 = 0, .ext = ext,
+                                .immW = 0, .signExtIb = false, .forceW = false, .noW = false, .pfx = 0 };
+        AsmLine tmp = *line;
+        tmp.ops[0] = line.ops[1];
+        tmp.nops = 1;
+        return encodeWithRow(&tmp, &row, size, ctx, err);
+    }
+    if (isShiftMnem(base) && line.nops == 2 && line.ops[0].kind == AsmOpKind::Imm && line.ops[0].imm == 1)
+    {
+        u8 ext = shiftExtOf(base);
+        u8 op1 = size == 1 ? 0xD0 : 0xD1;
+        FormRow row = FormRow { .base = base, .sizeMask = SZ1248, .sig = FS_RM,
+                                .op = op1, .op2 = 0, .ext = ext,
+                                .immW = 0, .signExtIb = false, .forceW = false, .noW = false, .pfx = 0 };
+        AsmLine tmp = *line;
+        tmp.ops[0] = line.ops[1];
+        tmp.nops = 1;
+        return encodeWithRow(&tmp, &row, size, ctx, err);
+    }
+
+    // xchg with rax/ax/al as one operand: the 90+r short form
+    if (base.equals("xchg") && line.nops == 2 && size != 1)
+    {
+        AsmOperand* a = &line.ops[0];
+        AsmOperand* b = &line.ops[1];
+        bool aIsAx = a.kind == AsmOpKind::Reg && (a.text.equals("rax") ||
+                     a.text.equals("eax") || a.text.equals("ax"));
+        bool bIsAx = b.kind == AsmOpKind::Reg && (b.text.equals("rax") ||
+                     b.text.equals("eax") || b.text.equals("ax"));
+        if (aIsAx || bIsAx)
+        {
+            AsmOperand* other = aIsAx ? b : a;
+            X86Reg* r = lookupReg(other.text);
+            if (r != null && r.cls == X86RegClass::RcGpr)
+            {
+                X86Rex rex = X86Rex::new();
+                if (size == 8) rex.w = true;
+                if ((r.num & 8) != 0) rex.b = true;
+                if (rex.any()) { if (!out.u8b(rex.byte())) return false; }
+                if (!out.u8b((u8)(0x90 + (r.num & 7)))) return false;
+                return true;
+            }
+        }
+    }
+
+    // plain table walk
+    u32 nforms = sizeof(_forms) / sizeof(_forms[0]);
+    for (u32 i = 0; i < nforms; i++)
+    {
+        FormRow* row = &_forms[i];
+        if (!row.base.equals(base)) continue;
+        u8 useSize = size;
+        if (!sizeAllowed(row.sizeMask, useSize))
+        {
+            // unsuffixed rows take the operand-implied size
+            if (size == 0)
+            {
+                // infer from a register operand or default 4/8 by sig
+                useSize = 0;
+                if (line.nops > 0 && line.ops[0].kind == AsmOpKind::Reg)
+                {
+                    X86Reg* r = lookupReg(line.ops[0].text);
+                    if (r != null) useSize = r.size;
+                }
+                if (useSize == 0 && line.nops > 1 && line.ops[1].kind == AsmOpKind::Reg)
+                {
+                    X86Reg* r = lookupReg(line.ops[1].text);
+                    if (r != null) useSize = r.size;
+                }
+                if (!sizeAllowed(row.sizeMask, useSize == 0 ? 4 : useSize) &&
+                    !sizeAllowed(row.sizeMask, 8))
+                {
+                    continue;
+                }
+                if (useSize == 0) useSize = sizeAllowed(row.sizeMask, 8) ? 8 : 4;
+            }
+            else continue;
+        }
+
+        // signature match
+        bool sigOk = false;
+        switch (row.sig)
+        {
+            FormSig::FS_NONE => { sigOk = line.nops == 0; },
+            FormSig::FS_REL => {
+                sigOk = line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel;
+            },
+            FormSig::FS_AI => {
+                if (line.nops != 2 || line.ops[0].kind != AsmOpKind::Imm) sigOk = false;
+                else
+                {
+                    X86Reg* r = lookupReg(line.ops[1].text);
+                    u8 want = useSize == 0 ? 4 : useSize;
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr && r.size == want &&
+                            (r.num & 7) == 0 && !r.needsRex;
+                }
+            },
+            FormSig::FS_R_I => {
+                sigOk = line.nops == 2 && line.ops[0].kind == AsmOpKind::Imm &&
+                        line.ops[1].kind == AsmOpKind::Reg;
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[1].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr;
+                }
+                // sign-ext-imm8 row (6B) only matches fitting immediates
+                if (sigOk && row.signExtIb)
+                {
+                    i64 imm = line.ops[0].imm;
+                    sigOk = imm >= -128 && imm <= 127;
+                }
+            },
+            FormSig::FS_R => {
+                sigOk = line.nops == 1 && line.ops[0].kind == AsmOpKind::Reg;
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[0].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr;
+                }
+            },
+            FormSig::FS_I => {
+                sigOk = line.nops == 1 && line.ops[0].kind == AsmOpKind::Imm;
+                if (sigOk && row.signExtIb)
+                {
+                    i64 imm = line.ops[0].imm;
+                    sigOk = imm >= -128 && imm <= 127;
+                }
+            },
+            FormSig::FS_RM => {
+                sigOk = line.nops == 1 &&
+                        (line.ops[0].kind == AsmOpKind::Reg || line.ops[0].kind == AsmOpKind::Mem);
+                if (sigOk && line.ops[0].kind == AsmOpKind::Reg)
+                {
+                    X86Reg* r = lookupReg(line.ops[0].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr;
+                }
+            },
+            FormSig::FS_RM_R => {
+                sigOk = line.nops == 2 && line.ops[0].kind == AsmOpKind::Reg &&
+                        (line.ops[1].kind == AsmOpKind::Reg || line.ops[1].kind == AsmOpKind::Mem);
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[0].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr &&
+                            (useSize == 0 || r.size == useSize);
+                }
+            },
+            FormSig::FS_R_RM => {
+                sigOk = line.nops == 2 &&
+                        (line.ops[0].kind == AsmOpKind::Reg || line.ops[0].kind == AsmOpKind::Mem) &&
+                        line.ops[1].kind == AsmOpKind::Reg;
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[1].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr &&
+                            (useSize == 0 || r.size == useSize);
+                    // movzx/movsx: source register must be narrower
+                    if (sigOk && (base.equals("movzx") || base.equals("movsx")) &&
+                        line.ops[0].kind == AsmOpKind::Reg)
+                    {
+                        X86Reg* s = lookupReg(line.ops[0].text);
+                        sigOk = s != null && s.size < r.size;
+                    }
+                }
+            },
+            FormSig::FS_RM_I => {
+                sigOk = line.nops == 2 && line.ops[0].kind == AsmOpKind::Imm &&
+                        (line.ops[1].kind == AsmOpKind::Reg || line.ops[1].kind == AsmOpKind::Mem);
+                if (sigOk && row.signExtIb)
+                {
+                    i64 imm = line.ops[0].imm;
+                    sigOk = imm >= -128 && imm <= 127;
+                }
+                if (sigOk && !row.signExtIb && row.immW == 9 && line.ops[0].kind == AsmOpKind::Imm)
+                {
+                    // the 81-style row must not steal the ib-sized immediates
+                    i64 imm = line.ops[0].imm;
+                    if (imm >= -128 && imm <= 127 && (row.op == 0x81 || row.op == 0xC7))
+                    {
+                        sigOk = false;
+                    }
+                }
+            },
+            FormSig::FS_IMR => {
+                sigOk = line.nops == 3 && line.ops[0].kind == AsmOpKind::Imm &&
+                        line.ops[1].kind == AsmOpKind::Reg &&
+                        (line.ops[2].kind == AsmOpKind::Reg || line.ops[2].kind == AsmOpKind::Mem);
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[1].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr &&
+                            (useSize == 0 || r.size == useSize);
+                }
+            },
+            else => { sigOk = false; },
+        }
+
+        if (!sigOk) continue;
+        return encodeWithRow(line, row, useSize, ctx, err);
+    }
+
+    err.msg = "no matching instruction form";
+    return false;
+}
+
+// Public entry: one AT&T source line → bytes, no object context.
+// Symbolic operands that need relocs are assembleText's job.
+pub bool encodeLine(str src, u32 lineNo, AsmBytes* out, AsmParseError* err)
+{
+    AsmLine line = AsmLine {};
+    if (!parseAttLine(src, lineNo, &line, err)) return false;
+    if (line.isEmpty || line.isDirective) return true;
+    EncodeCtx ctx = ctxNew(out, null, 1);
+    return matchAndEncode(&line, &ctx, err);
+}
+
+// ------------------------------------------------------------------
+// unit assembly: labels, directives, sections. Text goes to obj.text,
+// data to obj.data; symbols bind at the current section offset.
+// ------------------------------------------------------------------
+
+// append src onto dst
+static bool asmAppend(AsmBytes* dst, AsmBytes* src)
+{
+    for (u32 i = 0; i < src.len; i++)
+    {
+        if (!dst.u8b(src.data[i])) return false;
+    }
+    return true;
+}
+
+// .byte/.word/.long/.quad payload: comma-separated numbers or symbols
+static bool emitDataLits(AsmLine* line, AsmObject* obj, i32 sec, u32 width, AsmParseError* err)
+{
+    AsmBytes* out = sec == 1 ? &obj.text.data : &obj.data.data;
+    AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+    while (true)
+    {
+        lx.skipSpace();
+        if (lx.done()) break;
+        if (isAlpha(lx.peek()) || lx.peek() == (u8)'_')
+        {
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = "bad symbol in data literal"; err.lineNo = line.lineNo; return false; }
+            if (width == 4)
+            {
+                u64 at = out.len;
+                if (!out.u32b(0)) return false;
+                if (!asmAddReloc(obj, at, name, AsmRelocKind::RelAbs32, 0, sec))
+                {
+                    err.msg = "too many relocations";
+                    return false;
+                }
+            }
+            else if (width == 8)
+            {
+                u64 at = out.len;
+                if (!out.u64b(0)) return false;
+                if (!asmAddReloc(obj, at, name, AsmRelocKind::RelAbs64, 0, sec))
+                {
+                    err.msg = "too many relocations";
+                    return false;
+                }
+            }
+            else
+            {
+                err.msg = "symbol needs .long or .quad";
+                err.lineNo = line.lineNo;
+                return false;
+            }
+        }
+        else
+        {
+            i64 v = 0;
+            if (!lx.lexNumber(&v)) { err.msg = "bad data literal"; err.lineNo = line.lineNo; return false; }
+            if (width == 1) { if (!out.u8b((u8)v)) return false; }
+            else if (width == 2) { if (!out.u16b((u16)v)) return false; }
+            else if (width == 4) { if (!out.u32b((u32)v)) return false; }
+            else { if (!out.u64b((u64)v)) return false; }
+        }
+        lx.skipSpace();
+        if (lx.done()) break;
+        if (!lx.eat((u8)','))
+        {
+            err.msg = "expected ',' in data literal";
+            err.lineNo = line.lineNo;
+            return false;
+        }
+    }
+    return true;
+}
+
+// pad the section up to an a-byte boundary; text pads with nop bytes
+static bool alignSec(AsmBytes* out, i64 a, bool text, AsmParseError* err, u32 lineNo)
+{
+    if (a <= 0) return true;
+    if (a > 256) { err.msg = "alignment too large"; err.lineNo = lineNo; return false; }
+    u32 au = (u32)a;
+    while ((out.len % au) != 0)
+    {
+        if (!out.u8b(text ? (u8)0x90 : (u8)0)) { err.msg = "out of memory"; err.lineNo = lineNo; return false; }
+    }
+    return true;
+}
+
+// directive kinds resolved from the table below
+// 1 .text, 2 .data, 3 .globl name, 4-7 data literals of width 1/2/4/8,
+// 8 .zero N, 9 byte align N, 10 p2align N, 11 .type, 12 .size (ignore),
+// 13 .section name, 90 metadata we ignore
+struct DirEnt { str name; u8 kind; }
+
+static DirEnt _dirs[] = {
+    { ".text", 1 }, { ".data", 2 },
+    { ".globl", 3 }, { ".global", 3 },
+    { ".byte", 4 }, { ".word", 5 }, { ".long", 6 }, { ".quad", 7 },
+    { ".zero", 8 }, { ".space", 8 },
+    { ".align", 9 }, { ".balign", 9 }, { ".p2align", 10 },
+    { ".type", 11 }, { ".size", 12 },
+    { ".section", 13 },
+    { ".cfi_startproc", 90 }, { ".cfi_endproc", 90 },
+    { ".cfi_def_cfa_offset", 90 }, { ".cfi_def_cfa_register", 90 },
+    { ".cfi_offset", 90 }, { ".cfi_def_cfa", 90 },
+    { ".ident", 90 }, { ".file", 90 }, { ".loc", 90 }
+};
+
+static bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, AsmParseError* err)
+{
+    err.lineNo = line.lineNo;
+    u8 kind = 0;
+    u32 nd = sizeof(_dirs) / sizeof(_dirs[0]);
+    for (u32 i = 0; i < nd; i++)
+    {
+        if (_dirs[i].name.equals(line.mnem)) { kind = _dirs[i].kind; break; }
+    }
+    if (kind == 0)
+    {
+        // unknown directives are assembler metadata we do not need
+        return true;
+    }
+    switch (kind)
+    {
+        1 => { *sec = 1; return true; },
+        2 => { *sec = 2; return true; },
+        3 => {
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = ".globl needs a name"; return false; }
+            i32 si = asmFindOrAddSym(obj, name);
+            if (si < 0) { err.msg = "too many symbols"; return false; }
+            obj.syms[si].global = true;
+            return true;
+        },
+        4 => { return emitDataLits(line, obj, *sec, 1, err); },
+        5 => { return emitDataLits(line, obj, *sec, 2, err); },
+        6 => { return emitDataLits(line, obj, *sec, 4, err); },
+        7 => { return emitDataLits(line, obj, *sec, 8, err); },
+        8 => {
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            i64 n = 0;
+            if (!lx.lexNumber(&n) || n < 0) { err.msg = "bad .zero count"; return false; }
+            AsmBytes* out = *sec == 1 ? &obj.text.data : &obj.data.data;
+            for (i64 k = 0; k < n; k++)
+            {
+                if (!out.u8b(0)) { err.msg = "out of memory"; return false; }
+            }
+            return true;
+        },
+        9 => {
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            i64 a = 0;
+            if (!lx.lexNumber(&a)) { err.msg = "bad alignment"; return false; }
+            AsmBytes* out = *sec == 1 ? &obj.text.data : &obj.data.data;
+            return alignSec(out, a, *sec == 1, err, line.lineNo);
+        },
+        10 => {
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            i64 a = 0;
+            if (!lx.lexNumber(&a) || a < 0 || a > 8) { err.msg = "bad p2align"; return false; }
+            i64 bytes = (i64)1 << a;
+            AsmBytes* out = *sec == 1 ? &obj.text.data : &obj.data.data;
+            return alignSec(out, bytes, *sec == 1, err, line.lineNo);
+        },
+        11 => {
+            // .type name, @function — mark the symbol for the writers
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.isEmpty()) return true;
+            lx.eat((u8)',');
+            lx.skipSpace();
+            if (!lx.done() && lx.peek() == (u8)'@')
+            {
+                lx.pos++;
+                str what = lx.lexIdent();
+                if (what.equals("function"))
+                {
+                    i32 si = asmFindOrAddSym(obj, name);
+                    if (si >= 0) obj.syms[si].isFunc = true;
+                }
+            }
+            return true;
+        },
+        12 => { return true; },
+        13 => {
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.equals(".text")) { *sec = 1; return true; }
+            if (name.equals(".data") || name.equals(".rodata")) { *sec = 2; return true; }
+            err.msg = "unsupported section";
+            return false;
+        },
+        90 => { return true; },
+        else => { return true; },
+    }
+}
+
+// assemble a whole source unit: labels bind at the current section
+// offset, directives steer sections and emit data, everything else goes
+// through the encoder into the current section.
+pub bool assembleText(str text, AsmObject* obj, AsmParseError* err)
+{
+    u32 lineNo = 0;
+    usize i = 0;
+    i32 sec = 1;
+    while (i < text.len)
+    {
+        usize start = i;
+        while (i < text.len && text.ptr[i] != (u8)'\n') i++;
+        str ln = str::fromParts(text.ptr + start, i - start);
+        if (i < text.len) i++;
+        lineNo++;
+
+        AsmLine line = AsmLine {};
+        if (!parseAttLine(ln, lineNo, &line, err)) return false;
+        if (line.hasLabel)
+        {
+            i32 si = asmFindOrAddSym(obj, line.label);
+            if (si < 0) { err.msg = "too many symbols"; err.lineNo = lineNo; return false; }
+            obj.syms[si].defined = true;
+            obj.syms[si].value = sec == 1 ? obj.text.data.len : obj.data.data.len;
+            obj.syms[si].section = sec;
+        }
+        if (line.isEmpty) continue;
+        if (line.isDirective)
+        {
+            if (!handleDirective(&line, obj, &sec, err)) return false;
+            continue;
+        }
+        AsmBytes tmp = AsmBytes::new();
+        EncodeCtx ctx = ctxNew(&tmp, obj, sec);
+        if (!matchAndEncode(&line, &ctx, err))
+        {
+            tmp.deinit();
+            return false;
+        }
+        AsmBytes* dst = sec == 1 ? &obj.text.data : &obj.data.data;
+        if (!asmAppend(dst, &tmp))
+        {
+            tmp.deinit();
+            err.msg = "out of memory";
+            return false;
+        }
+        tmp.deinit();
+    }
+    return true;
+}
+
