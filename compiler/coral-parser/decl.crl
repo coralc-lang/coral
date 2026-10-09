@@ -489,6 +489,7 @@ pub extend Parser
                 bool mIsStatic = self.match(TokenKind::Static);
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
                 continue;
             }
 
@@ -503,26 +504,32 @@ pub extend Parser
             {
                 NodeId method = self.parseFuncDeclFlags(memberAttrs);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
                 continue;
             }
 
             Ty fieldType = self.parseType();
-            Token fieldNameTok = self.expect(TokenKind::Ident);
-            fieldType = self.parseDeclaratorArray(fieldType);
-            Field field;
-            field.name = self.ctx.intern(fieldNameTok.data.ptr, fieldNameTok.data.len);
-            field.typeNode = fieldType;
-            field.defaultValue = self.noneNode();
-            field.loc.data = 0;
-            field.flags = fieldFlags;
-            if (self.match(TokenKind::Equal))
+            /* C-style multi-declarator fields: `i32 goo, moo;` — repeat
+             * the parsed type per declarator (own array suffix/default) */
+            while (true)
             {
-                field.defaultValue = self.parseExpr();
-                field.flags = field.flags | 2;
+                Token fieldNameTok = self.expect(TokenKind::Ident);
+                Ty declType = self.parseDeclaratorArray(fieldType);
+                Field field;
+                field.name = self.ctx.intern(fieldNameTok.data.ptr, fieldNameTok.data.len);
+                field.typeNode = declType;
+                field.defaultValue = self.noneNode();
+                field.loc.data = 0;
+                field.flags = fieldFlags;
+                if (self.match(TokenKind::Equal))
+                {
+                    field.defaultValue = self.parseExpr();
+                    field.flags = field.flags | 2;
+                }
+                NodeId fieldNode = self.storeField(field);
+                if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
             }
-            NodeId fieldNode = self.storeField(field);
-            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
-            self.match(TokenKind::Comma);
             self.match(TokenKind::Semicolon);
         }
         self.expect(TokenKind::RBrace);
@@ -685,6 +692,7 @@ pub extend Parser
                 bool mIsStatic = self.match(TokenKind::Static);
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
                 continue;
             }
             ParserMark mark = self.save();
@@ -697,19 +705,24 @@ pub extend Parser
             {
                 NodeId method = self.parseFuncDeclFlags(memberAttrs);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
+                self.match(TokenKind::Semicolon);
                 continue;
             }
             Ty fieldType = self.parseType();
-            Token fieldTok = self.expect(TokenKind::Ident);
-            Field field;
-            field.name = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
-            field.typeNode = fieldType;
-            field.defaultValue = self.noneNode();
-            field.loc.data = 0;
-            field.flags = fieldFlags;
-            NodeId fieldNode = self.storeField(field);
-            if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
-            self.match(TokenKind::Comma);
+            /* C-style multi-declarator union arms: `i32 a, b;` */
+            while (true)
+            {
+                Token fieldTok = self.expect(TokenKind::Ident);
+                Field field;
+                field.name = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
+                field.typeNode = fieldType;
+                field.defaultValue = self.noneNode();
+                field.loc.data = 0;
+                field.flags = fieldFlags;
+                NodeId fieldNode = self.storeField(field);
+                if (!self.ctx.nodeListAppend(&fields, fieldNode)) self.reportAllocFailed();
+                if (!self.match(TokenKind::Comma)) break;
+            }
             self.match(TokenKind::Semicolon);
         }
         self.expect(TokenKind::RBrace);
