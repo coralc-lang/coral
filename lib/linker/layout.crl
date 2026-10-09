@@ -1,0 +1,326 @@
+/* layout.crl for linker
+ * M1: static non-PIE ET_EXEC. Input sections merge into eight
+ * canonical output sections (.text .rodata .eh_frame .note
+ * .init_array .fini_array .data .bss), classes ordered
+ * TEXT, RO, DATA, BSS. File-backed sections keep the invariant
+ * vma = imageBase + fileOff so segment math stays trivial.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import elf { SHT_NULL, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL, SHT_NOBITS, SHT_PROGBITS, SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHN_ABS, OUT_NONE, EM_X86_64, alignUp, pushHex };
+import object { ObjFile, Section, Sym };
+import resolve { GlobalDef, findDef };
+
+pub struct Piece
+{
+    usize objIdx;
+    usize secIdx;
+    u64 offset;
+    u64 size;
+}
+
+pub struct OutSec
+{
+    str name;
+    u32 type;
+    u64 flags;
+    u64 addr;
+    u64 offset;
+    u64 size;
+    u64 align;
+    Vec<Piece> pieces;
+}
+
+pub struct Layout
+{
+    Vec<OutSec> secs;
+    u64 imageBase;
+    u64 entry;
+    u64 phdrEnd;
+    u64 rxEnd;
+    bool hasRW;
+    u64 rwOff;
+    u64 rwFilesz;
+    u64 rwMemsz;
+    u64 fileEnd;
+    i32 bssIdx;
+
+    static Layout empty()
+    {
+        return Layout {
+            .secs = Vec<OutSec>::new(),
+            .imageBase = 0,
+            .entry = 0,
+            .phdrEnd = 0,
+            .rxEnd = 0,
+            .hasRW = false,
+            .rwOff = 0,
+            .rwFilesz = 0,
+            .rwMemsz = 0,
+            .fileEnd = 0,
+            .bssIdx = -1
+        };
+    }
+
+    void dispose()
+    {
+        for (usize i = 0; i < self.secs.count(); i++)
+            self.secs.atPtr(i)->pieces.dispose();
+        self.secs.dispose();
+    }
+}
+
+static void _addOut(Layout* L, str name, u32 type, u64 flags)
+{
+    OutSec o;
+    o.name = name;
+    o.type = type;
+    o.flags = flags;
+    o.addr = 0;
+    o.offset = 0;
+    o.size = 0;
+    o.align = 1;
+    o.pieces = Vec<Piece>::new();
+    L->secs.push(o);
+}
+
+static i32 _bucketFor(str name, u32 type, u64 flags)
+{
+    if ((flags & SHF_ALLOC) == 0) return -1;
+    if (name.startsWith(".tdata") || name.startsWith(".tbss")) return -2;
+    if (type == SHT_NULL || type == SHT_SYMTAB || type == SHT_STRTAB ||
+        type == SHT_RELA || type == SHT_REL) return -1;
+    if (type == SHT_NOBITS) return 7;
+    if ((flags & SHF_EXECINSTR) != 0) return 0;
+    if ((flags & SHF_WRITE) != 0)
+    {
+        if (name.startsWith(".init_array")) return 4;
+        if (name.startsWith(".fini_array")) return 5;
+        return 6;
+    }
+    if (name.startsWith(".note")) return 3;
+    if (name.startsWith(".eh_frame")) return 2;
+    return 1;
+}
+
+pub bool defAddress(Vec<ObjFile>* objs, Layout* L, GlobalDef* def, u64* out, String* err)
+{
+    if (def->common)
+    {
+        if (L->bssIdx < 0)
+        {
+            err->pushView("linker: COMMON symbol without .bss section: ");
+            err->pushView(def->name);
+            return false;
+        }
+        *out = L->secs.atPtr((usize)L->bssIdx)->addr + def->commonOff;
+        return true;
+    }
+    if (def->shndx == SHN_ABS)
+    {
+        *out = def->value;
+        return true;
+    }
+    ObjFile* obj = objs->atPtr(def->objIdx);
+    if ((usize)def->shndx >= obj->secs.count())
+    {
+        err->pushView("linker: symbol has bad section index: ");
+        err->pushView(def->name);
+        return false;
+    }
+    Section* in = obj->secs.atPtr(def->shndx);
+    if (in->outIdx == OUT_NONE)
+    {
+        err->pushView("linker: symbol defined in discarded section: ");
+        err->pushView(def->name);
+        return false;
+    }
+    *out = L->secs.atPtr(in->outIdx)->addr + def->value;
+    return true;
+}
+
+pub bool localAddress(Vec<ObjFile>* objs, Layout* L, usize objIdx, usize symIdx, u64* out, String* err)
+{
+    ObjFile* obj = objs->atPtr(objIdx);
+    Sym* sym = obj->syms.atPtr(symIdx);
+    if (sym->shndx == SHN_ABS)
+    {
+        *out = sym->value;
+        return true;
+    }
+    if (sym->shndx == SHN_UNDEF || (usize)sym->shndx >= obj->secs.count())
+    {
+        err->pushView("linker: undefined local symbol: ");
+        err->pushView(sym->name);
+        return false;
+    }
+    Section* in = obj->secs.atPtr(sym->shndx);
+    if (in->outIdx == OUT_NONE)
+    {
+        *out = 0;
+        return true;
+    }
+    *out = L->secs.atPtr(in->outIdx)->addr + sym->value;
+    return true;
+}
+
+pub bool computeLayout(u16 machine, u64 imageBase, str entry, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, String* err)
+{
+    bool is64 = machine == EM_X86_64;
+    u64 base = imageBase;
+    if (base == 0) base = is64 ? 0x400000 : 0x08048000;
+    L->imageBase = base;
+
+    _addOut(L, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+    _addOut(L, ".rodata", SHT_PROGBITS, SHF_ALLOC);
+    _addOut(L, ".eh_frame", SHT_PROGBITS, SHF_ALLOC);
+    _addOut(L, ".note", SHT_PROGBITS, SHF_ALLOC);
+    _addOut(L, ".init_array", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+    _addOut(L, ".fini_array", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+    _addOut(L, ".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+    _addOut(L, ".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);
+
+    bool needRW = false;
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        for (usize i = 0; i < obj->secs.count(); i++)
+        {
+            Section* s = obj->secs.atPtr(i);
+            i32 b = _bucketFor(s->name, s->type, s->flags);
+            if (b == -2)
+            {
+                err->pushView("linker: TLS section not supported: ");
+                err->pushView(s->name);
+                return false;
+            }
+            if (b == -1)
+            {
+                s->outIdx = OUT_NONE;
+                continue;
+            }
+            if (s->type != SHT_NOBITS && s->addralign > 0x1000)
+            {
+                err->pushView("linker: section ");
+                err->pushView(s->name);
+                err->pushView(" alignment ");
+                pushHex(err, s->addralign);
+                err->pushView(" exceeds 0x1000 (M1 page limit)");
+                return false;
+            }
+            OutSec* out = L->secs.atPtr((usize)b);
+            out->type = s->type;
+            if (s->addralign > out->align) out->align = s->addralign;
+            Piece p;
+            p.objIdx = o;
+            p.secIdx = i;
+            p.offset = 0;
+            p.size = s->size;
+            out->pieces.push(p);
+            s->outIdx = (u32)b;
+            if (b >= 4) needRW = true;
+        }
+    }
+
+    bool hasCommons = false;
+    for (usize d = 0; d < defs->count(); d++)
+    {
+        GlobalDef* def = defs->atPtr(d);
+        if (!def->common) continue;
+        hasCommons = true;
+        OutSec* bss = L->secs.atPtr(7);
+        if (def->align > bss->align) bss->align = def->align;
+    }
+    if (hasCommons) needRW = true;
+
+    for (usize i = 0; i < L->secs.count(); i++)
+    {
+        OutSec* out = L->secs.atPtr(i);
+        u64 off = 0;
+        for (usize j = 0; j < out->pieces.count(); j++)
+        {
+            Piece* p = out->pieces.atPtr(j);
+            Section* in = objs->atPtr(p->objIdx)->secs.atPtr(p->secIdx);
+            u64 a = in->addralign > 0 ? in->addralign : 1;
+            off = alignUp(off, a);
+            p->offset = off;
+            off += p->size;
+        }
+        out->size = off;
+    }
+
+    u32 phnum = needRW ? 3 : 2;
+    u64 phdrEnd = is64 ? (64 + (u64)phnum * 56) : (52 + (u64)phnum * 32);
+    L->phdrEnd = phdrEnd;
+
+    u64 cur = phdrEnd;
+    for (usize i = 0; i < 4; i++)
+    {
+        OutSec* out = L->secs.atPtr(i);
+        cur = alignUp(cur, out->align);
+        out->offset = cur;
+        out->addr = base + cur;
+        cur += out->size;
+    }
+    L->rxEnd = cur;
+
+    if (needRW)
+    {
+        L->hasRW = true;
+        L->bssIdx = 7;
+        L->rwOff = alignUp(cur, 0x1000);
+        cur = L->rwOff;
+        for (usize i = 4; i < 7; i++)
+        {
+            OutSec* out = L->secs.atPtr(i);
+            cur = alignUp(cur, out->align);
+            out->offset = cur;
+            out->addr = base + cur;
+            cur += out->size;
+        }
+        u64 dataEnd = cur;
+        OutSec* bss = L->secs.atPtr(7);
+        cur = alignUp(cur, bss->align);
+        bss->offset = cur;
+        bss->addr = base + cur;
+        cur += bss->size;
+        L->fileEnd = dataEnd;
+        L->rwFilesz = dataEnd - L->rwOff;
+        L->rwMemsz = cur - L->rwOff;
+
+        if (hasCommons)
+        {
+            u64 bssCur = bss->offset + bss->size;
+            for (usize d = 0; d < defs->count(); d++)
+            {
+                GlobalDef* def = defs->atPtr(d);
+                if (!def->common) continue;
+                bssCur = alignUp(bssCur, def->align > 0 ? def->align : 1);
+                def->commonOff = bssCur - bss->offset;
+                bssCur += def->size;
+            }
+            bss->size = bssCur - bss->offset;
+            L->rwMemsz = bssCur - L->rwOff;
+        }
+    }
+    else
+    {
+        L->fileEnd = L->rxEnd;
+    }
+
+    if (entry.len > 0)
+    {
+        i64 idx = findDef(defs, entry);
+        if (idx < 0)
+        {
+            err->pushView("linker: entry symbol not defined: ");
+            err->pushView(entry);
+            return false;
+        }
+        u64 addr = 0;
+        if (!defAddress(objs, L, defs->atPtr((usize)idx), &addr, err)) return false;
+        L->entry = addr;
+    }
+    return true;
+}

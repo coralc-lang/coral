@@ -1,0 +1,232 @@
+/* reloc.crl for linker
+ * Applies input relocations to the emitted image. x86_64 takes
+ * GOTPCREL/GOTPCRELX as a PC32 relaxation (static non-PIE output has
+ * no GOT); dynamic relocation types are hard errors. REL addends are
+ * read in-field, RELA addends come from the entry.
+ */
+
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::mman { alloc, dealloc };
+import elf { SHT_NOBITS, EM_X86_64, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_COPY, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32, R_X86_64_32S, R_X86_64_PC64, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_386_32, R_386_PC32, R_386_GOT32, R_386_PLT32, R_386_COPY, R_386_GLOB_DAT, R_386_JUMP_SLOT, SHN_ABS, SHN_UNDEF, OUT_NONE, fits, leU32, leU64, putU32, putU64, pushDec, pushHex };
+import object { ObjFile, Section, Sym, Reloc };
+import resolve { GlobalDef, findDef };
+import layout { Layout, OutSec, defAddress };
+
+static void _relErrBase(String* err, str objName)
+{
+    err->pushView("linker: ");
+    err->pushView(objName);
+}
+
+static bool _rangeErr(String* err, str objName, u32 type, u64 vaddr)
+{
+    _relErrBase(err, objName);
+    err->pushView(": relocation type ");
+    pushDec(err, type);
+    err->pushView(" out of range at ");
+    pushHex(err, vaddr);
+    err->pushView(" (S+A-P does not fit)");
+    return false;
+}
+
+static bool _dynErr(String* err, str objName, u32 type)
+{
+    _relErrBase(err, objName);
+    err->pushView(": dynamic relocation type ");
+    pushDec(err, type);
+    err->pushView(" is not supported by the static non-PIE linker");
+    return false;
+}
+
+static bool _supErr(String* err, str objName, u32 type)
+{
+    _relErrBase(err, objName);
+    err->pushView(": unsupported relocation type ");
+    pushDec(err, type);
+    return false;
+}
+
+pub bool applyRels(u16 machine, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, u8* img, usize imgLen, String* err)
+{
+    bool is64 = machine == EM_X86_64;
+    for (usize o = 0; o < objs->count(); o++)
+    {
+        ObjFile* obj = objs->atPtr(o);
+        usize nsyms = obj->syms.count();
+        u64* addrs = alloc<u64>(nsyms > 0 ? nsyms : 1);
+        for (usize i = 0; i < nsyms; i++)
+        {
+            Sym* sym = obj->syms.atPtr(i);
+            if (i >= obj->firstGlobal)
+            {
+                i64 di = findDef(defs, sym->name);
+                if (di < 0)
+                {
+                    addrs[i] = 0;
+                    continue;
+                }
+                if (!defAddress(objs, L, defs->atPtr((usize)di), &addrs[i], err))
+                {
+                    dealloc<u64>(addrs);
+                    return false;
+                }
+                continue;
+            }
+            if (sym->shndx == SHN_UNDEF || sym->shndx == SHN_ABS)
+            {
+                addrs[i] = sym->shndx == SHN_ABS ? sym->value : 0;
+                continue;
+            }
+            if ((usize)sym->shndx >= obj->secs.count())
+            {
+                addrs[i] = 0;
+                continue;
+            }
+            Section* in = obj->secs.atPtr(sym->shndx);
+            if (in->outIdx == OUT_NONE)
+            {
+                addrs[i] = 0;
+                continue;
+            }
+            addrs[i] = L->secs.atPtr(in->outIdx)->addr + sym->value;
+        }
+
+        for (usize si = 0; si < obj->secs.count(); si++)
+        {
+            Section* sec = obj->secs.atPtr(si);
+            Vec<Reloc>* bucket = obj->rels.atPtr(si);
+            if (bucket->count() == 0) continue;
+            if (sec->outIdx == OUT_NONE) continue;
+            if (sec->type == SHT_NOBITS)
+            {
+                _relErrBase(err, obj->name);
+                err->pushView(": relocation against NOBITS section ");
+                err->pushView(sec->name);
+                dealloc<u64>(addrs);
+                return false;
+            }
+            OutSec* out = L->secs.atPtr(sec->outIdx);
+            for (usize k = 0; k < bucket->count(); k++)
+            {
+                Reloc* r = bucket->atPtr(k);
+                u64 S = addrs[r->sym];
+                u64 P = out->addr + r->offset;
+                usize fileOff = (usize)(out->offset + r->offset);
+                u32 t = r->type;
+                u64 w = 4;
+                if (is64 && (t == R_X86_64_64 || t == R_X86_64_PC64)) w = 8;
+                if (r->offset + w > out->size || !fits(fileOff, (usize)w, imgLen))
+                {
+                    _relErrBase(err, obj->name);
+                    err->pushView(": relocation target out of section bounds at ");
+                    pushHex(err, P);
+                    dealloc<u64>(addrs);
+                    return false;
+                }
+                i64 A = r->addend;
+                if (!r->rela)
+                {
+                    if (w == 8) A = (i64)leU64(img + fileOff);
+                    else A = (i64)(i32)leU32(img + fileOff);
+                }
+                u8* patch = img + fileOff;
+
+                if (is64)
+                {
+                    if (t == R_X86_64_64)
+                    {
+                        putU64(patch, S + (u64)A);
+                    }
+                    else if (t == R_X86_64_PC64)
+                    {
+                        putU64(patch, S + (u64)A - P);
+                    }
+                    else if (t == R_X86_64_PC32 || t == R_X86_64_PLT32 ||
+                             t == R_X86_64_GOTPCREL || t == R_X86_64_GOTPCRELX ||
+                             t == R_X86_64_REX_GOTPCRELX)
+                    {
+                        i64 v = (i64)S + A - (i64)P;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)(i32)v);
+                    }
+                    else if (t == R_X86_64_32)
+                    {
+                        i64 v = (i64)S + A;
+                        if (v < 0 || v > 0xffffffffu)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)v);
+                    }
+                    else if (t == R_X86_64_32S)
+                    {
+                        i64 v = (i64)S + A;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)(i32)v);
+                    }
+                    else if (t == R_X86_64_GLOB_DAT || t == R_X86_64_JUMP_SLOT ||
+                             t == R_X86_64_COPY || t == R_X86_64_RELATIVE)
+                    {
+                        dealloc<u64>(addrs);
+                        return _dynErr(err, obj->name, t);
+                    }
+                    else
+                    {
+                        dealloc<u64>(addrs);
+                        return _supErr(err, obj->name, t);
+                    }
+                }
+                else
+                {
+                    if (t == R_386_32)
+                    {
+                        u64 v = S + (u64)A;
+                        if (v > 0xffffffffu)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)v);
+                    }
+                    else if (t == R_386_PC32 || t == R_386_PLT32)
+                    {
+                        i64 v = (i64)S + A - (i64)P;
+                        if (v < -2147483647 - 1 || v > 2147483647)
+                        {
+                            dealloc<u64>(addrs);
+                            return _rangeErr(err, obj->name, t, P);
+                        }
+                        putU32(patch, (u32)(i32)v);
+                    }
+                    else if (t == R_386_GLOB_DAT || t == R_386_JUMP_SLOT || t == R_386_COPY)
+                    {
+                        dealloc<u64>(addrs);
+                        return _dynErr(err, obj->name, t);
+                    }
+                    else if (t == R_386_GOT32)
+                    {
+                        dealloc<u64>(addrs);
+                        return _dynErr(err, obj->name, t);
+                    }
+                    else
+                    {
+                        dealloc<u64>(addrs);
+                        return _supErr(err, obj->name, t);
+                    }
+                }
+            }
+        }
+        dealloc<u64>(addrs);
+    }
+    return true;
+}
