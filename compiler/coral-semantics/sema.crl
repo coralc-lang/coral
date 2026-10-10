@@ -270,6 +270,220 @@ pub extend Sema
         return m;
     }
 
+    /* append to a fixed diagnostic buffer (truncates, never overflows) */
+    void tyAppend(u8* buf, usize cap, usize* len, u8* s)
+    {
+        usize i = 0;
+        while (s[i] != 0 && *len + 1 < cap) { buf[*len] = s[i]; *len = *len + 1; i = i + 1; }
+        buf[*len] = 0;
+    }
+
+    void tyAppendCh(u8* buf, usize cap, usize* len, u8 c)
+    {
+        if (*len + 1 < cap) { buf[*len] = c; *len = *len + 1; buf[*len] = 0; }
+    }
+
+    void tyAppendName(u8* buf, usize cap, usize* len, Str name)
+    {
+        if (name == 0 || name >= self.ctx.internsLen) return;
+        InternEntry* ie = self.ctx.interns + name;
+        usize i = 0;
+        while (i < ie->len && *len + 1 < cap) { buf[*len] = ie->ptr[i]; *len = *len + 1; i = i + 1; }
+        buf[*len] = 0;
+    }
+
+    /* render a Ty the way the user spelled it — i32, u8*, const cchar*,
+     * str, Vec<i32>, T — into buf; returns buf. used by mismatch diags. */
+    u8* tySpelling(Ty t, u8* buf, usize cap)
+    {
+        usize len = 0;
+        u8* sub = (u8*)malloc(128);
+        u8* digits = (u8*)malloc(12);
+        buf[0] = 0;
+        if (sub == null || digits == null) { buf[0] = 63; buf[1] = 0; return buf; }
+        sub[0] = 0;
+        if (t == 0) { self.tyAppend(buf, cap, &len, (u8*)"void"); free(sub); free(digits); return buf; }
+        TypeEntry* e = self.ctx.types + t;
+        TypeKind k = e.kind;
+        switch (k.tag)
+        {
+            TypeKind::Void => { self.tyAppend(buf, cap, &len, (u8*)"void"); },
+            TypeKind::Bool => { self.tyAppend(buf, cap, &len, (u8*)"bool"); },
+            TypeKind::Char => { self.tyAppend(buf, cap, &len, (u8*)"char"); },
+            TypeKind::I8 => { self.tyAppend(buf, cap, &len, (u8*)"i8"); },
+            TypeKind::U8 => { self.tyAppend(buf, cap, &len, (u8*)"u8"); },
+            TypeKind::I16 => { self.tyAppend(buf, cap, &len, (u8*)"i16"); },
+            TypeKind::U16 => { self.tyAppend(buf, cap, &len, (u8*)"u16"); },
+            TypeKind::I32 => { self.tyAppend(buf, cap, &len, (u8*)"i32"); },
+            TypeKind::U32 => { self.tyAppend(buf, cap, &len, (u8*)"u32"); },
+            TypeKind::I64 => { self.tyAppend(buf, cap, &len, (u8*)"i64"); },
+            TypeKind::U64 => { self.tyAppend(buf, cap, &len, (u8*)"u64"); },
+            TypeKind::I128 => { self.tyAppend(buf, cap, &len, (u8*)"i128"); },
+            TypeKind::U128 => { self.tyAppend(buf, cap, &len, (u8*)"u128"); },
+            TypeKind::F32 => { self.tyAppend(buf, cap, &len, (u8*)"f32"); },
+            TypeKind::F64 => { self.tyAppend(buf, cap, &len, (u8*)"f64"); },
+            TypeKind::Isize => { self.tyAppend(buf, cap, &len, (u8*)"isize"); },
+            TypeKind::Usize => { self.tyAppend(buf, cap, &len, (u8*)"usize"); },
+            TypeKind::Rawptr => { self.tyAppend(buf, cap, &len, (u8*)"rawptr"); },
+            TypeKind::Str => { self.tyAppend(buf, cap, &len, (u8*)"str"); },
+            TypeKind::Error => { self.tyAppend(buf, cap, &len, (u8*)"error"); },
+            TypeKind::Named => {
+                self.tyAppendName(buf, cap, &len, k.payload.Named.name);
+                if (k.payload.Named.genericArgsLen > 0)
+                {
+                    self.tyAppendCh(buf, cap, &len, 60);
+                    u32 g = 0;
+                    while (g < k.payload.Named.genericArgsLen)
+                    {
+                        if (g > 0) self.tyAppend(buf, cap, &len, (u8*)", ");
+                        self.tySpelling(k.payload.Named.genericArgs[g], sub, 128);
+                        self.tyAppend(buf, cap, &len, sub);
+                        g = g + 1;
+                    }
+                    self.tyAppendCh(buf, cap, &len, 62);
+                }
+            },
+            TypeKind::Pointer => {
+                self.tySpelling(k.payload.Pointer.base, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+                self.tyAppendCh(buf, cap, &len, 42);
+            },
+            TypeKind::Const => {
+                self.tyAppend(buf, cap, &len, (u8*)"const ");
+                self.tySpelling(k.payload.Const.base, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+            },
+            TypeKind::Comptime => {
+                self.tyAppend(buf, cap, &len, (u8*)"comptime ");
+                self.tySpelling(k.payload.Comptime.base, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+            },
+            TypeKind::Slice => {
+                self.tySpelling(k.payload.Slice.base, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+                self.tyAppend(buf, cap, &len, (u8*)"[]");
+            },
+            TypeKind::Array => {
+                self.tySpelling(k.payload.Array.base, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+                self.tyAppendCh(buf, cap, &len, 91);
+                u32 n = k.payload.Array.len;
+                u32 di = 0;
+                if (n == 0) { digits[0] = 48; di = 1; }
+                while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n = n / 10; di = di + 1; }
+                while (di > 0) { di = di - 1; self.tyAppendCh(buf, cap, &len, digits[di]); }
+                self.tyAppendCh(buf, cap, &len, 93);
+            },
+            TypeKind::FnPtr => {
+                self.tySpelling(k.payload.FnPtr.returnType, sub, 128);
+                self.tyAppend(buf, cap, &len, sub);
+                self.tyAppend(buf, cap, &len, (u8*)"(");
+                u32 p = 0;
+                while (p < k.payload.FnPtr.paramsLen)
+                {
+                    if (p > 0) self.tyAppend(buf, cap, &len, (u8*)", ");
+                    self.tySpelling(k.payload.FnPtr.params[p], sub, 128);
+                    self.tyAppend(buf, cap, &len, sub);
+                    p = p + 1;
+                }
+                self.tyAppendCh(buf, cap, &len, 41);
+            },
+            TypeKind::Tuple => {
+                self.tyAppendCh(buf, cap, &len, 40);
+                u32 p = 0;
+                while (p < k.payload.Tuple.elemsLen)
+                {
+                    if (p > 0) self.tyAppend(buf, cap, &len, (u8*)", ");
+                    self.tySpelling(k.payload.Tuple.elems[p], sub, 128);
+                    self.tyAppend(buf, cap, &len, sub);
+                    p = p + 1;
+                }
+                self.tyAppendCh(buf, cap, &len, 41);
+            },
+            TypeKind::TypeParam => { self.tyAppendName(buf, cap, &len, k.payload.TypeParam.name); },
+            else => { self.tyAppend(buf, cap, &len, (u8*)"?"); }
+        }
+        free(sub);
+        free(digits);
+        return buf;
+    }
+
+    /* "argument `name`: got `<from>`, expected `<to>`" */
+    u8* paramMismatchMsg(Str paramName, Ty fromTy, Ty toTy)
+    {
+        u8* fb = (u8*)malloc(128);
+        u8* tb = (u8*)malloc(128);
+        if (fb == null || tb == null) return (u8*)"argument type mismatch";
+        self.tySpelling(fromTy, fb, 128);
+        self.tySpelling(toTy, tb, 128);
+        InternEntry* pe = self.ctx.interns + paramName;
+        usize fl = 0;
+        while (fb[fl] != 0) fl = fl + 1;
+        usize tl = 0;
+        while (tb[tl] != 0) tl = tl + 1;
+        u8* m = (u8*)malloc(pe->len + fl + tl + 40);
+        if (m == null) { free(fb); free(tb); return (u8*)"argument type mismatch"; }
+        usize n = 0;
+        usize i = 0;
+        u8* p1 = (u8*)"argument `";
+        i = 0;
+        while (p1[i] != 0) { m[n] = p1[i]; n = n + 1; i = i + 1; }
+        i = 0;
+        while (i < pe->len) { m[n] = pe->ptr[i]; n = n + 1; i = i + 1; }
+        u8* p2 = (u8*)"`: got `";
+        i = 0;
+        while (p2[i] != 0) { m[n] = p2[i]; n = n + 1; i = i + 1; }
+        i = 0;
+        while (i < fl) { m[n] = fb[i]; n = n + 1; i = i + 1; }
+        u8* p3 = (u8*)"`, expected `";
+        i = 0;
+        while (p3[i] != 0) { m[n] = p3[i]; n = n + 1; i = i + 1; }
+        i = 0;
+        while (i < tl) { m[n] = tb[i]; n = n + 1; i = i + 1; }
+        m[n] = 96; n = n + 1;
+        m[n] = 0;
+        free(fb);
+        free(tb);
+        return m;
+    }
+
+    /* "<what>: got `<from>`, expected `<to>`" — frees nothing; caller
+     * passes the result straight to semaErrorNode (engine copies it) */
+    u8* typeMismatchMsg(u8* what, Ty fromTy, Ty toTy)
+    {
+        u8* fb = (u8*)malloc(128);
+        u8* tb = (u8*)malloc(128);
+        if (fb == null || tb == null) return what;
+        self.tySpelling(fromTy, fb, 128);
+        self.tySpelling(toTy, tb, 128);
+        usize wl = 0;
+        while (what[wl] != 0) wl = wl + 1;
+        usize fl = 0;
+        while (fb[fl] != 0) fl = fl + 1;
+        usize tl = 0;
+        while (tb[tl] != 0) tl = tl + 1;
+        u8* m = (u8*)malloc(wl + fl + tl + 40);
+        if (m == null) { free(fb); free(tb); return what; }
+        usize n = 0;
+        usize i = 0;
+        while (i < wl) { m[n] = what[i]; n = n + 1; i = i + 1; }
+        u8* mid = (u8*)": got `";
+        i = 0;
+        while (mid[i] != 0) { m[n] = mid[i]; n = n + 1; i = i + 1; }
+        i = 0;
+        while (i < fl) { m[n] = fb[i]; n = n + 1; i = i + 1; }
+        u8* mid2 = (u8*)"`, expected `";
+        i = 0;
+        while (mid2[i] != 0) { m[n] = mid2[i]; n = n + 1; i = i + 1; }
+        i = 0;
+        while (i < tl) { m[n] = tb[i]; n = n + 1; i = i + 1; }
+        m[n] = 96; n = n + 1;
+        m[n] = 0;
+        free(fb);
+        free(tb);
+        return m;
+    }
+
     /* duplicate declaration: name it and note where the first one is */
     void dupDeclDiag(Str name, NodeId id)
     {

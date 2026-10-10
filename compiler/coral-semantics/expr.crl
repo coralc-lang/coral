@@ -142,7 +142,8 @@ pub extend Sema
         while (i < argsLen)
         {
             if (!self.checkAssign(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
-                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i], "argument type does not match parameter type");
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                    self.typeMismatchMsg((u8*)"argument type", self.exprType(args[i]), te->kind.payload.FnPtr.params[i]));
             i = i + 1;
         }
         self.setExprType(callId, te->kind.payload.FnPtr.returnType);
@@ -208,6 +209,17 @@ pub extend Sema
         u32 i = 0;
         while (i < argsLen)
         {
+            /* a `...pack` spread consumes the variadic tail — no per-slot
+             * check against a fixed param */
+            Node* argNode = self.ctx.nodes + args[i].index;
+            bool isSpread = argNode != null && argNode->kind.tag == NodeKind::Expr &&
+                            argNode->kind.payload.Expr.value.kind.tag == ExprKind::Spread;
+            if (isSpread)
+            {
+                if (!self.checkExpr(args[i])) return false;
+                i = i + 1;
+                continue;
+            }
             if (i < paramsLen)
             {
                 NodeId paramId = decl->kind.payload.Func.params[i];
@@ -223,9 +235,10 @@ pub extend Sema
                         {
                             if (param->name != 0)
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
-                                    self.nameMsgS((u8*)"argument type does not match parameter `", param->name, (u8*)"`"));
+                                    self.paramMismatchMsg(param->name, self.exprType(args[i]), want));
                             else
-                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i], "argument type does not match parameter type");
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                                    self.typeMismatchMsg((u8*)"argument type", self.exprType(args[i]), want));
                         }
                     }
                 }
@@ -549,7 +562,8 @@ pub extend Sema
             if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
             if (lLit && !rLit) { self.setExprType(id, rightType); return true; }
             if (rLit && !lLit) { self.setExprType(id, leftType); return true; }
-            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match; insert an explicit cast");
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
             self.setExprType(id, leftType);
             return true;
         }
@@ -560,7 +574,8 @@ pub extend Sema
             bool rFLit = right.index != 0 && self.isFloatLitNode(right);
             if (lFLit && !rFLit) { self.setExprType(id, rightType); return true; }
             if (rFLit && !lFLit) { self.setExprType(id, leftType); return true; }
-            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match; insert an explicit cast");
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
             self.setExprType(id, leftType);
             return true;
         }
@@ -594,7 +609,8 @@ pub extend Sema
             { self.setExprType(id, rightType); return true; }
             if (right.index != 0 && self.isIntLitNode(right) && self.floatType(leftType))
             { self.setExprType(id, leftType); return true; }
-            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match");
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
         }
         self.setExprType(id, leftType);
         return true;
@@ -969,9 +985,10 @@ pub extend Sema
                         {
                             if (param->name != 0)
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
-                                    self.nameMsgS((u8*)"method argument type does not match parameter `", param->name, (u8*)"`"));
+                                    self.paramMismatchMsg(param->name, self.exprType(argId), want));
                             else
-                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId, "method argument type does not match parameter type");
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
+                                    self.typeMismatchMsg((u8*)"method argument type", self.exprType(argId), want));
                         }
                     }
                     i = i + 1;
@@ -1129,8 +1146,10 @@ pub extend Sema
                 if (!self.assignExpr(expr->kind.payload.Assign.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.Assign.value)) return false;
                 NodeId av = expr->kind.payload.Assign.value;
-                if (!self.checkAssign(av, self.exprType(av), self.assignTargetType(expr->kind.payload.Assign.target)))
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
+                Ty atgt = self.assignTargetType(expr->kind.payload.Assign.target);
+                if (!self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg((u8*)"assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignAdd => {
@@ -1141,7 +1160,8 @@ pub extend Sema
                 /* `p += 1` is pointer arithmetic, not an int→pointer bind */
                 if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
                     !self.checkAssign(av, self.exprType(av), atgt))
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg((u8*)"compound assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignSub => {
@@ -1151,7 +1171,8 @@ pub extend Sema
                 Ty atgt = self.assignTargetType(expr->kind.payload.AssignSub.target);
                 if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
                     !self.checkAssign(av, self.exprType(av), atgt))
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
+                        self.typeMismatchMsg((u8*)"compound assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignMul => {
@@ -1295,7 +1316,14 @@ pub extend Sema
                     Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
                     Ty actual = self.exprType(valueId);
                     if (!self.checkAssign(valueId, actual, expected))
-                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, self.nameMsgS((u8*)"variant field `", fieldName, (u8*)"` type mismatch"));
+                    {
+                        if (fieldName != 0)
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.paramMismatchMsg(fieldName, actual, expected));
+                        else
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.typeMismatchMsg((u8*)"field type", actual, expected));
+                    }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                         i = i + 1;
                     }
@@ -1322,9 +1350,11 @@ pub extend Sema
                     if (!self.checkAssign(valueId, actual, expected))
                     {
                         if (litNames != 0)
-                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, self.nameMsgS((u8*)"field `", litNames[i], (u8*)"` type mismatch"));
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.paramMismatchMsg(litNames[i], actual, expected));
                         else
-                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, "struct literal field type mismatch");
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
+                                self.typeMismatchMsg((u8*)"struct field type", actual, expected));
                     }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                     i = i + 1;
@@ -1381,9 +1411,10 @@ pub extend Sema
                         {
                             if (param->name != 0)
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
-                                    self.nameMsgS((u8*)"argument type does not match parameter `", param->name, (u8*)"`"));
+                                    self.paramMismatchMsg(param->name, self.exprType(sarg), param->typeNode));
                             else
-                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg, "static method argument type does not match parameter type");
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
+                                    self.typeMismatchMsg((u8*)"static method argument type", self.exprType(sarg), param->typeNode));
                         }
                     }
                     i = i + 1;
@@ -1527,6 +1558,14 @@ pub extend Sema
             ExprKind::PostDec => { if (!self.assignExpr(expr->kind.payload.PostDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PostDec.expr)); return true; },
             ExprKind::PreInc => { if (!self.assignExpr(expr->kind.payload.PreInc.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreInc.expr)); return true; },
             ExprKind::PreDec => { if (!self.assignExpr(expr->kind.payload.PreDec.expr)) return false; self.setExprType(id, self.exprType(expr->kind.payload.PreDec.expr)); return true; },
+            ExprKind::Spread => {
+                /* `...pack` in a call arg list — the pack itself; arity and
+                 * per-arg checks for the spread tail are the call checker's
+                 * job. here we only type the inner expr. */
+                if (!self.checkExpr(expr->kind.payload.Spread.expr)) return false;
+                self.setExprType(id, self.exprType(expr->kind.payload.Spread.expr));
+                return true;
+            },
             ExprKind::IfExpr => {
                 if (!self.checkExpr(expr->kind.payload.IfExpr.cond)) return false;
                 Ty ifExprCondTy = self.exprType(expr->kind.payload.IfExpr.cond);

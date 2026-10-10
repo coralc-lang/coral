@@ -244,22 +244,39 @@ pub extend MonoContext
         Expr* callee = &calleeNode->kind.payload.Expr.value;
         if (callee->kind.tag != ExprKind::Ident) return true;
         NodeId declaration = self.findDeclaration(callee->kind.payload.Ident.name);
-        if (declaration.index == 0 || self.genericCount(declaration) == 0) return true;
-        Ty* arguments = (Ty*)calloc((usize)call->kind.payload.Call.argsLen, @sizeof(Ty));
+        u32 gcount = self.genericCount(declaration);
+        if (declaration.index == 0 || gcount == 0) return true;
+        /* one generic argument per type-param POSITION in the decl's param
+         * list — the call arg at that slot supplies the binding. the
+         * variadic tail and non-generic fixed params are excluded, so
+         * `println<comptime T>(T fmt, ...)` binds T from fmt's type alone
+         * and `println("{}", 42, x)` enqueues with argumentsLen=1. */
+        Decl* gdecl = self.declAt(declaration);
+        if (gdecl == null || gdecl->kind.tag != DeclKind::Func) return true;
+        Ty* arguments = (Ty*)calloc((usize)gcount, @sizeof(Ty));
         if (arguments == null)
         {
             self.errors = self.errors + 1;
             return false;
         }
-        u32 i = 0;
-        while (i < call->kind.payload.Call.argsLen)
+        u32 next = 0;
+        u32 p = 0;
+        while (p < gdecl->kind.payload.Func.paramsLen && next < gcount)
         {
-            arguments[i] = self.sema.exprType(call->kind.payload.Call.args[i]);
-            if (self.activeSubsLen > 0 && self.activeSubs != null)
-                arguments[i] = self.substituteType(arguments[i], self.activeSubs, self.activeSubsLen);
-            i = i + 1;
+            NodeId paramId = gdecl->kind.payload.Func.params[p];
+            if (self.isTypeParameter(paramId))
+            {
+                if (p < call->kind.payload.Call.argsLen)
+                {
+                    arguments[next] = self.sema.exprType(call->kind.payload.Call.args[p]);
+                    if (self.activeSubsLen > 0 && self.activeSubs != null)
+                        arguments[next] = self.substituteType(arguments[next], self.activeSubs, self.activeSubsLen);
+                }
+                next = next + 1;
+            }
+            p = p + 1;
         }
-        bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, call->kind.payload.Call.argsLen);
+        bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, gcount);
         free((rawptr)arguments);
         return ok;
     }
@@ -275,6 +292,7 @@ pub extend MonoContext
             ExprKind::TypeRef => { return self.collectType(expr->kind.payload.TypeRef.typeNode); },
             ExprKind::Field => { return self.collectExpr(expr->kind.payload.Field.obj); },
             ExprKind::Cast => { return self.collectExpr(expr->kind.payload.Cast.expr); },
+            ExprKind::Spread => { return self.collectExpr(expr->kind.payload.Spread.expr); },
             
             ExprKind::StructLiteral => {
                 if (!self.collectType(expr->kind.payload.StructLiteral.typeNode)) return false;
