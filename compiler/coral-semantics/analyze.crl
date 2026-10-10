@@ -137,6 +137,11 @@ struct LibLoader
     u32 bufsCap;
     LibSeg* platformRootSegs;
     u32 platformRootSegsLen;
+    /* in-memory module table from the builder (module/alias::name → path).
+     * authoritative over lib-root probing: a hit here is the resolution. */
+    Slice* modKeys;
+    Slice* modVals;
+    u32 modLen;
     u32 errors;
 }
 
@@ -377,6 +382,28 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
 u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
 {
     if (nsPtr == null || nsLen == 0) return null;
+    /* map-first: the builder's table is authoritative for module paths.
+     * keys are byte-compared (no interning) — `common::token` hits the
+     * entry the builder registered for that import. Returns a malloc'd
+     * copy because callers free() the result, same as libCandidate. */
+    if (L->modKeys != null && L->modLen > 0)
+    {
+        u32 mi = 0;
+        while (mi < L->modLen)
+        {
+            if (libBytesEq(L->modKeys[mi].ptr, L->modKeys[mi].len, nsPtr, nsLen))
+            {
+                usize vl = L->modVals[mi].len;
+                u8* copy = (u8*)malloc(vl + 1);
+                if (copy == null) return null;
+                usize vi = 0;
+                while (vi < vl) { copy[vi] = L->modVals[mi].ptr[vi]; vi = vi + 1; }
+                copy[vl] = 0;
+                return copy;
+            }
+            mi = mi + 1;
+        }
+    }
     u32 maxSegs = 1;
     usize i = 0;
     while (i + 1 < nsLen)
@@ -651,8 +678,27 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
          if (dn->kind.tag == NodeKind::Decl)
          {
              Decl* dd = &dn->kind.payload.Decl.value;
-             if (dd->kind.tag == DeclKind::Import && (dd->kind.payload.Import.flags & 1) != 0 && dd->kind.payload.Import.path != 0)
+             if (dd->kind.tag == DeclKind::Import && dd->kind.payload.Import.path != 0)
              {
+                 /* route: import(lib) always; plain `import a::b` too — a
+                  * namespace path is a module import, resolved via the
+                  * module table / lib roots, not a sibling file. Bare
+                  * `import name` stays with libLoadSiblingImports. */
+                 bool colonPath = false;
+                 {
+                     InternEntry* cp = L->ctx->interns + dd->kind.payload.Import.path;
+                     usize cq = 0;
+                     while (cq < cp->len)
+                     {
+                         if (cp->ptr[cq] == 58) { colonPath = true; break; }
+                         cq = cq + 1;
+                     }
+                 }
+                 if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath)
+                 {
+                     i = i + 1;
+                     continue;
+                 }
                  /* copy out before libResolve — parsing manifests grows the
                   * intern table, invalidating InternEntry pointers */
                  InternEntry* ie = L->ctx->interns + dd->kind.payload.Import.path;
@@ -803,19 +849,26 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                   u32 k = 0;
                   while (k < targets && tPtrs != null)
                   {
-                      u8* target = tPtrs[k];
-                      usize targetLen = tLens[k];
-                      u8* resolved = libResolve(L, target, targetLen);
-                      if (resolved == null)
-                      {
-                          if (tHard[k] != 0)
-                          {
-                              write(2, "coral: cannot resolve import(lib) ", 34);
-                              write(2, target, targetLen);
-                              write(2, "\n", 1);
-                              L->errors = L->errors + 1;
-                          }
-                      }
+                       u8* target = tPtrs[k];
+                       usize targetLen = tLens[k];
+                       u8* resolved = libResolve(L, target, targetLen);
+                       if (resolved == null)
+                       {
+                           if (tHard[k] != 0)
+                           {
+                               if ((dd->kind.payload.Import.flags & 1) != 0)
+                                   write(2, "coral: cannot resolve import(lib) ", 34);
+                               else
+                                   write(2, "coral: cannot resolve import ", 28);
+                               write(2, target, targetLen);
+                               write(2, "\n", 1);
+                               /* with a module table present, name the
+                                * likely cause: an unlisted module */
+                               if (L->modKeys != null && L->modLen > 0)
+                                   write(2, "  note: not in the module table; check modules/aliases in the build file\n", 73);
+                               L->errors = L->errors + 1;
+                           }
+                       }
                       else
                       {
                           if (getenv((u8*)"CORAL_TRACE_LOAD") != null)
@@ -1054,7 +1107,84 @@ bool libMerge(LibLoader* L, File* file)
     return true;
 }
 
-CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool silenced)
+/* target-flag override for the platform root: --flag platform=windows
+ * (a bare OS name, or a full '/'-separated x86_64/windows triple) plus
+ * an optional --flag arch=... pick the root that neutral lib paths
+ * resolve under. Precedence: these flags > CORAL_PLATFORM env > the
+ * built-in host default. Returns null when no platform flag is set. */
+LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
+{
+    *outLen = 0;
+    if (ctx == null || ctx->flagsLen == 0) return null;
+    Str platName = ctx.intern((u8*)"platform", 8);
+    Str archName = ctx.intern((u8*)"arch", 4);
+    Str platVal = 0;
+    Str archVal = 0;
+    u32 fi = 0;
+    while (fi < ctx->flagsLen)
+    {
+        if (ctx->flagNames[fi] == platName) platVal = ctx->flagValues[fi];
+        if (ctx->flagNames[fi] == archName) archVal = ctx->flagValues[fi];
+        fi = fi + 1;
+    }
+    if (platVal == 0) return null;
+    InternEntry* pe = ctx->interns + platVal;
+    u32 slashes = 0;
+    usize pi = 0;
+    while (pi < pe->len) { if (pe->ptr[pi] == 47) slashes = slashes + 1; pi = pi + 1; }
+    u32 segCount = slashes + 1;
+    if (slashes == 0) segCount = 2;
+    if (segCount > 4) segCount = 4;
+    LibSeg* segs = (LibSeg*)malloc(segCount * @sizeof(LibSeg));
+    if (segs == null) return null;
+    u32 k = 0;
+    if (slashes == 0)
+    {
+        /* bare OS name — prefix the arch. x86_64 is the only tree that
+         * exists in lib/std today; once the builder does manifest
+         * selection the full triple comes from the selected manifest's
+         * platform_root and this shim goes away. An explicit arch flag
+         * wins over the default. */
+        if (archVal != 0)
+        {
+            InternEntry* ae = ctx->interns + archVal;
+            segs[0].ptr = ae->ptr;
+            segs[0].len = (u32)ae->len;
+        }
+        else
+        {
+            segs[0].ptr = (u8*)"x86_64";
+            segs[0].len = 6;
+        }
+        segs[1].ptr = pe->ptr;
+        segs[1].len = (u32)pe->len;
+        k = 2;
+    }
+    else
+    {
+        usize start = 0;
+        pi = 0;
+        while (pi <= pe->len && k < segCount)
+        {
+            if (pi == pe->len || pe->ptr[pi] == 47)
+            {
+                if (pi > start && k < segCount)
+                {
+                    segs[k].ptr = pe->ptr + start;
+                    segs[k].len = (u32)(pi - start);
+                    k = k + 1;
+                }
+                start = pi + 1;
+            }
+            pi = pi + 1;
+        }
+    }
+    if (k == 0) { free(segs); return null; }
+    *outLen = k;
+    return segs;
+}
+
+CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool silenced, Slice* modKeys, Slice* modVals, u32 modLen)
 {
     CompileUnit unit = CompileUnit {
         .ctx = null,
@@ -1173,6 +1303,9 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         .bufsCap = 0,
         .platformRootSegs = null,
         .platformRootSegsLen = 0,
+        .modKeys = modKeys,
+        .modVals = modVals,
+        .modLen = modLen,
         .errors = 0
     };
     
@@ -1184,10 +1317,19 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         loader.diag = engine;
         /* platform root — neutral lib paths resolve under
          * <platform_root>/ first, then the base tree (see
-         * coral-docs/builder_incomplete.md). CORAL_PLATFORM overrides the
-         * default host triple ('/'-separated, e.g. x86_64/windows);
-         * target flags from the build manifest override this once
-         * manifest selection lands. */
+         * coral-docs/builder_incomplete.md). Target flags select the
+         * root first (--flag platform=windows[,arch=...]); then
+         * CORAL_PLATFORM ('/'-separated, e.g. x86_64/windows); then
+         * the built-in host default. */
+        u32 prFlagLen = 0;
+        LibSeg* prFromFlag = segsFromPlatformFlag(ctx, &prFlagLen);
+        if (prFromFlag != null)
+        {
+            loader.platformRootSegs = prFromFlag;
+            loader.platformRootSegsLen = prFlagLen;
+        }
+        if (loader.platformRootSegs == null)
+        {
         u8* plat = getenv((u8*)"CORAL_PLATFORM");
         usize plen = 0;
         while (plat != null && plat[plen] != 0) plen = plen + 1;
@@ -1232,6 +1374,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
                 loader.platformRootSegs = prSegs; // seems kinda hardcoded. there will be more 
                 loader.platformRootSegsLen = 2;   // host platforms and more target archs
             }
+        }
         }
         loader.loaded = (u8**)malloc(8 * @sizeof(u8*));
         loader.loadedLen = 0;

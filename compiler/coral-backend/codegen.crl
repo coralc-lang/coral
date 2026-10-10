@@ -1506,21 +1506,22 @@ Slice cgValExprTy(Codegen* cg, NodeId id)
 bool cgIntTyTag(Codegen* cg, Ty t)
 {
     if (t == 0) return false;
-    TypeKind tag = (cg.ctx->types + t)->kind.tag;
-    return tag == TypeKind::U8 || tag == TypeKind::U16 || tag == TypeKind::U32 || tag == TypeKind::U64 ||
-           tag == TypeKind::U128 || tag == TypeKind::I8 || tag == TypeKind::I16 || tag == TypeKind::I32 ||
-           tag == TypeKind::I64 || tag == TypeKind::I128 || tag == TypeKind::Usize || tag == TypeKind::Isize ||
-           tag == TypeKind::Char;
+    TypeEntry* e = cg.ctx->types + t;
+    return e->kind.tag == TypeKind::U8 || e->kind.tag == TypeKind::U16 || e->kind.tag == TypeKind::U32 ||
+           e->kind.tag == TypeKind::U64 || e->kind.tag == TypeKind::U128 || e->kind.tag == TypeKind::I8 ||
+           e->kind.tag == TypeKind::I16 || e->kind.tag == TypeKind::I32 || e->kind.tag == TypeKind::I64 ||
+           e->kind.tag == TypeKind::I128 || e->kind.tag == TypeKind::Usize || e->kind.tag == TypeKind::Isize ||
+           e->kind.tag == TypeKind::Char;
 }
 
 bool cgPtrTyTag(Codegen* cg, Ty t)
 {
     while (t != 0)
     {
-        TypeKind tag = (cg.ctx->types + t)->kind.tag;
-        if (tag == TypeKind::Pointer || tag == TypeKind::Rawptr) return true;
-        if (tag == TypeKind::Const) t = (cg.ctx->types + t)->kind.payload.Const.base;
-        else if (tag == TypeKind::Comptime) t = (cg.ctx->types + t)->kind.payload.Comptime.base;
+        TypeEntry* e = cg.ctx->types + t;
+        if (e->kind.tag == TypeKind::Pointer || e->kind.tag == TypeKind::Rawptr) return true;
+        if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+        else if (e->kind.tag == TypeKind::Comptime) t = e->kind.payload.Comptime.base;
         else return false;
     }
     return false;
@@ -5200,6 +5201,27 @@ void cgEmitProtos(Codegen* cg)
             if (dd.kind.tag == DeclKind::Func)
             {
                 if (cgDeclIsGeneric(cg, id)) { i = i + 1; continue; }
+                /* two extern decls of the same C name (libc's printf vs a
+                 * user redeclaration with a different pointer type) must
+                 * produce ONE prototype — C allows a name only once per
+                 * translation unit; first declaration wins */
+                if ((dd.kind.payload.Func.flags & 2) != 0)
+                {
+                    u32 j = 0;
+                    while (j < i)
+                    {
+                        Node* d2 = cgNode(cg, cg.file.decls[j]);
+                        if (d2.kind.tag == NodeKind::Decl)
+                        {
+                            Decl* d2d = &d2.kind.payload.Decl.value;
+                            if (d2d.kind.tag == DeclKind::Func && (d2d.kind.payload.Func.flags & 2) != 0 &&
+                                d2d.kind.payload.Func.name == dd.kind.payload.Func.name)
+                            { i = i + 1; break; }
+                        }
+                        j = j + 1;
+                    }
+                    if (j < i) continue;
+                }
                 /* emit prototypes for ALL extern fns too — the system
                  * headers are gone, so coral's own decl is the only one */
                 cgEmitProto(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),

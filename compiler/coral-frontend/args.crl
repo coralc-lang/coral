@@ -6,7 +6,7 @@ mod io_mod = import "io" { readCmdline, sliceCStr };
 extern("C") i32 printf(u8* fmt, ...);
 
 pub enum Command { Build, Map, Init, Run, Compile }
-pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Out, Other }
+pub enum Flag { Help, Force, DryRun, MapOnly, Strict, File, Out, Other, Explain, Version, AllowIntPtr, Quiet, Set }
 
 pub struct Options
 {
@@ -21,6 +21,15 @@ pub struct Options
     bool mapOnly;
     bool strict;
     bool emitHir;
+    bool version;
+    Slice explain;
+    bool explainSet;
+    usize errorLimit;
+    Slice* flagNames;
+    Slice* flagValues;
+    u32 flagsCount;
+    bool allowIntPtr;
+    bool quiet;
 }
 
 bool aEq(Slice a, u8* b, usize bl)
@@ -29,6 +38,63 @@ bool aEq(Slice a, u8* b, usize bl)
     usize i = 0;
     while (i < bl) {
         if (a.ptr[i] != b[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+bool aStartsWith(Slice a, u8* p, usize pl)
+{
+    if (a.len < pl) return false;
+    usize i = 0;
+    while (i < pl) { if (a.ptr[i] != p[i]) return false; i = i + 1; }
+    return true;
+}
+
+pub bool addFlagPair(Options* opts, Slice key, Slice val)
+{
+    if (key.len == 0) return true;
+    if (opts->flagsCount >= 32) return true;
+    if (opts->flagNames == null)
+    {
+        opts->flagNames = (Slice*)malloc(32 * @sizeof(Slice));
+        opts->flagValues = (Slice*)malloc(32 * @sizeof(Slice));
+    }
+    if (opts->flagNames == null || opts->flagValues == null) return false;
+    opts->flagNames[opts->flagsCount] = key;
+    opts->flagValues[opts->flagsCount] = val;
+    opts->flagsCount = opts->flagsCount + 1;
+    return true;
+}
+
+/* --flag VALUE — the std form is brace-wrapped comma pairs:
+ *   --flag {platform=windows,arch=x86_64,mode=debug}
+ * a bare NAME=VALUE is also accepted (and may repeat) */
+bool parseFlagValue(Options* opts, Slice val)
+{
+    if (val.len == 0)
+    {
+        printf("coral: --flag needs {name=value,...} or name=value\n");
+        return false;
+    }
+    usize start = 0;
+    usize end = val.len;
+    if (val.ptr[0] == 123 && val.ptr[end - 1] == 125) { start = 1; end = end - 1; }
+    usize segStart = start;
+    usize i = start;
+    while (i <= end)
+    {
+        if (i == end || val.ptr[i] == 44)
+        {
+            usize eq = segStart;
+            while (eq < i && val.ptr[eq] != 61) eq = eq + 1;
+            if (eq > segStart)
+            {
+                if (!addFlagPair(opts, Slice::from(val.ptr + segStart, eq - segStart),
+                                 Slice::from(val.ptr + eq + 1, i - eq - 1))) return false;
+            }
+            segStart = i + 1;
+        }
         i = i + 1;
     }
     return true;
@@ -55,17 +121,27 @@ Flag classifyFlag(Slice a)
             if (aEq(a, "-h", 2)) return Flag::Help;
             if (aEq(a, "-f", 2)) return Flag::File;
             if (aEq(a, "-o", 2)) return Flag::Out;
+            if (aEq(a, "-V", 2)) return Flag::Version;
+            if (aEq(a, "-w", 2)) return Flag::Quiet;
         },
-        6 => { if (aEq(a, "--help", 6)) return Flag::Help; },
+        6 => { if (aEq(a, "--help", 6)) return Flag::Help; if (aEq(a, "--flag", 6)) return Flag::Set; },
         7 => { if (aEq(a, "--force", 7)) return Flag::Force; },
        
         8 => { if (aEq(a, "--strict", 8)) return Flag::Strict; },
-        9 => { if (aEq(a, "--dry-run", 9)) return Flag::DryRun; },
+        9 => {
+            if (aEq(a, "--dry-run", 9)) return Flag::DryRun;
+            if (aEq(a, "--explain", 9)) return Flag::Explain;
+            if (aEq(a, "--version", 9)) return Flag::Version;
+        },
         // 10 => { if (aEq(a, "--emit-hir", 10)) return Flag::EmitHir; },
         // 10 => { if (aEq(a, "--map-only", 10)) return Flag::MapOnly; },
         // // the same condition '10' this is wrong. logically
+        15 => { if (aEq(a, "--allow-int-ptr", 15)) return Flag::AllowIntPtr; },
         else => { return Flag::Other; }
     }
+    /* a listed length that matched nothing — e.g. a .crl path of exactly
+     * 15 chars — fell off the switch; return Other instead of garbage */
+    return Flag::Other;
 }
 
 pub void usage()
@@ -84,6 +160,12 @@ pub void usage()
     printf("  --map-only    write modules.map only\n");
     printf("  --dry-run     compile without producing output\n");
     printf("  --strict      reject unknown build-file fields\n");
+    printf("  --flag {k=v,...}  set build-time flags for flag (NAME) selection\n");
+    printf("  --allow-int-ptr  permit int->pointer assignments (still reported)\n");
+    printf("  -w            silence diagnostics (does not change success/failure)\n");
+    printf("  --explain C   print a long explanation of diagnostic code C\n");
+    printf("  -ferror-limit=N  stop after N errors (0 = unlimited)\n"); // diagnistic, will be removed.
+    printf("  -V, --version print version identification\n");
     printf("  -h, --help    show this help\n");
 }
 
@@ -100,7 +182,16 @@ pub bool parseArgs(Options* opts)
         .dryRun = false,
         .mapOnly = false,
         .strict = false,
-        .emitHir = false
+        .emitHir = false,
+        .version = false,
+        .explain = Slice::from(null, 0),
+        .explainSet = false,
+        .errorLimit = 20,
+        .flagNames = null,
+        .flagValues = null,
+        .flagsCount = 0,
+        .allowIntPtr = false,
+        .quiet = false
     };
 
     Slice argv = readCmdline();
@@ -119,11 +210,32 @@ pub bool parseArgs(Options* opts)
         switch (f)
         {
             Flag::Help => { opts->help = true; return true; },
+            Flag::Version => { opts->version = true; return true; },
             Flag::Force => { opts->force = true; continue; },
             Flag::DryRun => { opts->dryRun = true; continue; },
             Flag::MapOnly => { opts->mapOnly = true; continue; },
             Flag::Strict => { opts->strict = true; continue; },
+            Flag::AllowIntPtr => { opts->allowIntPtr = true; continue; },
+            Flag::Quiet => { opts->quiet = true; continue; },
+            Flag::Explain => {
+                Slice val;
+                pos = nextArg(argv, pos, &val);
+                if (val.len == 0)
+                {
+                    printf("coral: --explain needs a code, e.g. --explain PAR-0001\n");
+                    return false;
+                }
+                opts->explain = val;
+                opts->explainSet = true;
+                continue;
+            },
             
+            Flag::Set => {
+                Slice val;
+                pos = nextArg(argv, pos, &val);
+                if (!parseFlagValue(opts, val)) return false;
+                continue;
+            },
             Flag::File => {
                 Slice val;
                 pos = nextArg(argv, pos, &val);
@@ -148,7 +260,31 @@ pub bool parseArgs(Options* opts)
                 continue;
             },
             
-            Flag::Other => {},
+            Flag::Other => {
+                /* -ferror-limit=N — Clang's flag; 0 disables the limit */
+                usize pl = 14;
+                if (tok.len > pl && aStartsWith(tok, (u8*)"-ferror-limit=", pl))
+                {
+                    usize v = 0;
+                    usize qi = pl;
+                    bool ok = true;
+                    while (qi < tok.len)
+                    {
+                        u8 c = tok.ptr[qi];
+                        if (c < 48 || c > 57) { ok = false; break; }
+                        v = v * 10 + (usize)(c - 48);
+                        if (v > 1000000) v = 1000000;
+                        qi = qi + 1;
+                    }
+                    if (!ok)
+                    {
+                        printf("coral: -ferror-limit needs a number, e.g. -ferror-limit=20\n");
+                        return false;
+                    }
+                    opts->errorLimit = v;
+                    continue;
+                }
+            },
             else => { return false; }
         }
 

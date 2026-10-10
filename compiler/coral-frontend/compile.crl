@@ -74,16 +74,92 @@ bool codeHasMain(Slice code)
     return false;
 }
 
-pub i32 compileFile(Options* opts)
+/* one compilation unit → one binary/object. The build path calls this with
+ * the builder's in-memory module table; single-file mode passes nulls. */
+pub i32 compileUnitTo(u8* inC, u8* outC, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen)
 {
-    u8* inC = sliceCStr(opts.input);
-    if (inC == null) return 1;
     usize len = 0;
     Slice src = readFile(inC, &len);
     if (src.ptr == null) {
         printf("coral: cannot read %s\n", inC);
         return 1;
     }
+    CompileUnit unit = analyzeForCompile(src.ptr, len, inC, flagsN, flagsV, nFlags, errorLimit, allowIntPtr, quiet, modKeys, modVals, modLen);
+    if (unit.ctx == null) {
+        printf("coral: compile failed, errors=%d (parse=%d sema=%d mono=%d)\n",
+               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors),
+               (i32)unit.parseErrors, (i32)unit.semanticErrors, (i32)unit.monoErrors);
+        return 2;
+    }
+
+    /* generated C sits next to the output: <out>.c */
+    usize outLen = 0;
+    while (outC[outLen] != 0) outLen = outLen + 1;
+    u8* cPath = (u8*)malloc(outLen + 3);
+    if (cPath == null) { freeUnit(&unit); return 1; }
+    usize ci = 0;
+    while (ci < outLen) { cPath[ci] = outC[ci]; ci = ci + 1; }
+    cPath[ci] = 46; cPath[ci + 1] = 99; cPath[ci + 2] = 0;
+
+    Arena a;
+    a.init(4194304);
+    CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
+    if (cg.errors > 0 || cg.cCode.ptr == null) {
+        printf("coral: codegen failed, errors=%d\n", (i32)cg.errors);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+
+    if (!writeFile(cPath, cg.cCode)) {
+        printf("coral: cannot write %s\n", cPath);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+    printf("coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
+
+    i32 rc = 0;
+    if (dryRun) {
+        printf("coral: dry run, would link %s\n", outC);
+    } else {
+        /* helper/library files emit no main — compile to an object instead
+         * of linking an executable (which would fail with undefined main) */
+        bool hasMain = codeHasMain(cg.cCode);
+        u8* cmd = (u8*)malloc(outLen + 4096);
+        if (cmd == null) { rc = 3; }
+        else {
+            usize cl = 0;
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)"gcc -std=gnu11 ", 15);
+            cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(cPath, outLen + 2));
+            if (hasMain) {
+                cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -o ", 4);
+                cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(outC, outLen));
+            } else {
+                cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -c -o ", 7);
+                cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(outC, outLen));
+            }
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -lm", 4);
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)" 2>&1", 5);
+            i32 st = system((char*)cmd);
+            if (st != 0) {
+                printf("coral: gcc failed (status %d)\n", (i32)st);
+                rc = 3;
+            } else {
+                printf("coral: compiled %s -> %s\n", inC, outC);
+            }
+        }
+    }
+
+    a.freeAll();
+    freeUnit(&unit);
+    return rc;
+}
+
+pub i32 compileFile(Options* opts)
+{
+    u8* inC = sliceCStr(opts.input);
+    if (inC == null) return 1;
 
     /* also surfacing build-file flags: the manifest's `flags = [ "NAME=VALUE",
      * ... ]` list merges into the compile-time flag table (see Options).  */
@@ -153,82 +229,25 @@ pub i32 compileFile(Options* opts)
             }
         }
     }
-    CompileUnit unit = analyzeForCompile(src.ptr, len, inC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->quiet);
-    if (unit.ctx == null) {
-        printf("coral: compile failed, errors=%d (parse=%d sema=%d mono=%d)\n",
-               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors),
-               (i32)unit.parseErrors, (i32)unit.semanticErrors, (i32)unit.monoErrors);
-        return 2;
-    }
-
     /* output binary path: -o or input minus `.crl` */
     Slice out = opts.output;
     if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
     u8* outC = sliceCStr(out);
-    if (outC == null) { freeUnit(&unit); return 1; }
+    if (outC == null) return 1;
 
-    /* generated C sits next to the output: <out>.c */
-    u8* cPath = (u8*)malloc(out.len + 3);
-    if (cPath == null) { freeUnit(&unit); return 1; }
-    usize ci = 0;
-    while (ci < out.len) { cPath[ci] = out.ptr[ci]; ci = ci + 1; }
-    cPath[ci] = 46; cPath[ci + 1] = 99; cPath[ci + 2] = 0;
-
-    Arena a;
-    a.init(4194304);
-    CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
-    if (opts.emitHir) {
-        HirModule* hir = build(unit.ctx, unit.file, unit.mono, unit.ctx.intern(opts.input.ptr, opts.input.len));
-        printHir(unit.ctx, hir);
-    }
-    if (cg.errors > 0 || cg.cCode.ptr == null) {
-        printf("coral: codegen failed, errors=%d\n", (i32)cg.errors);
-        a.freeAll();
-        freeUnit(&unit);
-        return 3;
-    }
-
-    if (!writeFile(cPath, cg.cCode)) {
-        printf("coral: cannot write %s\n", cPath);
-        a.freeAll();
-        freeUnit(&unit);
-        return 3;
-    }
-    printf("coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
-
-    i32 rc = 0;
-    if (opts.dryRun) {
-        printf("coral: dry run, would link %s\n", outC);
-    } else {
-        /* helper/library files emit no main — compile to an object instead
-         * of linking an executable (which would fail with undefined main) */
-        bool hasMain = codeHasMain(cg.cCode);
-        u8* cmd = (u8*)malloc(out.len + 4096);
-        if (cmd == null) { rc = 3; }
-        else {
-            usize cl = 0;
-            cl = appendStr(cmd, out.len + 4096, cl, (u8*)"gcc -std=gnu11 ", 15);
-            cl = appendSlice(cmd, out.len + 4096, cl, Slice::from(cPath, out.len + 2));
-            if (hasMain) {
-                cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -o ", 4);
-                cl = appendSlice(cmd, out.len + 4096, cl, out);
-            } else {
-                cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -c -o ", 7);
-                cl = appendSlice(cmd, out.len + 4096, cl, out);
-            }
-            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" -lm", 4);
-            cl = appendStr(cmd, out.len + 4096, cl, (u8*)" 2>&1", 5);
-            i32 st = system((char*)cmd);
-            if (st != 0) {
-                printf("coral: gcc failed (status %d)\n", (i32)st);
-                rc = 3;
-            } else {
-                printf("coral: compiled %s -> %s\n", inC, outC);
+    i32 rc = compileUnitTo(inC, outC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->quiet, opts->dryRun, null, null, 0);
+    if (rc == 0 && opts.emitHir) {
+        /* HIR dump needs a second analysis pass; cheap enough for a debug flag */
+        usize hlen = 0;
+        Slice hsrc = readFile(inC, &hlen);
+        if (hsrc.ptr != null) {
+            CompileUnit hunit = analyzeForCompile(hsrc.ptr, hlen, inC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, true, null, null, 0);
+            if (hunit.ctx != null) {
+                HirModule* hir = build(hunit.ctx, hunit.file, hunit.mono, hunit.ctx.intern(opts.input.ptr, opts.input.len));
+                printHir(hunit.ctx, hir);
+                freeUnit(&hunit);
             }
         }
     }
-
-    a.freeAll();
-    freeUnit(&unit);
     return rc;
 }
