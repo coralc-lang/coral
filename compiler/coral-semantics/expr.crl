@@ -1481,6 +1481,66 @@ pub extend Sema
                     self.setExprType(id, lit ? self.boolType() : self.boolType());
                     return true;
                 }
+                /* @typeof(x) — the type of x, only inside comptime blocks,
+                 * and only on a type name, a variable, or a literal
+                 * (int/float/bool/null/str). not on arbitrary expressions. */
+                if (bname == self.ctx.intern((u8*)"typeof", 6))
+                {
+                    if (self.comptimeDepth == 0)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof is only allowed inside a comptime block");
+                        return false;
+                    }
+                    if (expr->kind.payload.BuiltinCall.argsLen != 1)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof takes exactly one argument");
+                        return false;
+                    }
+                    NodeId aid = expr->kind.payload.BuiltinCall.args[0];
+                    Node* an = self.ctx.nodes + aid.index;
+                    if (an == null || an->kind.tag != NodeKind::Expr)
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof argument must be a type, variable, or literal");
+                        return false;
+                    }
+                    Expr* ae = &an->kind.payload.Expr.value;
+                    u8 akind = 0;
+                    /* 1=literal 2=ident/var 3=type */
+                    if (ae->kind.tag == ExprKind::IntLit ||
+                        ae->kind.tag == ExprKind::FloatLit ||
+                        ae->kind.tag == ExprKind::BoolLit ||
+                        ae->kind.tag == ExprKind::NullLit ||
+                        ae->kind.tag == ExprKind::StringLit ||
+                        ae->kind.tag == ExprKind::CharLit)
+                        akind = 1;
+                    else if (ae->kind.tag == ExprKind::Ident)
+                        akind = 2;
+                    else if (ae->kind.tag == ExprKind::TypeRef)
+                        akind = 3;
+                    else
+                    {
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
+                            "@typeof argument must be a type, variable, or literal");
+                        return false;
+                    }
+                    /* resolve the type of the argument */
+                    Ty argTy = 0;
+                    if (akind == 3)
+                        argTy = ae->kind.payload.TypeRef.typeNode;
+                    else
+                    {
+                        if (!self.checkExpr(aid)) return false;
+                        argTy = self.exprType(aid);
+                    }
+                    /* @typeof returns a type as a comptime value; the
+                     * expression is typed as the type-of-types placeholder
+                     * (u64) so it can flow into comptime switch arms */
+                    self.setExprType(id, self.u64Type());
+                    return true;
+                }
                 return true;
             },
             ExprKind::TupleExpr => {

@@ -6,12 +6,18 @@ mod node = import "../coral-ast/node";
 import node { Node, NodeKind };
 mod decl_ast = import "../coral-ast/decl";
 import decl_ast { Decl, DeclKind, GenericParam };
+mod stmt_ast = import "../coral-ast/stmt";
+import stmt_ast { Stmt, StmtKind };
+mod context = import "../coral-context/context";
+import context { AstContext };
 mod sema = import "../coral-semantics/sema";
 import sema { Sema };
 mod mono = import "mono";
 import mono { MonoContext, MonoDeclKind, MonoInstance, MonoInstanceKind, MonoSubstitution };
 mod collect = import "collect";
 import collect;
+mod comptime_eval = import "comptime";
+import comptime_eval { CtEval, ctEvalStmts };
 
 extern("C") rawptr calloc(usize count, usize size);
 extern("C") rawptr realloc(rawptr ptr, usize size);
@@ -229,7 +235,14 @@ pub extend MonoContext
             self.activeSubsLen = instance.substitutionsLen;
             if (instance.kind == MonoInstanceKind::FunctionInstance)
             {
-                if (instance.body.index != 0) self.collectStmt(instance.body);
+                if (instance.body.index != 0)
+                {
+                    self.collectStmt(instance.body);
+                    /* staging: evaluate the body's comptime blocks with the
+                     * instance's type substitutions bound; surviving runtime
+                     * statements replace the original body */
+                    self.evalComptimeBody(instance);
+                }
             }
             else if (instance.kind == MonoInstanceKind::TypeInstance)
             {
@@ -267,5 +280,76 @@ pub extend MonoContext
             i = i + 1;
         }
         return self.errors == 0;
+    }
+
+    /* staging: evaluate comptime blocks in a function instance's body.
+     * binds type params from substitutions, then rewrites the body's
+     * comptime control flow into runtime statements. the original body
+     * is only replaced when the evaluator produced output (i.e. there
+     * was something to fold); otherwise the body passes through and
+     * codegen inlines the comptime blocks as before. */
+    void evalComptimeBody(MonoInstance* instance)
+    {
+        /* only rewire bodies that actually contain a comptime block —
+         * every other instance skips the evaluator entirely */
+        Node* bn = self.nodeAt(instance.body);
+        if (bn == null || bn->kind.tag != NodeKind::Stmt) return;
+        Stmt* bs = &bn->kind.payload.Stmt.value;
+        bool hasCt = false;
+        if (bs->kind.tag == StmtKind::Comptime) hasCt = true;
+        else if (bs->kind.tag == StmtKind::Block)
+        {
+            u32 s = 0;
+            while (s < bs->kind.payload.Block.stmtsLen)
+            {
+                Node* sn = self.nodeAt(bs->kind.payload.Block.stmts[s]);
+                if (sn != null && sn->kind.tag == NodeKind::Stmt &&
+                    sn->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                    hasCt = true;
+                s = s + 1;
+            }
+        }
+        if (!hasCt) return;
+
+        CtEval ct;
+        ct.init(self);
+        /* bind each generic parameter to its concrete type so type
+         * switches (`switch (T)`) fold during evaluation */
+        u32 i = 0;
+        while (i < instance.substitutionsLen)
+        {
+            ct.bind(instance.substitutions[i].parameter,
+                    ct.makeType(instance.substitutions[i].typeNode));
+            i = i + 1;
+        }
+        ct.evalStmt(instance.body);
+        if (ct.failed)
+        {
+            self.errors = self.errors + 1;
+            ct.dispose();
+            return;
+        }
+        /* replace the body with a Block of the surviving runtime stmts */
+        if (ct.emittedLen > 0 && ct.emittedLen != bs->kind.payload.Block.stmtsLen)
+        {
+            NodeId* out = (NodeId*)calloc((usize)ct.emittedLen, @sizeof(NodeId));
+            if (out != null)
+            {
+                u32 k = 0;
+                while (k < ct.emittedLen) { out[k] = ct.emitted[k]; k = k + 1; }
+                AstContext* c = self.ast;
+                NodeId newBody = c.allocNodeSlot();
+                if (newBody.index != 0)
+                {
+                    Node* nn = c.nodes + newBody.index;
+                    nn->loc = bn->loc;
+                    nn->kind = NodeKind::Stmt{ .value = Stmt{ .kind = StmtKind::Block{ .stmts = out, .stmtsLen = ct.emittedLen }, .loc = bn->loc } };
+                    instance.body = newBody;
+                    /* arena-tracked so clear() need not free it */
+                    c.track((rawptr)out);
+                }
+            }
+        }
+        ct.dispose();
     }
 }
