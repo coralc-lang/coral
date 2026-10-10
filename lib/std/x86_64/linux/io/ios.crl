@@ -8,7 +8,8 @@ import(lib) core::limits { INT64_MAX, INT64_MIN };
 struct _Buf
 {
     i32 fd;
-    str data;
+    u8* data;
+    usize len;
 }
 
 #[[inline]]
@@ -17,19 +18,19 @@ static void _writeStr(i32 fd, str s) { if (s.len > 0) write(fd, s.ptr, s.len); }
 #[[inline]]
 static void _pflush(_Buf* out)
 {
-    if (out->data.len > 0)
+    if (out->len > 0)
     {
-        write(out->fd, out->data.ptr, out->data.len);
-        out->data.len = 0;
+        write(out->fd, out->data, out->len);
+        out->len = 0;
     }
 }
 
 #[[inline]]
 static void _pbyte(_Buf* out, u8 c)
 {
-    if (out->data.len >= 1024u) _pflush(out);
-    out->data.ptr[out->data.len] = c;
-    out->data.len++;
+    if (out->len >= 1024u) _pflush(out);
+    out->data[out->len] = c;
+    out->len++;
 }
 
 #[[inline]]
@@ -43,9 +44,9 @@ static void _pbytes(_Buf* out, const cchar* s, usize n)
         _writeStr(out->fd, str::fromParts((u8*)s, n));
         return;
     }
-    if (out->data.len + n > 1024u) _pflush(out);
-    for (usize i = 0; i < n; i++) out->data.ptr[out->data.len + i] = s[i];
-    out->data.len += n;
+    if (out->len + n > 1024u) _pflush(out);
+    for (usize i = 0; i < n; i++) out->data[out->len + i] = s[i];
+    out->len += n;
 }
 
 // hand-rolled itoa - no std::fmt dep, no String alloc per number
@@ -301,7 +302,7 @@ static void _fprintOne<T>(_Buf* out, T val)
 static void _printOne<T>(T val)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 1, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
     _fprintOne(&out, val);
     _pflush(&out);
 }
@@ -309,7 +310,7 @@ static void _printOne<T>(T val)
 static void _eprintOne<T>(T val)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 2, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 2, .data = outBuf, .len = 0 };
     _fprintOne(&out, val);
     _pflush(&out);
 }
@@ -507,7 +508,7 @@ static void _printEmit<T>(_Buf* out, T fmt, ... args)
 pub void print<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 1, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
     comptime { _printEmit(&out, fmt, ...); }
     _pflush(&out);
 }
@@ -515,7 +516,7 @@ pub void print<comptime T>(T fmt, ...)
 pub void println<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 1, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
     comptime { _printEmit(&out, fmt, ...); }
     _fprintNewline(&out);
     _pflush(&out);
@@ -524,7 +525,7 @@ pub void println<comptime T>(T fmt, ...)
 pub void eprint<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 2, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 2, .data = outBuf, .len = 0 };
     comptime { _printEmit(&out, fmt, ...); }
     _pflush(&out);
 }
@@ -532,7 +533,7 @@ pub void eprint<comptime T>(T fmt, ...)
 pub void eprintln<comptime T>(T fmt, ...)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 2, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 2, .data = outBuf, .len = 0 };
     comptime { _printEmit(&out, fmt, ...); }
     _fprintNewline(&out);
     _pflush(&out);
@@ -548,7 +549,7 @@ pub void eprintln<comptime T>(T fmt, ...)
 pub void vaprint(... args)
 {
     u8 outBuf[1024];
-    _Buf out = _Buf { .fd = 1, .data.ptr = outBuf, .len = 0 };
+    _Buf out = _Buf { .fd = 1, .data = outBuf, .len = 0 };
     comptime { for (var arg : args) _fprintOne(&out, arg); }
     _pflush(&out);
 }
@@ -565,8 +566,8 @@ pub Repeat repeat(u8 ch, u64 count) { return Repeat { .ch = ch, .count = count }
 pub Hex hex(u64 value) { return Hex { .value = value }; }
 pub Bin bin(u64 value) { return Bin { .value = value }; }
 pub Fixed fixed(f64 value, u64 precision) { return Fixed { .value = value, .precision = precision }; }
-
-#[[inline]] pub void flush() { _fprintFlush(1); }
+#[[inline]]
+pub void flush() { _fprintFlush(1); }
 
 static i64 _readI64()
 {
