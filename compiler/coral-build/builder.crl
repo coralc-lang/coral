@@ -13,7 +13,8 @@ extern("C") void free(rawptr ptr);
 extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
 extern("C") usize strlen(u8* s);
 extern("C") i64 syscall(i64 num, ...);
-extern("C") u8* getenv(u8* name);
+/* getenv: declared by <stdlib.h> in the generated C — same as analyze.crl,
+ * no coral-level extern (a redeclaration would conflict with the header) */
 
 // small helpers
 
@@ -711,8 +712,9 @@ Slice bPlatformRoot(Builder* b)
     {
         u8* p = (u8*)b.arena.alloc(14, 1);
         if (p == null) return Slice::from(null, 0);
+        u8* dflt = (u8*)"x86_64/linux";
         usize k = 0;
-        while (k < 13) { p[k] = (u8*)"x86_64/linux"[k]; k = k + 1; }
+        while (k < 13) { p[k] = dflt[k]; k = k + 1; }
         p[13] = 0;
         return Slice::from(p, 13);
     }
@@ -838,7 +840,8 @@ u8* bProbePath(u8* baseC, u8* pathSlash, usize pathLen)
 {
     usize bl = 0;
     while (baseC[bl] != 0) bl = bl + 1;
-    usize cand = bl + 1 + pathLen + 4 + 1;
+    /* room for BOTH candidates: base + '/' + path + "/lib.crl" + NUL */
+    usize cand = bl + 1 + pathLen + 9 + 1;
     u8* p = (u8*)malloc(cand);
     if (p == null) return null;
     usize n = 0;
@@ -1016,13 +1019,13 @@ bool bBuildModuleTable(Builder* b)
         if (bFileExists(libP))
         {
             /* module surface: `module` → lib.crl; alias → lib.crl */
-            if (!bModTableHas(*b, b.modules[m])) bModTableAdd(b, b.modules[m], Slice::from(libP, n));
+            if (!bModTableHas(b, b.modules[m])) bModTableAdd(b, b.modules[m], Slice::from(libP, n));
             u32 ai = 0;
             while (ai < b.aliasesLen)
             {
                 if (bEq(b.aliases[ai].folder, b.modules[m].ptr, b.modules[m].len))
                 {
-                    if (!bModTableHas(*b, b.aliases[ai].name)) bModTableAdd(b, b.aliases[ai].name, Slice::from(libP, n));
+                    if (!bModTableHas(b, b.aliases[ai].name)) bModTableAdd(b, b.aliases[ai].name, Slice::from(libP, n));
                 }
                 ai = ai + 1;
             }
@@ -1111,7 +1114,8 @@ pub bool bWriteAllFps(Builder* b)
     return ok;
 }
 
-/* create the parent directory of a file path (for output=build/foo) */
+/* create the parent directory of a file path (for output=build/foo).
+ * an existing directory is success (mkdir EEXIST). */
 pub bool bMkdirParent(u8* path)
 {
     usize len = 0;
@@ -1126,8 +1130,15 @@ pub bool bMkdirParent(u8* path)
     while (i < (usize)last) { dir[i] = path[i]; i = i + 1; }
     dir[last] = 0;
     i32 r = (i32)syscall(83, dir, 493);
+    bool ok = r == 0;
+    if (!ok)
+    {
+        /* mkdir failed — fine if the directory is already there */
+        i32 fd = open(dir, 0, 0);
+        if (fd >= 0) { close(fd); ok = true; }
+    }
     free(dir);
-    return r == 0;
+    return ok;
 }
 
 bool bWriteMap(Builder* b)
