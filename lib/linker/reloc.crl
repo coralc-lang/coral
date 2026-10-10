@@ -13,7 +13,7 @@
 import(lib) std::vec { Vec };
 import(lib) std::text::string { String };
 import(lib) std::mman { alloc, dealloc };
-import elf { SHT_NOBITS, STB_LOCAL, SHN_ABS, SHN_UNDEF, OUT_NONE, EM_X86_64, FMT_ELF_DYN, FMT_PE_EXE, FMT_PE_DLL, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_COPY, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32, R_X86_64_32S, R_X86_64_PC64, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_386_32, R_386_PC32, R_386_GOT32, R_386_PLT32, R_386_COPY, R_386_GLOB_DAT, R_386_JUMP_SLOT, fits, leU32, leU64, putU16, putU32, putU64, pushDec, pushHex };
+import elf { SHT_NOBITS, SHF_ALLOC, STB_LOCAL, SHN_ABS, SHN_UNDEF, OUT_NONE, EM_X86_64, FMT_ELF_DYN, FMT_PE_EXE, FMT_PE_DLL, R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_COPY, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32, R_X86_64_32S, R_X86_64_PC64, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX, R_386_32, R_386_PC32, R_386_GOT32, R_386_PLT32, R_386_COPY, R_386_GLOB_DAT, R_386_JUMP_SLOT, fits, leU32, leU64, putU16, putU32, putU64, pushDec, pushHex };
 import coff { IMAGE_REL_AMD64_ADDR64, IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_AMD64_REL32, IMAGE_REL_AMD64_SECREL, IMAGE_REL_AMD64_SECREL7, IMAGE_REL_AMD64_SECTION, IMAGE_REL_I386_DIR32, IMAGE_REL_I386_DIR32NB, IMAGE_REL_I386_SECTION, IMAGE_REL_I386_SECREL, IMAGE_REL_I386_REL32 };
 import object { ObjFile, Section, Sym, Reloc };
 import resolve { GlobalDef, findDef };
@@ -105,7 +105,7 @@ static u16 _targetSecIndex(ObjFile* obj, u32 symIdx)
     if ((usize)ts->shndx >= obj->secs.count()) return 0;
     Section* tin = obj->secs.atPtr(ts->shndx);
     if (tin->outIdx == OUT_NONE) return 0;
-    return (u16)tin->outIdx;
+    return (u16)(tin->outIdx + 1); /* COFF section numbers are 1-based */
 }
 
 pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* defs, Layout* L, u8* img, usize imgLen, Vec<u32>* fixups, String* err)
@@ -168,11 +168,16 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                 return false;
             }
             OutSec* out = L->secs.atPtr(sec->outIdx);
+            /* non-allocated (debug/metadata) sections relocate as if
+             * P were zero: the stored value is S+A, the form debug
+             * consumers expect; they never get base fixups either. */
+            bool allocd = (out->flags & SHF_ALLOC) != 0;
+            Vec<u32>* rec = allocd ? fixups : null;
             for (usize k = 0; k < bucket->count(); k++)
             {
                 Reloc* r = bucket->atPtr(k);
                 u64 S = addrs[r->sym];
-                u64 P = out->addr + r->offset;
+                u64 P = allocd ? out->addr + r->offset : 0;
                 usize fileOff = (usize)(out->offset + r->offset);
                 u32 t = r->type;
 
@@ -221,7 +226,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                         if (t == IMAGE_REL_AMD64_ADDR64)
                         {
                             putU64(patch, S + (u64)A);
-                            if (!_recordFixup(fixups, outFmt, true, fileOff, true))
+                            if (!_recordFixup(rec, outFmt, true, fileOff, true))
                             {
                                 dealloc<u64>(addrs);
                                 return _dyn32Err(err, obj->name, t, P);
@@ -236,7 +241,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                                 return _rangeErr(err, obj->name, t, P);
                             }
                             putU32(patch, (u32)v);
-                            if (!_recordFixup(fixups, outFmt, true, fileOff, false))
+                            if (!_recordFixup(rec, outFmt, true, fileOff, false))
                             {
                                 dealloc<u64>(addrs);
                                 return _dyn32Err(err, obj->name, t, P);
@@ -295,7 +300,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                                 return _rangeErr(err, obj->name, t, P);
                             }
                             putU32(patch, (u32)v);
-                            if (!_recordFixup(fixups, outFmt, false, fileOff, false))
+                            if (!_recordFixup(rec, outFmt, false, fileOff, false))
                             {
                                 dealloc<u64>(addrs);
                                 return _dyn32Err(err, obj->name, t, P);
@@ -351,7 +356,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                     if (t == R_X86_64_64)
                     {
                         putU64(patch, S + (u64)A);
-                        if (!_recordFixup(fixups, outFmt, true, fileOff, true))
+                        if (!_recordFixup(rec, outFmt, true, fileOff, true))
                         {
                             dealloc<u64>(addrs);
                             return _dyn32Err(err, obj->name, t, P);
@@ -382,7 +387,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                             return _rangeErr(err, obj->name, t, P);
                         }
                         putU32(patch, (u32)v);
-                        if (!_recordFixup(fixups, outFmt, true, fileOff, false))
+                        if (!_recordFixup(rec, outFmt, true, fileOff, false))
                         {
                             dealloc<u64>(addrs);
                             return _dyn32Err(err, obj->name, t, P);
@@ -397,7 +402,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                             return _rangeErr(err, obj->name, t, P);
                         }
                         putU32(patch, (u32)(i32)v);
-                        if (!_recordFixup(fixups, outFmt, true, fileOff, false))
+                        if (!_recordFixup(rec, outFmt, true, fileOff, false))
                         {
                             dealloc<u64>(addrs);
                             return _dyn32Err(err, obj->name, t, P);
@@ -426,7 +431,7 @@ pub bool applyRels(u16 machine, u8 outFmt, Vec<ObjFile>* objs, Vec<GlobalDef>* d
                             return _rangeErr(err, obj->name, t, P);
                         }
                         putU32(patch, (u32)v);
-                        if (!_recordFixup(fixups, outFmt, false, fileOff, false))
+                        if (!_recordFixup(rec, outFmt, false, fileOff, false))
                         {
                             dealloc<u64>(addrs);
                             return _dyn32Err(err, obj->name, t, P);

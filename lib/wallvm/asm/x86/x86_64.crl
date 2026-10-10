@@ -12,6 +12,7 @@ import(lib) wallvm::asm::x86::obj { AsmObject, AsmSymbol, AsmRelocKind, asmAddRe
 import(lib) wallvm::asm::x86::x86_avx { EncodeCtx, ctxNew, tryVecTable };
 import(lib) core::char_util { isAlpha, isDigit, isSpace };
 import(lib) core::cchar { cchar };
+import(lib) platform::libc { free };
 
 // operand-size suffixes
 static u8 sizeOfSuffix(str s)
@@ -96,7 +97,8 @@ enum FormSig
     FS_R,      // reg alone    → B8+r/50+r (push/movabs/bswap)
     FS_I,      // imm alone    (push $imm)
     FS_REL,    // relative branch
-    FS_IMR     // imm, reg, rm — shld/shrd imm form
+    FS_IMR,    // imm, reg, rm — shld/shrd imm form
+    FS_RRM     // imm, rm, reg — three-operand imul (imm, src, dst)
 }
 
 // immediate width codes in a row
@@ -210,11 +212,11 @@ static FormRow _forms[] = {
     { "inc", SZ1248, FS_RM, 0xFE, 0, 0, 0, false, false, false, 0 },
     { "dec", SZ1248, FS_RM, 0xFE, 0, 1, 0, false, false, false, 0 },
 
-    // imul: 1-op F7/5, 2-op 0F AF, 3-op imm forms
+    // imul: 1-op F7/5, 2-op 0F AF, imm forms 6B/69 (reg field 0, rm is dst)
     { "imul", SZ1248, FS_RM, 0xF6, 0, 5, 0, false, false, false, 0 },
     { "imul", SZ248,  FS_R_RM, 0x0F, 0xAF, NOREG, 0, false, false, false, 0 },
-    { "imul", SZ248,  FS_R_I,  0x6B, 0, NOREG, 1, true,  false, false, 0 },
-    { "imul", SZ248,  FS_R_I,  0x69, 0, NOREG, 9, false, false, false, 0 },
+    { "imul", SZ248,  FS_RM_I, 0x6B, 0, 0, 1, true,  false, false, 0 },
+    { "imul", SZ248,  FS_RM_I, 0x69, 0, 0, 9, false, false, false, 0 },
 
     // shifts: rol ror rcl rcr shl sal shr sar — group C0/D0/D3. The
     // by-cl (D3) and by-one (D0/D1) forms are built by the matcher from
@@ -297,7 +299,76 @@ static FormRow _forms[] = {
     { "hlt",     0, FS_NONE, 0xF4, 0, NOREG, 0, false, false, false, 0 },
     { "call", 0, FS_REL, 0xE8, 0, NOREG, 4, false, false, false, 0 },
     { "call", 0, FS_RM,  0xFF, 0, 2, 0, false, false, false, 0 },
-    { "jmp",  0, FS_REL, 0xE9, 0, NOREG, 4, false, false, false, 0 }
+    { "jmp",  0, FS_REL, 0xE9, 0, NOREG, 4, false, false, false, 0 },
+
+    // flag manipulation — no size suffix
+    { "clc",  0, FS_NONE, 0xF8, 0, NOREG, 0, false, false, false, 0 },
+    { "stc",  0, FS_NONE, 0xF9, 0, NOREG, 0, false, false, false, 0 },
+    { "cmc",  0, FS_NONE, 0xF5, 0, NOREG, 0, false, false, false, 0 },
+    { "cld",  0, FS_NONE, 0xFC, 0, NOREG, 0, false, false, false, 0 },
+    { "std",  0, FS_NONE, 0xFD, 0, NOREG, 0, false, false, false, 0 },
+    { "sahf", 0, FS_NONE, 0x9E, 0, NOREG, 0, false, false, false, 0 },
+    { "lahf", 0, FS_NONE, 0x9F, 0, NOREG, 0, false, false, false, 0 },
+    { "cbw",  0, FS_NONE, 0x66, 0x98, NOREG, 0, false, false, false, 0 },
+    { "cwde", 0, FS_NONE, 0x98, 0, NOREG, 0, false, false, false, 0 },
+    { "cdqe", 0, FS_NONE, 0x48, 0x98, NOREG, 0, false, false, false, 0 },
+    { "rdtsc", 0, FS_NONE, 0x0F, 0x31, NOREG, 0, false, false, false, 0 },
+    { "iretq", 0, FS_NONE, 0x48, 0xCF, NOREG, 0, false, false, false, 0 },
+    { "int", 0, FS_I, 0xCD, 0, NOREG, 1, false, false, false, 0 },
+    { "ret", 0, FS_I, 0xC2, 0, NOREG, 2, false, false, false, 0 },
+
+    // atomic compare-exchange and exchange-add
+    { "cmpxchg", SZ1248, FS_RM_R, 0x0F, 0xB0, NOREG, 0, false, false, false, 0 },
+    { "cmpxchg", SZ248,  FS_RM_R, 0x0F, 0xB1, NOREG, 0, false, false, false, 0 },
+    { "xadd", SZ1248, FS_RM_R, 0x0F, 0xC0, NOREG, 0, false, false, false, 0 },
+    { "xadd", SZ248,  FS_RM_R, 0x0F, 0xC1, NOREG, 0, false, false, false, 0 },
+    { "cmpxchg8b", SZ8, FS_RM, 0x0F, 0xC7, 1, 0, false, false, false, 0 },
+    { "cmpxchg16b", SZ8, FS_RM, 0x0F, 0xC7, 1, 0, false, true, false, 0 },
+
+    // three-operand imul: imm, src(rm), dst(reg) — 6B sign-ext imm8,
+    // 69 imm32; reg field is the destination
+    { "imul", SZ248, FS_RRM, 0x6B, 0, NOREG, 1, true,  false, false, 0 },
+    { "imul", SZ248, FS_RRM, 0x69, 0, NOREG, 9, false, false, false, 0 }
+};
+
+// string instructions: full mnemonic match (movsq must not split into
+// mov+s+q), implicit operands. { op, forceW, p66 } — the p66 column is
+// the operand-size prefix for the 16-bit form.
+struct StrOpRow { str name; u8 op; bool forceW; bool p66; }
+
+static StrOpRow _strOps[] = {
+    { "movsb", 0xA4, false, false }, { "movsw", 0xA5, false, true },
+    { "movsl", 0xA5, false, false }, { "movsq", 0xA5, true, false },
+    { "cmpsb", 0xA6, false, false }, { "cmpsw", 0xA7, false, true },
+    { "cmpsl", 0xA7, false, false }, { "cmpsq", 0xA7, true, false },
+    { "stosb", 0xAA, false, false }, { "stosw", 0xAB, false, true },
+    { "stosl", 0xAB, false, false }, { "stosq", 0xAB, true, false },
+    { "lodsb", 0xAC, false, false }, { "lodsw", 0xAD, false, true },
+    { "lodsl", 0xAD, false, false }, { "lodsq", 0xAD, true, false },
+    { "scasb", 0xAE, false, false }, { "scasw", 0xAF, false, true },
+    { "scasl", 0xAF, false, false }, { "scasq", 0xAF, true, false }
+};
+
+// MMX: 0F-escaped packed ops on mm0-mm7. AT&T order src, dst — the reg
+// field is the destination, rm the source (same shape as FS_R_RM).
+struct MmxRow { str name; u8 op; }
+
+static MmxRow _mmxOps[] = {
+    { "paddb", 0xFC }, { "paddw", 0xFD }, { "paddd", 0xFE }, { "paddq", 0xD4 },
+    { "psubb", 0xF8 }, { "psubw", 0xF9 }, { "psubd", 0xFA }, { "psubq", 0xFB },
+    { "paddsb", 0xEC }, { "paddsw", 0xED },
+    { "psubsb", 0xE8 }, { "psubsw", 0xE9 },
+    { "pmullw", 0xD5 }, { "pmulhw", 0xE5 }, { "pmuludq", 0xF4 },
+    { "pand", 0xDB }, { "pandn", 0xDF }, { "por", 0xEB }, { "pxor", 0xEF },
+    { "pcmpeqb", 0x74 }, { "pcmpeqw", 0x75 }, { "pcmpeqd", 0x76 },
+    { "pcmpgtb", 0x64 }, { "pcmpgtw", 0x65 }, { "pcmpgtd", 0x66 },
+    { "pavgw", 0x0E }, { "pavgb", 0x0F },
+    { "psllw", 0xF1 }, { "pslld", 0xF2 }, { "psllq", 0xF3 },
+    { "psrlw", 0xD1 }, { "psrld", 0xD2 }, { "psrlq", 0xD3 },
+    { "psraw", 0xE1 }, { "psrad", 0xE2 },
+    { "punpcklbw", 0x60 }, { "punpcklwd", 0x61 }, { "punpckldq", 0x62 },
+    { "punpckhbw", 0x68 }, { "punpckhwd", 0x69 }, { "punpckhdq", 0x6A },
+    { "packsswb", 0x63 }, { "packssdw", 0x6B }
 };
 
 // split "movl" → base "mov", size 4. "sete"/"jne"/"cmovl" handled by the
@@ -337,6 +408,24 @@ bool splitMnemonic(str mnem, str* base, u8* size, AsmParseError* err)
         {
             *base = str::fromParts(mnem.ptr, mnem.len - 1);
             *size = sz;
+            // gas accepts retq/callq/jmpq/leaveq — the suffix is an
+            // explicit-64 alias for the unsuffixed control form; the
+            // control rows carry sizeMask 0, so drop back to 0 here
+            if (base.equals("ret") || base.equals("call") || base.equals("jmp") ||
+                base.equals("leave") || base.equals("hlt") || base.equals("int3") ||
+                base.equals("nop") || base.equals("ud2") || base.equals("pause") ||
+                base.equals("cqto") || base.equals("cltd") || base.equals("cwtl") ||
+                base.equals("cwtd") || base.equals("cbw") || base.equals("cwde") ||
+                base.equals("cdqe") || base.equals("iretq") || base.equals("syscall") ||
+                base.equals("sysret") || base.equals("cpuid") || base.equals("rdtsc") ||
+                base.equals("clc") || base.equals("stc") || base.equals("cmc") ||
+                base.equals("cld") || base.equals("std") || base.equals("sahf") ||
+                base.equals("lahf") || base.equals("loop") || base.equals("loope") ||
+                base.equals("loopne") || base.equals("lfence") || base.equals("mfence") ||
+                base.equals("sfence") || base.equals("emms") || base.equals("retq"))
+            {
+                *size = 0;
+            }
             return true;
         }
     }
@@ -347,6 +436,9 @@ bool splitMnemonic(str mnem, str* base, u8* size, AsmParseError* err)
 
 static bool sizeAllowed(u8 mask, u8 size)
 {
+    // sizeMask 0 = control/no-suffix rows (nop, ret, syscall, ...): they
+    // accept only the unsuffixed form, never a sized one
+    if (mask == 0) return size == 0;
     if (size == 0) return (mask & 0x01) != 0; // no suffix: accept the unsuffixed forms
     if (size == 1) return (mask & SZ1) != 0;
     if (size == 2) return (mask & SZ2) != 0;
@@ -366,10 +458,23 @@ bool emitPrefixes(EncodeCtx* ctx, FormRow* row, u8 size)
     {
         if (!out.u8b(0x66)) return false;
     }
-    if (ctx.rex.any())
+    if (ctx.rex.hasAny())
     {
         if (!out.u8b(ctx.rex.byte())) return false;
     }
+    return true;
+}
+
+// user-written prefixes (lock, rep, repne, data16, data32/addr32) come
+// before the instruction's own prefixes and REX
+bool emitUserPrefixes(EncodeCtx* ctx, AsmLine* line)
+{
+    AsmBytes* out = ctx.out;
+    if (line.pfxLock) { if (!out.u8b(0xF0)) return false; }
+    if (line.pfxRep) { if (!out.u8b(0xF3)) return false; }
+    if (line.pfxRepne) { if (!out.u8b(0xF2)) return false; }
+    if (line.pfxData16) { if (!out.u8b(0x66)) return false; }
+    if (line.pfxData32 || line.pfxAddr32) { if (!out.u8b(0x67)) return false; }
     return true;
 }
 
@@ -546,6 +651,17 @@ bool encodeWithRow(AsmLine* line, FormRow* row, u8 size, EncodeCtx* ctx, AsmPars
             rm = &line.ops[2];
             rmReg = rm.kind == AsmOpKind::Reg ? lookupReg(rm.text) : null;
         },
+        FormSig::FS_RRM => {
+            // imm, rm, reg — three-operand imul: reg field is the dst,
+            // rm the src
+            if (line.nops < 3) { err.msg = "missing operands"; return false; }
+            X86Reg* dr = line.ops[2].kind == AsmOpKind::Reg ? lookupReg(line.ops[2].text) : null;
+            if (dr == null) { err.msg = "expected register operand"; return false; }
+            regField = dr.num;
+            if ((dr.num & 8) != 0) ctx.rex.r = true;
+            rm = &line.ops[1];
+            rmReg = rm.kind == AsmOpKind::Reg ? lookupReg(rm.text) : null;
+        },
         FormSig::FS_RM_I => {
             rm = dst;
             rmReg = dstReg;
@@ -652,6 +768,11 @@ bool encodeWithRow(AsmLine* line, FormRow* row, u8 size, EncodeCtx* ctx, AsmPars
     {
         return emitImmOrSym(ctx, src, 1, err);
     }
+    if (row.immW != 0 && row.sig == FS_RRM)
+    {
+        u32 bytes = row.immW == 1 ? 1 : (row.immW == 9 ? 4 : row.immW);
+        return emitImmOrSym(ctx, src, bytes, err);
+    }
     return true;
 }
 
@@ -706,6 +827,169 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
     i32 vr = tryVecTable(line, line.mnem, ctx, err);
     if (vr == 1) return true;
     if (vr == -1) return false;
+
+    // string instructions on the full mnemonic: movsq must not split
+    // into mov + s + q. Implicit operands; rep/repne ride the prefix
+    // flags the parser captured.
+    u32 nstr = sizeof(_strOps) / sizeof(_strOps[0]);
+    for (u32 i = 0; i < nstr; i++)
+    {
+        if (_strOps[i].name.equals(line.mnem))
+        {
+            if (line.nops != 0)
+            {
+                err.msg = "string instruction takes no operands";
+                return false;
+            }
+            if (!emitUserPrefixes(ctx, line)) return false;
+            if (_strOps[i].p66) { if (!out.u8b(0x66)) return false; }
+            if (_strOps[i].forceW)
+            {
+                X86Rex rex = X86Rex::new();
+                rex.w = true;
+                if (!out.u8b(rex.byte())) return false;
+            }
+            return out.u8b(_strOps[i].op);
+        }
+    }
+
+    // MMX packed ops on mm0-mm7: full-name match before suffix splitting
+    // (movq must not split into mov + q and hit the GPR table). AT&T
+    // order src, dst — the reg field is the destination.
+    if (line.mnem.equals("movq") && line.nops == 2)
+    {
+        AsmOperand* s0 = &line.ops[0];
+        AsmOperand* d0 = &line.ops[1];
+        if (d0.kind == AsmOpKind::Reg && s0.kind == AsmOpKind::Reg)
+        {
+            X86Reg* sr = lookupReg(s0.text);
+            X86Reg* dr = lookupReg(d0.text);
+            bool sMmx = sr != null && sr.cls == X86RegClass::RcMmx;
+            bool dMmx = dr != null && dr.cls == X86RegClass::RcMmx;
+            if (sMmx && dMmx)
+            {
+                if (!emitUserPrefixes(ctx, line)) return false;
+                if (!out.u8b(0x0F) || !out.u8b(0x6F)) return false;
+                return out.u8b(encodeRegReg(dr.num & 7, sr.num & 7));
+            }
+        }
+        else if (d0.kind == AsmOpKind::Reg)
+        {
+            X86Reg* dr = lookupReg(d0.text);
+            if (dr != null && dr.cls == X86RegClass::RcMmx && s0.kind == AsmOpKind::Mem)
+            {
+                X86Reg* b2 = s0.base.isEmpty() ? null : lookupReg(s0.base);
+                X86Reg* i2 = s0.index.isEmpty() ? null : lookupReg(s0.index);
+                if (!emitUserPrefixes(ctx, line)) return false;
+                if (!out.u8b(0x0F) || !out.u8b(0x6F)) return false;
+                return encodeMem(out, b2, i2, s0.scale, s0.hasDisp, s0.disp,
+                                 s0.rip, dr.num & 7, null, null);
+            }
+        }
+        else if (s0.kind == AsmOpKind::Reg)
+        {
+            X86Reg* sr = lookupReg(s0.text);
+            if (sr != null && sr.cls == X86RegClass::RcMmx && d0.kind == AsmOpKind::Mem)
+            {
+                X86Reg* b2 = d0.base.isEmpty() ? null : lookupReg(d0.base);
+                X86Reg* i2 = d0.index.isEmpty() ? null : lookupReg(d0.index);
+                if (!emitUserPrefixes(ctx, line)) return false;
+                if (!out.u8b(0x0F) || !out.u8b(0x7F)) return false;
+                return encodeMem(out, b2, i2, d0.scale, d0.hasDisp, d0.disp,
+                                 d0.rip, sr.num & 7, null, null);
+            }
+        }
+    }
+    u32 nmmx = sizeof(_mmxOps) / sizeof(_mmxOps[0]);
+    for (u32 i = 0; i < nmmx; i++)
+    {
+        if (!_mmxOps[i].name.equals(line.mnem)) continue;
+        if (line.nops != 2)
+        {
+            err.msg = "MMX instruction needs two operands";
+            return false;
+        }
+        AsmOperand* src = &line.ops[0];
+        AsmOperand* dst = &line.ops[1];
+        if (dst.kind != AsmOpKind::Reg)
+        {
+            err.msg = "MMX destination must be a register";
+            return false;
+        }
+        X86Reg* dr = lookupReg(dst.text);
+        if (dr == null || dr.cls != X86RegClass::RcMmx)
+        {
+            err.msg = "MMX destination must be an mm register";
+            return false;
+        }
+        X86Reg* b2 = null;
+        X86Reg* i2 = null;
+        u8 regField = dr.num & 7;
+        if (src.kind == AsmOpKind::Reg)
+        {
+            X86Reg* sr = lookupReg(src.text);
+            if (sr == null || sr.cls != X86RegClass::RcMmx)
+            {
+                err.msg = "MMX source must be an mm register or memory";
+                return false;
+            }
+            if (!emitUserPrefixes(ctx, line)) return false;
+            if (!out.u8b(0x0F) || !out.u8b(_mmxOps[i].op)) return false;
+            return out.u8b(encodeRegReg(regField, sr.num & 7));
+        }
+        if (src.kind != AsmOpKind::Mem)
+        {
+            err.msg = "MMX source must be an mm register or memory";
+            return false;
+        }
+        if (!src.base.isEmpty()) b2 = lookupReg(src.base);
+        if (!src.index.isEmpty()) i2 = lookupReg(src.index);
+        if (!emitUserPrefixes(ctx, line)) return false;
+        if (!out.u8b(0x0F) || !out.u8b(_mmxOps[i].op)) return false;
+        return encodeMem(out, b2, i2, src.scale, src.hasDisp, src.disp,
+                         src.rip, regField, null, null);
+    }
+    // emms: 0F 77, no operands
+    if (line.mnem.equals("emms") && line.nops == 0)
+    {
+        if (!emitUserPrefixes(ctx, line)) return false;
+        if (!out.u8b(0x0F)) return false;
+        return out.u8b(0x77);
+    }
+
+    // fences: 0F AE with a fixed reg/rm byte (E8 lfence, F0 mfence, F8 sfence)
+    if (line.mnem.equals("lfence") || line.mnem.equals("mfence") || line.mnem.equals("sfence"))
+    {
+        if (line.nops != 0)
+        {
+            err.msg = "fence takes no operands";
+            return false;
+        }
+        if (!emitUserPrefixes(ctx, line)) return false;
+        if (!out.u8b(0x0F) || !out.u8b(0xAE)) return false;
+        if (line.mnem.equals("lfence")) return out.u8b(0xE8);
+        if (line.mnem.equals("mfence")) return out.u8b(0xF0);
+        return out.u8b(0xF8);
+    }
+
+    // loop/loope/loopne: E0-E2, rel8 only
+    if ((line.mnem.equals("loop") || line.mnem.equals("loope") || line.mnem.equals("loopne")) &&
+        line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel && line.ops[0].text.isEmpty())
+    {
+        u8 op = line.mnem.equals("loop") ? 0xE2 : (line.mnem.equals("loope") ? 0xE1 : 0xE0);
+        i64 shortRel = line.ops[0].imm - 2;
+        if (shortRel < -128 || shortRel > 127)
+        {
+            err.msg = "loop target out of range";
+            return false;
+        }
+        if (!emitUserPrefixes(ctx, line)) return false;
+        if (!out.u8b(op)) return false;
+        return out.u8b((u8)(i8)shortRel);
+    }
+
+    // user prefixes land before REX/mandatory prefixes on every legacy path
+    if (!emitUserPrefixes(ctx, line)) return false;
 
     str base;
     u8 size = 0;
@@ -788,7 +1072,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
                     if (index2 != null && (index2.num & 8) != 0) tctx.rex.x = true;
                 }
             }
-            if (tctx.rex.any())
+            if (tctx.rex.hasAny())
             {
                 if (!tmp.u8b(tctx.rex.byte())) { tmp.deinit(); return false; }
             }
@@ -827,7 +1111,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
             }
             if ((r.num & 8) != 0) tctx.rex.b = true;
             if (r.needsRex) tctx.rex.force = true;
-            if (tctx.rex.any())
+            if (tctx.rex.hasAny())
             {
                 if (!tmp.u8b(tctx.rex.byte())) { tmp.deinit(); return false; }
             }
@@ -971,7 +1255,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
                 X86Rex rex = X86Rex::new();
                 if (size == 8) rex.w = true;
                 if ((r.num & 8) != 0) rex.b = true;
-                if (rex.any()) { if (!out.u8b(rex.byte())) return false; }
+                if (rex.hasAny()) { if (!out.u8b(rex.byte())) return false; }
                 if (!out.u8b((u8)(0x90 + (r.num & 7)))) return false;
                 return true;
             }
@@ -1127,6 +1411,22 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
                             (useSize == 0 || r.size == useSize);
                 }
             },
+            FormSig::FS_RRM => {
+                sigOk = line.nops == 3 && line.ops[0].kind == AsmOpKind::Imm &&
+                        (line.ops[1].kind == AsmOpKind::Reg || line.ops[1].kind == AsmOpKind::Mem) &&
+                        line.ops[2].kind == AsmOpKind::Reg;
+                if (sigOk)
+                {
+                    X86Reg* r = lookupReg(line.ops[2].text);
+                    sigOk = r != null && r.cls == X86RegClass::RcGpr &&
+                            (useSize == 0 || r.size == useSize);
+                }
+                if (sigOk && row.signExtIb)
+                {
+                    i64 imm = line.ops[0].imm;
+                    sigOk = imm >= -128 && imm <= 127;
+                }
+            },
             else => { sigOk = false; },
         }
 
@@ -1241,31 +1541,81 @@ static bool alignSec(AsmBytes* out, i64 a, bool text, AsmParseError* err, u32 li
 // directive kinds resolved from the table below
 // 1 .text, 2 .data, 3 .globl name, 4-7 data literals of width 1/2/4/8,
 // 8 .zero N, 9 byte align N, 10 p2align N, 11 .type, 12 .size (ignore),
-// 13 .section name, 90 metadata we ignore
-struct DirEnt { str name; u8 kind; }
+// 13 .section name, 14 .ascii/.asciz/.string strings, 15 .extern,
+// 16 .weak, 17 .hidden/.internal/.protected (arg = visibility code),
+// 90 metadata we ignore
+struct DirEnt { str name; u8 kind; u8 arg; }
 
 static DirEnt _dirs[] = {
-    { ".text", 1 }, { ".data", 2 },
-    { ".globl", 3 }, { ".global", 3 },
-    { ".byte", 4 }, { ".word", 5 }, { ".long", 6 }, { ".quad", 7 },
-    { ".zero", 8 }, { ".space", 8 },
-    { ".align", 9 }, { ".balign", 9 }, { ".p2align", 10 },
-    { ".type", 11 }, { ".size", 12 },
-    { ".section", 13 },
-    { ".cfi_startproc", 90 }, { ".cfi_endproc", 90 },
-    { ".cfi_def_cfa_offset", 90 }, { ".cfi_def_cfa_register", 90 },
-    { ".cfi_offset", 90 }, { ".cfi_def_cfa", 90 },
-    { ".ident", 90 }, { ".file", 90 }, { ".loc", 90 }
+    { ".text", 1, 0 }, { ".data", 2, 0 },
+    { ".globl", 3, 0 }, { ".global", 3, 0 },
+    { ".byte", 4, 0 }, { ".word", 5, 0 }, { ".long", 6, 0 }, { ".quad", 7, 0 },
+    { ".zero", 8, 0 }, { ".space", 8, 0 },
+    { ".align", 9, 0 }, { ".balign", 9, 0 }, { ".p2align", 10, 0 },
+    { ".type", 11, 0 }, { ".size", 12, 0 },
+    { ".section", 13, 0 },
+    { ".ascii", 14, 0 }, { ".asciz", 14, 1 }, { ".string", 14, 1 },
+    { ".extern", 15, 0 },
+    { ".weak", 16, 0 },
+    { ".hidden", 17, 2 }, { ".internal", 17, 1 },
+    { ".protected", 17, 3 },
+    { ".cfi_startproc", 90, 0 }, { ".cfi_endproc", 90, 0 },
+    { ".cfi_def_cfa_offset", 90, 0 }, { ".cfi_def_cfa_register", 90, 0 },
+    { ".cfi_offset", 90, 0 }, { ".cfi_def_cfa", 90, 0 },
+    { ".ident", 90, 0 }, { ".file", 90, 0 }, { ".loc", 90, 0 }
 };
+
+// .ascii/.asciz payload: comma-separated string literals, decoded by the
+// lexer; the NUL-terminated form appends a 0 after each literal
+static bool emitStringLits(AsmLine* line, AsmObject* obj, i32 sec, bool nulTerm, AsmParseError* err)
+{
+    AsmBytes* out = sec == 1 ? &obj.text.data : &obj.data.data;
+    AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+    while (true)
+    {
+        lx.skipSpace();
+        if (lx.done()) break;
+        str s = str::empty();
+        if (!lx.lexQuoted(&s, err)) return false;
+        for (usize k = 0; k < s.len; k++)
+        {
+            if (!out.u8b(s.ptr[k]))
+            {
+                err.msg = "out of memory";
+                free(s.ptr);
+                return false;
+            }
+        }
+        if (nulTerm)
+        {
+            if (!out.u8b(0))
+            {
+                err.msg = "out of memory";
+                free(s.ptr);
+                return false;
+            }
+        }
+        free(s.ptr);
+        lx.skipSpace();
+        if (lx.done()) break;
+        if (!lx.eat((u8)','))
+        {
+            err.msg = "expected ',' between string literals";
+            return false;
+        }
+    }
+    return true;
+}
 
 static bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, AsmParseError* err)
 {
     err.lineNo = line.lineNo;
     u8 kind = 0;
+    u8 darg = 0;
     u32 nd = sizeof(_dirs) / sizeof(_dirs[0]);
     for (u32 i = 0; i < nd; i++)
     {
-        if (_dirs[i].name.equals(line.mnem)) { kind = _dirs[i].kind; break; }
+        if (_dirs[i].name.equals(line.mnem)) { kind = _dirs[i].kind; darg = _dirs[i].arg; break; }
     }
     if (kind == 0)
     {
@@ -1316,7 +1666,7 @@ static bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, AsmParseErr
             return alignSec(out, bytes, *sec == 1, err, line.lineNo);
         },
         11 => {
-            // .type name, @function — mark the symbol for the writers
+            // .type name, @function / @object — mark the symbol for the writers
             AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
             str name = lx.lexIdent();
             if (name.isEmpty()) return true;
@@ -1326,10 +1676,17 @@ static bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, AsmParseErr
             {
                 lx.pos++;
                 str what = lx.lexIdent();
+                i32 si = asmFindOrAddSym(obj, name);
+                if (si < 0) return true;
                 if (what.equals("function"))
                 {
-                    i32 si = asmFindOrAddSym(obj, name);
-                    if (si >= 0) obj.syms[si].isFunc = true;
+                    obj.syms[si].isFunc = true;
+                }
+                else if (what.equals("object"))
+                {
+                    // defined data symbols already read as STT_OBJECT;
+                    // nothing to store beyond not being a function
+                    obj.syms[si].isFunc = false;
                 }
             }
             return true;
@@ -1342,6 +1699,39 @@ static bool handleDirective(AsmLine* line, AsmObject* obj, i32* sec, AsmParseErr
             if (name.equals(".data") || name.equals(".rodata")) { *sec = 2; return true; }
             err.msg = "unsupported section";
             return false;
+        },
+        14 => { return emitStringLits(line, obj, *sec, darg != 0, err); },
+        15 => {
+            // .extern name — external linkage; valid with or without a
+            // later definition (undefined + global = resolved by the linker)
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = ".extern needs a name"; return false; }
+            i32 si = asmFindOrAddSym(obj, name);
+            if (si < 0) { err.msg = "too many symbols"; return false; }
+            obj.syms[si].global = true;
+            return true;
+        },
+        16 => {
+            // .weak name — weak binding: undefined stays weak, defined
+            // overrides only if no strong definition exists at link time
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = ".weak needs a name"; return false; }
+            i32 si = asmFindOrAddSym(obj, name);
+            if (si < 0) { err.msg = "too many symbols"; return false; }
+            obj.syms[si].weak = true;
+            return true;
+        },
+        17 => {
+            // .hidden/.internal/.protected name — ELF visibility
+            AsmLexer lx = AsmLexer::new(line.dargs, line.lineNo);
+            str name = lx.lexIdent();
+            if (name.isEmpty()) { err.msg = "visibility directive needs a name"; return false; }
+            i32 si = asmFindOrAddSym(obj, name);
+            if (si < 0) { err.msg = "too many symbols"; return false; }
+            obj.syms[si].vis = darg;
+            return true;
         },
         90 => { return true; },
         else => { return true; },

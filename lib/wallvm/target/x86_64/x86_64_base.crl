@@ -598,7 +598,7 @@ pub struct X86_64CodeGen
         return false;
     }
 
-    // True when any parameter can land on the stack: the banks are
+    // True when hasAny parameter can land on the stack: the banks are
     // counted exactly the way classifyCallArg assigns them, so an
     // integer word past the int bank or an fp word past the fp bank
     // ends up at 16(%rbp) and forces a frame. Called only for the
@@ -901,7 +901,7 @@ pub struct X86_64CodeGen
     // SysV's first free homes tend to be rcx/rdx/rsi/rdi, and rdx is
     // argument 2's incoming register, so a one-pass walk can store one
     // parameter over the top of another before it has been read.
-    // Reading every bank word before writing any home makes every
+    // Reading every bank word before writing hasAny home makes every
     // ordering safe, for either ABI, and also covers a struct whose
     // word0 lands in a home that a later word of the same struct
     // arrives in. Stack parameters read from memory (16(%rbp) upward,
@@ -917,7 +917,7 @@ pub struct X86_64CodeGen
         // words or maxFp fp words from registers, and each word stages
         // in at most 8 (integer) or 16 (fp, vectors included) bytes,
         // so this bound covers every slot the staging phase can emit.
-        // The pair is balanced before any call or return; the only
+        // The pair is balanced before hasAny call or return; the only
         // path that touches the red zone is the frameless one, where
         // the gates above guarantee the zone is still empty.
         u32 maxInt = self.isWindows ? 4 : 6;
@@ -2235,7 +2235,7 @@ pub struct X86_64CodeGen
     // values fit; scalar ints store their 8-byte register with movq and
     // f32/f64 store 4/8 bytes with movss/movsd into the slot head. Slot
     // i lives at -16*(i+1)(%rbp). rbp is established in the prologue
-    // whenever any spill slot exists, so the homes are stable for the
+    // whenever hasAny spill slot exists, so the homes are stable for the
     // whole function.
     const cchar* slotText(u32 slot)
     {
@@ -2254,7 +2254,7 @@ pub struct X86_64CodeGen
         return buf;
     }
 
-    // Operand usable in any position that accepts a memory operand:
+    // Operand usable in hasAny position that accepts a memory operand:
     // the value's register name, or its spill-slot address text.
     const cchar* opFor(IrValue* v)
     {
@@ -2384,7 +2384,7 @@ pub struct X86_64CodeGen
 
     u32 countSpillSlots(IrFunc* func)
     {
-        bool any = false;
+        bool hasAny = false;
         u32 max = 0;
         for (u32 bi = 0; bi < func->nblocks; bi++)
         {
@@ -2396,8 +2396,8 @@ pub struct X86_64CodeGen
                 if ((vd & 0x80000000UL) != 0)
                 {
                     u32 idx = (u32)(vd & 0x3FFFFFFF);
-                    if (!any || idx > max) max = idx;
-                    any = true;
+                    if (!hasAny || idx > max) max = idx;
+                    hasAny = true;
                 }
                 for (u32 oi = 0; oi < inst->nops; oi++)
                 {
@@ -2407,13 +2407,13 @@ pub struct X86_64CodeGen
                     if ((ov & 0x80000000UL) != 0)
                     {
                         u32 idx = (u32)(ov & 0x3FFFFFFF);
-                        if (!any || idx > max) max = idx;
-                        any = true;
+                        if (!hasAny || idx > max) max = idx;
+                        hasAny = true;
                     }
                 }
             }
         }
-        return any ? max + 1 : 0;
+        return hasAny ? max + 1 : 0;
     }
 
     void emitInst(IrInst* inst)
@@ -2667,7 +2667,7 @@ pub struct X86_64CodeGen
         self.emitter.emitLine(", %rax");
         // Set up rdx:eax. Signed divides sign-extend the dividend into rdx
         // (cqo); unsigned needs rdx zeroed — cqo there would feed an all-ones
-        // high word to divq and produce a wrong quotient for any dividend
+        // high word to divq and produce a wrong quotient for hasAny dividend
         // with bit 63 set. xorl is 32-bit and implicitly clears the upper
         // half, so it is the correct form for a 64-bit unsigned divide too.
         if (isSigned)
@@ -4296,7 +4296,7 @@ pub struct X86_64CodeGen
     // park in a 16-byte window below rsp (pure sse2 — no pextr/pinsr
     // gate, so no sse4.1 dependency), each lane travels r10/r11 — and
     // rax/rdx for idiv, pushed and popped around the walk because lsra
-    // hands those out like any other allocatable — and the result
+    // hands those out like hasAny other allocatable — and the result
     // rides back through the window into the work register. The window
     // sits below rsp, inside a leaf's red zone; nothing calls while it
     // is live.
@@ -4378,7 +4378,7 @@ pub struct X86_64CodeGen
             else if (kind == 1)
             {
                 // multiply: only the low bits of the product matter, so
-                // zero-extension is enough for any signedness
+                // zero-extension is enough for hasAny signedness
                 if (ew == 64)
                 {
                     self.emitter.emit("\tmovq ");
@@ -4409,7 +4409,7 @@ pub struct X86_64CodeGen
             else
             {
                 // unsigned min/max by compare + cmov: covers 64-bit
-                // lanes and any machine without sse4.1's pminuw/pminud
+                // lanes and hasAny machine without sse4.1's pminuw/pminud
                 // (8-bit pminub/pmaxub are sse2 and take the packed path)
                 if (ew == 64)
                 {
@@ -4546,7 +4546,7 @@ pub struct X86_64CodeGen
         const cchar* s1 = getRegForValue(v1);
         const cchar* s2 = getRegForValue(v2);
 
-        // one pshufd covers any pattern living in a single source —
+        // one pshufd covers hasAny pattern living in a single source —
         // 32-bit lanes select dwords, 64-bit lanes select dword pairs
         if (lanes <= 4 && (allOne || allTwo))
         {
@@ -4626,7 +4626,7 @@ pub struct X86_64CodeGen
 
         // general path: park both inputs, copy each selected lane into
         // a result window below them, then lift the result back out —
-        // any element width, any const mask, sse2 only
+        // hasAny element width, hasAny const mask, sse2 only
         const cchar* s1s = valueIsSpill(v1) ? opForRegF(v1, "xmm0") : getRegForValue(v1);
         const cchar* s2s = valueIsSpill(v2) ? opForRegF(v2, "xmm1") : getRegForValue(v2);
         self.emitter.emit("\tmovdqu ");

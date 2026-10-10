@@ -416,9 +416,9 @@ import(lib) std::text {
   struct this { // `this` is not a coral keyword, no need to worry
     i32 goo, moo;
 
-    this new(i32 a, i32 b) { return this { .goo = a, .moo = b }; }
+    static this new(i32 a, i32 b) { return this { .goo = a, .moo = b }; }
     i32 add() { return self.goo + self.moo; }
-    i32 sub() { return self.goo - self.moo };
+    i32 sub() { return self.goo - self.moo; }
   }
 
   pub i32 main()
