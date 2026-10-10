@@ -73,6 +73,7 @@ pub struct CtEval
     u8* errMsg;
     u32 depth;
     SourceLoc loc;
+    Str variadicPackName;
 }
 
 pub extend CtEval
@@ -90,6 +91,7 @@ pub extend CtEval
         self.errMsg = null;
         self.depth = 0;
         self.loc.data = 0;
+        self.variadicPackName = 0;
     }
 
     void dispose()
@@ -468,7 +470,17 @@ pub extend CtEval
                 if (an != null && an->kind.tag == NodeKind::Expr &&
                     an->kind.payload.Expr.value.kind.tag == ExprKind::Spread)
                 {
-                    CtVal pack = self.evalExpr(an->kind.payload.Expr.value.kind.payload.Spread.expr);
+                    NodeId spreadInner = an->kind.payload.Expr.value.kind.payload.Spread.expr;
+                    CtVal pack;
+                    if (spreadInner.index == 0)
+                    {
+                        /* bare `...` — forward the enclosing variadic pack */
+                        pack = self.lookup(self.variadicPackName);
+                    }
+                    else
+                    {
+                        pack = self.evalExpr(spreadInner);
+                    }
                     if (pack.kind == 6)
                     {
                         u32 k = 0;
@@ -546,9 +558,14 @@ pub extend CtEval
                             {
                                 u32 k = 0;
                                 while (k < rest) { elems[k] = argv[pi + k]; k = k + 1; }
-                                if (pp->name != 0) self.bind(pp->name, self.makePack(elems, rest));
+                                if (pp->name != 0)
+                                {
+                                    self.bind(pp->name, self.makePack(elems, rest));
+                                    self.variadicPackName = pp->name;
+                                }
                                 else free((rawptr)elems);
                             }
+                            else free((rawptr)elems);
                         }
                         pi = argc;
                     }
