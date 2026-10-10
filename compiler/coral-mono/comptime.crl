@@ -1,0 +1,975 @@
+/* mono/comptime.crl — staging evaluator for `comptime { … }` blocks.
+ *
+ * Runs during generic instantiation with the call site's actual values
+ * bound: type params → concrete types, value params → literals or
+ * runtime-expr handles, variadic packs → element lists. Evaluates
+ * control flow that is comptime-known (type switches, format-literal
+ * gates, pack iteration, string scanning of literals) and EMITS the
+ * surviving runtime statements; anything touching runtime values stays
+ * as code. `@compileError` reached during eval is a hard error.
+ *
+ * Values: int / bool / str (comptime bytes) / type / runtime-expr /
+ * pack (heterogeneous list). Runtime-exprs are NodeIds that already
+ * exist in the instance body; the evaluator never invents new runtime
+ * values, it only rewrites control flow around them. */
+
+mod id = import "../coral-ast/id";
+import id { Str, NodeId, SourceLoc };
+mod types = import "../coral-ast/types";
+import types { Ty, TypeEntry, TypeKind };
+mod node = import "../coral-ast/node";
+import node { Node, NodeKind };
+mod decl_ast = import "../coral-ast/decl";
+import decl_ast { Decl, DeclKind, Param };
+mod expr_ast = import "../coral-ast/expr";
+import expr_ast { Expr, ExprKind };
+mod stmt_ast = import "../coral-ast/stmt";
+import stmt_ast { Stmt, StmtKind, SwitchCase };
+mod pat_ast = import "../coral-ast/pat";
+import pat_ast { Pat, PatKind };
+mod context = import "../coral-context/context";
+import context { AstContext };
+mod sema = import "../coral-semantics/sema";
+import sema { Sema };
+mod mono = import "mono";
+import mono { MonoContext, MonoSubstitution };
+
+extern("C") rawptr malloc(usize size);
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+pub const u8 CT_NONE = 0;
+pub const u8 CT_INT = 1;
+pub const u8 CT_BOOL = 2;
+pub const u8 CT_STR = 3;
+pub const u8 CT_TYPE = 4;
+pub const u8 CT_RT = 5;
+pub const u8 CT_PACK = 6;
+
+pub struct CtVal
+{
+    u8 kind;
+    u64 ival;
+    u8* sptr;
+    usize slen;
+    Ty ty;
+    NodeId rid;
+    CtVal* elems;
+    u32 elemsLen;
+}
+
+pub struct CtBinding
+{
+    Str name;
+    CtVal val;
+}
+
+pub struct CtEval
+{
+    MonoContext* mono;
+    CtBinding* bindings;
+    u32 bindingsLen;
+    u32 bindingsCap;
+    NodeId* emitted;
+    u32 emittedLen;
+    u32 emittedCap;
+    bool failed;
+    u8* errMsg;
+    u32 depth;
+    SourceLoc loc;
+}
+
+pub extend CtEval
+{
+    void init(MonoContext* m)
+    {
+        self.mono = m;
+        self.bindings = null;
+        self.bindingsLen = 0;
+        self.bindingsCap = 0;
+        self.emitted = null;
+        self.emittedLen = 0;
+        self.emittedCap = 0;
+        self.failed = false;
+        self.errMsg = null;
+        self.depth = 0;
+        self.loc.data = 0;
+    }
+
+    void dispose()
+    {
+        if (self.bindings != null) free((rawptr)self.bindings);
+        if (self.emitted != null) free((rawptr)self.emitted);
+        self.bindings = null;
+        self.emitted = null;
+    }
+
+    CtVal makeNone()
+    {
+        CtVal v;
+        v.kind = CT_NONE;
+        v.ival = 0;
+        v.sptr = null;
+        v.slen = 0;
+        v.ty = 0;
+        v.rid.index = 0;
+        v.elems = null;
+        v.elemsLen = 0;
+        return v;
+    }
+
+    CtVal makeInt(u64 x)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_INT;
+        v.ival = x;
+        return v;
+    }
+
+    CtVal makeBool(bool b)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_BOOL;
+        if (b) v.ival = 1;
+        return v;
+    }
+
+    CtVal makeType(Ty t)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_TYPE;
+        v.ty = t;
+        return v;
+    }
+
+    CtVal makeRt(NodeId n, Ty t)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_RT;
+        v.rid = n;
+        v.ty = t;
+        return v;
+    }
+
+    CtVal makeStrCopy(u8* p, usize n)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_STR;
+        if (n == 0) { v.sptr = null; v.slen = 0; return v; }
+        v.sptr = (u8*)malloc(n);
+        if (v.sptr == null) return v;
+        usize i = 0;
+        while (i < n) { v.sptr[i] = p[i]; i = i + 1; }
+        v.slen = n;
+        return v;
+    }
+
+    CtVal makePack(CtVal* elems, u32 n)
+    {
+        CtVal v = self.makeNone();
+        v.kind = CT_PACK;
+        v.elems = elems;
+        v.elemsLen = n;
+        return v;
+    }
+
+    bool reserveBindings()
+    {
+        if (self.bindingsLen < self.bindingsCap) return true;
+        u32 newCap = self.bindingsCap * 2;
+        if (newCap == 0) newCap = 16;
+        rawptr raw = realloc((rawptr)self.bindings, (usize)newCap * @sizeof(CtBinding));
+        if (raw == null) { self.mono.errors = self.mono.errors + 1; return false; }
+        self.bindings = (CtBinding*)raw;
+        self.bindingsCap = newCap;
+        return true;
+    }
+
+    bool reserveEmitted()
+    {
+        if (self.emittedLen < self.emittedCap) return true;
+        u32 newCap = self.emittedCap * 2;
+        if (newCap == 0) newCap = 16;
+        rawptr raw = realloc((rawptr)self.emitted, (usize)newCap * @sizeof(NodeId));
+        if (raw == null) { self.mono.errors = self.mono.errors + 1; return false; }
+        self.emitted = (NodeId*)raw;
+        self.emittedCap = newCap;
+        return true;
+    }
+
+    bool emit(NodeId stmt)
+    {
+        if (stmt.index == 0) return true;
+        if (!self.reserveEmitted()) return false;
+        self.emitted[self.emittedLen] = stmt;
+        self.emittedLen = self.emittedLen + 1;
+        return true;
+    }
+
+    void bind(Str name, CtVal v)
+    {
+        u32 i = 0;
+        while (i < self.bindingsLen)
+        {
+            if (self.bindings[i].name == name) { self.bindings[i].val = v; return; }
+            i = i + 1;
+        }
+        if (!self.reserveBindings()) return;
+        self.bindings[self.bindingsLen].name = name;
+        self.bindings[self.bindingsLen].val = v;
+        self.bindingsLen = self.bindingsLen + 1;
+    }
+
+    /* lookup by name; returns none-kind when absent */
+    CtVal lookup(Str name)
+    {
+        u32 i = 0;
+        while (i < self.bindingsLen)
+        {
+            if (self.bindings[i].name == name) return self.bindings[i].val;
+            i = i + 1;
+        }
+        return self.makeNone();
+    }
+
+    void fail(u8* msg)
+    {
+        if (self.failed) return;
+        self.failed = true;
+        self.errMsg = msg;
+    }
+
+    Node* nodeAt(NodeId n) { return self.mono.nodeAt(n); }
+
+    Decl* declAt(NodeId n) { return self.mono.declAt(n); }
+
+    bool sameTy(Ty a, Ty b) { return self.mono.sema.sameType(a, b); }
+
+    /* strip Const/Comptime wrappers for pattern matching */
+    Ty stripCt(Ty t)
+    {
+        while (t != 0)
+        {
+            TypeEntry* e = self.mono.ctx.types + t;
+            if (e->kind.tag == TypeKind::Const) t = e->kind.payload.Const.base;
+            else if (e->kind.tag == TypeKind::Comptime) t = e->kind.payload.Comptime.base;
+            else break;
+        }
+        return t;
+    }
+
+    /* match a type pattern against a concrete type */
+    bool matchTypePat(PatKind k, Ty want)
+    {
+        if (k.tag != PatKind::Type) return false;
+        return self.sameTy(self.stripCt(k.payload.Type.typeNode), self.stripCt(want));
+    }
+
+    /* match an int/char literal pattern against a comptime int */
+    bool matchLitPat(NodeId patId, u64 val)
+    {
+        Node* pn = self.nodeAt(patId);
+        if (pn == null || pn->kind.tag != NodeKind::Pat) return false;
+        Pat* p = &pn->kind.payload.Pat.value;
+        if (p->kind.tag != PatKind::Lit) return false;
+        Node* en = self.nodeAt(p->kind.payload.Lit.expr);
+        if (en == null || en->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &en->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::IntLit) return e->kind.payload.IntLit.value == val;
+        if (e->kind.tag == ExprKind::CharLit) return (u64)e->kind.payload.CharLit.value == val;
+        if (e->kind.tag == ExprKind::BoolLit)
+        {
+            u64 bv = e->kind.payload.BoolLit.flags & 1;
+            return bv == val;
+        }
+        return false;
+    }
+
+    /* build a fresh expression node */
+    NodeId mkExpr(ExprKind kind, Ty t)
+    {
+        NodeId n = self.mono.ctx.allocNodeSlot();
+        if (n.index == 0) return n;
+        Node* node = self.mono.ctx.nodes + n.index;
+        Expr e = Expr{ .kind = kind, .loc = self.loc, .resolvedType = t };
+        node->loc = self.loc;
+        node->kind = NodeKind::Expr{ .value = e };
+        return n;
+    }
+
+    NodeId mkIntLit(u64 v, Ty t)
+    {
+        return self.mkExpr(ExprKind::IntLit{ .value = v, .flags = 0 }, t);
+    }
+
+    NodeId mkStmt(StmtKind kind)
+    {
+        NodeId n = self.mono.ctx.allocNodeSlot();
+        if (n.index == 0) return n;
+        Node* node = self.mono.ctx.nodes + n.index;
+        Stmt s = Stmt{ .kind = kind, .loc = self.loc };
+        node->loc = self.loc;
+        node->kind = NodeKind::Stmt{ .value = s };
+        return n;
+    }
+
+    /* CtVal → a NodeId usable in emitted code. comptime ints/bools become
+     * fresh literals; str becomes a runtime expr only if we have one
+     * (otherwise unsupported — the caller should have kept it runtime);
+     * runtime-exprs pass through; types have no runtime form. */
+    NodeId valToNode(CtVal v)
+    {
+        if (v.kind == CT_INT) return self.mkIntLit(v.ival, self.mono.sema.u64Type());
+        if (v.kind == CT_BOOL)
+        {
+            ExprKind k;
+            if (v.ival != 0) k = ExprKind::BoolLit{ .flags = 1 };
+            else k = ExprKind::BoolLit{ .flags = 0 };
+            return self.mkExpr(k, self.mono.sema.boolType());
+        }
+        if (v.kind == CT_RT) return v.rid;
+        return NodeId{ .index = 0 };
+    }
+
+    /* ---- expression evaluation ---- */
+
+    CtVal evalExpr(NodeId id);
+
+    /* literal string bytes if the node is a str/C-string literal */
+    bool litStringBytes(NodeId id, u8** outPtr, usize* outLen)
+    {
+        Node* n = self.nodeAt(id);
+        if (n == null || n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::StringLit) return false;
+        Str s = e->kind.payload.StringLit.value;
+        if (s == 0 || s >= self.mono.ctx.internsLen) return false;
+        *outPtr = self.mono.ctx.interns[s].ptr;
+        *outLen = self.mono.ctx.interns[s].len;
+        return true;
+    }
+
+    /* evaluate a builtin call (@compileError / @isFormatLiteral / @typeof) */
+    CtVal evalBuiltin(NodeId id, Expr* e)
+    {
+        Str bname = e->kind.payload.BuiltinCall.name;
+        u32 n = e->kind.payload.BuiltinCall.argsLen;
+        /* @compileError("msg") — reached during eval = hard error */
+        if (bname == self.mono.ctx.intern((u8*)"compileError", 12))
+        {
+            u8* msg = (u8*)"@compileError tripped";
+            if (n > 0)
+            {
+                u8* p = null;
+                usize pl = 0;
+                if (self.litStringBytes(e->kind.payload.BuiltinCall.args[0], &p, &pl))
+                {
+                    u8* copy = (u8*)malloc(pl + 1);
+                    if (copy != null)
+                    {
+                        usize i = 0;
+                        while (i < pl) { copy[i] = p[i]; i = i + 1; }
+                        copy[pl] = 0;
+                        msg = copy;
+                    }
+                }
+            }
+            self.fail(msg);
+            return self.makeNone();
+        }
+        /* @isFormatLiteral(x) — true iff x is a string literal */
+        if (bname == self.mono.ctx.intern((u8*)"isFormatLiteral", 15))
+        {
+            if (n == 1)
+            {
+                u8* p = null;
+                usize pl = 0;
+                if (self.litStringBytes(e->kind.payload.BuiltinCall.args[0], &p, &pl))
+                    return self.makeBool(true);
+            }
+            return self.makeBool(false);
+        }
+        /* @typeof(expr) — the type of a comptime-known value; for runtime
+         * exprs the resolvedType is already on the node */
+        if (bname == self.mono.ctx.intern((u8*)"typeof", 6))
+        {
+            if (n == 1)
+            {
+                CtVal a = self.evalExpr(e->kind.payload.BuiltinCall.args[0]);
+                if (a.kind == CT_TYPE) return a;
+                if (a.kind == CT_RT && a.ty != 0) return self.makeType(a.ty);
+                Node* an = self.nodeAt(e->kind.payload.BuiltinCall.args[0]);
+                if (an != null && an->kind.tag == NodeKind::Expr &&
+                    an->kind.payload.Expr.value.resolvedType != 0)
+                    return self.makeType(an->kind.payload.Expr.value.resolvedType);
+            }
+            return self.makeNone();
+        }
+        return self.makeNone();
+    }
+
+    /* find a Func decl by name across merged files */
+    NodeId findFunc(Str name)
+    {
+        return self.mono.findDeclaration(name);
+    }
+
+    /* evaluate a call: inline functions whose bodies contain comptime
+     * blocks we can fold; emit runtime calls for everything else */
+    CtVal evalCall(NodeId id, Expr* e)
+    {
+        if (e->kind.tag != ExprKind::Call) return self.makeNone();
+        Node* calleeNode = self.nodeAt(e->kind.payload.Call.callee);
+        if (calleeNode == null || calleeNode->kind.tag != NodeKind::Expr) return self.makeNone();
+        Expr* callee = &calleeNode->kind.payload.Expr.value;
+        if (callee->kind.tag != ExprKind::Ident) return self.makeNone();
+        Str fname = callee->kind.payload.Ident.name;
+
+        /* evaluate args first (spread expands a pack) */
+        u32 rawArgs = e->kind.payload.Call.argsLen;
+        CtVal* argv = null;
+        u32 argc = 0;
+        if (rawArgs > 0)
+        {
+            argv = (CtVal*)calloc((usize)(rawArgs + 8), @sizeof(CtVal));
+            if (argv == null) return self.makeNone();
+            u32 i = 0;
+            while (i < rawArgs)
+            {
+                Node* an = self.nodeAt(e->kind.payload.Call.args[i]);
+                if (an != null && an->kind.tag == NodeKind::Expr &&
+                    an->kind.payload.Expr.value.kind.tag == ExprKind::Spread)
+                {
+                    CtVal pack = self.evalExpr(an->kind.payload.Expr.value.kind.payload.Spread.expr);
+                    if (pack.kind == CT_PACK)
+                    {
+                        u32 k = 0;
+                        while (k < pack.elemsLen && argc < rawArgs + 8)
+                        {
+                            argv[argc] = pack.elems[k];
+                            argc = argc + 1;
+                            k = k + 1;
+                        }
+                    }
+                    i = i + 1;
+                    continue;
+                }
+                argv[argc] = self.evalExpr(e->kind.payload.Call.args[i]);
+                argc = argc + 1;
+                i = i + 1;
+            }
+        }
+
+        /* depth guard */
+        if (self.depth > 24)
+        {
+            if (argv != null) free((rawptr)argv);
+            self.fail((u8*)"comptime: inline depth limit (24) — likely recursive comptime call");
+            return self.makeNone();
+        }
+
+        /* try to inline a coral function that has a comptime block */
+        NodeId declId = self.findFunc(fname);
+        Decl* decl = self.declAt(declId);
+        bool hasComptime = false;
+        if (decl != null && decl->kind.tag == DeclKind::Func)
+        {
+            /* scan body for a top-level comptime stmt (shallow) */
+            Node* bn = self.nodeAt(decl->kind.payload.Func.body);
+            if (bn != null && bn->kind.tag == NodeKind::Stmt)
+            {
+                Stmt* bs = &bn->kind.payload.Stmt.value;
+                if (bs->kind.tag == StmtKind::Block)
+                {
+                    u32 s = 0;
+                    while (s < bs->kind.payload.Block.stmtsLen)
+                    {
+                        Node* sn = self.nodeAt(bs->kind.payload.Block.stmts[s]);
+                        if (sn != null && sn->kind.tag == NodeKind::Stmt &&
+                            sn->kind.payload.Stmt.value.kind.tag == StmtKind::Comptime)
+                            hasComptime = true;
+                        s = s + 1;
+                    }
+                }
+                else if (bs->kind.tag == StmtKind::Comptime) hasComptime = true;
+            }
+        }
+
+        if (hasComptime && decl != null && decl->kind.tag == DeclKind::Func)
+        {
+            /* inline: bind params to arg values, evaluate the body */
+            u32 savedLen = self.bindingsLen;
+            u32 p = 0;
+            u32 pi = 0;
+            while (p < decl->kind.payload.Func.paramsLen && pi < argc)
+            {
+                Node* pn = self.nodeAt(decl->kind.payload.Func.params[p]);
+                if (pn != null && pn->kind.tag == NodeKind::Param)
+                {
+                    Param* pp = &pn->kind.payload.Param.value;
+                    if ((pp->flags & 16) != 0)
+                    {
+                        /* variadic — bind the rest as a pack */
+                        if (pi < argc)
+                        {
+                            u32 rest = argc - pi;
+                            CtVal* elems = (CtVal*)calloc((usize)rest, @sizeof(CtVal));
+                            if (elems != null)
+                            {
+                                u32 k = 0;
+                                while (k < rest) { elems[k] = argv[pi + k]; k = k + 1; }
+                                if (pp->name != 0) self.bind(pp->name, self.makePack(elems, rest));
+                                else free((rawptr)elems);
+                            }
+                        }
+                        pi = argc;
+                    }
+                    else
+                    {
+                        if (pp->name != 0) self.bind(pp->name, argv[pi]);
+                        pi = pi + 1;
+                    }
+                }
+                p = p + 1;
+            }
+            self.depth = self.depth + 1;
+            /* evaluate every comptime block in the body; also keep non-comptime
+             * statements as emitted runtime code */
+            Node* bn2 = self.nodeAt(decl->kind.payload.Func.body);
+            if (bn2 != null && bn2->kind.tag == NodeKind::Stmt)
+                self.evalStmt(bn2);
+            self.depth = self.depth - 1;
+            /* drop the inlined frame (keep outer bindings) */
+            self.bindingsLen = savedLen;
+            if (argv != null) free((rawptr)argv);
+            /* inlined functions return nothing useful to the caller here —
+             * print's callees are all void */
+            return self.makeNone();
+        }
+
+        /* not inlinable — emit a runtime call with whatever we have */
+        if (argv != null) free((rawptr)argv);
+        return self.makeNone();
+    }
+
+    /* evaluate one expression */
+    CtVal evalExpr(NodeId id)
+    {
+        Node* n = self.nodeAt(id);
+        if (n == null || n->kind.tag != NodeKind::Expr) return self.makeNone();
+        Expr* e = &n->kind.payload.Expr.value;
+        Ty rt = e->resolvedType;
+        switch (e->kind.tag)
+        {
+            ExprKind::IntLit => { return self.makeInt(e->kind.payload.IntLit.value); },
+            ExprKind::CharLit => { return self.makeInt((u64)e->kind.payload.CharLit.value); },
+            ExprKind::BoolLit => { return self.makeBool((e->kind.payload.BoolLit.flags & 1) != 0); },
+            ExprKind::FloatLit => { return self.makeRt(id, rt); },
+            ExprKind::StringLit => {
+                u8* p = null;
+                usize pl = 0;
+                if (self.litStringBytes(id, &p, &pl)) return self.makeStrCopy(p, pl);
+                return self.makeRt(id, rt);
+            },
+            ExprKind::Ident => {
+                CtVal v = self.lookup(e->kind.payload.Ident.name);
+                if (v.kind != CT_NONE) return v;
+                return self.makeRt(id, rt);
+            },
+            ExprKind::BuiltinCall => { return self.evalBuiltin(id, e); },
+            ExprKind::Call => { return self.evalCall(id, e); },
+            ExprKind::Spread => { return self.evalExpr(e->kind.payload.Spread.expr); },
+            ExprKind::Cast => {
+                CtVal a = self.evalExpr(e->kind.payload.Cast.expr);
+                /* cast of a comptime int stays comptime */
+                if (a.kind == CT_INT || a.kind == CT_BOOL) return a;
+                if (a.kind == CT_RT) return self.makeRt(id, rt);
+                return a;
+            },
+            ExprKind::Field => {
+                /* s.len / s.ptr on a comptime str */
+                CtVal obj = self.evalExpr(e->kind.payload.Field.obj);
+                if (obj.kind == CT_STR)
+                {
+                    if (e->kind.payload.Field.field == self.mono.ctx.intern((u8*)"len", 3))
+                        return self.makeInt((u64)obj.slen);
+                    if (e->kind.payload.Field.field == self.mono.ctx.intern((u8*)"ptr", 3))
+                        return self.makeRt(id, rt);
+                }
+                if (obj.kind == CT_RT) return self.makeRt(id, rt);
+                return self.makeNone();
+            },
+            ExprKind::Index => {
+                /* f.ptr[i] on comptime str via ptr field, or direct */
+                CtVal obj = self.evalExpr(e->kind.payload.Index.obj);
+                CtVal idx = self.evalExpr(e->kind.payload.Index.index);
+                if (obj.kind == CT_STR && idx.kind == CT_INT)
+                {
+                    if (idx.ival < obj.slen) return self.makeInt((u64)obj.sptr[idx.ival]);
+                    return self.makeInt(0);
+                }
+                /* ptr-of-comptime-str indexed: track via a side table is
+                 * overkill — the format scanner indexes f.ptr[i] where f
+                 * is comptime; handle DerefField-of-Field shape below */
+                return self.makeRt(id, rt);
+            },
+            ExprKind::DerefField => {
+                CtVal obj = self.evalExpr(e->kind.payload.DerefField.obj);
+                if (obj.kind == CT_STR)
+                {
+                    if (e->kind.payload.DerefField.field == self.mono.ctx.intern((u8*)"len", 3))
+                        return self.makeInt((u64)obj.slen);
+                }
+                return self.makeRt(id, rt);
+            },
+            ExprKind::Add => { return self.evalIntBin(e->kind.payload.Add.left, e->kind.payload.Add.right, 1, 0); },
+            ExprKind::Sub => { return self.evalIntBin(e->kind.payload.Sub.left, e->kind.payload.Sub.right, 2, 0); },
+            ExprKind::Mul => { return self.evalIntBin(e->kind.payload.Mul.left, e->kind.payload.Mul.right, 3, 0); },
+            ExprKind::Div => { return self.evalIntBin(e->kind.payload.Div.left, e->kind.payload.Div.right, 4, 0); },
+            ExprKind::Mod => { return self.evalIntBin(e->kind.payload.Mod.left, e->kind.payload.Mod.right, 5, 0); },
+            ExprKind::Lt => { return self.evalIntBin(e->kind.payload.Lt.left, e->kind.payload.Lt.right, 6, 1); },
+            ExprKind::Le => { return self.evalIntBin(e->kind.payload.Le.left, e->kind.payload.Le.right, 7, 1); },
+            ExprKind::Gt => { return self.evalIntBin(e->kind.payload.Gt.left, e->kind.payload.Gt.right, 8, 1); },
+            ExprKind::Ge => { return self.evalIntBin(e->kind.payload.Ge.left, e->kind.payload.Ge.right, 9, 1); },
+            ExprKind::Eq => { return self.evalIntBin(e->kind.payload.Eq.left, e->kind.payload.Eq.right, 10, 1); },
+            ExprKind::Ne => { return self.evalIntBin(e->kind.payload.Ne.left, e->kind.payload.Ne.right, 11, 1); },
+            ExprKind::And => {
+                CtVal l = self.evalExpr(e->kind.payload.And.left);
+                if (l.kind == CT_BOOL && l.ival == 0) return self.makeBool(false);
+                CtVal r = self.evalExpr(e->kind.payload.And.right);
+                if (l.kind == CT_BOOL && r.kind == CT_BOOL) return self.makeBool(r.ival != 0);
+                return self.makeRt(id, rt);
+            },
+            ExprKind::Or => {
+                CtVal l = self.evalExpr(e->kind.payload.Or.left);
+                if (l.kind == CT_BOOL && l.ival != 0) return self.makeBool(true);
+                CtVal r = self.evalExpr(e->kind.payload.Or.right);
+                if (l.kind == CT_BOOL && r.kind == CT_BOOL) return self.makeBool(r.ival != 0);
+                return self.makeRt(id, rt);
+            },
+            ExprKind::Not => {
+                CtVal a = self.evalExpr(e->kind.payload.Not.expr);
+                if (a.kind == CT_BOOL) return self.makeBool(a.ival == 0);
+                return self.makeRt(id, rt);
+            },
+            ExprKind::Neg => {
+                CtVal a = self.evalExpr(e->kind.payload.Neg.expr);
+                if (a.kind == CT_INT) return self.makeInt((u64)(-(i64)a.ival));
+                return self.makeRt(id, rt);
+            },
+            ExprKind::AddressOf, ExprKind::Deref => {
+                CtVal a = self.evalExpr(
+                    e->kind.tag == ExprKind::AddressOf
+                        ? e->kind.payload.AddressOf.expr
+                        : e->kind.payload.Deref.expr);
+                if (a.kind == CT_RT) return self.makeRt(id, rt);
+                return self.makeRt(id, rt);
+            },
+            else => { return self.makeRt(id, rt); }
+        }
+        return self.makeRt(id, rt);
+    }
+
+    /* op: 1=+ 2=- 3=* 4=/ 5=% 6=< 7=<= 8=> 9=>= 10=== 11=!= ; cmp=1 → bool result */
+    CtVal evalIntBin(NodeId lid, NodeId rid, u32 op, u8 cmp)
+    {
+        CtVal l = self.evalExpr(lid);
+        CtVal r = self.evalExpr(rid);
+        if (l.kind != CT_INT || r.kind != CT_INT) return self.makeRt(NodeId{ .index = 0 }, 0);
+        u64 a = l.ival;
+        u64 b = r.ival;
+        if (cmp != 0)
+        {
+            bool t = false;
+            if (op == 6) t = a < b;
+            else if (op == 7) t = a <= b;
+            else if (op == 8) t = a > b;
+            else if (op == 9) t = a >= b;
+            else if (op == 10) t = a == b;
+            else if (op == 11) t = a != b;
+            return self.makeBool(t);
+        }
+        u64 x = 0;
+        if (op == 1) x = a + b;
+        else if (op == 2) x = a - b;
+        else if (op == 3) x = a * b;
+        else if (op == 4) { if (b == 0) return self.makeInt(0); x = a / b; }
+        else if (op == 5) { if (b == 0) return self.makeInt(0); x = a % b; }
+        return self.makeInt(x);
+    }
+
+    /* ---- statement evaluation ---- */
+
+    void evalStmt(NodeId id)
+    {
+        Node* n = self.nodeAt(id);
+        if (n == null || n->kind.tag != NodeKind::Stmt) return;
+        Stmt* s = &n->kind.payload.Stmt.value;
+        self.loc = s->loc;
+        switch (s->kind.tag)
+        {
+            StmtKind::Comptime => {
+                u32 i = 0;
+                while (i < s->kind.payload.Comptime.stmtsLen)
+                {
+                    self.evalStmt(s->kind.payload.Comptime.stmts[i]);
+                    i = i + 1;
+                }
+                return;
+            },
+            StmtKind::Block => {
+                u32 saved = self.bindingsLen;
+                u32 i = 0;
+                while (i < s->kind.payload.Block.stmtsLen)
+                {
+                    self.evalStmt(s->kind.payload.Block.stmts[i]);
+                    i = i + 1;
+                }
+                self.bindingsLen = saved;
+                return;
+            },
+            StmtKind::VarDecl => { return self.evalVarDecl(id, s); },
+            StmtKind::Expr => { return self.evalExprStmt(s); },
+            StmtKind::Return => {
+                /* keep the return as runtime code */
+                self.emit(id);
+                return;
+            },
+            StmtKind::If => { return self.evalIf(id, s); },
+            StmtKind::Switch => { return self.evalSwitch(id, s); },
+            StmtKind::While => { return self.evalWhile(id, s); },
+            StmtKind::ForIn => { return self.evalForIn(id, s); },
+            StmtKind::For => { self.emit(id); return; },
+            StmtKind::Loop => { self.emit(id); return; },
+            StmtKind::Break, StmtKind::Continue => { self.emit(id); return; },
+            StmtKind::Defer => { self.emit(id); return; },
+            StmtKind::Assign => {
+                /* bind simple `x = comptime` to the local; else emit */
+                Node* tn = self.nodeAt(s->kind.payload.Assign.target);
+                if (tn != null && tn->kind.tag == NodeKind::Expr &&
+                    tn->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                {
+                    CtVal v = self.evalExpr(s->kind.payload.Assign.value);
+                    if (v.kind != CT_NONE && v.kind != CT_RT)
+                    {
+                        Str nm = tn->kind.payload.Expr.value.kind.payload.Ident.name;
+                        CtVal cur = self.lookup(nm);
+                        if (cur.kind != CT_NONE)
+                        {
+                            self.bind(nm, v);
+                            return;
+                        }
+                    }
+                }
+                self.emit(id);
+                return;
+            },
+            else => { self.emit(id); return; }
+        }
+    }
+
+    void evalVarDecl(NodeId id, Stmt* s)
+    {
+        /* VarDecl shape: name, typeNode, init — look through the payload */
+        /* the stmt AST stores var decls as Decl nodes in some paths; handle
+         * the StmtKind::VarDecl payload the parser produces */
+        Str name = s->kind.payload.VarDecl.name;
+        CtVal v = self.evalExpr(s->kind.payload.VarDecl.init);
+        if (name != 0 && v.kind != CT_NONE && v.kind != CT_RT)
+        {
+            self.bind(name, v);
+            /* also emit the original decl so runtime uses still see it —
+             * but a purely comptime local should vanish. keep it only if
+             * the init was runtime; comptime locals are dropped. */
+            return;
+        }
+        /* runtime local: keep the decl, bind nothing */
+        self.emit(id);
+    }
+
+    void evalExprStmt(Stmt* s)
+    {
+        NodeId eid = s->kind.payload.Expr.stmt;
+        Node* en = self.nodeAt(eid);
+        if (en != null && en->kind.tag == NodeKind::Expr)
+        {
+            Expr* e = &en->kind.payload.Expr.value;
+            /* a bare call — try the inlining evaluator */
+            if (e->kind.tag == ExprKind::Call)
+            {
+                CtVal r = self.evalCall(eid, e);
+                /* evalCall emits whatever runtime stmts the inlined body
+                 * produced; a non-inlinable call falls through as none —
+                 * re-emit the original so it is not lost */
+                if (r.kind == CT_NONE && !self.failed)
+                {
+                    /* rebuild an ExprStmt around the original call */
+                    NodeId wrap = self.mkStmt(StmtKind::Expr{ .stmt = eid });
+                    self.emit(wrap);
+                }
+                return;
+            }
+            if (e->kind.tag == ExprKind::BuiltinCall)
+            {
+                self.evalBuiltin(eid, e);
+                return;
+            }
+        }
+        /* other expressions: emit the statement as-is */
+        NodeId wrap = self.mkStmt(StmtKind::Expr{ .stmt = eid });
+        self.emit(wrap);
+    }
+
+    void evalIf(NodeId id, Stmt* s)
+    {
+        CtVal c = self.evalExpr(s->kind.payload.If.cond);
+        if (c.kind == CT_BOOL)
+        {
+            if (c.ival != 0) self.evalStmt(s->kind.payload.If.thenBody);
+            else if (s->kind.payload.If.elseBody.index != 0)
+                self.evalStmt(s->kind.payload.If.elseBody);
+            return;
+        }
+        /* runtime condition — emit whole if; its bodies may still contain
+         * comptime blocks, so walk them to rewrite in place is complex —
+         * emit as-is for now */
+        self.emit(id);
+    }
+
+    void evalSwitch(NodeId id, Stmt* s)
+    {
+        CtVal sc = self.evalExpr(s->kind.payload.Switch.expr);
+        /* type switch: scrutinee is a comptime type (T bound to concrete) */
+        if (sc.kind == CT_TYPE)
+        {
+            u32 i = 0;
+            while (i < s->kind.payload.Switch.casesLen)
+            {
+                SwitchCase* c = s->kind.payload.Switch.cases + i;
+                u32 p = 0;
+                bool hit = false;
+                while (p < c->patternsLen)
+                {
+                    Node* pn = self.nodeAt(c->patterns[p]);
+                    if (pn != null && pn->kind.tag == NodeKind::Pat)
+                    {
+                        if (self.matchTypePat(pn->kind.payload.Pat.value.kind, sc.ty)) { hit = true; break; }
+                    }
+                    p = p + 1;
+                }
+                if (hit)
+                {
+                    self.evalStmt(c->body);
+                    return;
+                }
+                i = i + 1;
+            }
+            /* no arm matched — @compileError territory; drop silently only
+             * if the author put one after the switch */
+            return;
+        }
+        /* comptime int switch (spec chars, etc.) */
+        if (sc.kind == CT_INT)
+        {
+            u32 i = 0;
+            while (i < s->kind.payload.Switch.casesLen)
+            {
+                SwitchCase* c = s->kind.payload.Switch.cases + i;
+                u32 p = 0;
+                bool hit = false;
+                bool isElse = false;
+                while (p < c->patternsLen)
+                {
+                    Node* pn = self.nodeAt(c->patterns[p]);
+                    if (pn != null && pn->kind.tag == NodeKind::Pat)
+                    {
+                        Pat* pp = &pn->kind.payload.Pat.value;
+                        if (pp->kind.tag == PatKind::Wildcard) { isElse = true; hit = true; break; }
+                        if (self.matchLitPat(c->patterns[p], sc.ival)) { hit = true; break; }
+                    }
+                    p = p + 1;
+                }
+                if (hit)
+                {
+                    self.evalStmt(c->body);
+                    return;
+                }
+                i = i + 1;
+            }
+            return;
+        }
+        /* runtime switch — emit as-is */
+        self.emit(id);
+    }
+
+    void evalWhile(NodeId id, Stmt* s)
+    {
+        /* comptime-known trip: unroll when cond folds and body does not
+         * emit a runtime break. guard with an iteration cap. */
+        CtVal c = self.evalExpr(s->kind.payload.While.cond);
+        if (c.kind == CT_BOOL || c.kind == CT_INT)
+        {
+            u32 guard = 0;
+            while (guard < 4096)
+            {
+                CtVal cc = self.evalExpr(s->kind.payload.While.cond);
+                bool truth = false;
+                if (cc.kind == CT_BOOL) truth = cc.ival != 0;
+                else if (cc.kind == CT_INT) truth = cc.ival != 0;
+                if (!truth) return;
+                u32 before = self.emittedLen;
+                u32 savedB = self.bindingsLen;
+                self.evalStmt(s->kind.payload.While.body);
+                self.bindingsLen = savedB;
+                /* if the body emitted anything, stop unrolling — it needs
+                 * to run at runtime; emit the while instead */
+                if (self.emittedLen != before)
+                {
+                    self.emittedLen = before;
+                    self.emit(id);
+                    return;
+                }
+                guard = guard + 1;
+            }
+            self.emit(id);
+            return;
+        }
+        self.emit(id);
+    }
+
+    void evalForIn(NodeId id, Stmt* s)
+    {
+        /* for (var x : pack) — unroll over comptime pack elements */
+        CtVal it = self.evalExpr(s->kind.payload.ForIn.iterExpr);
+        if (it.kind != CT_PACK)
+        {
+            /* runtime iterable — emit as-is */
+            self.emit(id);
+            return;
+        }
+        Str bindName = s->kind.payload.ForIn.bindName;
+        u32 k = 0;
+        while (k < it.elemsLen)
+        {
+            u32 saved = self.bindingsLen;
+            if (bindName != 0) self.bind(bindName, it.elems[k]);
+            self.evalStmt(s->kind.payload.ForIn.body);
+            self.bindingsLen = saved;
+            if (self.failed) return;
+            k = k + 1;
+        }
+    }
+}
+
+/* the entry: evaluate a comptime block (or any stmt list) with the given
+ * bindings already installed; returns emitted runtime stmts in ct.emitted */
+pub void ctEvalStmts(CtEval* ct, NodeId* stmts, u32 stmtsLen)
+{
+    u32 i = 0;
+    while (i < stmtsLen)
+    {
+        ct.evalStmt(stmts[i]);
+        i = i + 1;
+    }
+}
