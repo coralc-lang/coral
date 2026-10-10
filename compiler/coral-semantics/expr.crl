@@ -141,8 +141,8 @@ pub extend Sema
         u32 i = 0;
         while (i < argsLen)
         {
-            if (!self.assignCompatible(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
-                self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+            if (!self.checkAssign(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
+                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i], "argument type does not match parameter type");
             i = i + 1;
         }
         self.setExprType(callId, te->kind.payload.FnPtr.returnType);
@@ -219,7 +219,14 @@ pub extend Sema
                     {
                         Ty want = param->typeNode;
                         if (sflag == 1) want = self.substituteFieldTy(want, calleeTy);
-                        if (!self.assignCompatible(args[i], self.exprType(args[i]), want)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, callId, "argument type does not match parameter type");
+                        if (!self.checkAssign(args[i], self.exprType(args[i]), want))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
+                                    self.nameMsgS((u8*)"argument type does not match parameter `", param->name, (u8*)"`"));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i], "argument type does not match parameter type");
+                        }
                     }
                 }
             }
@@ -337,6 +344,24 @@ pub extend Sema
         return true;
     }
 
+    /* TC-0009: an integer (literal or typed) is never a pointer. Always
+     * reported; --allow-int-ptr keeps it non-fatal, -w silences it. */
+    void intToPtrDiag(NodeId value)
+    {
+        if (self.diag == null) return;
+        SourceLoc loc;
+        loc.data = 0;
+        if (value.index != 0)
+        {
+            Node* node = self.ctx.nodes + value.index;
+            loc = node->loc;
+        }
+        u8* msg = (u8*)"cannot assign an integer to a pointer";
+        u8* help = (u8*)"use `null` for a null pointer, or cast the integer explicitly";
+        if (self.allowIntPtr) self.diag.emitAllowed(ErrorCode::SemaIntToPtr, loc, msg, help);
+        else self.semaError(ErrorCode::SemaIntToPtr, loc, msg);
+    }
+
     bool assignCompatible(NodeId value, Ty fromTy, Ty targetTy)
     {
         if (self.compatible(fromTy, targetTy)) return true;
@@ -400,6 +425,9 @@ pub extend Sema
                     TypeEntry* te = targetTy != 0 ? self.ctx.types + targetTy : null;
                     if (te != null)
                     {
+                        /* `T* p = 0` — an integer literal is not a pointer;
+                         * pure rejection here, checkAssign reports TC-0009 */
+                        if (self.pointerLike(targetTy)) return false;
                         switch (te->kind.tag)
                         {
                             TypeKind::U8 => { return !negated && v <= 255; },
@@ -435,6 +463,42 @@ pub extend Sema
                     if (vs != null && vs->kind == 2) return true;
                 }
             }
+        }
+        return false;
+    }
+
+    /* is the value an integer (literal or typed) that a pointer target
+     * must reject — the shape checkAssign turns into TC-0009 */
+    bool intToPtrAssign(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (fromTy == 0 || targetTy == 0 || value.index == 0) return false;
+        if (!self.pointerLike(targetTy)) return false;
+        if (self.integerType(fromTy)) return true;
+        Node* vn = self.ctx.nodes + value.index;
+        if (vn->kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &vn->kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::IntLit) return true;
+        if (ev->kind.tag == ExprKind::Neg)
+        {
+            NodeId inner = ev->kind.payload.Neg.expr;
+            if (inner.index == 0) return false;
+            Node* nin = self.ctx.nodes + inner.index;
+            return nin->kind.tag == NodeKind::Expr && nin->kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
+        }
+        return false;
+    }
+
+    /* assignCompatible + the one diagnostic it cannot phrase itself:
+     * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
+     * non-fatal). Returns false only for ordinary mismatches — the
+     * caller then emits its generic message on the same node. */
+    bool checkAssign(NodeId value, Ty fromTy, Ty targetTy)
+    {
+        if (self.assignCompatible(value, fromTy, targetTy)) return true;
+        if (self.intToPtrAssign(value, fromTy, targetTy))
+        {
+            self.intToPtrDiag(value);
+            return true;
         }
         return false;
     }
@@ -475,30 +539,28 @@ pub extend Sema
         }
         // a particular rule makes ths possible, but will throw an error. 
         // with -fcast casts will be forced. and compilation will be terminated.
-        // /* C-like rule: int+int promotes to the wider int (the smaller
-        //  * operand behaves as if cast to the wider type); same for floats.
-        //  * Int->float/implicit widening of one type to the other still
-        //  * requires a cast; different categories still error. */
+        /* no implicit scalar conversion in operators either: same type,
+         * or a literal adopting the typed side (`i < 10`, `8 + (u32)x`);
+         * mixed typed operands need an explicit cast on one side */
         if (self.integerType(leftType) && self.integerType(rightType))
         {
-            /* C-like rule: int+int promotes to the wider int; a literal
-             * defers to the typed operand (`8 + (u32)x` → u32); equal
-             * width with mixed signedness → the unsigned side wins. */
             bool lLit = left.index != 0 && self.isIntLitNode(left);
             bool rLit = right.index != 0 && self.isIntLitNode(right);
-            Ty wider = leftType;
-            if (lLit && !rLit) wider = rightType;
-            else if (!lLit && rLit) wider = leftType;
-            else if (self.intWidth(rightType) > self.intWidth(leftType)) wider = rightType;
-            else if (self.intWidth(leftType) > self.intWidth(rightType)) wider = leftType;
-            else if (self.intSigned(leftType) != self.intSigned(rightType)) wider = self.intSigned(leftType) ? rightType : leftType;
-            self.setExprType(id, wider);
+            if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
+            if (lLit && !rLit) { self.setExprType(id, rightType); return true; }
+            if (rLit && !lLit) { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match; insert an explicit cast");
+            self.setExprType(id, leftType);
             return true;
         }
         if (self.floatType(leftType) && self.floatType(rightType))
         {
-            /* floats: keep the left operand's type for now */
-            // float conversion. hmmmm
+            if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
+            bool lFLit = left.index != 0 && self.isFloatLitNode(left);
+            bool rFLit = right.index != 0 && self.isFloatLitNode(right);
+            if (lFLit && !rFLit) { self.setExprType(id, rightType); return true; }
+            if (rFLit && !lFLit) { self.setExprType(id, leftType); return true; }
+            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "binary operand types do not match; insert an explicit cast");
             self.setExprType(id, leftType);
             return true;
         }
@@ -544,6 +606,14 @@ pub extend Sema
         Node* n = self.ctx.nodes + id.index;
         if (n.kind.tag != NodeKind::Expr) return false;
         return n.kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
+    }
+
+    bool isFloatLitNode(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        return n.kind.payload.Expr.value.kind.tag == ExprKind::FloatLit;
     }
 
     /* Pointer or rawptr, looking through Const/Comptime wrappers — the
@@ -894,7 +964,15 @@ pub extend Sema
                     {
                         Param* param = &paramNode->kind.payload.Param.value;
                         Ty want = self.substituteFieldTy(param->typeNode, recvTy);
-                        if (!self.assignCompatible(expr->kind.payload.MethodCall.args[i], self.exprType(expr->kind.payload.MethodCall.args[i]), want)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method argument type does not match parameter type");
+                        NodeId argId = expr->kind.payload.MethodCall.args[i];
+                        if (!self.checkAssign(argId, self.exprType(argId), want))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
+                                    self.nameMsgS((u8*)"method argument type does not match parameter `", param->name, (u8*)"`"));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId, "method argument type does not match parameter type");
+                        }
                     }
                     i = i + 1;
                 }
@@ -1050,19 +1128,30 @@ pub extend Sema
             ExprKind::Assign => {
                 if (!self.assignExpr(expr->kind.payload.Assign.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.Assign.value)) return false;
-                if (!self.assignCompatible(expr->kind.payload.Assign.value, self.exprType(expr->kind.payload.Assign.value), self.assignTargetType(expr->kind.payload.Assign.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                NodeId av = expr->kind.payload.Assign.value;
+                if (!self.checkAssign(av, self.exprType(av), self.assignTargetType(expr->kind.payload.Assign.target)))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignAdd => {
                 if (!self.assignExpr(expr->kind.payload.AssignAdd.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignAdd.value)) return false;
-                if (!self.assignCompatible(expr->kind.payload.AssignAdd.value, self.exprType(expr->kind.payload.AssignAdd.value), self.assignTargetType(expr->kind.payload.AssignAdd.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                NodeId av = expr->kind.payload.AssignAdd.value;
+                Ty atgt = self.assignTargetType(expr->kind.payload.AssignAdd.target);
+                /* `p += 1` is pointer arithmetic, not an int→pointer bind */
+                if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
+                    !self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignSub => {
                 if (!self.assignExpr(expr->kind.payload.AssignSub.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignSub.value)) return false;
-                if (!self.assignCompatible(expr->kind.payload.AssignSub.value, self.exprType(expr->kind.payload.AssignSub.value), self.assignTargetType(expr->kind.payload.AssignSub.target))) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "type mismatch in assignment");
+                NodeId av = expr->kind.payload.AssignSub.value;
+                Ty atgt = self.assignTargetType(expr->kind.payload.AssignSub.target);
+                if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
+                    !self.checkAssign(av, self.exprType(av), atgt))
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, av, "type mismatch in assignment");
                 return true;
             },
             ExprKind::AssignMul => {
@@ -1205,7 +1294,8 @@ pub extend Sema
                     if (!self.checkExpr(valueId)) return false;
                     Ty expected = self.substituteFieldTy(ft, expr->kind.payload.StructLiteral.typeNode);
                     Ty actual = self.exprType(valueId);
-                    if (!self.assignCompatible(valueId, actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "variant field type mismatch");
+                    if (!self.checkAssign(valueId, actual, expected))
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, self.nameMsgS((u8*)"variant field `", fieldName, (u8*)"` type mismatch"));
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                         i = i + 1;
                     }
@@ -1229,7 +1319,13 @@ pub extend Sema
                     if (!self.checkExpr(valueId)) return false;
                     Ty expected = self.substituteFieldTy(member.typeNode, expr->kind.payload.StructLiteral.typeNode);
                     Ty actual = self.exprType(valueId);
-                    if (!self.assignCompatible(valueId, actual, expected)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "struct literal field type mismatch");
+                    if (!self.checkAssign(valueId, actual, expected))
+                    {
+                        if (litNames != 0)
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, self.nameMsgS((u8*)"field `", litNames[i], (u8*)"` type mismatch"));
+                        else
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId, "struct literal field type mismatch");
+                    }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                     i = i + 1;
                 }
@@ -1280,8 +1376,15 @@ pub extend Sema
                     if (paramNode->kind.tag == NodeKind::Param)
                     {
                         Param* param = &paramNode->kind.payload.Param.value;
-                        if (!self.assignCompatible(expr->kind.payload.StaticCall.args[i], self.exprType(expr->kind.payload.StaticCall.args[i]), param->typeNode))
-                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static method argument type does not match parameter type");
+                        NodeId sarg = expr->kind.payload.StaticCall.args[i];
+                        if (!self.checkAssign(sarg, self.exprType(sarg), param->typeNode))
+                        {
+                            if (param->name != 0)
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
+                                    self.nameMsgS((u8*)"argument type does not match parameter `", param->name, (u8*)"`"));
+                            else
+                                self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg, "static method argument type does not match parameter type");
+                        }
                     }
                     i = i + 1;
                 }

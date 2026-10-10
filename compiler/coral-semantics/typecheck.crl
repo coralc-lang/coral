@@ -822,7 +822,14 @@ pub extend Sema
     {
         t = self.unqualTy(t);
         if (t == 0) return false;
-        return self.ctx.types[t].kind.tag == TypeKind::I8 || self.ctx.types[t].kind.tag == TypeKind::U8 || self.ctx.types[t].kind.tag == TypeKind::Char;
+        TypeEntry* e = self.ctx.types + t;
+        if (e->kind.tag == TypeKind::I8 || e->kind.tag == TypeKind::U8 || e->kind.tag == TypeKind::Char) return true;
+        /* Named `cchar` is the C ABI byte type (codegen maps it to C
+         * `char`); like clang's -Wpointer-sign family it mixes with
+         * u8* /i8* pointers — C"..." vs `u8* fmt`, `str.ptr` vs `cchar*` */
+        if (e->kind.tag == TypeKind::Named && e->kind.payload.Named.genericArgsLen == 0 &&
+            e->kind.payload.Named.name == self.ctx.intern((u8*)"cchar", 5)) return true;
+        return false;
     }
 
     bool charSignMix(Ty a, Ty b)
@@ -883,20 +890,9 @@ pub extend Sema
         if (source->kind.tag == TypeKind::Array && target->kind.tag == TypeKind::Rawptr)
             return true;
 
-        /* Integer conversion only when it cannot narrow (C-style
-         * integer promotion): same signedness widening is fine; narrowing
-         * or int<->float still requires an explicit cast. Equal-width
-         * same-signedness matches; same-width unsigned->signed is NOT a
-         * faithful conversion unless the target is strictly wider. */
-        if (self.integerType(from) && self.integerType(to))
-        {
-            u32 fw = self.intWidth(from);
-            u32 tw = self.intWidth(to);
-            if (tw < fw) return false;
-            if (tw == fw && self.intSigned(from) != self.intSigned(to)) return false;
-            if (!self.intSigned(from) && self.intSigned(to) && tw <= fw) return false;
-            return true;
-        }
+        /* no implicit scalar conversion: typed int→int / int→float etc.
+         * require an exact match (or an explicit cast); only literals and
+         * the pointer/array/const rules above are lenient */
 
         /* Dependent/generic flexibility (no bounds yet — mono boundary is
          * the enforcement point): one side dependent fits anything, BUT two

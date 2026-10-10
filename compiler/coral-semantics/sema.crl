@@ -29,6 +29,9 @@ pub struct Sema
     u32 extendsLen;
     u32 extendsCap;
     DiagnosticEngine* diag;
+    /* --allow-int-ptr: int→pointer assignments are reported (TC-0009)
+     * but non-fatal; without it they fail the build */
+    bool allowIntPtr;
     /* direct (unqualified) import bindings by (file, local name) — a
      * second direct pull of the same name in one file conflicts */
     Str* directNames;
@@ -78,6 +81,7 @@ pub extend Sema
         self.currentReturnType = 0;
         self.errors = 0;
         self.extends = null;
+        self.allowIntPtr = false;
         self.extendsLen = 0;
         self.extendsCap = 0;
         self.diag = diag;
@@ -244,5 +248,38 @@ pub extend Sema
         while (i < ie->len) { m[pl + i] = ie->ptr[i]; i = i + 1; }
         m[pl + ie->len] = 0;
         return m;
+    }
+
+    /* "<prefix><interned name><suffix>" as a fresh cstr */
+    u8* nameMsgS(u8* prefix, Str name, u8* suffix)
+    {
+        usize pl = 0;
+        while (prefix[pl] != 0) pl = pl + 1;
+        usize sl = 0;
+        while (suffix[sl] != 0) sl = sl + 1;
+        InternEntry* ie = self.ctx.interns + name;
+        u8* m = (u8*)malloc(pl + ie->len + sl + 1);
+        if (m == null) return prefix;
+        usize i = 0;
+        while (i < pl) { m[i] = prefix[i]; i = i + 1; }
+        i = 0;
+        while (i < ie->len) { m[pl + i] = ie->ptr[i]; i = i + 1; }
+        i = 0;
+        while (i < sl) { m[pl + ie->len + i] = suffix[i]; i = i + 1; }
+        m[pl + ie->len + sl] = 0;
+        return m;
+    }
+
+    /* duplicate declaration: name it and note where the first one is */
+    void dupDeclDiag(Str name, NodeId id)
+    {
+        self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id,
+            self.nameMsgS((u8*)"duplicate declaration of `", name, (u8*)"`"));
+        if (self.scopes.dupSymbol != null && self.scopes.dupSymbol->declaration.index != 0 && self.diag != null)
+        {
+            Node* prev = self.ctx.nodes + self.scopes.dupSymbol->declaration.index;
+            self.diag.emitNote(ErrorCode::SemaDuplicateDecl, prev->loc,
+                self.nameMsgS((u8*)"previous declaration of `", name, (u8*)"` is here"), null);
+        }
     }
 }

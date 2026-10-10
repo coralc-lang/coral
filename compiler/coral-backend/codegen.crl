@@ -1501,6 +1501,53 @@ Slice cgValExprTy(Codegen* cg, NodeId id)
     return cgResultTy(cg, id, &n.kind.payload.Expr.value);
 }
 
+/* --allow-int-ptr lowering: sema waived an integer→pointer bind, but gcc
+ * still rejects the bare conversion — emit the explicit C cast instead */
+bool cgIntTyTag(Codegen* cg, Ty t)
+{
+    if (t == 0) return false;
+    TypeKind tag = (cg.ctx->types + t)->kind.tag;
+    return tag == TypeKind::U8 || tag == TypeKind::U16 || tag == TypeKind::U32 || tag == TypeKind::U64 ||
+           tag == TypeKind::U128 || tag == TypeKind::I8 || tag == TypeKind::I16 || tag == TypeKind::I32 ||
+           tag == TypeKind::I64 || tag == TypeKind::I128 || tag == TypeKind::Usize || tag == TypeKind::Isize ||
+           tag == TypeKind::Char;
+}
+
+bool cgPtrTyTag(Codegen* cg, Ty t)
+{
+    while (t != 0)
+    {
+        TypeKind tag = (cg.ctx->types + t)->kind.tag;
+        if (tag == TypeKind::Pointer || tag == TypeKind::Rawptr) return true;
+        if (tag == TypeKind::Const) t = (cg.ctx->types + t)->kind.payload.Const.base;
+        else if (tag == TypeKind::Comptime) t = (cg.ctx->types + t)->kind.payload.Comptime.base;
+        else return false;
+    }
+    return false;
+}
+
+bool cgIntToPtrInit(Codegen* cg, NodeId value, Ty targetTy)
+{
+    if (value.index == 0 || targetTy == 0) return false;
+    if (!cgPtrTyTag(cg, targetTy)) return false;
+    Node* n = cgNode(cg, value);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* ev = &n.kind.payload.Expr.value;
+    if (ev->kind.tag == ExprKind::IntLit) return true;
+    return cgIntTyTag(cg, ev->resolvedType);
+}
+
+Slice cgWrapPtrCast(Codegen* cg, Slice tyText, Slice inner)
+{
+    usize rs = cg.ebuf.len;
+    stP(&cg.ebuf, "((");
+    stPS(&cg.ebuf, tyText);
+    stP(&cg.ebuf, ")(");
+    stPS(&cg.ebuf, inner);
+    stP(&cg.ebuf, "))");
+    return stTail(&cg.ebuf, rs);
+}
+
 Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
 {
     if (e.resolvedType != 0) return tyStr(cg, cgSubstTy(cg, e.resolvedType));
@@ -2789,6 +2836,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
             else { target = e.kind.payload.AssignShr.target; value = e.kind.payload.AssignShr.value; op = (u8*)">>="; }
             Slice lv = cgLvalue(cg, target);
             Slice rv = cgExpr(cg, value);
+            if (e.kind.tag == ExprKind::Assign)
+            {
+                Node* tn = cgNode(cg, target);
+                Ty tt = 0;
+                if (tn.kind.tag == NodeKind::Expr) tt = tn.kind.payload.Expr.value.resolvedType;
+                if (cgIntToPtrInit(cg, value, tt)) rv = cgWrapPtrCast(cg, tyStr(cg, tt), rv);
+            }
             usize ascs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
             stPS(&cg.ebuf, lv);
@@ -3665,6 +3719,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 bool hasInit = init.index != 0;
                 Slice initText;
                 if (hasInit) initText = cgExpr(cg, init);
+                if (hasInit && cgIntToPtrInit(cg, init, ty)) initText = cgWrapPtrCast(cg, tyText, initText);
                 stNL(&cg.body, cg.ind);
                 if ((s.kind.payload.VarDecl.flags & 4) != 0) stP(&cg.body, "static ");
                 stPS(&cg.body, tyText);
@@ -3683,6 +3738,16 @@ void cgStmt(Codegen* cg, NodeId id)
             Slice lv = cgLvalue(cg, s.kind.payload.Assign.target);
             Slice rv = cgExpr(cg, s.kind.payload.Assign.value);
             Slice op = cgIntern(cg, s.kind.payload.Assign.op);
+            /* plain `=` of an integer into a pointer (only reachable with
+             * --allow-int-ptr) — gcc needs the cast; `+=` is pointer
+             * arithmetic and needs none */
+            if (op.len == 1 && op.ptr[0] == 61)
+            {
+                Node* tn = cgNode(cg, s.kind.payload.Assign.target);
+                Ty tt = 0;
+                if (tn.kind.tag == NodeKind::Expr) tt = tn.kind.payload.Expr.value.resolvedType;
+                if (cgIntToPtrInit(cg, s.kind.payload.Assign.value, tt)) rv = cgWrapPtrCast(cg, tyStr(cg, tt), rv);
+            }
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, lv);
             stCh(&cg.body, ' ');
