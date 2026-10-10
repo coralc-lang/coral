@@ -560,8 +560,8 @@ pub extend Sema
             bool lLit = left.index != 0 && self.isIntLitNode(left);
             bool rLit = right.index != 0 && self.isIntLitNode(right);
             if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
-            if (lLit && !rLit) { self.setExprType(id, rightType); return true; }
-            if (rLit && !lLit) { self.setExprType(id, leftType); return true; }
+            if (lLit && !rLit && self.intLitAdoptsTo(left, rightType)) { self.setExprType(id, rightType); return true; }
+            if (rLit && !lLit && self.intLitAdoptsTo(right, leftType)) { self.setExprType(id, leftType); return true; }
             self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
                 self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
             self.setExprType(id, leftType);
@@ -616,13 +616,43 @@ pub extend Sema
         return true;
     }
 
+    /* True when the node is an integer literal (looking through unary
+     * negation). Does not inspect the unsigned suffix. */
     bool isIntLitNode(NodeId id)
     {
         if (id.index == 0) return false;
         Node* n = self.ctx.nodes + id.index;
         if (n.kind.tag != NodeKind::Expr) return false;
-        return n.kind.payload.Expr.value.kind.tag == ExprKind::IntLit;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::Neg) return self.isIntLitNode(ev->kind.payload.Neg.expr);
+        return ev->kind.tag == ExprKind::IntLit;
     }
+
+    /* True when the literal node carries the unsigned suffix (flags & 1). */
+    bool isUnsignedIntLit(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::Neg) return self.isUnsignedIntLit(ev->kind.payload.Neg.expr);
+        if (ev->kind.tag != ExprKind::IntLit) return false;
+        return (ev->kind.payload.IntLit.flags & 1) != 0;
+    }
+
+    /* A literal adopts the other operand's type, but an unsigned-suffixed
+     * literal only adopts unsigned types (it is generic for unsigned only). */
+    bool intLitAdoptsTo(NodeId id, Ty targetType)
+    {
+        if (!self.isIntLitNode(id)) return false;
+        if (self.isUnsignedIntLit(id)) return !self.intSigned(targetType);
+        return true;
+    }
+
+    /* A bare (unsuffixed) integer literal is generic: it adopts the other
+     * operand's type in operators, initializers, and comparisons. `-4095`
+     * parses as Neg(IntLit), so we look through the unary negation. A literal
+     * carrying the unsigned suffix is generic for unsigned types only. */
 
     bool isFloatLitNode(NodeId id)
     {
@@ -706,10 +736,12 @@ pub extend Sema
                 Ty t;
                 if ((expr->kind.payload.IntLit.flags & 1) != 0)
                 {
-                    /* unsigned suffix: smallest unsigned type that fits */
-                    if (v <= 255) t = self.u8Type();
-                    else if (v <= 65535) t = self.u16Type();
-                    else if (v <= 4294967295) t = self.u32Type();
+                    /* `u` suffix: unsigned-int width (u32), C semantics.
+                     * No width-carrying suffix exists, so smallest-fitting
+                     * would wrongly type `1u` as u8; the literal-adoption
+                     * rule widens it to u64/usize when the other operand is
+                     * wider. */
+                    if (v <= 4294967295) t = self.u32Type();
                     else t = self.u64Type();
                 }
                 else

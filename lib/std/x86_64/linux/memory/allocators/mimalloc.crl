@@ -9,16 +9,16 @@ extern i32 sched_yield();
 // Architecture: Arena → Segment → Page → Block
 // Features: free list sharding, size-class pages, cross-thread free, page retirement
 
-const u64 MI_ARENA_SIZE = 64 * 1024 * 1024;     // 64 MiB arenas
-const u64 MI_SEGMENT_SIZE = 4 * 1024 * 1024;     // 4 MiB segments
-const u64 MI_PAGE_SIZE = 64 * 1024;               // 64 KiB pages
-const u64 MI_SLICE_SIZE = 64 * 1024;              // 64 KiB slices
+const usize MI_ARENA_SIZE = 64 * 1024 * 1024;     // 64 MiB arenas
+const usize MI_SEGMENT_SIZE = 4 * 1024 * 1024;     // 4 MiB segments
+const usize MI_PAGE_SIZE = 64 * 1024;               // 64 KiB pages
+const usize MI_SLICE_SIZE = 64 * 1024;              // 64 KiB slices
 const u32 MI_ALIGN = 16;
 const u32 MI_MAX_BLOCK_SIZE = 512 * 1024;         // 512 KiB max block
 const u32 MI_SMALL_PAGE_MAX = 64 * 1024;          // max size for small pages
 const u32 MI_MEDIUM_PAGE_MAX = 512 * 1024;        // max size for medium pages
-const u32 MI_HUGE_THRESHOLD = 128 * 1024;         // 128 KiB huge page threshold
-const u32 MI_INITIAL_CAPACITY = 4;                // start with 4 blocks
+const usize MI_HUGE_THRESHOLD = 128 * 1024;         // 128 KiB huge page threshold
+const usize MI_INITIAL_CAPACITY = 4;              // start with 4 blocks
 const u32 MI_SEGMENT_MAP_SIZE = 64;               // hash table size for O(1) lookup
 
 // Size classes (44 total):
@@ -54,11 +54,11 @@ struct MiPage
     MiPage* next;
     MiPage* prev;
     u32 sizeClass;
-    u32 blockSize;
-    u32 capacity;
+    usize blockSize;
+    usize capacity;
     u32 used;
     u32 freeCount;
-    u32 reserved;           // current reserved capacity (for incremental extension)
+    usize reserved;         // current reserved capacity (for incremental extension)
     u8* base;
     MiBlock* free;           // thread-local free list (fast path)
     MiBlock* localFree;      // freed by owning thread while page active
@@ -95,7 +95,7 @@ struct MiArena
     u8* base;
     usize size;
     u64* bitmap;
-    u64 bitmapWords;
+    usize bitmapWords;
     u32 sliceCount;
     u32 usedSlices;
 }
@@ -162,7 +162,7 @@ static u32 _miSizeClass(usize size)
     // Slow path for large sizes
     for (u32 i = 0; i < MI_SIZE_CLASS_COUNT; i++)
     {
-        if (size <= MI_BLOCK_SIZES[i]) return i;
+        if (size <= (usize)MI_BLOCK_SIZES[i]) return i;
     }
     return MI_SIZE_CLASS_COUNT - 1;
 }
@@ -173,8 +173,8 @@ static usize _miBlockSize(u32 sc) { return (usize)MI_BLOCK_SIZES[sc]; }
 static u32 _miBlocksPerPage(u32 sc)
 {
     usize blockSize = _miBlockSize(sc);
-    usize pageSize = MI_PAGE_SIZES[sc];
-    usize metaSize = (@sizeof(MiPage) + 255) & ~256u;
+    usize pageSize = (usize)MI_PAGE_SIZES[sc];
+    usize metaSize = (@sizeof(MiPage) + 255) & ~(usize)255;
     usize usable = pageSize - metaSize;
     return (u32)(usable / blockSize);
 }
@@ -274,8 +274,8 @@ static MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
     raw = raw ^ page->key2;
     if (raw == 0) return null;
     u8* p = (u8*)raw;
-    u8* end = page->base + (u64)page->capacity * page->blockSize;
-    if (p < page->base || p >= end || (u64)(p - page->base) % page->blockSize != 0)
+    u8* end = page->base + page->capacity * page->blockSize;
+    if (p < page->base || p >= end || (usize)(p - page->base) % page->blockSize != 0)
     {
         printf((const cchar*)C"mimalloc: corrupted free list entry\n");
         return null;
@@ -289,7 +289,7 @@ static u32 _miSegmentMapHash(u8* addr)
 {
     u64 val = (u64)addr >> 22;
     val = val ^ (val >> 16);
-    return (u32)(val % MI_SEGMENT_MAP_SIZE);
+    return (u32)(val % (u64)MI_SEGMENT_MAP_SIZE);
 }
 
 static void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* page)
@@ -325,10 +325,10 @@ static void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
 static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
 {
     _miLockAcquire(&_miMapLockWord);
-    u64 size = (u64)page->capacity * page->blockSize;
+    usize size = page->capacity * page->blockSize;
     if (size == 0) size = 1;
     u64 start = (u64)pageBase & ~(u64)0x3FFFFF;
-    u64 end = ((u64)pageBase + size - 1) & ~(u64)0x3FFFFF;
+    u64 end = ((u64)pageBase + (u64)size - 1) & ~(u64)0x3FFFFF;
     for (u64 w = start; w <= end; w += (u64)0x400000)
     {
         _miMapInsertChain(map, _miSegmentMapHash((u8*)w), pageBase, page);
@@ -336,12 +336,12 @@ static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
     _miLockRelease(&_miMapLockWord);
 }
 
-static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, u64 size)
+static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, usize size)
 {
     _miLockAcquire(&_miMapLockWord);
     if (size == 0) size = 1;
     u64 start = (u64)pageBase & ~(u64)0x3FFFFF;
-    u64 end = ((u64)pageBase + size - 1) & ~(u64)0x3FFFFF;
+    u64 end = ((u64)pageBase + (u64)size - 1) & ~(u64)0x3FFFFF;
     for (u64 w = start; w <= end; w += (u64)0x400000)
     {
         _miMapRemoveChain(map, _miSegmentMapHash((u8*)w), pageBase);
@@ -375,7 +375,7 @@ static MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
     arena->base = mem;
     arena->size = arenaSize;
     arena->sliceCount = (u32)(arenaSize / MI_SLICE_SIZE);
-    arena->bitmapWords = (arena->sliceCount + 63) / 64;
+    arena->bitmapWords = ((usize)arena->sliceCount + 63) / 64;
     arena->bitmap = (u64*)(mem + @sizeof(MiArena));
     arena->usedSlices = 0;
     arena->next = heap->arenas;
@@ -385,12 +385,12 @@ static MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
         arena->bitmap[i] = 0;
 
     // Mark header slices as used
-    u32 headerSlices = (u32)((@sizeof(MiArena) + arena->bitmapWords * 8 + MI_SLICE_SIZE - 1) / MI_SLICE_SIZE);
-    for (u32 i = 0; i < headerSlices && i < arena->sliceCount; i++)
+    usize headerSlices = (@sizeof(MiArena) + arena->bitmapWords * 8 + MI_SLICE_SIZE - 1) / MI_SLICE_SIZE;
+    for (u32 i = 0; i < (u32)headerSlices && i < arena->sliceCount; i++)
     {
         arena->bitmap[i / 64] |= (1u << (i % 64));
     }
-    arena->usedSlices = headerSlices;
+    arena->usedSlices = (u32)headerSlices;
 
     heap->arenas = arena;
     heap->mapped += arenaSize;
@@ -402,9 +402,9 @@ static rawptr _miArenaSliceAlloc(MiArena* arena, u32 count)
     for (u32 i = 0; i + count <= arena->sliceCount; i++)
     {
         bool found = true;
-        for (u32 j = 0; j < count; j++)
+        for (usize j = 0; j < count; j++)
         {
-            if (arena->bitmap[(i + j) / 64] & (1u << ((i + j) % 64)))
+            if (arena->bitmap[(((usize)i + j)) / 64] & ((u64)1 << ((((usize)i + j)) % 64)))
             {
                 found = false;
                 break;
@@ -413,9 +413,9 @@ static rawptr _miArenaSliceAlloc(MiArena* arena, u32 count)
         if (found)
         {
             for (u32 j = 0; j < count; j++)
-                arena->bitmap[(i + j) / 64] |= (1u << ((i + j) % 64));
+                arena->bitmap[(((usize)i + (usize)j)) / 64] |= ((u64)1 << ((((usize)i + (usize)j)) % (usize)64));
             arena->usedSlices += count;
-            return arena->base + (u64)i * MI_SLICE_SIZE;
+            return arena->base + (usize)i * MI_SLICE_SIZE;
         }
     }
     return null;
@@ -504,7 +504,7 @@ static void _miSegmentFree(MiHeap* heap, MiSegment* seg)
 
 static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 {
-    u32 pageSize = MI_PAGE_SIZES[sc];
+    usize pageSize = (usize)MI_PAGE_SIZES[sc];
     u32 pageCount = 1;
     if (pageSize < MI_SEGMENT_SIZE) pageCount = (u32)(MI_SEGMENT_SIZE / pageSize);
 
@@ -513,8 +513,8 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 
     // Page metadata goes at the start, blocks follow after alignment
     usize blockSize = _miBlockSize(sc);
-    u32 blocksPerPage = _miBlocksPerPage(sc);
-    u32 metaSize = (u32)((@sizeof(MiSegment) + @sizeof(MiPage) + 255) & ~255u); // align to 256 bytes
+    usize blocksPerPage = (usize)_miBlocksPerPage(sc);
+    usize metaSize = (@sizeof(MiSegment) + @sizeof(MiPage) + 255) & ~(usize)255; // align to 256 bytes
 
     // the segment struct itself lives at seg->base — page metadata must
     // follow it, otherwise `page->sizeClass` aliases (and clobbers) the
@@ -523,10 +523,10 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
     page->next = null;
     page->prev = null;
     page->sizeClass = sc;
-    page->blockSize = (u32)blockSize;
+    page->blockSize = blockSize;
     page->capacity = MI_INITIAL_CAPACITY; // start small
     page->used = 0;
-    page->freeCount = MI_INITIAL_CAPACITY;
+    page->freeCount = (u32)MI_INITIAL_CAPACITY;
     page->reserved = blocksPerPage; // can extend up to this
     page->base = seg->base + metaSize; // blocks start after metadata
     page->free = null;
@@ -543,9 +543,9 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 
     // Build free list (only initial capacity)
     MiBlock* head = null;
-    for (u32 i = 0; i < MI_INITIAL_CAPACITY; i++)
+    for (usize i = 0; i < MI_INITIAL_CAPACITY; i++)
     {
-        MiBlock* block = (MiBlock*)(page->base + (u64)i * blockSize);
+        MiBlock* block = (MiBlock*)(page->base + i * blockSize);
         _miFreeBlockEncode(block, head, page);
         head = block;
     }
@@ -569,20 +569,20 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 // Extend page capacity incrementally
 static bool _miPageExtend(MiHeap* heap, MiPage* page)
 {
-    u32 newCap = page->capacity * 2;
+    usize newCap = page->capacity * 2;
     if (newCap > page->reserved) newCap = page->reserved;
     if (newCap <= page->capacity) return false;
 
     // Add new blocks to free list
     MiBlock* head = page->free;
-    for (u32 i = page->capacity; i < newCap; i++)
+    for (usize i = page->capacity; i < newCap; i++)
     {
-        MiBlock* block = (MiBlock*)(page->base + (u64)i * page->blockSize);
+        MiBlock* block = (MiBlock*)(page->base + i * page->blockSize);
         _miFreeBlockEncode(block, head, page);
         head = block;
     }
     page->free = head;
-    page->freeCount += (newCap - page->capacity);
+    page->freeCount += (u32)(newCap - page->capacity);
     page->capacity = newCap;
     return true;
 }
@@ -590,7 +590,7 @@ static bool _miPageExtend(MiHeap* heap, MiPage* page)
 static void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Remove from segment map
-    _miSegmentMapRemove(&_miGlobalPages, page->base, (u64)page->capacity * page->blockSize);
+    _miSegmentMapRemove(&_miGlobalPages, page->base, page->capacity * page->blockSize);
 
     // Unlink from heap
     if (page->prev != null) page->prev->next = page->next;
@@ -711,7 +711,7 @@ static void _miPageCollect(MiHeap* heap, MiPage* page)
         page->freeCount++;
         heap->totalFreed += page->blockSize;
         count++;
-        if (count > page->capacity)
+        if ((usize)count > page->capacity)
         {
             printf((const cchar*)C"mimalloc: corrupted thread-free list\n");
             return;
@@ -844,10 +844,10 @@ static MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
     MiSegmentMapEntry* entry = _miGlobalPages.buckets[idx];
     while (entry != null)
     {
-        u8* pageEnd = entry->page->base + (u64)entry->page->capacity * entry->page->blockSize;
+        u8* pageEnd = entry->page->base + entry->page->capacity * entry->page->blockSize;
         if (p >= entry->page->base && p < pageEnd)
         {
-            u64 offset = (u64)(p - entry->page->base);
+            usize offset = (usize)(p - entry->page->base);
             if (offset % entry->page->blockSize == 0)
                 return entry->page;
         }
@@ -932,7 +932,7 @@ pub struct MiAlloc
         // Handle huge allocations directly
         if (size >= MI_HUGE_THRESHOLD)
         {
-            usize allocSize = (size + 255) & ~255u; // align to 256 bytes
+            usize allocSize = (size + 255) & ~(usize)255; // align to 256 bytes
             u8* mem = (u8*)mmap(null, allocSize, 3, 0x22, -1, 0);
             if (mem == null) return null;
 
@@ -943,7 +943,7 @@ pub struct MiAlloc
             page->next = null;
             page->prev = null;
             page->sizeClass = sc;
-            page->blockSize = (u32)allocSize;
+            page->blockSize = allocSize;
             page->capacity = 1;
             page->used = 1;
             page->freeCount = 0;
