@@ -5,7 +5,7 @@ import types { Ty, TypeEntry, TypeKind };
 mod node = import "../coral-ast/node";
 import node { Node, NodeKind };
 mod decl_ast = import "../coral-ast/decl";
-import decl_ast { File, Decl, DeclKind };
+import decl_ast { File, Decl, DeclKind, Param, GenericParam };
 mod expr = import "../coral-ast/expr";
 import expr { Expr, ExprKind };
 mod stmt = import "../coral-ast/stmt";
@@ -19,6 +19,7 @@ import scope { Symbol, ScopeStack };
 mod context = import "../coral-context/context";
 import context { AstContext, InternEntry };
 
+extern("C") i32 printf(rawptr fmt, ...);
 
 pub extend MonoContext
 {
@@ -100,6 +101,21 @@ pub extend MonoContext
         TypeEntry* entry = self.typeEntryAt(typeNode);
         if (entry == null) return false;
         if (entry->kind.tag == TypeKind::TypeParam) return false;
+        /* builtin scalar/string types are always concrete — they have no
+         * file declaration for findDeclaration to resolve */
+        if (entry->kind.tag == TypeKind::Str || entry->kind.tag == TypeKind::Char ||
+            entry->kind.tag == TypeKind::Bool || entry->kind.tag == TypeKind::Void ||
+            entry->kind.tag == TypeKind::U8 || entry->kind.tag == TypeKind::U16 ||
+            entry->kind.tag == TypeKind::U32 || entry->kind.tag == TypeKind::U64 ||
+            entry->kind.tag == TypeKind::U128 || entry->kind.tag == TypeKind::I8 ||
+            entry->kind.tag == TypeKind::I16 || entry->kind.tag == TypeKind::I32 ||
+            entry->kind.tag == TypeKind::I64 || entry->kind.tag == TypeKind::I128 ||
+            entry->kind.tag == TypeKind::F32 || entry->kind.tag == TypeKind::F64 ||
+            entry->kind.tag == TypeKind::Usize || entry->kind.tag == TypeKind::Isize ||
+            entry->kind.tag == TypeKind::Rawptr || entry->kind.tag == TypeKind::Pointer ||
+            entry->kind.tag == TypeKind::Slice || entry->kind.tag == TypeKind::Array ||
+            entry->kind.tag == TypeKind::Const || entry->kind.tag == TypeKind::Comptime)
+            return true;
         if (entry->kind.tag == TypeKind::Named)
         {
             NodeId declId = self.findDeclaration(entry->kind.payload.Named.name);
@@ -129,6 +145,7 @@ pub extend MonoContext
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
+            printf("[mono] enqueue mismatch decl=%d gcount=%d argsLen=%d\n", (i32)declaration.index, (i32)self.genericCount(declaration), (i32)argumentsLen);
             self.errors = self.errors + 1;
             return false;
         }
@@ -274,9 +291,63 @@ pub extend MonoContext
                 }
                 next = next + 1;
             }
+            else
+            {
+                /* named param whose type is a generic (`T fmt`): the type
+                 * is TypeParam{index} after parser rebind — bind the call
+                 * arg at this position to that generic slot */
+                Node* pn = self.nodeAt(paramId);
+                if (pn != null && pn->kind.tag == NodeKind::Param)
+                {
+                    Ty pt = pn->kind.payload.Param.value.typeNode;
+                    while (pt != 0)
+                    {
+                        TypeEntry* te2 = self.ast.types + pt;
+                        if (te2->kind.tag == TypeKind::Comptime) pt = te2->kind.payload.Comptime.base;
+                        else if (te2->kind.tag == TypeKind::Const) pt = te2->kind.payload.Const.base;
+                        else break;
+                    }
+                    if (pt != 0)
+                    {
+                        TypeEntry* te3 = self.ast.types + pt;
+                        u32 slot = 0;
+                        bool haveSlot = false;
+                        if (te3->kind.tag == TypeKind::TypeParam)
+                        {
+                            slot = te3->kind.payload.TypeParam.index;
+                            haveSlot = true;
+                        }
+                        else if (te3->kind.tag == TypeKind::Named)
+                        {
+                            Str tn = te3->kind.payload.Named.name;
+                            u32 gi = 0;
+                            while (gi < gdecl->kind.payload.Func.genericParamsLen)
+                            {
+                                Node* gpn = self.nodeAt(gdecl->kind.payload.Func.genericParams[gi]);
+                                if (gpn != null && gpn->kind.tag == NodeKind::GenericParam &&
+                                    gpn->kind.payload.GenericParam.value.name == tn)
+                                {
+                                    slot = gi;
+                                    haveSlot = true;
+                                    break;
+                                }
+                                gi = gi + 1;
+                            }
+                        }
+                        if (haveSlot && slot < gcount &&
+                            arguments[slot] == 0 && p < call->kind.payload.Call.argsLen)
+                        {
+                            arguments[slot] = self.sema.exprType(call->kind.payload.Call.args[p]);
+                            if (self.activeSubsLen > 0 && self.activeSubs != null)
+                                arguments[slot] = self.substituteType(arguments[slot], self.activeSubs, self.activeSubsLen);
+                        }
+                    }
+                }
+            }
             p = p + 1;
         }
         bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, gcount);
+        printf("[mono] collectCall decl=%d gcount=%d ok=%d arg0=%d\n", (i32)declaration.index, (i32)gcount, (i32)ok, (i32)(gcount > 0 ? arguments[0] : 0));
         free((rawptr)arguments);
         return ok;
     }
