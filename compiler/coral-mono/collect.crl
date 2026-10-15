@@ -143,6 +143,12 @@ pub extend MonoContext
 
     bool enqueue(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen)
     {
+        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0);
+    }
+
+    bool enqueueVal(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen,
+                    u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen)
+    {
         if (self.genericCount(declaration) != argumentsLen)
         {
             printf("[mono] enqueue mismatch decl=%d gcount=%d argsLen=%d\n", (i32)declaration.index, (i32)self.genericCount(declaration), (i32)argumentsLen);
@@ -161,7 +167,7 @@ pub extend MonoContext
                     if (!self.sema.sameType(self.work[i].arguments[j], arguments[j])) break;
                     j = j + 1;
                 }
-                if (j == argumentsLen) return true;
+                if (j == argumentsLen && self.work[i].valueKey == valueKey) return true;
             }
             i = i + 1;
         }
@@ -173,6 +179,34 @@ pub extend MonoContext
         item.argumentsLen = argumentsLen;
         item.inherited = null;
         item.inheritedLen = 0;
+        item.valueKey = valueKey;
+        item.packArity = packArity;
+        item.literalNames = null;
+        item.literalNodes = null;
+        item.literalsLen = 0;
+        if (literalsLen > 0)
+        {
+            Str* lnames = (Str*)malloc((usize)literalsLen * @sizeof(Str));
+            NodeId* lnodes = (NodeId*)malloc((usize)literalsLen * @sizeof(NodeId));
+            if (lnames != null && lnodes != null)
+            {
+                u32 k = 0;
+                while (k < literalsLen)
+                {
+                    lnames[k] = literalNames[k];
+                    lnodes[k] = literalNodes[k];
+                    k = k + 1;
+                }
+                item.literalNames = lnames;
+                item.literalNodes = lnodes;
+                item.literalsLen = literalsLen;
+            }
+            else
+            {
+                if (lnames != null) free((rawptr)lnames);
+                if (lnodes != null) free((rawptr)lnodes);
+            }
+        }
         self.workLen = self.workLen + 1;
         return item.arguments != null || argumentsLen == 0;
     }
@@ -277,6 +311,16 @@ pub extend MonoContext
             return false;
         }
         u32 next = 0;
+        u32 namedCount = 0;
+        u32 litCap = call->kind.payload.Call.argsLen;
+        Str* litNames = null;
+        NodeId* litNodes = null;
+        if (litCap > 0)
+        {
+            litNames = (Str*)malloc((usize)litCap * @sizeof(Str));
+            litNodes = (NodeId*)malloc((usize)litCap * @sizeof(NodeId));
+        }
+        u32 litsLen = 0;
         u32 p = 0;
         while (p < gdecl->kind.payload.Func.paramsLen && next < gcount)
         {
@@ -342,12 +386,46 @@ pub extend MonoContext
                                 arguments[slot] = self.substituteType(arguments[slot], self.activeSubs, self.activeSubsLen);
                         }
                     }
+                    /* fixed named param: count it for the variadic-tail
+                     * arity and record a literal call arg so the instance
+                     * can bind the parameter's comptime value */
+                    if ((pn->kind.payload.Param.value.flags & 16) == 0)
+                    {
+                        namedCount = namedCount + 1;
+                        if (p < call->kind.payload.Call.argsLen &&
+                            pn->kind.payload.Param.value.name != 0)
+                        {
+                            NodeId avId = call->kind.payload.Call.args[p];
+                            Node* avn = self.nodeAt(avId);
+                            bool isLit = false;
+                            if (avn != null && avn->kind.tag == NodeKind::Expr)
+                            {
+                                Expr* ave = &avn->kind.payload.Expr.value;
+                                if (ave->kind.tag == ExprKind::StringLit ||
+                                    ave->kind.tag == ExprKind::IntLit ||
+                                    ave->kind.tag == ExprKind::CharLit ||
+                                    ave->kind.tag == ExprKind::BoolLit) isLit = true;
+                            }
+                            if (isLit && litNames != null && litNodes != null && litsLen < litCap)
+                            {
+                                litNames[litsLen] = pn->kind.payload.Param.value.name;
+                                litNodes[litsLen] = avId;
+                                litsLen = litsLen + 1;
+                            }
+                        }
+                    }
                 }
             }
             p = p + 1;
         }
-        bool ok = self.enqueue(MonoDeclKind::FunctionDecl, declaration, arguments, gcount);
-        printf("[mono] collectCall decl=%d gcount=%d ok=%d arg0=%d\n", (i32)declaration.index, (i32)gcount, (i32)ok, (i32)(gcount > 0 ? arguments[0] : 0));
+        u32 arity = 0;
+        if (call->kind.payload.Call.argsLen > namedCount)
+            arity = call->kind.payload.Call.argsLen - namedCount;
+        u64 key = self.callValueKey(call->kind.payload.Call.args, call->kind.payload.Call.argsLen);
+        bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
+                                  key, arity, litNames, litNodes, litsLen);
+        if (litNames != null) free((rawptr)litNames);
+        if (litNodes != null) free((rawptr)litNodes);
         free((rawptr)arguments);
         return ok;
     }

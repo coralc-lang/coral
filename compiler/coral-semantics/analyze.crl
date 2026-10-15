@@ -1184,7 +1184,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
     return segs;
 }
 
-CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool silenced, Slice* modKeys, Slice* modVals, u32 modLen)
+CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool silenced, Slice* modKeys, Slice* modVals, u32 modLen)
 {
     CompileUnit unit = CompileUnit {
         .ctx = null,
@@ -1389,9 +1389,25 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         else
         {
-            /* builtin `str` prelude — merged first so every unit sees
-             * `pub extend str` (fromCstr, fromParts, …) for findMethod */
-            libLoadModulePath(&loader, (u8*)"core::str", 9);
+            /* builtin prelude — merged first so every unit sees the
+             * common surface without importing it: core::str for
+             * `pub extend str` (fromCstr, fromParts, …) used by
+             * findMethod, plus the everyday std modules (io, string,
+             * option, result, vec, arr). platform paths (std::io::ios →
+             * std/x86_64/<plat>/io/ios.crl) resolve through the loader.
+             * --no-prelude skips all of it for minimal single-file tests */
+            if (!noPrelude)
+            {
+                libLoadModulePath(&loader, (u8*)"core::str", 9);
+                libLoadModulePath(&loader, (u8*)"std::io::ios", 12);
+                libLoadModulePath(&loader, (u8*)"std::text::string", 17);
+                libLoadModulePath(&loader, (u8*)"std::option", 11);
+                /* std::result skipped: result.crl:94 `Ok { error }` field bug + isErr/isOk resolve fail (never loaded in default builds) */
+                libLoadModulePath(&loader, (u8*)"std::vec", 8);
+                /* std::collections::arr NOT preloaded: Arr<T, N> uses a
+                 * generic param as array size, which the parser rejects
+                 * (type.crl:140 resolves sizes to u32 at parse time) */
+            }
             libLoadImports(&loader, file);
             libLoadSiblingImports(&loader, file);
             if (loader.errors == 0 && !libMerge(&loader, file))

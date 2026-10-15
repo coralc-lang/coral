@@ -384,6 +384,11 @@ pub extend Sema
          * the literal-sum as i32 and rejects a usize param. */
         if (value.index != 0 && self.integerType(targetTy) && self.isConstIntExpr(value))
         {
+            /* a `u`-suffixed literal stays unsigned-only even inside a
+             * compound const-int expr (`5u + 1`), matching the bare-literal
+             * rule further down — the fast path must not launder it into a
+             * signed target during ternary branch unification either */
+            if (self.hasUnsignedSuffix(value)) return !self.intSigned(targetTy);
             self.setExprType(value, targetTy);
             return true;
         }
@@ -677,25 +682,99 @@ pub extend Sema
      * an integer literal, a char literal, or a binary op whose both
      * operands are themselves const-int expressions (`16 + 1`, `'a' - 1`).
      * These are generic — they adopt the expected type at the use site. */
-    bool isConstIntExpr(NodeId id)
+    bool isConstIntExpr(NodeId id) { return self.isConstIntExprD(id, 0); }
+
+    bool isConstIntExprD(NodeId id, u32 depth)
     {
-        if (id.index == 0) return false;
+        if (id.index == 0 || depth > 24) return false;
         Node* n = self.ctx.nodes + id.index;
         if (n.kind.tag != NodeKind::Expr) return false;
         Expr* ev = &n.kind.payload.Expr.value;
         if (ev->kind.tag == ExprKind::IntLit) return true;
         if (ev->kind.tag == ExprKind::CharLit) return true;
-        if (ev->kind.tag == ExprKind::Neg) return self.isConstIntExpr(ev->kind.payload.Neg.expr);
-        if (ev->kind.tag == ExprKind::Add) return self.isConstIntExpr(ev->kind.payload.Add.left) && self.isConstIntExpr(ev->kind.payload.Add.right);
-        if (ev->kind.tag == ExprKind::Sub) return self.isConstIntExpr(ev->kind.payload.Sub.left) && self.isConstIntExpr(ev->kind.payload.Sub.right);
-        if (ev->kind.tag == ExprKind::Mul) return self.isConstIntExpr(ev->kind.payload.Mul.left) && self.isConstIntExpr(ev->kind.payload.Mul.right);
-        if (ev->kind.tag == ExprKind::Div) return self.isConstIntExpr(ev->kind.payload.Div.left) && self.isConstIntExpr(ev->kind.payload.Div.right);
-        if (ev->kind.tag == ExprKind::Mod) return self.isConstIntExpr(ev->kind.payload.Mod.left) && self.isConstIntExpr(ev->kind.payload.Mod.right);
-        if (ev->kind.tag == ExprKind::BitAnd) return self.isConstIntExpr(ev->kind.payload.BitAnd.left) && self.isConstIntExpr(ev->kind.payload.BitAnd.right);
-        if (ev->kind.tag == ExprKind::BitOr) return self.isConstIntExpr(ev->kind.payload.BitOr.left) && self.isConstIntExpr(ev->kind.payload.BitOr.right);
-        if (ev->kind.tag == ExprKind::BitXor) return self.isConstIntExpr(ev->kind.payload.BitXor.left) && self.isConstIntExpr(ev->kind.payload.BitXor.right);
-        if (ev->kind.tag == ExprKind::Shl) return self.isConstIntExpr(ev->kind.payload.Shl.left) && self.isConstIntExpr(ev->kind.payload.Shl.right);
-        if (ev->kind.tag == ExprKind::Shr) return self.isConstIntExpr(ev->kind.payload.Shr.left) && self.isConstIntExpr(ev->kind.payload.Shr.right);
+        if (ev->kind.tag == ExprKind::Neg) return self.isConstIntExprD(ev->kind.payload.Neg.expr, depth + 1);
+        if (ev->kind.tag == ExprKind::Add) return self.isConstIntExprD(ev->kind.payload.Add.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Add.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Sub) return self.isConstIntExprD(ev->kind.payload.Sub.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Sub.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mul) return self.isConstIntExprD(ev->kind.payload.Mul.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Mul.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Div) return self.isConstIntExprD(ev->kind.payload.Div.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Div.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mod) return self.isConstIntExprD(ev->kind.payload.Mod.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Mod.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitAnd) return self.isConstIntExprD(ev->kind.payload.BitAnd.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitAnd.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitOr) return self.isConstIntExprD(ev->kind.payload.BitOr.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitOr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitXor) return self.isConstIntExprD(ev->kind.payload.BitXor.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.BitXor.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shl) return self.isConstIntExprD(ev->kind.payload.Shl.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Shl.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shr) return self.isConstIntExprD(ev->kind.payload.Shr.left, depth + 1) && self.isConstIntExprD(ev->kind.payload.Shr.right, depth + 1);
+        /* a reference to an int constant counts — `u64 x = r ? y : INT64_MAX` */
+        if (ev->kind.tag == ExprKind::Ident)
+        {
+            Symbol* sym = self.lookupAt(ev->kind.payload.Ident.name, id);
+            if (sym != null && sym->declaration.index != 0)
+            {
+                Node* dn = self.ctx.nodes + sym->declaration.index;
+                if (dn.kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &dn.kind.payload.Decl.value;
+                    if (dd->kind.tag == DeclKind::Constant) return self.isConstIntExprD(dd->kind.payload.Constant.value, depth + 1);
+                }
+            }
+            return false;
+        }
+        /* a ternary over const-int branches is int-generic too — the
+         * condition does not affect the result's type */
+        if (ev->kind.tag == ExprKind::Ternary)
+        {
+            return self.isConstIntExprD(ev->kind.payload.Ternary.thenExpr, depth + 1) &&
+                   self.isConstIntExprD(ev->kind.payload.Ternary.elseExpr, depth + 1);
+        }
+        return false;
+    }
+
+    /* True when a const-int expr contains a `u`-suffixed literal anywhere
+     * (or references an unsigned-typed int constant): such an expr is
+     * generic for unsigned targets only, matching the bare-literal rule. */
+    bool hasUnsignedSuffix(NodeId id) { return self.hasUnsignedSuffixD(id, 0); }
+
+    bool hasUnsignedSuffixD(NodeId id, u32 depth)
+    {
+        if (id.index == 0 || depth > 24) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n.kind.tag != NodeKind::Expr) return false;
+        Expr* ev = &n.kind.payload.Expr.value;
+        if (ev->kind.tag == ExprKind::IntLit) return (ev->kind.payload.IntLit.flags & 1) != 0;
+        if (ev->kind.tag == ExprKind::CharLit) return false;
+        if (ev->kind.tag == ExprKind::Neg) return self.hasUnsignedSuffixD(ev->kind.payload.Neg.expr, depth + 1);
+        if (ev->kind.tag == ExprKind::Add) return self.hasUnsignedSuffixD(ev->kind.payload.Add.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Add.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Sub) return self.hasUnsignedSuffixD(ev->kind.payload.Sub.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Sub.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mul) return self.hasUnsignedSuffixD(ev->kind.payload.Mul.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Mul.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Div) return self.hasUnsignedSuffixD(ev->kind.payload.Div.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Div.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Mod) return self.hasUnsignedSuffixD(ev->kind.payload.Mod.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Mod.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitAnd) return self.hasUnsignedSuffixD(ev->kind.payload.BitAnd.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitAnd.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitOr) return self.hasUnsignedSuffixD(ev->kind.payload.BitOr.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitOr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::BitXor) return self.hasUnsignedSuffixD(ev->kind.payload.BitXor.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.BitXor.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shl) return self.hasUnsignedSuffixD(ev->kind.payload.Shl.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Shl.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Shr) return self.hasUnsignedSuffixD(ev->kind.payload.Shr.left, depth + 1) || self.hasUnsignedSuffixD(ev->kind.payload.Shr.right, depth + 1);
+        if (ev->kind.tag == ExprKind::Ident)
+        {
+            Symbol* sym = self.lookupAt(ev->kind.payload.Ident.name, id);
+            if (sym != null)
+            {
+                if (sym->typeNode != 0 && self.integerType(sym->typeNode) && !self.intSigned(sym->typeNode)) return true;
+                if (sym->declaration.index != 0)
+                {
+                    Node* dn = self.ctx.nodes + sym->declaration.index;
+                    if (dn.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* dd = &dn.kind.payload.Decl.value;
+                        if (dd->kind.tag == DeclKind::Constant) return self.hasUnsignedSuffixD(dd->kind.payload.Constant.value, depth + 1);
+                    }
+                }
+            }
+            return false;
+        }
+        if (ev->kind.tag == ExprKind::Ternary)
+        {
+            return self.hasUnsignedSuffixD(ev->kind.payload.Ternary.thenExpr, depth + 1) ||
+                   self.hasUnsignedSuffixD(ev->kind.payload.Ternary.elseExpr, depth + 1);
+        }
         return false;
     }
 

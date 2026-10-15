@@ -119,13 +119,14 @@ pub extend MonoContext
         return true;
     }
 
-    bool hasInstance(MonoDeclKind kind, Str name, Ty* arguments, u32 argumentsLen)
+    bool hasInstance(MonoDeclKind kind, Str name, Ty* arguments, u32 argumentsLen, u64 valueKey)
     {
         u32 i = 0;
         while (i < self.instancesLen)
         {
             if (self.instances[i].kind == (u8)kind && self.instances[i].name == name &&
                 self.instances[i].argumentsLen == argumentsLen &&
+                self.instances[i].valueKey == valueKey &&
                 self.sameArguments(self.instances[i].arguments, arguments, argumentsLen))
                 return true;
             i = i + 1;
@@ -133,7 +134,9 @@ pub extend MonoContext
         return false;
     }
 
-    bool addInstance(NodeId declaration, Ty* arguments, u32 argumentsLen)
+    bool addInstance(NodeId declaration, Ty* arguments, u32 argumentsLen,
+                     u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
+                     u32* outIndex)
     {
         Decl* decl = self.declAt(declaration);
         if (decl == null) return false;
@@ -141,7 +144,27 @@ pub extend MonoContext
         MonoDeclKind kind;
         if (decl->kind.tag == DeclKind::Func) kind = MonoDeclKind::FunctionDecl;
         else kind = MonoDeclKind::TypeDecl;
-        if (self.hasInstance(kind, name, arguments, argumentsLen)) return true;
+        u32 foundIdx = 0;
+        bool found = false;
+        u32 scan = 0;
+        while (scan < self.instancesLen)
+        {
+            if (self.instances[scan].kind == (u8)kind && self.instances[scan].name == name &&
+                self.instances[scan].argumentsLen == argumentsLen &&
+                self.instances[scan].valueKey == valueKey &&
+                self.sameArguments(self.instances[scan].arguments, arguments, argumentsLen))
+            {
+                found = true;
+                foundIdx = scan;
+                break;
+            }
+            scan = scan + 1;
+        }
+        if (found)
+        {
+            if (outIndex != null) *outIndex = foundIdx;
+            return true;
+        }
         if (!self.reserveInstances()) return false;
         MonoInstance* instance = self.instances + self.instancesLen;
         if (decl->kind.tag == DeclKind::Func) instance.kind = MonoInstanceKind::FunctionInstance;
@@ -156,6 +179,34 @@ pub extend MonoContext
         instance.argumentsLen = argumentsLen;
         instance.substitutions = self.buildSubstitutions(declaration, arguments, argumentsLen);
         instance.substitutionsLen = self.genericCount(declaration);
+        instance.valueKey = valueKey;
+        instance.packArity = packArity;
+        instance.literalNames = null;
+        instance.literalNodes = null;
+        instance.literalsLen = 0;
+        if (literalsLen > 0)
+        {
+            Str* lnames = (Str*)malloc((usize)literalsLen * @sizeof(Str));
+            NodeId* lnodes = (NodeId*)malloc((usize)literalsLen * @sizeof(NodeId));
+            if (lnames != null && lnodes != null)
+            {
+                u32 k = 0;
+                while (k < literalsLen)
+                {
+                    lnames[k] = literalNames[k];
+                    lnodes[k] = literalNodes[k];
+                    k = k + 1;
+                }
+                instance.literalNames = lnames;
+                instance.literalNodes = lnodes;
+                instance.literalsLen = literalsLen;
+            }
+            else
+            {
+                if (lnames != null) free((rawptr)lnames);
+                if (lnodes != null) free((rawptr)lnodes);
+            }
+        }
         if (decl->kind.tag == DeclKind::Func) instance.body = decl->kind.payload.Func.body;
         else
         {
@@ -195,6 +246,7 @@ pub extend MonoContext
             instance.typeNode = self.sema.allocType(kind);
         }
         self.instancesLen = self.instancesLen + 1;
+        if (outIndex != null) *outIndex = self.instancesLen - 1;
         return true;
     }
 
@@ -223,8 +275,12 @@ pub extend MonoContext
         u32 i = 0;
         while (i < self.workLen)
         {
-            if (!self.addInstance(self.work[i].declaration, self.work[i].arguments, self.work[i].argumentsLen)) return false;
-            MonoInstance* instance = self.instances + self.instancesLen - 1;
+            u32 instIdx = 0;
+            if (!self.addInstance(self.work[i].declaration, self.work[i].arguments, self.work[i].argumentsLen,
+                                  self.work[i].valueKey, self.work[i].packArity,
+                                  self.work[i].literalNames, self.work[i].literalNodes, self.work[i].literalsLen,
+                                  &instIdx)) return false;
+            MonoInstance* instance = self.instances + instIdx;
             if (!self.validateInstance(instance))
             {
                 printf("[mono] validateInstance FAILED decl=%d ret=%d\n", (i32)instance.declaration.index, (i32)instance.returnType);
@@ -324,6 +380,27 @@ pub extend MonoContext
                     ct.makeType(instance.substitutions[i].typeNode));
             i = i + 1;
         }
+        /* bind call-site literal values recorded for this instance
+         * (Zig-style value specialization: `println("hello")` binds fmt
+         * to the literal bytes, so `@isFormatLiteral(fmt)` folds) */
+        u32 li = 0;
+        while (li < instance.literalsLen)
+        {
+            Node* vn = self.nodeAt(instance.literalNodes[li]);
+            if (vn != null && vn->kind.tag == NodeKind::Expr)
+            {
+                Expr* ve = &vn->kind.payload.Expr.value;
+                if (ve->kind.tag == ExprKind::StringLit)
+                    ct.bind(instance.literalNames[li], ct.strLitVal(instance.literalNodes[li]));
+                else if (ve->kind.tag == ExprKind::IntLit)
+                    ct.bind(instance.literalNames[li], ct.makeInt(ve->kind.payload.IntLit.value));
+                else if (ve->kind.tag == ExprKind::CharLit)
+                    ct.bind(instance.literalNames[li], ct.makeInt((u64)ve->kind.payload.CharLit.value));
+                else if (ve->kind.tag == ExprKind::BoolLit)
+                    ct.bind(instance.literalNames[li], ct.makeBool((ve->kind.payload.BoolLit.flags & 1) != 0));
+            }
+            li = li + 1;
+        }
         /* if the instance function is variadic, remember the pack param
          * name so bare `...` in its body can forward it */
         Node* fnNode = self.nodeAt(instance.declaration);
@@ -338,6 +415,12 @@ pub extend MonoContext
                     (lpn->kind.payload.Param.value.flags & 16) != 0)
                 {
                     ct.variadicPackName = lpn->kind.payload.Param.value.name;
+                    /* this call site passed no trailing args — bind the
+                     * pack to an empty pack so `for (x : args)` unrolls
+                     * to zero iterations instead of falling back to a
+                     * runtime loop over a pack codegen cannot lower */
+                    if (instance.packArity == 0)
+                        ct.bind(ct.variadicPackName, ct.makePack(null, 0));
                 }
             }
         }
@@ -358,8 +441,10 @@ pub extend MonoContext
             ct.dispose();
             return;
         }
-        /* replace the body with a Block of the surviving runtime stmts */
-        if (ct.emittedLen > 0 && ct.emittedLen != bs->kind.payload.Block.stmtsLen)
+        /* replace the body with a Block of the surviving runtime stmts —
+         * length is not a proxy for "unchanged" (one comptime stmt can
+         * fold into one different runtime stmt) */
+        if (ct.emittedLen > 0)
         {
             NodeId* out = (NodeId*)calloc((usize)ct.emittedLen, @sizeof(NodeId));
             if (out != null)

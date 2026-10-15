@@ -69,6 +69,14 @@ pub struct MonoInstance
     u32 attributesLen;
     u8 validationAttempted;
     u8 validated;
+    /* Zig-style value specialization: instances of the same declaration
+     * with the same type arguments but different comptime-visible call
+     * values (literal formats, argument arity) are distinct instances */
+    u64 valueKey;
+    u32 packArity;
+    Str* literalNames;
+    NodeId* literalNodes;
+    u32 literalsLen;
 }
 
 pub struct MonoWorkItem
@@ -79,6 +87,11 @@ pub struct MonoWorkItem
     u32 argumentsLen;
     MonoSubstitution* inherited;
     u32 inheritedLen;
+    u64 valueKey;
+    u32 packArity;
+    Str* literalNames;
+    NodeId* literalNodes;
+    u32 literalsLen;
 }
 
 pub struct MonoContext
@@ -132,6 +145,8 @@ pub extend MonoContext
         {
             if (self.work[i].arguments != null) free((rawptr)self.work[i].arguments);
             if (self.work[i].inherited != null) free((rawptr)self.work[i].inherited);
+            if (self.work[i].literalNames != null) free((rawptr)self.work[i].literalNames);
+            if (self.work[i].literalNodes != null) free((rawptr)self.work[i].literalNodes);
             i = i + 1;
         }
         if (self.work != null) free((rawptr)self.work);
@@ -141,6 +156,8 @@ pub extend MonoContext
             if (self.instances[i].arguments != null) free((rawptr)self.instances[i].arguments);
              if (self.instances[i].paramTypes != null) free((rawptr)self.instances[i].paramTypes);
              if (self.instances[i].substitutions != null) free((rawptr)self.instances[i].substitutions);
+            if (self.instances[i].literalNames != null) free((rawptr)self.instances[i].literalNames);
+            if (self.instances[i].literalNodes != null) free((rawptr)self.instances[i].literalNodes);
             i = i + 1;
         }
         if (self.instances != null) free((rawptr)self.instances);
@@ -352,6 +369,58 @@ pub extend MonoContext
         Node* node = self.nodeAt(id);
         if (node == null || node->kind.tag != NodeKind::Decl) return null;
         return &node->kind.payload.Decl.value;
+    }
+
+    /* FNV-1a over the call's per-argument comptime-visible identity:
+     * a literal token (string bytes / int / char / bool value) or 'R'
+     * for runtime args. Two call sites to the same generic function
+     * produce the same valueKey iff their literal args are equal (and
+     * the arity matches) — this is the value half of instance identity
+     * (Zig-style: `println("a")` and `println("b")` are distinct
+     * instances, `println(fmt)` with a runtime fmt shares the runtime
+     * instance). Computed identically at collect time (collectCall) and
+     * at codegen time (cgCallFromDecl), both over the call's arg nodes. */
+    u64 callValueKey(NodeId* args, u32 argsLen)
+    {
+        u64 h = 1469598103934665603;
+        h = (h ^ (u64)argsLen) * 1099511628211;
+        u32 i = 0;
+        while (i < argsLen)
+        {
+            u64 tag = 82; /* 'R' — runtime value */
+            u64 val = 0;
+            u8* sp = null;
+            usize sl = 0;
+            Node* an = self.nodeAt(args[i]);
+            if (an != null && an->kind.tag == NodeKind::Expr)
+            {
+                Expr* e = &an->kind.payload.Expr.value;
+                if (e->kind.tag == ExprKind::StringLit)
+                {
+                    tag = 83; /* 'S' */
+                    Str s = e->kind.payload.StringLit.value;
+                    if (s != 0 && s < self.ast.internsLen)
+                    {
+                        sp = self.ast.interns[s].ptr;
+                        sl = self.ast.interns[s].len;
+                    }
+                }
+                else if (e->kind.tag == ExprKind::IntLit) { tag = 73; val = e->kind.payload.IntLit.value; } /* 'I' */
+                else if (e->kind.tag == ExprKind::CharLit) { tag = 67; val = (u64)e->kind.payload.CharLit.value; } /* 'C' */
+                else if (e->kind.tag == ExprKind::BoolLit) { tag = 66; val = (u64)(e->kind.payload.BoolLit.flags & 1); } /* 'B' */
+                else if (e->kind.tag == ExprKind::Spread && e->kind.payload.Spread.expr.index == 0) tag = 80; /* 'P' bare spread */
+            }
+            h = (h ^ tag) * 1099511628211;
+            h = (h ^ val) * 1099511628211;
+            usize b = 0;
+            while (b < sl)
+            {
+                h = (h ^ (u64)sp[b]) * 1099511628211;
+                b = b + 1;
+            }
+            i = i + 1;
+        }
+        return h;
     }
 
     TypeEntry* typeEntryAt(Ty typeNode)

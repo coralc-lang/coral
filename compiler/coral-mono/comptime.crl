@@ -89,6 +89,13 @@ pub struct CtEval
     bool typeSwitchMissed;
     bool declEmitted;
     u32 loopDepth;
+    /* names of locals declared in this evaluation — used to fold
+     * `local = comptime` onto uninitialized locals and to emit each
+     * runtime declaration once even when an unrolled loop re-runs the
+     * same VarDecl statement */
+    Str* declNames;
+    u32 declNamesLen;
+    u32 declNamesCap;
 }
 
 pub extend CtEval
@@ -113,14 +120,19 @@ pub extend CtEval
         self.typeSwitchMissed = false;
         self.declEmitted = false;
         self.loopDepth = 0;
+        self.declNames = null;
+        self.declNamesLen = 0;
+        self.declNamesCap = 0;
     }
 
     void dispose()
     {
         if (self.bindings != null) free((rawptr)self.bindings);
         if (self.emitted != null) free((rawptr)self.emitted);
+        if (self.declNames != null) free((rawptr)self.declNames);
         self.bindings = null;
         self.emitted = null;
+        self.declNames = null;
     }
 
     CtVal makeNone()
@@ -249,6 +261,33 @@ pub extend CtEval
             i = i + 1;
         }
         return self.makeNone();
+    }
+
+    bool hasDeclName(Str name)
+    {
+        u32 i = 0;
+        while (i < self.declNamesLen)
+        {
+            if (self.declNames[i] == name) return true;
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void addDeclName(Str name)
+    {
+        if (name == 0 || self.hasDeclName(name)) return;
+        if (self.declNamesLen >= self.declNamesCap)
+        {
+            u32 newCap = self.declNamesCap * 2;
+            if (newCap == 0) newCap = 16;
+            rawptr raw = realloc((rawptr)self.declNames, (usize)newCap * @sizeof(Str));
+            if (raw == null) { self.mono.errors = self.mono.errors + 1; return; }
+            self.declNames = (Str*)raw;
+            self.declNamesCap = newCap;
+        }
+        self.declNames[self.declNamesLen] = name;
+        self.declNamesLen = self.declNamesLen + 1;
     }
 
     void fail(u8* msg)
@@ -540,6 +579,32 @@ pub extend CtEval
         return self.mkExpr(ExprKind::IntLit{ .value = v, .flags = 0 }, t);
     }
 
+    /* fresh string literal from comptime bytes — codegen reads StringLit
+     * intern text with surrounding quotes, so build a quoted form with
+     * backslash and quote escaped */
+    NodeId mkStrLit(u8* p, usize n)
+    {
+        if (p == null) return NodeId{ .index = 0 };
+        u8* buf = (u8*)malloc(n * 2 + 2);
+        if (buf == null) { self.mono.errors = self.mono.errors + 1; return NodeId{ .index = 0 }; }
+        usize w = 0;
+        buf[w] = 34; w = w + 1;
+        usize i = 0;
+        while (i < n)
+        {
+            u8 c = p[i];
+            if (c == 34 || c == 92) { buf[w] = 92; w = w + 1; }
+            buf[w] = c;
+            w = w + 1;
+            i = i + 1;
+        }
+        buf[w] = 34; w = w + 1;
+        Str s = self.internStr(buf, w);
+        free((rawptr)buf);
+        Sema* sm = self.mono.sema;
+        return self.mkExpr(ExprKind::StringLit{ .value = s, .flags = 0 }, sm.strType());
+    }
+
     Ty u64Ty()
     {
         Sema* s = self.mono.sema;
@@ -583,6 +648,7 @@ pub extend CtEval
             else k = ExprKind::BoolLit{ .flags = 0 };
             return self.mkExpr(k, self.boolTy());
         }
+        if (v.kind == 3) return self.mkStrLit(v.sptr, v.slen);
         if (v.kind == 5) return v.rid;
         return NodeId{ .index = 0 };
     }
@@ -601,6 +667,22 @@ pub extend CtEval
         *outPtr = self.mono.ast.interns[s].ptr;
         *outLen = self.mono.ast.interns[s].len;
         return true;
+    }
+
+    /* comptime str VALUE of a source string literal — intern text keeps
+     * the surrounding quotes (codegen strips them when re-emitting); the
+     * value bytes are what sits inside the quotes */
+    CtVal strLitVal(NodeId id)
+    {
+        u8* p = null;
+        usize pl = 0;
+        if (!self.litStringBytes(id, &p, &pl)) return self.makeNone();
+        usize begin = 0;
+        if (pl >= 3 && p[0] == 67 && p[1] == 34) begin = 2;
+        else if (pl >= 2 && p[0] == 34) begin = 1;
+        usize end = pl;
+        if (end > begin && p[end - 1] == 34) end = end - 1;
+        return self.makeStrCopy(p + begin, end - begin);
     }
 
     /* evaluate a builtin call (@compileError / @isFormatLiteral / @typeof) */
@@ -631,15 +713,16 @@ pub extend CtEval
             self.fail(msg);
             return self.makeNone();
         }
-        /* @isFormatLiteral(x) — true iff x is a string literal */
+        /* @isFormatLiteral(x) — true iff x is a comptime-known string
+         * value (a literal in scope, or a call-site literal bound for
+         * this instance; runtime strings evaluate to kind 5 and stay
+         * false) */
         if (bname == self.internStr((u8*)"isFormatLiteral", 15))
         {
             if (n == 1)
             {
-                u8* p = null;
-                usize pl = 0;
-                if (self.litStringBytes(e->kind.payload.BuiltinCall.args[0], &p, &pl))
-                    return self.makeBool(true);
+                CtVal a = self.evalExpr(e->kind.payload.BuiltinCall.args[0]);
+                if (a.kind == 3) return self.makeBool(true);
             }
             return self.makeBool(false);
         }
@@ -765,7 +848,7 @@ pub extend CtEval
             u32 savedLen = self.bindingsLen;
             u32 p = 0;
             u32 pi = 0;
-            while (p < decl->kind.payload.Func.paramsLen && pi < argc)
+            while (p < decl->kind.payload.Func.paramsLen)
             {
                 Node* pn = self.nodeAt(decl->kind.payload.Func.params[p]);
                 if (pn != null && pn->kind.tag == NodeKind::Param)
@@ -773,7 +856,12 @@ pub extend CtEval
                     Param* pp = &pn->kind.payload.Param.value;
                     if ((pp->flags & 16) != 0)
                     {
-                        /* variadic — bind the rest as a pack */
+                        /* variadic — bind the rest as a pack; when the
+                         * caller passed no trailing args (or forwarded an
+                         * empty pack through bare `...`) bind an EMPTY
+                         * pack so `for (x : args)` unrolls to zero
+                         * iterations instead of falling back to a
+                         * runtime loop over a pack codegen cannot lower */
                         if (pi < argc)
                         {
                             u32 rest = argc - pi;
@@ -791,11 +879,17 @@ pub extend CtEval
                             }
                             else free((rawptr)elems);
                         }
+                        else if (pp->name != 0)
+                        {
+                            self.bind(pp->name, self.makePack(null, 0));
+                            self.variadicPackName = pp->name;
+                        }
                         pi = argc;
+                        break;
                     }
                     else
                     {
-                        if (pp->name != 0) self.bind(pp->name, argv[pi]);
+                        if (pi < argc && pp->name != 0) self.bind(pp->name, argv[pi]);
                         pi = pi + 1;
                     }
                 }
@@ -845,12 +939,7 @@ pub extend CtEval
             ExprKind::CharLit => { return self.makeInt((u64)e->kind.payload.CharLit.value); },
             ExprKind::BoolLit => { return self.makeBool((e->kind.payload.BoolLit.flags & 1) != 0); },
             ExprKind::FloatLit => { return self.makeRt(id, rt); },
-            ExprKind::StringLit => {
-                u8* p = null;
-                usize pl = 0;
-                if (self.litStringBytes(id, &p, &pl)) return self.makeStrCopy(p, pl);
-                return self.makeRt(id, rt);
-            },
+            ExprKind::StringLit => { return self.strLitVal(id); },
             ExprKind::Ident => {
                 CtVal v = self.lookup(e->kind.payload.Ident.name);
                 if (v.kind != 0) return v;
@@ -1068,13 +1157,21 @@ pub extend CtEval
     {
         Str name = s->kind.payload.VarDecl.name;
         CtVal v = self.evalExpr(s->kind.payload.VarDecl.init);
-        /* bind comptime-known values so later uses fold; the declaration
-         * is emitted either way — a folded use keeps it dead, an emitted
-         * use keeps it declared (assignments to it may stay runtime) */
+        /* bind comptime-known values so later uses fold */
         if (name != 0 && (v.kind == 1 || v.kind == 2 || v.kind == 3 || v.kind == 6))
             self.bind(name, v);
-        self.emit(id);
-        self.declEmitted = true;
+        /* emit the runtime declaration once per name — an unrolled loop
+         * re-evaluating the same VarDecl must not duplicate the C decl.
+         * Inside an unrolled body the single declaration lands in the
+         * flat emitted block, so it stays visible to later statements.
+         * `declEmitted` (the unroll-unsafe rewind signal) is only set for
+         * declarations outside loops. */
+        if (name == 0 || !self.hasDeclName(name))
+        {
+            if (name != 0) self.addDeclName(name);
+            self.emit(id);
+            if (self.loopDepth == 0) self.declEmitted = true;
+        }
     }
 
     /* is this an assignment expression tag? */
@@ -1128,6 +1225,25 @@ pub extend CtEval
             if (cur.kind == val.kind && (cur.kind == 1 || cur.kind == 2 || cur.kind == 3))
             {
                 self.bind(nm, val);
+                return true;
+            }
+            /* a local declared in this evaluation (`str f;`) that has no
+             * binding yet: record the comptime value so later uses fold,
+             * and emit the assignment with a fresh literal RHS so the
+             * flat C body stays valid (the original RHS may reference
+             * comptime-only names like the entry param `fmt`) */
+            if (cur.kind == 0 && (val.kind == 1 || val.kind == 2 || val.kind == 3) &&
+                self.hasDeclName(nm))
+            {
+                self.bind(nm, val);
+                NodeId vn = self.valToNode(val);
+                if (vn.index != 0)
+                {
+                    ExprKind nk = ExprKind::Assign{ .target = t, .value = vn };
+                    NodeId ne = self.mkExpr(nk, e->resolvedType);
+                    NodeId wrap = self.mkStmt(StmtKind::ExprStmt{ .expr = ne });
+                    self.emit(wrap);
+                }
                 return true;
             }
             return false;
@@ -1223,6 +1339,15 @@ pub extend CtEval
                                     NodeId nn = self.valToNode(av);
                                     if (nn.index != 0) { newArgs[j] = nn; any = true; }
                                 }
+                                else if (av.kind == 5 && av.rid.index != 0)
+                                {
+                                    /* runtime-bound name (inlined callee
+                                     * param, e.g. `out` → `&out` at the
+                                     * call site): emit the caller-side
+                                     * node so the reference resolves */
+                                    newArgs[j] = av.rid;
+                                    any = true;
+                                }
                             }
                             j = j + 1;
                         }
@@ -1285,6 +1410,28 @@ pub extend CtEval
         self.emit(id);
     }
 
+    /* evaluate a switch arm's body without the Block scope-restore —
+     * an assignment the arm makes to an outer comptime local
+     * (`f = fmt;` inside `str => { ... }`) must survive the arm so the
+     * statements after the switch fold against it */
+    void evalArmBody(NodeId bodyId)
+    {
+        Node* bn = self.nodeAt(bodyId);
+        if (bn != null && bn->kind.tag == NodeKind::Stmt &&
+            bn->kind.payload.Stmt.value.kind.tag == StmtKind::Block)
+        {
+            u32 i = 0;
+            while (i < bn->kind.payload.Stmt.value.kind.payload.Block.stmtsLen)
+            {
+                self.evalStmt(bn->kind.payload.Stmt.value.kind.payload.Block.stmts[i]);
+                if (self.returned || self.broken || self.continued) return;
+                i = i + 1;
+            }
+            return;
+        }
+        self.evalStmt(bodyId);
+    }
+
     void evalSwitch(NodeId id, Stmt* s)
     {
         CtVal sc = self.evalExpr(s->kind.payload.Switch.expr);
@@ -1304,7 +1451,7 @@ pub extend CtEval
                 }
                 if (hit)
                 {
-                    self.evalStmt(c->body);
+                    self.evalArmBody(c->body);
                     return;
                 }
                 i = i + 1;
@@ -1338,7 +1485,7 @@ pub extend CtEval
                 }
                 if (hit)
                 {
-                    self.evalStmt(c->body);
+                    self.evalArmBody(c->body);
                     return;
                 }
                 i = i + 1;

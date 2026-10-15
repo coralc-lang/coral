@@ -337,6 +337,45 @@ Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
     return stTail(&cg.tybuf, st);
 }
 
+void cgWriteHex(Stream* s, u64 v)
+{
+    u8* digits = (u8*)"0123456789abcdef";
+    i32 sh = 60;
+    bool started = false;
+    while (sh >= 0)
+    {
+        u32 d = (u32)((v >> (u64)sh) & 15);
+        if (d != 0 || started || sh == 0)
+        {
+            stCh(s, digits[d]);
+            started = true;
+        }
+        sh = sh - 4;
+    }
+}
+
+/* instance name with the Zig-style value-specialization key appended —
+ * `println` of "hello" and of "bye" are distinct C symbols; key 0 (no
+ * recorded call-site values) keeps the plain name */
+Slice cgInstanceNameV(Codegen* cg, Str name, Ty* args, u32 argsLen, u64 valueKey)
+{
+    usize st = cg.tybuf.len;
+    stPS(&cg.tybuf, cgIntern(cg, name));
+    u32 i = 0;
+    while (i < argsLen)
+    {
+        stCh(&cg.tybuf, 95);
+        cgMangleTy(cg, args[i]);
+        i = i + 1;
+    }
+    if (valueKey != 0)
+    {
+        stP(&cg.tybuf, "_v");
+        cgWriteHex(&cg.tybuf, valueKey);
+    }
+    return stTail(&cg.tybuf, st);
+}
+
 /* ── name mangling (coral-docs/mangle_asm.md; C keeps the `__
  *      separator instead of asm's `$`) ───────────────────────────
  *
@@ -980,17 +1019,23 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
         *outRet = dd.kind.payload.Func.returnType;
         return cgMangle(cg, declId, dd.kind.payload.Func.name, alias);
     }
-    /* generic: pick the mono instance whose collected argument types match */
+    /* generic: pick the mono instance whose collected argument types and
+     * Zig-style value key match this call site (the key is computed over
+     * the same arg nodes collectCall saw, so literal formats select their
+     * own specialized instance) */
+    u64 callKey = cg.mono.callValueKey(args, argsLen);
     u32 total = 0;
-    u32 firstMatch = 0;
-    u32 matches = 0;
+    u32 firstTotal = 0;
+    u32 keyPick = 0;
+    u32 typePick = 0;
+    u32 typeMatches = 0;
     u32 i = 0;
     while (i < cg.mono.instancesLen)
     {
         MonoInstance* inst = cg.mono.instances + i;
         if (inst.kind == MonoInstanceKind::FunctionInstance && inst.declaration.index == declId.index)
         {
-            if (total == 0) firstMatch = i;
+            if (total == 0) firstTotal = i;
             total = total + 1;
             bool ok = true;
             if (inst.argumentsLen == argsLen) {
@@ -1007,25 +1052,27 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
                 ok = false;
             }
             if (ok) {
-                if (matches == 0) firstMatch = i;
-                matches = matches + 1;
+                typeMatches = typeMatches + 1;
+                if (typePick == 0) typePick = i + 1;
+                if (keyPick == 0 && inst.valueKey == callKey) keyPick = i + 1;
             }
         }
         i = i + 1;
     }
     if (total == 0) return Slice::from(null, 0);
-    u32 pick = firstMatch;
-    if (matches == 0) {
-        /* no argument match: fall back to the first instance (sema already
-           accepted the call) and surface the mismatch */
+    u32 pick = firstTotal;
+    if (keyPick != 0) pick = keyPick - 1;
+    else if (typeMatches == 1 && cg.mono.instances[typePick - 1].valueKey == 0) pick = typePick - 1;
+    else {
+        /* no argument+value match, and the fallback (a lone unkeyed
+           instance) is unavailable — surface the mismatch */
         cgError(cg, (u8*)"no unique mono instance for call");
-        pick = firstMatch;
     }
     MonoInstance* p = cg.mono.instances + pick;
     *found = true;
     *outRet = p.returnType;
     return cgMangleS(cg, p.declaration,
-                     cgInstanceName(cg, p.name, p.arguments, p.argumentsLen), alias);
+                     cgInstanceNameV(cg, p.name, p.arguments, p.argumentsLen, p.valueKey), alias);
 }
 
 Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet, bool* found, NodeId refSite, NodeId* outDecl)
@@ -1167,7 +1214,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
                     if (outDecl != null) *outDecl = inst.declaration;
                     if (gbuf != null) free((rawptr)gbuf);
                     return cgMangleS(cg, inst.declaration,
-                                     cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), alias);
+                                     cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), alias);
                 }
             }
             i = i + 1;
@@ -1197,7 +1244,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
                     if (outDecl != null) *outDecl = inst.declaration;
                     if (gbuf != null) free((rawptr)gbuf);
                     return cgMangleS(cg, inst.declaration,
-                                     cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
+                                     cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
                 }
             }
             i = i + 1;
@@ -4276,7 +4323,42 @@ void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys
     cg.subsLen = oldSubsLen;
 }
 
-void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner, u8 isStatic)
+/* the monomorphised instance's rewritten body for this decl + subs —
+ * comptime blocks were already evaluated into it; 0 when there is no
+ * matching instance (callers fall back to the declaration's body) */
+NodeId cgInstanceBody(Codegen* cg, NodeId declId, MonoSubstitution* subs, u32 subsLen, u64 valueKey)
+{
+    if (cg.mono == null) return NodeId{ .index = 0 };
+    u32 k = 0;
+    while (k < cg.mono.instancesLen)
+    {
+        MonoInstance* inst = cg.mono.instances + k;
+        if (inst.kind == MonoInstanceKind::FunctionInstance &&
+            inst.declaration.index == declId.index &&
+            inst.substitutionsLen == subsLen &&
+            inst.valueKey == valueKey &&
+            inst.body.index != 0)
+        {
+            bool same = true;
+            u32 j = 0;
+            while (j < subsLen)
+            {
+                if (subs[j].parameter != inst.substitutions[j].parameter ||
+                    subs[j].typeNode != inst.substitutions[j].typeNode)
+                {
+                    same = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if (same) return inst.body;
+        }
+        k = k + 1;
+    }
+    return NodeId{ .index = 0 };
+}
+
+void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner, u8 isStatic, u64 valueKey)
 {
     Node* ddn = cgNode(cg, declId);
     Decl* dd = &ddn.kind.payload.Decl.value;
@@ -4309,6 +4391,8 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
         }
     }
     NodeId bodyId = dd.kind.payload.Func.body;
+    NodeId instBody = cgInstanceBody(cg, declId, subs, subsLen, valueKey);
+    if (instBody.index != 0) bodyId = instBody;
     Node* bn = cgNode(cg, bodyId);
     if (bn.kind.tag == NodeKind::Stmt && bn.kind.payload.Stmt.value.kind.tag == StmtKind::Block)
     {
@@ -5087,7 +5171,7 @@ void cgEmitMethodSet(Codegen* cg, NodeId declId, bool withBodies)
                 if (withBodies)
                 {
                     if ((flags & 8) != 0 && (flags & 2) == 0)
-                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, paramOwner, (flags & 4) != 0 ? 1 : 0);
+                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, paramOwner, (flags & 4) != 0 ? 1 : 0, 0);
                 }
                 else
                 {
@@ -5142,7 +5226,7 @@ void cgEmitInstMethodList(Codegen* cg, NodeId* methods, u32 mlen, Slice m, MonoI
                 if (withBodies)
                 {
                     if ((flags & 8) != 0 && (flags & 2) == 0)
-                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, inst.substitutions, inst.substitutionsLen, m, (flags & 4) != 0 ? 1 : 0);
+                        cgEmitFuncCommon(cg, mid, cname, md.kind.payload.Func.returnType, null, inst.substitutions, inst.substitutionsLen, m, (flags & 4) != 0 ? 1 : 0, inst.valueKey);
                 }
                 else
                 {
@@ -5251,7 +5335,7 @@ void cgEmitProtos(Codegen* cg)
             if (inst.kind == MonoInstanceKind::FunctionInstance)
             {
                 Slice m = cgMangleS(cg, inst.declaration,
-                                    cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
+                                    cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
                 cgEmitProto(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
                             inst.substitutions, inst.substitutionsLen, Slice::from(null, 0));
             }
@@ -5286,7 +5370,7 @@ void cgEmitBodies(Codegen* cg)
                 if ((flags & 8) != 0 && (flags & 2) == 0 && !cgDeclIsGeneric(cg, id))
                     cgEmitFuncCommon(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),
                                      dd.kind.payload.Func.returnType, null, null, 0,
-                                     Slice::from(null, 0), (flags & 4) != 0 ? 1 : 0);
+                                     Slice::from(null, 0), (flags & 4) != 0 ? 1 : 0, 0);
             }
             else if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union ||
                      dd.kind.tag == DeclKind::Variant || dd.kind.tag == DeclKind::Extend ||
@@ -5310,9 +5394,9 @@ void cgEmitBodies(Codegen* cg)
                 if ((dd.kind.payload.Func.flags & 8) != 0 && (dd.kind.payload.Func.flags & 2) == 0)
                 {
                     Slice m = cgMangleS(cg, inst.declaration,
-                                        cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen), 0);
+                                        cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
                     cgEmitFuncCommon(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
-                                     inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0);
+                                     inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0, inst.valueKey);
                 }
             }
             else if (inst.kind == MonoInstanceKind::TypeInstance)
