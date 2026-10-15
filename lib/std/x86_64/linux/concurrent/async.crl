@@ -153,14 +153,14 @@ struct TimeSpec
     i64 nsec;
 }
 
-static u64 _nowMs()
+u64 _nowMs()
 {
     TimeVal tv;
     gettimeofday((rawptr)&tv, null);
     return (u64)tv.sec * 1000u + (u64)tv.usec / 1000u;
 }
 
-static void _initScheduler()
+void _initScheduler()
 {
     if (_sched.inited) return;
     _sched.mutex.init();
@@ -183,19 +183,19 @@ pub bool init()
     return _sched.inited;
 }
 
-static void _lock()
+void _lock()
 {
     if (!_sched.inited) _initScheduler();
     _sched.mutex.lock();
 }
 
-static void _unlock()
+void _unlock()
 {
     _sched.mutex.unlock();
 }
 
 // Lock must be held. Hands result out to every parked waiter and wakes run().
-static void _resolveLocked(Future* f, rawptr result)
+void _resolveLocked(Future* f, rawptr result)
 {
     if (f == null || f->state == FUTURE_READY) return;
     f->state = FUTURE_READY;
@@ -215,7 +215,7 @@ static void _resolveLocked(Future* f, rawptr result)
 
 // Lock must be held. Single funnel for every completion, so the pool-in-flight
 // counter stays honest.
-static void _completeLocked(Future* f, rawptr result)
+void _completeLocked(Future* f, rawptr result)
 {
     if (f != null && f->counted)
     {
@@ -226,7 +226,7 @@ static void _completeLocked(Future* f, rawptr result)
 }
 
 // Lock must be held.
-static void _pushReady(Fiber* f)
+void _pushReady(Fiber* f)
 {
     f->next = null;
     if (_sched.readyTail != null) _sched.readyTail->next = f;
@@ -235,7 +235,7 @@ static void _pushReady(Fiber* f)
 }
 
 // Lock must be held.
-static Fiber* _popReady()
+Fiber* _popReady()
 {
     Fiber* f = _sched.readyHead;
     if (f == null) return null;
@@ -247,7 +247,7 @@ static Fiber* _popReady()
 
 // Lock must be held. Expired timers resolve their futures (wakes parked
 // waiters) and free their entries.
-static void _expireTimersLocked()
+void _expireTimersLocked()
 {
     u64 now = _nowMs();
     while (_sched.timerHead != null && _sched.timerHead->deadlineMs <= now)
@@ -261,7 +261,7 @@ static void _expireTimersLocked()
 
 // Lock must be held. Finished fibers no longer execute on their stacks, so
 // they may go back on the free list for reuse.
-static void _drainReapLocked()
+void _drainReapLocked()
 {
     while (_sched.reapHead != null)
     {
@@ -273,7 +273,7 @@ static void _drainReapLocked()
 }
 
 // Lock must be held (pthread_cond_timedwait drops and re-takes it).
-static void _condTimedWait(u64 deadlineMs)
+void _condTimedWait(u64 deadlineMs)
 {
     TimeSpec ts;
     ts.sec = (i64)(deadlineMs / 1000u);
@@ -281,7 +281,7 @@ static void _condTimedWait(u64 deadlineMs)
     pthread_cond_timedwait(_sched.cond.impl, _sched.mutex.impl, (rawptr)&ts);
 }
 
-static void _prepareContext(Fiber* f)
+void _prepareContext(Fiber* f)
 {
     getcontext((rawptr)&f->ctx);
     f->ctx.uc_link = null;
@@ -291,7 +291,7 @@ static void _prepareContext(Fiber* f)
     makecontext((rawptr)&f->ctx, _fiberEntry, 0);
 }
 
-static Fiber* _popFree()
+Fiber* _popFree()
 {
     _lock();
     Fiber* f = _sched.freeHead;
@@ -304,7 +304,7 @@ static Fiber* _popFree()
     return f;
 }
 
-static Fiber* _acquireFiber()
+Fiber* _acquireFiber()
 {
     Fiber* f = _popFree();
     if (f != null)
@@ -326,7 +326,7 @@ static Fiber* _acquireFiber()
     return f;
 }
 
-static Future* _newFuture()
+Future* _newFuture()
 {
     Future* f = alloc<Future>(1);
     if (f == null) return null;
@@ -341,7 +341,7 @@ static Future* _newFuture()
 // makecontext entry for every fiber. _startingFiber is stashed by the driver
 // immediately before the first switch in, since makecontext is called with
 // argc 0 and cannot carry the pointer itself.
-static void _fiberEntry()
+void _fiberEntry()
 {
     Fiber* f = _startingFiber;
     _startingFiber = null;
@@ -358,7 +358,7 @@ static void _fiberEntry()
     swapcontext((rawptr)&f->ctx, (rawptr)&_schedCtx);
 }
 
-static void _poolEntry(rawptr p)
+void _poolEntry(rawptr p)
 {
     PoolJob* job = (PoolJob*)p;
     Future* fut = job->fut;
@@ -372,7 +372,7 @@ static void _poolEntry(rawptr p)
 // One scheduler slice. Lock is taken inside and released on every exit path.
 // A fiber swap-out leaves the lock held for the driver to pick up, a fiber
 // swap-in happens with the lock dropped.
-static i32 _step(bool allowWait)
+i32 _step(bool allowWait)
 {
     _lock();
     _expireTimersLocked();

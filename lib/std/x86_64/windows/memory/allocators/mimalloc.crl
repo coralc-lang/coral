@@ -151,7 +151,7 @@ static const u8 MI_SIZE_CLASS_SMALL[129] = {
     11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11   // 113-128: sc 11 (128)
 };
 
-static u32 _miSizeClass(usize size)
+u32 _miSizeClass(usize size)
 {
     if (size == 0) return 0;
     // Fast path for small sizes (<= 128) using lookup table
@@ -167,9 +167,9 @@ static u32 _miSizeClass(usize size)
 }
 
 #[[inline]]
-static usize _miBlockSize(u32 sc) { return (usize)MI_BLOCK_SIZES[sc]; }
+usize _miBlockSize(u32 sc) { return (usize)MI_BLOCK_SIZES[sc]; }
 
-static u32 _miBlocksPerPage(u32 sc)
+u32 _miBlocksPerPage(u32 sc)
 {
     usize blockSize = _miBlockSize(sc);
     usize pageSize = (usize)MI_PAGE_SIZES[sc];
@@ -179,7 +179,7 @@ static u32 _miBlocksPerPage(u32 sc)
 }
 
 // LCG random number generator for free list key generation
-static u64 _miRandomU64()
+u64 _miRandomU64()
 {
     static u64 state = 0x123456789ABCDEF0;
     state = state * 6364136223846793005 + 1442695040888963407;
@@ -190,7 +190,7 @@ static u64 _miRandomU64()
 // AtomicU64 primitives; replace with std::concurrent when it is ported.
 
 #[[inline]]
-static u64 _miAtomicLoad(u64* p)
+u64 _miAtomicLoad(u64* p)
 {
     u64 v;
     asm volatile { "movq %1, %0" : "=r"(v) : "m"(*p) : "memory" }
@@ -198,26 +198,26 @@ static u64 _miAtomicLoad(u64* p)
 }
 
 #[[inline]]
-static void _miAtomicStore(u64* p, u64 v)
+void _miAtomicStore(u64* p, u64 v)
 {
     asm volatile { "movq %1, %0" : "=m"(*p) : "r"(v) : "memory" }
 }
 
-static bool _miAtomicCAS(u64* p, u64* expected, u64 desired)
+bool _miAtomicCAS(u64* p, u64* expected, u64 desired)
 {
     u8 ok;
     asm volatile { "lock cmpxchgq %3, %1\n\tsete %0" : "=q"(ok), "+m"(*p), "+a"(*expected) : "r"(desired) : "cc", "memory" }
     return ok != 0;
 }
 
-static u64 _miAtomicExchange(u64* p, u64 v)
+u64 _miAtomicExchange(u64* p, u64 v)
 {
     u64 old = v;
     asm volatile { "xchgq %0, %1" : "+r"(old), "+m"(*p) :: "memory" }
     return old;
 }
 
-static u64 _miAtomicFetchAdd(u64* p, u64 delta)
+u64 _miAtomicFetchAdd(u64* p, u64 delta)
 {
     u64 result;
     asm volatile { "lock xaddq %0, %1" : "=r"(result), "=m"(*p) : "0"(delta), "m"(*p) : "memory" }
@@ -227,7 +227,7 @@ static u64 _miAtomicFetchAdd(u64* p, u64 delta)
 // mimalloc lock: CAS try-acquire with bounded retry and yield.
 // Only arena reservation and the segment map use locks; the
 // allocation fast path never takes one.
-static void _miLockAcquire(u64* p)
+void _miLockAcquire(u64* p)
 {
     for (u32 i = 0; i < 10000; i++)
     {
@@ -239,7 +239,7 @@ static void _miLockAcquire(u64* p)
 }
 
 #[[inline]]
-static void _miLockRelease(u64* p)
+void _miLockRelease(u64* p)
 {
     _miAtomicStore(p, 0);
 }
@@ -257,7 +257,7 @@ static u64 _miMapLockWord = 0;
 // key1 term defeats the xor/rotate linearity of plain p^k encodings.
 // A null next encodes to the fixed sentinel below and decodes back to
 // null (the sentinel branch keeps a distinct value out of real chains).
-static void _miFreeBlockEncode(MiBlock* block, MiBlock* next, MiPage* page)
+void _miFreeBlockEncode(MiBlock* block, MiBlock* next, MiPage* page)
 {
     u64 raw = (u64)next;
     u64 rot = ((raw ^ page->key2) << page->key1) | ((raw ^ page->key2) >> (64 - page->key1));
@@ -266,7 +266,7 @@ static void _miFreeBlockEncode(MiBlock* block, MiBlock* next, MiPage* page)
 
 // Decode and validate: the result must be null or live inside this
 // page at a block boundary, otherwise the list is corrupted.
-static MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
+MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
 {
     u64 encoded = (u64)block->next;
     u64 raw = ((encoded - page->key1) >> page->key1) | ((encoded - page->key1) << (64 - page->key1));
@@ -284,14 +284,14 @@ static MiBlock* _miFreeBlockDecode(MiBlock* block, MiPage* page)
 
 // Hash function for the page map: 4 MiB windows, so every address
 // inside a page (pages are <= 4 MiB) hashes to the same bucket.
-static u32 _miSegmentMapHash(u8* addr)
+u32 _miSegmentMapHash(u8* addr)
 {
     u64 val = (u64)addr >> 22;
     val = val ^ (val >> 16);
     return (u32)(val % (u64)MI_SEGMENT_MAP_SIZE);
 }
 
-static void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* page)
+void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* page)
 {
     MiSegmentMapEntry* entry = (MiSegmentMapEntry*)mmap(null, @sizeof(MiSegmentMapEntry), 3, 0x22, -1, 0);
     if (entry == null) return;
@@ -301,7 +301,7 @@ static void _miMapInsertChain(MiSegmentMap* map, u32 idx, u8* pageBase, MiPage* 
     map->buckets[idx] = entry;
 }
 
-static void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
+void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
 {
     MiSegmentMapEntry* prev = null;
     MiSegmentMapEntry* entry = map->buckets[idx];
@@ -321,7 +321,7 @@ static void _miMapRemoveChain(MiSegmentMap* map, u32 idx, u8* pageBase)
 
 // Segment map operations. A page is indexed once per 4 MiB window it
 // touches so lookups by any interior pointer resolve to it.
-static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
+void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
 {
     _miLockAcquire(&_miMapLockWord);
     usize size = page->capacity * page->blockSize;
@@ -335,7 +335,7 @@ static void _miSegmentMapInsert(MiSegmentMap* map, u8* pageBase, MiPage* page)
     _miLockRelease(&_miMapLockWord);
 }
 
-static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, usize size)
+void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, usize size)
 {
     _miLockAcquire(&_miMapLockWord);
     if (size == 0) size = 1;
@@ -348,7 +348,7 @@ static void _miSegmentMapRemove(MiSegmentMap* map, u8* pageBase, usize size)
     _miLockRelease(&_miMapLockWord);
 }
 
-static MiPage* _miSegmentMapLookup(MiSegmentMap* map, u8* addr)
+MiPage* _miSegmentMapLookup(MiSegmentMap* map, u8* addr)
 {
     u32 idx = _miSegmentMapHash(addr);
     MiSegmentMapEntry* entry = map->buckets[idx];
@@ -362,7 +362,7 @@ static MiPage* _miSegmentMapLookup(MiSegmentMap* map, u8* addr)
 
 // Arena Management
 
-static MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
+MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
 {
     usize arenaSize = MI_ARENA_SIZE;
     if (arenaSize < minSize) arenaSize = minSize;
@@ -396,7 +396,7 @@ static MiArena* _miArenaAlloc(MiHeap* heap, usize minSize)
     return arena;
 }
 
-static rawptr _miArenaSliceAlloc(MiArena* arena, u32 count)
+rawptr _miArenaSliceAlloc(MiArena* arena, u32 count)
 {
     for (u32 i = 0; i + count <= arena->sliceCount; i++)
     {
@@ -420,7 +420,7 @@ static rawptr _miArenaSliceAlloc(MiArena* arena, u32 count)
     return null;
 }
 
-static void _miArenaSliceFree(MiArena* arena, rawptr ptr, u32 count)
+void _miArenaSliceFree(MiArena* arena, rawptr ptr, u32 count)
 {
     u8* p = (u8*)ptr;
     u32 startIdx = (u32)((p - arena->base) / MI_SLICE_SIZE);
@@ -431,7 +431,7 @@ static void _miArenaSliceFree(MiArena* arena, rawptr ptr, u32 count)
 
 // Segment Management
 
-static MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
+MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
 {
     usize segSize = (usize)pageCount * MI_PAGE_SIZE;
     if (segSize < MI_SEGMENT_SIZE) segSize = MI_SEGMENT_SIZE;
@@ -483,7 +483,7 @@ static MiSegment* _miSegmentAlloc(MiHeap* heap, u32 pageCount)
     return seg;
 }
 
-static void _miSegmentFree(MiHeap* heap, MiSegment* seg)
+void _miSegmentFree(MiHeap* heap, MiSegment* seg)
 {
     if (seg->prev != null) seg->prev->next = seg->next;
     else heap->segments = seg->next;
@@ -501,7 +501,7 @@ static void _miSegmentFree(MiHeap* heap, MiSegment* seg)
 
 // Page Management
 
-static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
+MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 {
     usize pageSize = (usize)MI_PAGE_SIZES[sc];
     u32 pageCount = 1;
@@ -563,7 +563,7 @@ static MiPage* _miPageAlloc(MiHeap* heap, u32 sc)
 }
 
 // Extend page capacity incrementally
-static bool _miPageExtend(MiHeap* heap, MiPage* page)
+bool _miPageExtend(MiHeap* heap, MiPage* page)
 {
     usize newCap = page->capacity * 2;
     if (newCap > page->reserved) newCap = page->reserved;
@@ -583,7 +583,7 @@ static bool _miPageExtend(MiHeap* heap, MiPage* page)
     return true;
 }
 
-static void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
+void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Remove from segment map
     _miSegmentMapRemove(&_miGlobalPages, page->base, page->capacity * page->blockSize);
@@ -601,7 +601,7 @@ static void _miPageFree(MiHeap* heap, MiPage* page, u32 sc)
 }
 
 // Retire a page with expiry to prevent thrashing
-static void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
+void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
 {
     if (page->used > 0 || page->inFull) { page->retireCount = 0; return; }
     // Only retire if this is not the only page with free blocks
@@ -629,7 +629,7 @@ static void _miPageMaybeRetire(MiHeap* heap, MiPage* page, u32 sc)
 // is set FIRST: while the page sits in fullPages its cross-thread
 // frees must also notify the owner via heap->delayedFree, because the
 // normal pages[] walk no longer sees it.
-static void _miPageMoveToFull(MiHeap* heap, MiPage* page, u32 sc)
+void _miPageMoveToFull(MiHeap* heap, MiPage* page, u32 sc)
 {
     u64 raw = _miAtomicLoad((u64*)&page->xthreadFree);
     while (!_miAtomicCAS((u64*)&page->xthreadFree, &raw, raw | (u64)1))
@@ -654,7 +654,7 @@ static void _miPageMoveToFull(MiHeap* heap, MiPage* page, u32 sc)
 // Linked back into the walkable list before the flag clears, so a
 // concurrent cross-thread free either sees the flag (queues to the
 // delayed list) or sees a walkable page (normal collect) - never lost.
-static void _miPageMoveFromFull(MiHeap* heap, MiPage* page, u32 sc)
+void _miPageMoveFromFull(MiHeap* heap, MiPage* page, u32 sc)
 {
     // Unlink from fullPages
     if (page->prev != null) page->prev->next = page->next;
@@ -680,7 +680,7 @@ static void _miPageMoveFromFull(MiHeap* heap, MiPage* page, u32 sc)
 // head atomically while preserving the delayed flag in the low bit,
 // decodes the chain (validated against the page), and applies the
 // deferred used/freeCount updates for each block.
-static void _miPageCollect(MiHeap* heap, MiPage* page)
+void _miPageCollect(MiHeap* heap, MiPage* page)
 {
     u64 raw = _miAtomicLoad((u64*)&page->xthreadFree);
     MiBlock* head = null;
@@ -722,7 +722,7 @@ static void _miPageCollect(MiHeap* heap, MiPage* page)
 
 // Allocation Fast Path
 
-static rawptr _miAllocFast(MiHeap* heap, u32 sc)
+rawptr _miAllocFast(MiHeap* heap, u32 sc)
 {
     MiPage* page = heap->pages[sc];
 
@@ -774,7 +774,7 @@ static rawptr _miAllocFast(MiHeap* heap, u32 sc)
 
 // Free Fast Path
 
-static void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
+void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
 {
     MiBlock* block = (MiBlock*)ptr;
 
@@ -833,7 +833,7 @@ static void _miFreeFast(MiHeap* heap, MiPage* page, rawptr ptr)
 
 // Find which page a pointer belongs to: hash the address into its
 // 4 MiB window bucket in the global page map, then range-check.
-static MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
+MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
 {
     u8* p = (u8*)ptr;
     u32 idx = _miSegmentMapHash(p);
@@ -856,7 +856,7 @@ static MiPage* _miPageFind(MiHeap* heap, rawptr ptr)
 // crosses pages (blocks were queued here because their page was full),
 // so the chain is plain pointers; each block is resolved through the
 // global page map and gets its deferred counters applied.
-static void _miProcessDelayedFree(MiHeap* heap)
+void _miProcessDelayedFree(MiHeap* heap)
 {
     u64 head = _miAtomicExchange((u64*)&heap->delayedFree, 0);
     MiBlock* current = (MiBlock*)head;
@@ -1169,19 +1169,19 @@ pub struct MiAlloc
 
 // Wrapper Functions
 
-static rawptr _miWrapAlloc(rawptr ctx, usize size)
+rawptr _miWrapAlloc(rawptr ctx, usize size)
 {
     if (!ctx) return null;
     return ((MiAlloc*)ctx)->alloc(size);
 }
 
-static void _miWrapFree(rawptr ctx, rawptr ptr)
+void _miWrapFree(rawptr ctx, rawptr ptr)
 {
     if (!ctx || !ptr) return;
     ((MiAlloc*)ctx)->free(ptr);
 }
 
-static rawptr _miWrapRealloc(rawptr ctx, rawptr ptr, usize newSize)
+rawptr _miWrapRealloc(rawptr ctx, rawptr ptr, usize newSize)
 {
     if (!ctx) return null;
     return ((MiAlloc*)ctx)->realloc(ptr, newSize);
