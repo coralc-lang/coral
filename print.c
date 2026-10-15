@@ -630,7 +630,6 @@ uint64_t crl__lib__std__x86_64__linux__io__ios__parseU64(_coral_str sv, _Bool* o
 double crl__lib__std__x86_64__linux__io__ios__parseF64(_coral_str sv, _Bool* ok);
 uint8_t crl__lib__std__x86_64__linux__io__ios__readChar(void);
 _Bool crl__lib__std__x86_64__linux__io__ios__readLine(crl__lib__std__x86_64__linux__text__string__String* out);
-void crl__loc____swap(int32_t* a, int32_t* b);
 int32_t main(void);
 void crl__lib__std__x86_64__linux__memory__mman__copy_voidp(void** dst, void** src, size_t count);
 void crl__lib__std__x86_64__linux__memory__mman__copy_size_t(size_t* dst, size_t* src, size_t count);
@@ -669,6 +668,7 @@ int64_t crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_binarySea
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_dispose(Vec__coral_str* self);
 void crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_drop(Vec__coral_str* self);
 void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint8_t* src, size_t count);
+void crl__lib__std__x86_64__linux__io__ios__println__coral_str_v6721e0bebd50ba24(_coral_str fmt, _coral_str _varg0, int32_t _varg1, int32_t _varg2);
 _coral_str* crl__lib__std__x86_64__linux__memory__mman__alloc__coral_str(size_t count);
 _coral_str* crl__lib__std__x86_64__linux__memory__mman__realloc__coral_str(_coral_str* ptr, size_t newCount);
 void crl__lib__std__x86_64__linux__memory__mman__dealloc__coral_str(_coral_str* ptr);extern char** environ;
@@ -729,6 +729,7 @@ double crl__lib__core__limits__F64_MAX = 1.7976931348623157e+308;
 double crl__lib__core__limits__F64_MIN = 2.2250738585072014e-308;
 double crl__lib__core__limits__F32_MAX = 3.40282347e+38;
 double crl__lib__core__limits__F32_MIN = 1.17549435e-38;
+_coral_str crl__loc_____a = (_coral_str){ (const uint8_t*)"fooooo", 6 };
 
 _Bool crl__lib__core__char_util__isDigit(uint8_t c) {
     uint16_t v = ((uint16_t)(c));
@@ -4216,17 +4217,10 @@ _Bool crl__lib__std__x86_64__linux__io__ios__readLine(crl__lib__std__x86_64__lin
         }
     }
 }
-void crl__loc____swap(int32_t* a, int32_t* b) {
-    int32_t tmp = 0;
-    (((&(tmp)) = a));
-    ((a = b));
-    ((b = (&(tmp))));
-}
 int32_t main(void) {
     int32_t a = 4;
     int32_t b = 5;
-    crl__loc____swap((&(a)), (&(b)));
-    printf("a =%d, b=%d", a, b);
+    crl__lib__std__x86_64__linux__io__ios__println__coral_str_v6721e0bebd50ba24((_coral_str){ (const uint8_t*)"HELLO {} ---- {:x}, {} {{}}", 27 }, crl__loc_____a, a, b);
     return 0;
 }
 void crl__lib__std__x86_64__linux__memory__mman__copy_voidp(void** dst, void** src, size_t count) {
@@ -4522,6 +4516,37 @@ void crl__lib__std__x86_64__linux__memory__mman__copy_uint8_t(uint8_t* dst, uint
     {
         memcpy(((void*)(dst)), ((const void*)(src)), ((sizeof(uint8_t) * count)));
     }
+}
+void crl__lib__std__x86_64__linux__io__ios__println__coral_str_v6721e0bebd50ba24(_coral_str fmt, _coral_str _varg0, int32_t _varg1, int32_t _varg2) {
+    uint8_t outBuf[1024] = {0};
+    crl__lib__std__x86_64__linux__io__ios___Buf out = ((crl__lib__std__x86_64__linux__io__ios___Buf){.fd = 1, .data = outBuf, .len = 0});
+    _coral_str f;
+    ((f = (_coral_str){ (const uint8_t*)"HELLO {} ---- {:x}, {} {{}}", 27 }));
+    size_t i = 0;
+    uint8_t c = f.ptr[i];
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 72);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 69);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 76);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 76);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 79);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 32);
+    uint8_t spec = 0;
+    crl__lib__std__x86_64__linux__io__ios___fprintBytes((&(out)), _varg0.ptr, _varg0.len);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 32);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 45);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 45);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 45);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 45);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 32);
+    crl__lib__std__x86_64__linux__io__ios___fprintSigned((&(out)), _varg1, 16);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 44);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 32);
+    crl__lib__std__x86_64__linux__io__ios___fprintI32((&(out)), _varg2);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 32);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 123);
+    crl__lib__std__x86_64__linux__io__ios___pbyte((&(out)), 125);
+    crl__lib__std__x86_64__linux__io__ios___fprintNewline((&(out)));
+    crl__lib__std__x86_64__linux__io__ios___pflush((&(out)));
 }
 _coral_str* crl__lib__std__x86_64__linux__memory__mman__alloc__coral_str(size_t count) {
     if (((count == 0)))
