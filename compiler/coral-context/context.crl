@@ -339,7 +339,7 @@ pub struct AstContext
     {
         if (self.typesLen < self.typesCap) return true;
         u32 newCap = self.typesCap;
-        rawptr raw = self.grow((rawptr)self.types, self.typesCap, &newCap, @sizeof(TypeEntry));
+        rawptr raw = self.growStable((rawptr)self.types, self.typesCap, &newCap, @sizeof(TypeEntry));
         if (raw == null) return false;
         self.types = (TypeEntry*)raw;
         self.typesCap = newCap;
@@ -350,11 +350,62 @@ pub struct AstContext
     {
         if (self.nodesLen < self.nodesCap) return true;
         u32 newCap = self.nodesCap;
-        rawptr raw = self.grow((rawptr)self.nodes, self.nodesCap, &newCap, @sizeof(Node));
+        rawptr raw = self.growStable((rawptr)self.nodes, self.nodesCap, &newCap, @sizeof(Node));
         if (raw == null) return false;
         self.nodes = (Node*)raw;
         self.nodesCap = newCap;
         return true;
+    }
+
+    /* grow, but into a fresh block with the old one left allocated (not
+     * freed). Node and TypeEntry pointers are cached in locals all over
+     * the evaluator; a moving realloc mid-evaluation leaves those stale
+     * reads dangling the moment a nested instantiation grows the arena.
+     * Keeping the old block alive (geometric growth, so under 2x waste
+     * total) keeps stale pointers valid and content-identical. */
+    rawptr growStable(rawptr data, u32 oldCap, u32* newCap, usize elementSize)
+    {
+        if (self.error != 0) return null;
+        u32 nextCap = 4;
+        if (oldCap != 0)
+        {
+            if (oldCap > 2147483647)
+            {
+                self.setError();
+                return null;
+            }
+            nextCap = oldCap * 2;
+            if (nextCap <= oldCap)
+            {
+                self.setError();
+                return null;
+            }
+        }
+        usize bytes = 0;
+        if (!self.byteCount(nextCap, elementSize, &bytes)) return null;
+        rawptr result = malloc(bytes);
+        if (result == null)
+        {
+            self.setError();
+            return null;
+        }
+        if (data != null && oldCap != 0)
+        {
+            usize oldBytes = 0;
+            if (self.byteCount(oldCap, elementSize, &oldBytes))
+            {
+                u8* src = (u8*)data;
+                u8* dst = (u8*)result;
+                usize k = 0;
+                while (k < oldBytes)
+                {
+                    dst[k] = src[k];
+                    k = k + 1;
+                }
+            }
+        }
+        *newCap = nextCap;
+        return result;
     }
 
     u32 intern(u8* ptr, usize len)

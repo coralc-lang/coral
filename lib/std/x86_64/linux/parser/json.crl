@@ -1,6 +1,13 @@
 import(lib) std::text::string { String };
 import(lib) std::vec { Vec };
+import(lib) std::result { Result };
 import(lib) platform::libc { snprintf, strtod };
+
+pub variant ParseError
+{
+    Syntax { str msg; u32 line; u32 col; },
+    Semantic { str msg; }
+}
 
 pub enum JsonType
 {
@@ -91,7 +98,24 @@ struct _ParseCtx
     usize len;
     usize pos;
     bool error;
-    String errMsg;
+    str errMsg;
+    u32 line;
+    u32 col;
+
+    void fail(str msg)
+    {
+        if (self.error) return;
+        self.error = true;
+        self.errMsg = msg;
+        u32 ln = 1;
+        usize lineStart = 0;
+        for (usize i = 0; i < self.pos && i < self.len; i++)
+        {
+            if (self.ptr[i] == '\n') { ln++; lineStart = i + 1; }
+        }
+        self.line = ln;
+        self.col = (u32)(self.pos - lineStart) + 1u;
+    }
 
     void skipSpace()
     {
@@ -120,14 +144,14 @@ struct _ParseCtx
     bool expect(u8 ch)
     {
         u8 c = (u8)self.next();
-        if (c != ch) { self.error = true; return false; }
+        if (c != ch) { self.fail("unexpected character"); return false; }
         return true;
     }
 
     String parseString()
     {
         String s = String::new();
-        if (self.next() != '"') { self.error = true; return s; }
+        if (self.next() != '"') { self.fail("expected '\"'"); return s; }
         while (self.pos < self.len)
         {
             u8 c = self.ptr[self.pos++];
@@ -159,7 +183,7 @@ struct _ParseCtx
                         else { bad = true; break; }
                         code = (code << 4) | hv;
                     }
-                    if (bad) { self.error = true; return s; }
+                    if (bad) { self.fail("invalid \\u escape"); return s; }
                     if (code >= 0xD800 && code <= 0xDBFF)
                     {
                         bool combined = false;
@@ -199,7 +223,7 @@ struct _ParseCtx
             }
             else s.pushChar(c);
         }
-        self.error = true;
+        self.fail("unterminated string");
         return s;
     }
 
@@ -218,7 +242,7 @@ struct _ParseCtx
                 self.pos += 4;
                 return JsonValue::boolVal(true);
             }
-            self.error = true;
+            self.fail("invalid literal, expected 'true'");
             return JsonValue::nullVal();
         }
         if (c == 'f')
@@ -228,7 +252,7 @@ struct _ParseCtx
                 self.pos += 5;
                 return JsonValue::boolVal(false);
             }
-            self.error = true;
+            self.fail("invalid literal, expected 'false'");
             return JsonValue::nullVal();
         }
         if (c == 'n')
@@ -238,7 +262,7 @@ struct _ParseCtx
                 self.pos += 4;
                 return JsonValue::nullVal();
             }
-            self.error = true;
+            self.fail("invalid literal, expected 'null'");
             return JsonValue::nullVal();
         }
         if (c == '[') return self.parseArray();
@@ -255,7 +279,7 @@ struct _ParseCtx
                 u64 d = (u64)(self.ptr[self.pos] - '0');
                 if (intVal > (limit - d) / 10u)
                 {
-                    self.error = true;
+                    self.fail("integer out of range");
                     return JsonValue::nullVal();
                 }
                 intVal = intVal * 10 + d;
@@ -263,7 +287,7 @@ struct _ParseCtx
             }
             if (neg && self.pos == start + 1)
             {
-                self.error = true;
+                self.fail("expected digit after '-'");
                 return JsonValue::nullVal();
             }
             if (self.pos < self.len && (self.ptr[self.pos] == '.' || self.ptr[self.pos] == 'e' || self.ptr[self.pos] == 'E'))

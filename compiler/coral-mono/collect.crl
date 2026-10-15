@@ -143,11 +143,12 @@ pub extend MonoContext
 
     bool enqueue(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen)
     {
-        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0);
+        return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0, null, null, 0);
     }
 
     bool enqueueVal(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen,
-                    u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen)
+                    u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
+                    Ty* tailTypes, NodeId* tailNodes, u32 tailLen)
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
@@ -167,7 +168,18 @@ pub extend MonoContext
                     if (!self.sema.sameType(self.work[i].arguments[j], arguments[j])) break;
                     j = j + 1;
                 }
-                if (j == argumentsLen && self.work[i].valueKey == valueKey) return true;
+                if (j == argumentsLen && self.work[i].valueKey == valueKey &&
+                    self.work[i].tailLen == tailLen)
+                {
+                    bool sameTail = true;
+                    u32 tt = 0;
+                    while (tt < tailLen)
+                    {
+                        if (!self.sema.sameType(self.work[i].tailTypes[tt], tailTypes[tt])) { sameTail = false; break; }
+                        tt = tt + 1;
+                    }
+                    if (sameTail) return true;
+                }
             }
             i = i + 1;
         }
@@ -184,6 +196,32 @@ pub extend MonoContext
         item.literalNames = null;
         item.literalNodes = null;
         item.literalsLen = 0;
+        item.tailTypes = null;
+        item.tailNodes = null;
+        item.tailLen = 0;
+        if (tailLen > 0 && tailTypes != null && tailNodes != null)
+        {
+            Ty* ttypes = (Ty*)malloc((usize)tailLen * @sizeof(Ty));
+            NodeId* tnodes = (NodeId*)malloc((usize)tailLen * @sizeof(NodeId));
+            if (ttypes != null && tnodes != null)
+            {
+                u32 k = 0;
+                while (k < tailLen)
+                {
+                    ttypes[k] = tailTypes[k];
+                    tnodes[k] = tailNodes[k];
+                    k = k + 1;
+                }
+                item.tailTypes = ttypes;
+                item.tailNodes = tnodes;
+                item.tailLen = tailLen;
+            }
+            else
+            {
+                if (ttypes != null) free((rawptr)ttypes);
+                if (tnodes != null) free((rawptr)tnodes);
+            }
+        }
         if (literalsLen > 0)
         {
             Str* lnames = (Str*)malloc((usize)literalsLen * @sizeof(Str));
@@ -321,6 +359,14 @@ pub extend MonoContext
             litNodes = (NodeId*)malloc((usize)litCap * @sizeof(NodeId));
         }
         u32 litsLen = 0;
+        Ty* tailTypes = null;
+        NodeId* tailNodes = null;
+        if (litCap > 0)
+        {
+            tailTypes = (Ty*)malloc((usize)litCap * @sizeof(Ty));
+            tailNodes = (NodeId*)malloc((usize)litCap * @sizeof(NodeId));
+        }
+        u32 tailLen = 0;
         u32 p = 0;
         while (p < gdecl->kind.payload.Func.paramsLen && next < gcount)
         {
@@ -418,14 +464,43 @@ pub extend MonoContext
             }
             p = p + 1;
         }
-        u32 arity = 0;
-        if (call->kind.payload.Call.argsLen > namedCount)
-            arity = call->kind.payload.Call.argsLen - namedCount;
-        u64 key = self.callValueKey(call->kind.payload.Call.args, call->kind.payload.Call.argsLen);
+        /* trailing args past the fixed params are the variadic tail: record
+         * each one's concrete type + node so the instance can fold literal
+         * tails and give runtime tails named C parameters. A bare `...`
+         * forwards the caller's pack — it is not a concrete tail arg and
+         * must not count toward the arity (`_printEmit(&out, fmt, ...)`
+         * forwarded through `println("hello")` stays an arity-0 site). */
+        u32 ti = namedCount;
+        while (ti < call->kind.payload.Call.argsLen)
+        {
+            NodeId avId = call->kind.payload.Call.args[ti];
+            Node* avn = self.nodeAt(avId);
+            bool isSpread = false;
+            if (avn != null && avn->kind.tag == NodeKind::Expr &&
+                avn->kind.payload.Expr.value.kind.tag == ExprKind::Spread) isSpread = true;
+            if (!isSpread && tailTypes != null && tailNodes != null && tailLen < litCap)
+            {
+                Ty tt = 0;
+                if (avn != null && avn->kind.tag == NodeKind::Expr)
+                    tt = self.sema.exprType(avId);
+                if (self.activeSubsLen > 0 && self.activeSubs != null)
+                    tt = self.substituteType(tt, self.activeSubs, self.activeSubsLen);
+                tailTypes[tailLen] = tt;
+                tailNodes[tailLen] = avId;
+                tailLen = tailLen + 1;
+            }
+            ti = ti + 1;
+        }
+        u32 arity = tailLen;
+        u64 key = self.callValueKeyTyped(call->kind.payload.Call.args, call->kind.payload.Call.argsLen,
+                                         self.activeSubs, self.activeSubsLen);
         bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
-                                  key, arity, litNames, litNodes, litsLen);
+                                  key, arity, litNames, litNodes, litsLen,
+                                  tailTypes, tailNodes, tailLen);
         if (litNames != null) free((rawptr)litNames);
         if (litNodes != null) free((rawptr)litNodes);
+        if (tailTypes != null) free((rawptr)tailTypes);
+        if (tailNodes != null) free((rawptr)tailNodes);
         free((rawptr)arguments);
         return ok;
     }

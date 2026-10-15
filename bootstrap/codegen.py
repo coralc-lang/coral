@@ -644,6 +644,17 @@ class CodeGen:
         self.current_return_type = saved_return
         self.local_types = saved_locals
 
+    def field_decl(self, f):
+        t = f.type_node
+        if isinstance(t, ArrayType):
+            dims = []
+            base = t
+            while isinstance(base, ArrayType):
+                dims.append(self.gen_expr(base.size))
+                base = base.base
+            return f"{self.gen_type(base)} {f.name}" + "".join(f"[{d}]" for d in dims)
+        return f"{self.gen_type(t)} {f.name}"
+
     def gen_struct(self, node):
         self.struct_names.add(node.name)
         name = node.name
@@ -651,7 +662,7 @@ class CodeGen:
         self.pointer_fields[name] = set()
         for f in node.fields:
             tp = self.gen_type(f.type_node)
-            self.emit(f"    {tp} {f.name};\n")
+            self.emit(f"    {self.field_decl(f)};\n")
             if isinstance(f.type_node, PointerType):
                 self.pointer_fields[name].add(f.name)
                 self.field_type_names[(name, f.name)] = tp
@@ -732,7 +743,7 @@ class CodeGen:
                 if len(v.fields) > 0:
                     self.emit(f"        struct {{\n")
                     for f in v.fields:
-                        self.emit(f"            {self.gen_type(f.type_node)} {f.name};\n")
+                        self.emit(f"            {self.field_decl(f)};\n")
                     self.emit(f"        }} {v.name};\n")
             self.emit(f"    }} payload;\n")
         self.emit(f"}} {name};\n\n")
@@ -770,7 +781,7 @@ class CodeGen:
         name = node.name
         self.emit(f"typedef union {name} {{\n")
         for f in node.fields:
-            self.emit(f"    {self.gen_type(f.type_node)} {f.name};\n")
+            self.emit(f"    {self.field_decl(f)};\n")
         self.emit(f"}} {name};\n\n")
 
     def gen_tuple_typedefs(self):
