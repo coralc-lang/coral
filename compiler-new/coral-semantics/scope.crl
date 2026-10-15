@@ -1,0 +1,266 @@
+mod id = import "../coral-ast/id";
+mod types = import "../coral-ast/types";
+
+import id { Str, NodeId };
+import types { Ty };
+
+extern("C") rawptr calloc(usize count, usize size);
+extern("C") rawptr realloc(rawptr ptr, usize size);
+extern("C") void free(rawptr ptr);
+
+pub struct Symbol
+{
+    Str name;
+    u8 kind;
+    Ty typeNode;
+    NodeId declaration;
+    u8 flags;
+    /* source file the declaration lives in (diagnostic file id). symbols
+     * with the same name from different files are distinct (the backend
+     * mangles their names apart) — see coral-docs/mangle_asm.md */
+    u32 fileId;
+}
+
+pub struct Scope
+{
+    Symbol* symbols;
+    u32 symbolsLen;
+    u32 symbolsCap;
+    Scope* parent;
+}
+
+pub struct ScopeStack
+{
+    rawptr* scopes;
+    u32 len;
+    u32 cap;
+    u32 errors;
+    /* why the last declare() failed: 0 = none, 1 = redeclaration in this
+     * scope, 2 = out of memory / no scope */
+    u8 lastDeclFail;
+    /* the symbol the last declare() conflicted with (lastDeclFail == 1) */
+    Symbol* dupSymbol;
+}
+
+pub extend ScopeStack
+{
+    void init(u32 cap)
+    {
+        self.scopes = null;
+        self.len = 0;
+        self.cap = 0;
+        self.errors = 0;
+        self.lastDeclFail = 0;
+        self.dupSymbol = null;
+        if (cap == 0) return;
+        self.scopes = (rawptr*)calloc((usize)cap, @sizeof(rawptr));
+        if (self.scopes != null) self.cap = cap;
+    }
+
+    void deinit()
+    {
+        while (self.len > 0)
+        {
+            self.len = self.len - 1;
+            Scope* scope = (Scope*)self.scopes[self.len];
+            if (scope->symbols != null) free((rawptr)scope->symbols);
+            free((rawptr)scope);
+        }
+        if (self.scopes != null) free((rawptr)self.scopes);
+        self.scopes = null;
+        self.len = 0;
+        self.cap = 0;
+        self.errors = 0;
+    }
+
+    Scope* current()
+    {
+        if (self.scopes == null || self.len == 0) return null;
+        return (Scope*)self.scopes[self.len - 1];
+    }
+
+    bool enter()
+    {
+        if (self.scopes == null) return false;
+        if (self.len >= self.cap)
+        {
+            u32 newCap = self.cap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc((rawptr)self.scopes, (usize)newCap * @sizeof(rawptr));
+            if (raw == null)
+            {
+                self.errors = self.errors + 1;
+                return false;
+            }
+            self.scopes = (rawptr*)raw;
+            self.cap = newCap;
+        }
+        Scope* scope = (Scope*)calloc(1, @sizeof(Scope));
+        if (scope == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        scope->parent = self.current();
+        self.scopes[self.len] = (rawptr)scope;
+        self.len = self.len + 1;
+        return true;
+    }
+
+    bool leave()
+    {
+        if (self.len == 0)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        self.len = self.len - 1;
+        Scope* scope = (Scope*)self.scopes[self.len];
+        if (scope->symbols != null) free((rawptr)scope->symbols);
+        free((rawptr)scope);
+        self.scopes[self.len] = null;
+        return true;
+    }
+
+    bool declare(Str name, u8 kind, Ty typeNode, NodeId declaration, u8 flags, u32 fileId)
+    {
+        self.lastDeclFail = 0;
+        self.dupSymbol = null;
+        Scope* scope = self.current();
+        if (scope == null)
+        {
+            self.lastDeclFail = 2;
+            self.errors = self.errors + 1;
+            return false;
+        }
+        u32 i = 0;
+        while (i < scope->symbolsLen)
+        {
+            if (scope->symbols[i].name == name)
+            {
+                /* different source file: distinct (mangled) symbols —
+                 * allowed; this also lets an import binding coexist with
+                 * the real merged declaration it points at */
+                if (scope->symbols[i].fileId != fileId)
+                {
+                    i = i + 1;
+                    continue;
+                }
+                if (scope->symbols[i].declaration.index == declaration.index) return true;
+                self.lastDeclFail = 1;
+                self.dupSymbol = scope->symbols + i;
+                self.errors = self.errors + 1;
+                return false;
+            }
+            i = i + 1;
+        }
+        if (scope->symbolsLen >= scope->symbolsCap)
+        {
+            u32 newCap = scope->symbolsCap * 2;
+            if (newCap == 0) newCap = 4;
+            rawptr raw = realloc((rawptr)scope->symbols, (usize)newCap * @sizeof(Symbol));
+            if (raw == null)
+            {
+                self.lastDeclFail = 2;
+                self.errors = self.errors + 1;
+                return false;
+            }
+            scope->symbols = (Symbol*)raw;
+            scope->symbolsCap = newCap;
+        }
+        Symbol* symbol = scope->symbols + scope->symbolsLen;
+        symbol->name = name;
+        symbol->kind = kind;
+        symbol->typeNode = typeNode;
+        symbol->declaration = declaration;
+        symbol->flags = flags;
+        symbol->fileId = fileId;
+        scope->symbolsLen = scope->symbolsLen + 1;
+        return true;
+    }
+
+    Symbol* lookup(Str name)
+    {
+        Scope* scope = self.current();
+        while (scope != null)
+        {
+            u32 i = 0;
+            while (i < scope->symbolsLen)
+            {
+                if (scope->symbols[i].name == name) return scope->symbols + i;
+                i = i + 1;
+            }
+            scope = scope->parent;
+        }
+        return null;
+    }
+
+    /* like lookup, but the symbol declared in `fileId`'s own file wins over
+     * same-named symbols merged from other files; shadowing still applies
+     * (an inner scope's entry beats any outer entry) */
+    Symbol* lookupFrom(Str name, u32 fileId)
+    {
+        Scope* scope = self.current();
+        while (scope != null)
+        {
+            Symbol* first = null;
+            u32 i = 0;
+            while (i < scope->symbolsLen)
+            {
+                if (scope->symbols[i].name == name)
+                {
+                    if (scope->symbols[i].fileId == fileId) return scope->symbols + i;
+                    if (first == null) first = scope->symbols + i;
+                }
+                i = i + 1;
+            }
+            if (first != null) return first;
+            scope = scope->parent;
+        }
+        return null;
+    }
+
+    /* every symbol named `name`, innermost scope first — lets callers
+     * resolve ambiguous names (the same name declared in several merged
+     * files, e.g. libc's extern realloc vs mman's realloc<T>) by a
+     * secondary criterion such as generic arity */
+    u32 lookupAll(Str name, Symbol** out, u32 max)
+    {
+        u32 n = 0;
+        Scope* scope = self.current();
+        while (scope != null)
+        {
+            u32 i = 0;
+            while (i < scope->symbolsLen)
+            {
+                if (scope->symbols[i].name == name && n < max)
+                {
+                    out[n] = scope->symbols + i;
+                    n = n + 1;
+                }
+                i = i + 1;
+            }
+            scope = scope->parent;
+        }
+        return n;
+    }
+
+    bool assign(Str name, NodeId target)
+    {
+        Symbol* symbol = self.lookup(name);
+        if (symbol == null)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        if (symbol->kind != 1 || (symbol->flags & 1) != 0)
+        {
+            self.errors = self.errors + 1;
+            return false;
+        }
+        symbol->flags = symbol->flags | 2;
+        return true;
+    }
+
+    u32 errorCount() { return self.errors; }
+}

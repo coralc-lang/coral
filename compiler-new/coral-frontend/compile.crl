@@ -1,0 +1,253 @@
+/* frontend/compile.crl — single-file compile: coralc name.crl -o name. */
+
+mod slice_mod = import "../coral-common/slice" { Slice };
+mod args_mod = import "args" { Options };
+mod io_mod = import "io";
+import io_mod { readFile, sliceCStr, writeFile };
+mod analyze_module = import "analyze";
+import analyze_module { CompileUnit, analyzeForCompile, freeUnit };
+mod arena_mod = import "../coral-build/arena";
+import arena_mod { Arena };
+mod codegen_mod = import "../coral-backend/codegen";
+import codegen_mod { generateC, CodegenResult };
+mod hir_mod = import "../coral-hir/hir";
+import hir_mod { build, printHir, HirModule };
+mod crlb_mod = import "../coral-build/parser";
+import crlb_mod { CrlbParser };
+mod ast_mod = import "../coral-build/ast";
+import ast_mod { CrlbNode, CrlbNodeKind, Value, ValueArray };
+
+extern("C") i32 printf(u8* fmt, ...);
+extern("C") i32 system(const char* cmd);
+extern("C") rawptr malloc(usize size);
+
+bool endsWithCrl(Slice s)
+{
+    if (s.len < 4) return false;
+    return s.ptr[s.len - 4] == 46 && s.ptr[s.len - 3] == 99 &&
+           s.ptr[s.len - 2] == 114 && s.ptr[s.len - 1] == 108;
+}
+
+/* default output: input with a trailing `.crl` stripped */
+Slice defaultOutput(Slice input)
+{
+    if (endsWithCrl(input)) return Slice::from(input.ptr, input.len - 4);
+    return input;
+}
+
+/* append a NUL-terminated string to a byte buffer */
+usize appendStr(u8* buf, usize cap, usize len, u8* s, usize slen)
+{
+    usize i = 0;
+    while (i < slen && len + 1 < cap) {
+        buf[len] = s[i];
+        len = len + 1;
+        i = i + 1;
+    }
+    buf[len] = 0;
+    return len;
+}
+
+usize appendSlice(u8* buf, usize cap, usize len, Slice s)
+{
+    return appendStr(buf, cap, len, s.ptr, s.len);
+}
+
+bool codeHasMain(Slice code)
+{
+    u8* pat = (u8*)"int32_t main(";
+    usize pl = 13;
+    if (code.ptr == null || code.len < pl) return false;
+    usize i = 0;
+    while (i + pl <= code.len)
+    {
+        bool m = true;
+        usize j = 0;
+        while (j < pl)
+        {
+            if (code.ptr[i + j] != pat[j]) { m = false; break; }
+            j = j + 1;
+        }
+        if (m) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+/* one compilation unit → one binary/object. The build path calls this with
+ * the builder's in-memory module table; single-file mode passes nulls. */
+pub i32 compileUnitTo(u8* inC, u8* outC, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen)
+{
+    usize len = 0;
+    Slice src = readFile(inC, &len);
+    if (src.ptr == null) {
+        printf("coral: cannot read %s\n", inC);
+        return 1;
+    }
+    CompileUnit unit = analyzeForCompile(src.ptr, len, inC, flagsN, flagsV, nFlags, errorLimit, allowIntPtr, noPrelude, quiet, modKeys, modVals, modLen);
+    if (unit.ctx == null) {
+        printf("coral: compile failed, errors=%d (parse=%d sema=%d mono=%d)\n",
+               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors),
+               (i32)unit.parseErrors, (i32)unit.semanticErrors, (i32)unit.monoErrors);
+        return 2;
+    }
+
+    /* generated C sits next to the output: <out>.c */
+    usize outLen = 0;
+    while (outC[outLen] != 0) outLen = outLen + 1;
+    u8* cPath = (u8*)malloc(outLen + 3);
+    if (cPath == null) { freeUnit(&unit); return 1; }
+    usize ci = 0;
+    while (ci < outLen) { cPath[ci] = outC[ci]; ci = ci + 1; }
+    cPath[ci] = 46; cPath[ci + 1] = 99; cPath[ci + 2] = 0;
+
+    Arena a;
+    a.init(4194304);
+    CodegenResult cg = generateC(unit.ctx, unit.file, unit.mono, &a);
+    if (cg.errors > 0 || cg.cCode.ptr == null) {
+        printf("coral: codegen failed, errors=%d\n", (i32)cg.errors);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+
+    if (!writeFile(cPath, cg.cCode)) {
+        printf("coral: cannot write %s\n", cPath);
+        a.freeAll();
+        freeUnit(&unit);
+        return 3;
+    }
+    printf("coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
+
+    i32 rc = 0;
+    if (dryRun) {
+        printf("coral: dry run, would link %s\n", outC);
+    } else {
+        /* helper/library files emit no main — compile to an object instead
+         * of linking an executable (which would fail with undefined main) */
+        bool hasMain = codeHasMain(cg.cCode);
+        u8* cmd = (u8*)malloc(outLen + 4096);
+        if (cmd == null) { rc = 3; }
+        else {
+            usize cl = 0;
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)"gcc -std=gnu11 ", 15);
+            cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(cPath, outLen + 2));
+            if (hasMain) {
+                cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -o ", 4);
+                cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(outC, outLen));
+            } else {
+                cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -c -o ", 7);
+                cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(outC, outLen));
+            }
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)" -lm", 4);
+            cl = appendStr(cmd, outLen + 4096, cl, (u8*)" 2>&1", 5);
+            i32 st = system((char*)cmd);
+            if (st != 0) {
+                printf("coral: gcc failed (status %d)\n", (i32)st);
+                rc = 3;
+            } else {
+                printf("coral: compiled %s -> %s\n", inC, outC);
+            }
+        }
+    }
+
+    a.freeAll();
+    freeUnit(&unit);
+    return rc;
+}
+
+pub i32 compileFile(Options* opts)
+{
+    u8* inC = sliceCStr(opts.input);
+    if (inC == null) return 1;
+
+    /* also surfacing build-file flags: the manifest's `flags = [ "NAME=VALUE",
+     * ... ]` list merges into the compile-time flag table (see Options).  */
+    if (opts->buildFileSet)
+    {
+        usize fbuflen = 0;
+        Slice fsrc = readFile(sliceCStr(opts->buildFile), &fbuflen);
+        if (fsrc.ptr != null && fbuflen > 0)
+        {
+            Arena fa;
+            fa.init(1 << 18);
+            CrlbParser fp;
+            fp.init(&fa, fsrc);
+            CrlbNode* rootp = fp.parseFile();
+            if (rootp != null && fp.errors == 0)
+            {
+                u32 bi = 0;
+                while (bi < rootp.children.len)
+                {
+                    CrlbNode* c = rootp.children.data + bi;
+                    if (c.kind == CrlbNodeKind::Build)
+                    {
+                        /* find fields. */
+                        u32 fi = 0;
+                        while (fi < c.fields.len)
+                        {
+                            CrlbField* f = c.fields.data + fi;
+                            if (f.name.len == 5 && f.name.ptr[0] == 102 && f.name.ptr[1] == 108 && f.name.ptr[2] == 97 && f.name.ptr[3] == 103 && f.name.ptr[4] == 115)
+                            {
+                                /* Value::List */
+                                u32 vi = 0;
+                                ValueArray* va = f.value.payload.List.value;
+                                if (va != null) {
+                                while (vi < va.len)
+                                {
+                                    Value* v = va.data + vi;
+                                    if (v.tag == Value::String)
+                                    {
+                                        usize si = 0;
+                                        usize ev = v.payload.String.value.len;
+                                        while (si < ev)
+                                        {
+                                            if (v.payload.String.value.ptr[si] == 61) break;
+                                            si = si + 1;
+                                        }
+                                        if (si > 0 && si < ev && opts->flagsCount < 32)
+                                        {
+                                            if (opts->flagNames == null)
+                                            {
+                                                opts->flagNames = (Slice*)malloc(32 * @sizeof(Slice));
+                                                opts->flagValues = (Slice*)malloc(32 * @sizeof(Slice));
+                                            }
+                                            opts->flagNames[opts->flagsCount] = Slice::from(v.payload.String.value.ptr, (u32)si);
+                                            opts->flagValues[opts->flagsCount] = Slice::from(v.payload.String.value.ptr + si + 1, ev - si - 1);
+                                            opts->flagsCount = opts->flagsCount + 1;
+                                        }
+                                    }
+                                    vi = vi + 1;
+                                }
+                                }
+                            }
+                            fi = fi + 1;
+                        }
+                    }
+                    bi = bi + 1;
+                }
+            }
+        }
+    }
+    /* output binary path: -o or input minus `.crl` */
+    Slice out = opts.output;
+    if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
+    u8* outC = sliceCStr(out);
+    if (outC == null) return 1;
+
+    i32 rc = compileUnitTo(inC, outC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, opts->quiet, opts->dryRun, null, null, 0);
+    if (rc == 0 && opts.emitHir) {
+        /* HIR dump needs a second analysis pass; cheap enough for a debug flag */
+        usize hlen = 0;
+        Slice hsrc = readFile(inC, &hlen);
+        if (hsrc.ptr != null) {
+            CompileUnit hunit = analyzeForCompile(hsrc.ptr, hlen, inC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, true, null, null, 0);
+            if (hunit.ctx != null) {
+                HirModule* hir = build(hunit.ctx, hunit.file, hunit.mono, hunit.ctx.intern(opts.input.ptr, opts.input.len));
+                printHir(hunit.ctx, hir);
+                freeUnit(&hunit);
+            }
+        }
+    }
+    return rc;
+}

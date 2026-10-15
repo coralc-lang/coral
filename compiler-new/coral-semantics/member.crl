@@ -1,0 +1,279 @@
+mod id = import "../coral-ast/id";
+mod types = import "../coral-ast/types";
+mod node = import "../coral-ast/node";
+mod decl_ast = import "../coral-ast/decl";
+mod scope = import "scope";
+mod sema = import "sema";
+
+import id { Str, NodeId };
+import types { Ty, TypeEntry, TypeKind };
+import node { Node, NodeKind };
+import decl_ast { Decl, DeclKind };
+import scope { Symbol };
+import sema { Sema };
+
+pub struct MemberInfo
+{
+    Ty typeNode;
+    NodeId declaration;
+    u8 kind;
+}
+
+pub extend Sema
+{
+    Ty stripType(Ty typeNode)
+    {
+        while (typeNode != 0)
+        {
+            TypeEntry* entry = self.ctx.types + typeNode;
+            if (entry->kind.tag == TypeKind::Pointer)
+                typeNode = entry->kind.payload.Pointer.base;
+            else if (entry->kind.tag == TypeKind::Const)
+                typeNode = entry->kind.payload.Const.base;
+            else if (entry->kind.tag == TypeKind::Comptime)
+                typeNode = entry->kind.payload.Comptime.base;
+            else
+                break;
+        }
+        return typeNode;
+    }
+
+    MemberInfo findMember(Ty receiver, Str name)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        /* str is an immutable slice view: { ptr, len } */
+        if (typeEntry->kind.tag == TypeKind::Str)
+        {
+            if (name == self.ctx.intern((u8*)"len", 3)) {
+                none.typeNode = self.usizeType();
+                none.kind = 1;
+                return none;
+            }
+            if (name == self.ctx.intern((u8*)"ptr", 3)) {
+                none.typeNode = self.strPtrType();
+                none.kind = 1;
+                return none;
+            }
+            return none;
+        }
+        if (typeEntry->kind.tag != TypeKind::Named) return none;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null) return none;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return none;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        if (decl->kind.tag == DeclKind::Struct || decl->kind.tag == DeclKind::Union)
+        {
+            NodeId* fields = decl->kind.payload.Struct.fields;
+            u32 fieldCount = decl->kind.payload.Struct.fieldsLen;
+            if (decl->kind.tag == DeclKind::Union)
+            {
+                fields = decl->kind.payload.Union.fields;
+                fieldCount = decl->kind.payload.Union.fieldsLen;
+            }
+            u32 i = 0;
+            while (i < fieldCount)
+            {
+                Node* fieldNode = self.ctx.nodes + fields[i].index;
+                if (fieldNode->kind.tag == NodeKind::Field && fieldNode->kind.payload.Field.value.name == name)
+                {
+                    none.typeNode = fieldNode->kind.payload.Field.value.typeNode;
+                    none.declaration = fields[i];
+                    none.kind = 1;
+                    return none;
+                }
+                i = i + 1;
+            }
+        }
+        if (decl->kind.tag == DeclKind::Variant)
+        {
+            u32 i = 0;
+            while (i < decl->kind.payload.Variant.variantsLen)
+            {
+                u32 p = 0;
+                while (p < decl->kind.payload.Variant.variants[i].fieldsLen)
+                {
+                    if (decl->kind.payload.Variant.variants[i].fieldNames[p] == name)
+                    {
+                        none.typeNode = decl->kind.payload.Variant.variants[i].fieldTypes[p];
+                        none.declaration.index = 0;
+                        none.kind = 1;
+                        return none;
+                    }
+                    p = p + 1;
+                }
+                i = i + 1;
+            }
+        }
+        return none;
+    }
+
+    /* positional lookup: field at declaration order `index`; mirrors
+     * findMember but without a name (brace literals like `T { v1, v2 }`) */
+    MemberInfo findMemberByIndex(Ty receiver, u32 index)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        /* str is an immutable slice view: { ptr, len } */
+        if (typeEntry->kind.tag == TypeKind::Str)
+        {
+            if (index == 0) {
+                none.typeNode = self.strPtrType();
+                none.kind = 1;
+                return none;
+            }
+            if (index == 1) {
+                none.typeNode = self.usizeType();
+                none.kind = 1;
+                return none;
+            }
+            return none;
+        }
+        if (typeEntry->kind.tag != TypeKind::Named) return none;
+        Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+        if (symbol == null) return none;
+        Node* declNode = self.ctx.nodes + symbol->declaration.index;
+        if (declNode->kind.tag != NodeKind::Decl) return none;
+        Decl* decl = &declNode->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null || index >= fieldCount) return none;
+        Node* fieldNode = self.ctx.nodes + fields[index].index;
+        if (fieldNode->kind.tag != NodeKind::Field) return none;
+        none.typeNode = fieldNode->kind.payload.Field.value.typeNode;
+        none.declaration = fields[index];
+        none.kind = 1;
+        return none;
+    }
+
+    MemberInfo findMethod(Ty receiver, Str name)
+    {
+        MemberInfo none;
+        none.typeNode = 0;
+        none.declaration.index = 0;
+        none.kind = 0;
+        receiver = self.stripType(receiver);
+        if (receiver == 0) return none;
+        TypeEntry* typeEntry = self.ctx.types + receiver;
+        /* builtin receivers (`str`) carry no decl — they resolve through
+         * `extend` blocks only; Named walks its own decl's method list first */
+        if (typeEntry->kind.tag != TypeKind::Named && typeEntry->kind.tag != TypeKind::Str) return none;
+        if (typeEntry->kind.tag == TypeKind::Named)
+        {
+            Symbol* symbol = self.lookupType(typeEntry->kind.payload.Named.name, typeEntry->loc);
+            if (symbol == null) return none;
+            Node* declNode = self.ctx.nodes + symbol->declaration.index;
+            if (declNode->kind.tag != NodeKind::Decl) return none;
+            Decl* decl = &declNode->kind.payload.Decl.value;
+            NodeId* methods = null;
+            u32 methodCount = 0;
+
+            switch (decl->kind.tag)
+            {
+                DeclKind::Struct => {
+                    methods = decl->kind.payload.Struct.methods;
+                    methodCount = decl->kind.payload.Struct.methodsLen;
+                },
+
+                DeclKind::Union => {
+                    methods = decl->kind.payload.Union.methods;
+                    methodCount = decl->kind.payload.Union.methodsLen;
+                },
+
+                DeclKind::Trait => {
+                    methods = decl->kind.payload.Trait.methods;
+                    methodCount = decl->kind.payload.Trait.methodsLen;
+                },
+                DeclKind::Variant => {
+                    methods = decl->kind.payload.Variant.methods;
+                    methodCount = decl->kind.payload.Variant.methodsLen;
+                },
+                else => {}
+            }
+            u32 i = 0;
+            while (i < methodCount)
+            {
+                Node* methodNode = self.ctx.nodes + methods[i].index;
+                if (methodNode->kind.tag == NodeKind::Decl)
+                {
+                    Decl* method = &methodNode->kind.payload.Decl.value;
+                    if (method->kind.tag == DeclKind::Func && method->kind.payload.Func.name == name)
+                    {
+                        none.typeNode = method->kind.payload.Func.returnType;
+                        none.declaration = methods[i];
+                        none.kind = 2;
+                        return none;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        u32 e = 0;
+        while (e < self.extendsLen)
+        {
+            Node* extNode = self.ctx.nodes + self.extends[e].index;
+            if (extNode->kind.tag == NodeKind::Decl)
+            {
+                Decl* ext = &extNode->kind.payload.Decl.value;
+                NodeId* extMethods = null;
+                u32 extMethodsLen = 0;
+                bool matches = false;
+                if (ext->kind.tag == DeclKind::Extend)
+                {
+                    extMethods = ext->kind.payload.Extend.methods;
+                    extMethodsLen = ext->kind.payload.Extend.methodsLen;
+                    if (self.sameTypePattern(ext->kind.payload.Extend.selfType, receiver)) matches = true;
+                }
+                else if (ext->kind.tag == DeclKind::ExtendTrait)
+                {
+                    extMethods = ext->kind.payload.ExtendTrait.methods;
+                    extMethodsLen = ext->kind.payload.ExtendTrait.methodsLen;
+                    if (self.sameTypePattern(ext->kind.payload.ExtendTrait.selfType, receiver)) matches = true;
+                }
+                if (matches)
+                {
+                    u32 m = 0;
+                    while (m < extMethodsLen)
+                    {
+                        Node* methodNode = self.ctx.nodes + extMethods[m].index;
+                        if (methodNode->kind.tag == NodeKind::Decl)
+                        {
+                            Decl* method = &methodNode->kind.payload.Decl.value;
+                            if (method->kind.tag == DeclKind::Func && method->kind.payload.Func.name == name)
+                            {
+                                none.typeNode = method->kind.payload.Func.returnType;
+                                none.declaration = extMethods[m];
+                                none.kind = 2;
+                                return none;
+                            }
+                        }
+                        m = m + 1;
+                    }
+                }
+            }
+            e = e + 1;
+        }
+        return none;
+    }
+}

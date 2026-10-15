@@ -1,0 +1,843 @@
+/* frontend/test.crl — parser test harness
+ *
+ * Exercises the self-host lexer, parser, context, modules, and Sema
+ * on focused source snippets. Reports item and node counts.
+ */
+
+mod token = import "../coral-common/token";
+import token { Token, TokenKind, IdentifierInfo };
+mod lexer = import "../coral-lexer/lexer";
+import lexer { Lexer };
+mod ident = import "../coral-lexer/ident";
+import ident { isXidStart, isXidContinue };
+mod table = import "../coral-lexer/table";
+import table { IdentifierTable, IdentEntry };
+mod context = import "../coral-context/context";
+import context { AstContext };
+mod id = import "../coral-ast/id";
+import id { NodeId };
+mod module = import "../coral-module/module";
+import module { ModuleMap, ModuleId };
+mod scope = import "../coral-semantics/scope";
+import scope { ScopeStack, Symbol };
+mod sema = import "../coral-semantics/sema";
+import sema { Sema };
+mod sema_decl = import "../coral-semantics/decl";
+import sema_decl;
+mod sema_expr = import "../coral-semantics/expr";
+import sema_expr;
+mod sema_stmt = import "../coral-semantics/stmt";
+import sema_stmt;
+mod typecheck = import "../coral-semantics/typecheck";
+import typecheck;
+mod member = import "../coral-semantics/member";
+import member { MemberInfo };
+mod analyze_module = import "analyze";
+import analyze_module { AnalyzeResult, analyze };
+mod decl_ast = import "../coral-ast/decl";
+import decl_ast { File };
+mod parser_lib = import "../coral-parser/lib";
+import parser_lib { Parser };
+
+extern("C") i32 printf(u8* fmt, ...);
+extern("C") rawptr malloc(usize size);
+extern("C") void free(rawptr ptr);
+
+usize sourceLen(u8* src)
+{
+    usize len = 0;
+    while (src[len] != 0) {
+        len += 1;
+    }
+    return len;
+}
+
+pub struct TestResult
+{
+    u32 items;
+    u32 nodes;
+    u32 errors;
+
+    void print()
+    {
+        printf("items=%u nodes=%u errors=%u\n", self.items, self.nodes, self.errors);
+    }
+}
+
+TestResult runParser(u8* src, usize len)
+{
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
+
+    IdentEntry* identEntries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(identEntries, 256);
+    idents.addKeywords();
+
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + len;
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+
+    Parser p;
+    p.lexer = &lexer;
+    p.ctx = &ctx;
+    p.panicMode = 0;
+    p.pendingGreater = false;
+    p.lastAssignPtr = null;
+    p.outerGenerics = null;
+    p.outerGenericsLen = 0;
+    p.constNames = null;
+    p.constValues = null;
+    p.constLen = 0;
+    p.constCap = 0;
+    p.current = lexer.nextToken();
+    p.previous = p.current;
+
+    File* file = p.parseFile(ctx.intern("test", 4));
+    u32 decls = 0;
+    if (file != null) decls = file->declsLen;
+
+    TestResult r;
+    r.items = decls;
+    r.nodes = ctx.nodeCount();
+    r.errors = p.panicMode;
+    ctx.deinit();
+    free(identEntries);
+    return r;
+}
+
+TestResult runExpr(u8* src, usize len)
+{
+    AstContext ctx;
+    ctx.init(4096, 4096, 4096);
+
+    IdentEntry* identEntries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(identEntries, 256);
+    idents.addKeywords();
+
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + len;
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+
+    Parser p;
+    p.lexer = &lexer;
+    p.ctx = &ctx;
+    p.panicMode = 0;
+    p.pendingGreater = false;
+    p.lastAssignPtr = null;
+    p.outerGenerics = null;
+    p.outerGenericsLen = 0;
+    p.constNames = null;
+    p.constValues = null;
+    p.constLen = 0;
+    p.constCap = 0;
+    p.current = lexer.nextToken();
+    p.previous = p.current;
+
+    p.parseExpr();
+
+    TestResult r;
+    r.items = 1;
+    r.nodes = ctx.nodeCount();
+    r.errors = p.panicMode;
+    ctx.deinit();
+    free(identEntries);
+    return r;
+}
+
+bool runSema(u8* src, usize len)
+{
+    AnalyzeResult result = analyze(src, len);
+    bool ok = result.parseErrors == 0 && result.semanticErrors == 0 && result.monoErrors == 0;
+    printf("sema check: ok=%u parse_errors=%u semantic_errors=%u mono_errors=%u instances=%u\n", ok ? 1 : 0, result.parseErrors, result.semanticErrors, result.monoErrors, result.instances);
+    return ok;
+}
+
+bool testLexer()
+{
+    u8* src = "if x { return 1; }";
+    IdentEntry* entries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + sourceLen(src);
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+
+    u32 count = 0;
+    while (lexer.cur < lexer.bufEnd)
+    {
+        Token tok = lexer.nextToken();
+        if (tok.kind == TokenKind::Eof) break;
+        count = count + 1;
+    }
+    IdentifierInfo* switchInfo = idents.get("switch", 6);
+    printf("lexer test: tokens=%u switch_keyword=%u\n", count, switchInfo != null && switchInfo->isKeyword ? 1 : 0);
+    free(entries);
+    return true;
+}
+
+bool testNumberTokens()
+{
+    u8* src = "0xFF 0b1010 0o77";
+    IdentEntry* entries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + sourceLen(src);
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+    Token hex = lexer.nextToken();
+    Token binary = lexer.nextToken();
+    Token octal = lexer.nextToken();
+    bool ok = hex.kind == TokenKind::Hex && hex.data.len == 2 && hex.data.ptr[0] == 'F';
+    ok = ok && binary.kind == TokenKind::Bin && binary.data.len == 4 && binary.data.ptr[0] == '1';
+    ok = ok && octal.kind == TokenKind::Oct && octal.data.len == 2 && octal.data.ptr[0] == '7';
+    printf("number token test: ok=%u\n", ok ? 1 : 0);
+    free(entries);
+    return ok;
+}
+
+bool testCharLiteral()
+{
+    u8* src = "'a'";
+    printf("char literal test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testCharTokens()
+{
+    u8* src = "char 'a'";
+    IdentEntry* entries = malloc(256 * 64);
+    IdentifierTable idents;
+    idents.init(entries, 256);
+    idents.addKeywords();
+    Lexer lexer;
+    lexer.bufStart = src;
+    lexer.cur = src;
+    lexer.bufEnd = src + sourceLen(src);
+    lexer.line = 1;
+    lexer.lineStart = src;
+    lexer.diag = null;
+    lexer.idents = &idents;
+    Token typeToken = lexer.nextToken();
+    Token literalToken = lexer.nextToken();
+    bool ok = typeToken.kind == TokenKind::Char && literalToken.kind == TokenKind::CharLit;
+    printf("char token test: ok=%u\n", ok ? 1 : 0);
+    free(entries);
+    return ok;
+}
+
+bool testIdentifierRanges()
+{
+    bool ok = isXidStart(0x00C0) && isXidStart(0x06FF) && isXidStart(0x0700);
+    ok = ok && !isXidStart(0x07C0) && !isXidStart(0x1380);
+    ok = ok && isXidStart(0x13A0) && isXidStart(0x18AF) && !isXidStart(0x18B0);
+    ok = ok && isXidStart(0xA7FF) && isXidStart(0xA800) && isXidStart(0xD7FF);
+    ok = ok && !isXidStart(0xD800) && isXidStart(0x105BF) && !isXidStart(0x105C0);
+    ok = ok && isXidContinue('0') && isXidContinue(0x0300) && !isXidContinue('.');
+    printf("identifier ranges test: ok=%u\n", ok ? 1 : 0);
+    return ok;
+}
+
+bool testContext()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    Str first = ctx.intern("same", 4);
+    Str second = ctx.intern("same", 4);
+    printf("context test: interned=%u same=%u\n", ctx.internsLen, first == second ? 1 : 0);
+    ctx.deinit();
+    return true;
+}
+
+bool testModuleMap()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    ModuleMap map;
+    map.init(4);
+    Str path = ctx.intern("std/math", 8);
+    Str manifest = ctx.intern("std", 3);
+    ModuleId first = map.add(path, manifest, 2);
+    ModuleId second = map.resolvePath(path);
+    ModuleId missing = map.resolveLib(ctx.intern("other", 5));
+    printf("module map test: first=%u second=%u missing=%u\n", first.index, second.index, missing.index);
+    map.deinit();
+    ctx.deinit();
+    return true;
+}
+
+bool testScopes()
+{
+    AstContext ctx;
+    ctx.init(8, 8, 8);
+    Str x = ctx.intern("x", 1);
+    Str y = ctx.intern("y", 1);
+    Str missing = ctx.intern("missing", 7);
+    NodeId none;
+    none.index = 0;
+
+    ScopeStack scopes;
+    scopes.init(4);
+    bool ok = scopes.enter();
+    ok = ok && scopes.declare(x, 1, 0, none, 2);
+    ok = ok && !scopes.declare(x, 1, 0, none, 2);
+    ok = ok && scopes.assign(x, none);
+    ok = ok && scopes.enter();
+    ok = ok && scopes.declare(x, 1, 0, none, 2);
+    Symbol* shadow = scopes.lookup(x);
+    ok = ok && shadow != null;
+    ok = ok && scopes.leave();
+    ok = ok && scopes.lookup(x) != null;
+    ok = ok && scopes.declare(y, 1, 0, none, 1);
+    ok = ok && !scopes.assign(y, none);
+    ok = ok && !scopes.assign(missing, none);
+    ok = ok && scopes.errorCount() == 3;
+    printf("scope test: ok=%u errors=%u\n", ok ? 1 : 0, scopes.errorCount());
+    scopes.leave();
+    scopes.deinit();
+    ctx.deinit();
+    return ok;
+}
+
+bool testSema()
+{
+    u8* valid = "u32 f(u32 value) { return value; }";
+    u8* callValid = "u32 add(u32 a, u32 b) { return a + b; } u32 f() { return add(1, 2); }";
+    u8* duplicate = "u32 value; u32 value;";
+    u8* unknown = "u32 f() { return missing; }";
+    u8* constAssign = "u32 f() { const u32 value = 1; value = 2; return value; }";
+    u8* typeMismatch = "u32 f() { u32 value = 1; value = \"text\"; return value; }";
+    u8* arityMismatch = "u32 add(u32 a, u32 b) { return a + b; } u32 f() { return add(1); }";
+    u8* genericValid = "pub struct Box<T> { T value; } Box<T> make<T>(T a) { return Box<T>{ .value = a }; }";
+    u8* genericArity = "pub struct Box<T> { T value; } Box<u32, i32> make() { return null; }";
+    u8* comptimeValid = "void println(comptime T) { }";
+    u8* enumValid = "pub enum Color { Red, Green }";
+    u8* nonGenericBox = "pub struct Box<T> { T value; } Box<i32> fill() { return Box<i32>{ .value = 1 }; }";
+    u8* nonGenericBoxBad = "pub struct Box<T> { T value; } Box<i32> bad() { return Box<i32>{ .value = \"text\" }; }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool callValidOk = runSema(callValid, sourceLen(callValid));
+    bool duplicateRejected = !runSema(duplicate, sourceLen(duplicate));
+    bool unknownRejected = !runSema(unknown, sourceLen(unknown));
+    bool constRejected = !runSema(constAssign, sourceLen(constAssign));
+    bool typeMismatchRejected = !runSema(typeMismatch, sourceLen(typeMismatch));
+    bool arityRejected = !runSema(arityMismatch, sourceLen(arityMismatch));
+    bool genericValidOk = runSema(genericValid, sourceLen(genericValid));
+    bool genericArityRejected = !runSema(genericArity, sourceLen(genericArity));
+    bool comptimeOk = runSema(comptimeValid, sourceLen(comptimeValid));
+    bool enumOk = runSema(enumValid, sourceLen(enumValid));
+    bool nonGenericOk = runSema(nonGenericBox, sourceLen(nonGenericBox));
+    bool nonGenericBadRejected = !runSema(nonGenericBoxBad, sourceLen(nonGenericBoxBad));
+    printf("semantic declaration test: valid=%u call_valid=%u duplicate=%u unknown=%u const_assign=%u type_mismatch=%u arity=%u generic_valid=%u generic_arity=%u comptime=%u enum=%u nongeneric=%u nongeneric_bad=%u\n", validOk ? 1 : 0, callValidOk ? 1 : 0, duplicateRejected ? 1 : 0, unknownRejected ? 1 : 0, constRejected ? 1 : 0, typeMismatchRejected ? 1 : 0, arityRejected ? 1 : 0, genericValidOk ? 1 : 0, genericArityRejected ? 1 : 0, comptimeOk ? 1 : 0, enumOk ? 1 : 0, nonGenericOk ? 1 : 0, nonGenericBadRejected ? 1 : 0);
+    return validOk && callValidOk && duplicateRejected && unknownRejected && constRejected && typeMismatchRejected && arityRejected && genericValidOk && genericArityRejected && comptimeOk && enumOk && nonGenericOk && nonGenericBadRejected;
+}
+
+bool testMono()
+{
+    u8* src = "pub struct Box<T> { T value; } Box<T> make<T>(T a) { return Box<T>{ .value = a }; } void invoke() { make(1); } Box<u32> use() { return null; }";
+    AnalyzeResult result = analyze(src, sourceLen(src));
+    bool ok = result.parseErrors == 0 && result.semanticErrors == 0 && result.monoErrors == 0 && result.instances >= 2;
+    printf("mono test: ok=%u parse=%u semantic=%u instances=%u errors=%u\n", ok ? 1 : 0, result.parseErrors, result.semanticErrors, result.instances, result.monoErrors);
+    return ok;
+}
+
+bool testExpr()
+{
+    u8* src = "a + b * (c - d);";
+    printf("expr test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testMemberSemantics()
+{
+    u8* valid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.x; }";
+    u8* invalid = "pub struct Point { u32 x; u32 y; } u32 get() { Point p = Point { .x = 1, .y = 2 }; return p.z; }";
+    u8* method = "pub struct Counter { u32 value; u32 get() { return 1; } } u32 read() { Counter c = Counter { .value = 1 }; return c.get(); }";
+    u8* genericField = "pub struct Box<T> { T value; } i32 get() { Box<i32> b = Box<i32>{ .value = 1 }; return b.value; }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool invalidRejected = !runSema(invalid, sourceLen(invalid));
+    bool methodOk = runSema(method, sourceLen(method));
+    bool genericFieldOk = runSema(genericField, sourceLen(genericField));
+    printf("member semantic test: valid=%u invalid=%u method=%u generic_field=%u\n", validOk ? 1 : 0, invalidRejected ? 1 : 0, methodOk ? 1 : 0, genericFieldOk ? 1 : 0);
+    return validOk && invalidRejected && methodOk && genericFieldOk;
+}
+
+bool testFlowSemantics()
+{
+    u8* valid = "u32 f(i32 x) { while (x < 10) { if (x == 5) { break; } if (x == 3) { continue; } x = x + 1; } loop { break; } switch (x) { 1 => { x = 2; }, else => { x = 0; } } return 0; }";
+    u8* bad = "u32 f(i32 x) { while (x < 10) { return unknown_fn(x); } return 0; }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool badRejected = !runSema(bad, sourceLen(bad));
+    printf("flow semantic test: valid=%u invalid=%u\n", validOk ? 1 : 0, badRejected ? 1 : 0);
+    return validOk && badRejected;
+}
+
+bool testBoolSemantics()
+{
+    u8* valid = "bool f() { bool b = 1 < 2; bool c = b && true; return c; }";
+    u8* bad = "u32 f() { return \"hi\"; }";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool badRejected = !runSema(bad, sourceLen(bad));
+    printf("bool semantic test: valid=%u invalid=%u\n", validOk ? 1 : 0, badRejected ? 1 : 0);
+    return validOk && badRejected;
+}
+
+bool testGenericCallResult()
+{
+    u8* src1 = "pub struct Box<T> { T value; } Box<T> make<T>(T a) { return Box<T>{ .value = a }; } i32 use() { Box<i32> x = make(1); return x.value; }";
+    u8* src2 = "T id<T>(T a) { return a; } i32 use() { i32 y = id(1); return y; }";
+    bool ok1 = runSema(src1, sourceLen(src1));
+    bool ok2 = runSema(src2, sourceLen(src2));
+    printf("generic call result test: box=%u id=%u\n", ok1 ? 1 : 0, ok2 ? 1 : 0);
+    return ok1 && ok2;
+}
+
+bool testExtendSemantics()
+{
+    u8* src = "pub struct Point { u32 x; u32 y; } extend Point { u32 sum() { return self.x + self.y; } } u32 f() { Point p = Point { .x = 1, .y = 2 }; return p.sum(); }";
+    bool ok = runSema(src, sourceLen(src));
+    printf("extend semantic test: ok=%u\n", ok ? 1 : 0);
+    return ok;
+}
+
+bool testNumbers()
+{
+    u8* src = "0xFF + 0b1010 + 0o77 + 1_000 + 1.25e+3";
+    printf("number test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testTernary()
+{
+    u8* src = "true ? 1 : 2";
+    printf("ternary test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testCompositeExpressions()
+{
+    u8* src = "Point { .x = 1, .y = 2 }";
+    printf("composite expression test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testFunc()
+{
+    u8* src = "pub i32 add(u32 a, u32 b) { return a + b; }";
+    printf("func test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testDeclarations()
+{
+    u8* src = "pub struct Point { u32 x; u32 y; } pub enum Color { Red, Green }";
+    printf("declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0 && r.nodes >= 7;
+}
+
+bool testGlobal()
+{
+    u8* src = "u32 global = 1;";
+    printf("global declaration test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testExternalDeclarations()
+{
+    u8* src = "extern(\"C\") void puts(u8* text); static u32 counter;";
+    printf("external declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testTypeDeclarations()
+{
+    u8* src = "const u32 LIMIT = 10; typedef Word = u32; distinct Meters = u32;";
+    printf("type declarations test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testFunctionPointer()
+{
+    u8* src = "void f() { T(T) callback; }";
+    printf("function pointer test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testGenericSyntax()
+{
+    u8* src = "pub struct Pair<T, U> { T first; U second; }";
+    printf("generic syntax test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0 && r.nodes >= 4;
+}
+
+bool testGenericExpressions()
+{
+    u8* path = "Option<f64>::None";
+    TestResult pathResult = runExpr(path, sourceLen(path));
+    u8* literal = "Box<u32> { .value = 1 }";
+    TestResult literalResult = runExpr(literal, sourceLen(literal));
+    printf("generic expression test: path=%u literal=%u\n", pathResult.errors, literalResult.errors);
+    return pathResult.errors == 0 && literalResult.errors == 0;
+}
+
+bool testGenericTypeForms()
+{
+    u8* src = "pub struct Vec<T> { T* data; } Vec<u32> make() { return Vec<u32>{ .data = null }; }";
+    printf("generic type form test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testGenericExtension()
+{
+    u8* src = "pub extend Option<T> { bool isSome() { return true; } }";
+    printf("generic extension test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testComptimeType()
+{
+    u8* src = "void println(comptime T) { }";
+    printf("comptime type test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testVariant()
+{
+    u8* src = "pub variant Option { Some { u32 value }, None }";
+    printf("variant test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testSwitch()
+{
+    u8* src = "switch (x) { A => { 1 }, else => { 0 } }";
+    printf("switch test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testSwitchStmt()
+{
+    u8* src = "void f() { switch (x) { A => { a; }, else => { b; } } }";
+    printf("switch stmt test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testFlag()
+{
+    u8* src = "flag(PLATFORM) { linux => { a; }, else => { b; } }";
+    printf("flag test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testImport()
+{
+    u8* src = "import \"path\" { foo, bar as baz };";
+    printf("import path test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors != 0;
+}
+
+bool testImportRoot()
+{
+    u8* src = "import file::math::core { square };";
+    printf("import root test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testImportAlias()
+{
+    u8* src = "import \"path\" { foo as bar, baz };";
+    printf("import alias test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors != 0;
+}
+
+bool testImportLib()
+{
+    u8* src = "import(lib) std::math { pow };";
+    printf("import lib test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testModReexport()
+{
+    u8* src = "pub mod m = import path { add as plus }; import m { add }; u32 f() { return m::add(1, 2); }";
+    printf("mod reexport test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testModLibReexport()
+{
+    u8* src = "pub mod math = import(lib) std::math;";
+    printf("mod lib reexport test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testModImportString()
+{
+    u8* src = "import \"path\"; mod x = import \"path\";";
+    printf("mod import string test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors != 0;
+}
+
+bool testNestedImport()
+{
+    u8* src = "pub mod m = import path { ios { add, sub }, mul }; import m { mul };";
+    printf("nested import test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testAttr()
+{
+    u8* src = "#[[packed]] pub struct Foo { u32 x; }";
+    printf("attr test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testSwitchPatterns()
+{
+    u8* src = "switch (x) { 0, 1 => { 1 }, Some { .value } => { 2 }, else => { 0 } }";
+    printf("switch pattern test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    u8* underscore = "switch (x) { _ => { 0 }, else => { 1 } }";
+    TestResult underscoreResult = runExpr(underscore, sourceLen(underscore));
+    u8* orpat = "switch (x) { 0 | 1 => { 1 }, else => { 0 } }";
+    TestResult orResult = runExpr(orpat, sourceLen(orpat));
+    printf("switch or-pattern test: ");
+    orResult.print();
+    return r.errors == 0 && underscoreResult.errors == 0 && orResult.errors == 0;
+}
+
+bool testNestedPathImport()
+{
+    u8* src = "import std::text { string::{ String }, strutil::{ splitVec } };";
+    printf("nested path import test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testForIn()
+{
+    u8* src = "void f() { for (u32 value : values) { use(value); } }";
+    printf("for-in test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testLocals()
+{
+    u8* src = "void f() { var x = 1; const u32 y = 2; x = y; }";
+    printf("locals test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testAssignmentPrecedence()
+{
+    u8* src = "void f() { a = b = c; }";
+    printf("assignment precedence test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testControlFlow()
+{
+    u8* src = "void f() { if (x) { y; } else { z; } while (x) { x = x - 1; } }";
+    printf("control flow test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testSpecialStatements()
+{
+    u8* src = "void f() { defer cleanup(); comptime { x; } asm { nop; } }";
+    printf("special statements test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testExpressionStatements()
+{
+    u8* src = "if (x) { 1 } else { 2 }";
+    printf("expression statement test: ");
+    TestResult r = runExpr(src, sourceLen(src));
+    r.print();
+    return r.errors == 0;
+}
+
+bool testRecovery()
+{
+    u8* src = "u32";
+    printf("recovery test: ");
+    TestResult r = runParser(src, sourceLen(src));
+    r.print();
+    return r.errors != 0;
+}
+
+bool testImportBindings()
+{
+    u8* valid = "pub mod m = import path { add as plus }; import m { add }; u32 f() { return m::add(1, 2); }";
+    u8* wildcard = "pub mod m = import path { * }; import m { whatever };";
+    u8* opaque = "pub mod m = import path; u32 f() { return m::anything(1); }";
+    u8* rootPath = "import file::math::core { square };";
+    u8* libPath = "import(lib) std::math { pow };";
+    u8* unknownNs = "u32 f() { return zzz::add(1, 2); }";
+    u8* unknownMod = "import missing { x };";
+    u8* unknownMember = "pub mod m = import path { add as plus }; u32 f() { return m::nope(1); }";
+    u8* unknownSymbol = "pub mod m = import path { add as plus }; import m { missing };";
+    bool validOk = runSema(valid, sourceLen(valid));
+    bool wildcardOk = runSema(wildcard, sourceLen(wildcard));
+    bool opaqueOk = runSema(opaque, sourceLen(opaque));
+    bool rootOk = runSema(rootPath, sourceLen(rootPath));
+    bool libOk = runSema(libPath, sourceLen(libPath));
+    bool unknownNsRejected = !runSema(unknownNs, sourceLen(unknownNs));
+    bool unknownModRejected = !runSema(unknownMod, sourceLen(unknownMod));
+    bool unknownMemberRejected = !runSema(unknownMember, sourceLen(unknownMember));
+    bool unknownSymbolRejected = !runSema(unknownSymbol, sourceLen(unknownSymbol));
+    printf("import binding test: valid=%u wildcard=%u opaque=%u root=%u lib=%u unknown_ns=%u unknown_mod=%u unknown_member=%u unknown_symbol=%u\n", validOk ? 1 : 0, wildcardOk ? 1 : 0, opaqueOk ? 1 : 0, rootOk ? 1 : 0, libOk ? 1 : 0, unknownNsRejected ? 1 : 0, unknownModRejected ? 1 : 0, unknownMemberRejected ? 1 : 0, unknownSymbolRejected ? 1 : 0);
+    return validOk && wildcardOk && opaqueOk && rootOk && libOk && unknownNsRejected && unknownModRejected && unknownMemberRejected && unknownSymbolRejected;
+}
+
+pub i32 main()
+{
+    printf("****coral parser self-test****\n");
+    bool ok = true;
+    ok = testLexer() && ok;
+    ok = testNumberTokens() && ok;
+    ok = testCharLiteral() && ok;
+    ok = testCharTokens() && ok;
+    ok = testIdentifierRanges() && ok;
+    ok = testContext() && ok;
+    ok = testModuleMap() && ok;
+    ok = testScopes() && ok;
+    ok = testSema() && ok;
+    ok = testMemberSemantics() && ok;
+    ok = testFlowSemantics() && ok;
+    ok = testBoolSemantics() && ok;
+    ok = testGenericCallResult() && ok;
+    ok = testExtendSemantics() && ok;
+    ok = testMono() && ok;
+    ok = testExpr() && ok;
+    ok = testTernary() && ok;
+    ok = testNumbers() && ok;
+    ok = testCompositeExpressions() && ok;
+    ok = testFunc() && ok;
+    ok = testDeclarations() && ok;
+    ok = testGlobal() && ok;
+    ok = testExternalDeclarations() && ok;
+    ok = testTypeDeclarations() && ok;
+    ok = testFunctionPointer() && ok;
+    ok = testGenericSyntax() && ok;
+    ok = testGenericExpressions() && ok;
+    ok = testGenericTypeForms() && ok;
+    ok = testGenericExtension() && ok;
+    ok = testComptimeType() && ok;
+    ok = testVariant() && ok;
+    ok = testSwitch() && ok;
+    ok = testSwitchStmt() && ok;
+    ok = testFlag() && ok;
+    ok = testImport() && ok;
+    ok = testImportRoot() && ok;
+    ok = testImportAlias() && ok;
+    ok = testImportLib() && ok;
+    ok = testModReexport() && ok;
+    ok = testModLibReexport() && ok;
+    ok = testModImportString() && ok;
+    ok = testNestedImport() && ok;
+    ok = testNestedPathImport() && ok;
+    ok = testImportBindings() && ok;
+    ok = testAttr() && ok;
+    ok = testSwitchPatterns() && ok;
+    ok = testForIn() && ok;
+    ok = testLocals() && ok;
+    ok = testAssignmentPrecedence() && ok;
+    ok = testControlFlow() && ok;
+    ok = testSpecialStatements() && ok;
+    ok = testExpressionStatements() && ok;
+    ok = testRecovery() && ok;
+    printf("****done****\n");
+    return ok ? 0 : 1;
+}
