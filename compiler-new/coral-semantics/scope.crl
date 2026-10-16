@@ -2,9 +2,7 @@
 import ast::id { Str, NodeId };
 import ast::types { Ty };
 
-extern("C") rawptr calloc(usize count, usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
-extern("C") void free(rawptr ptr);
+import(lib) std::mman { alloc, dealloc, realloc, zero };
 
 pub struct Symbol
 {
@@ -51,8 +49,12 @@ pub extend ScopeStack
         self.lastDeclFail = 0;
         self.dupSymbol = null;
         if (cap == 0) return;
-        self.scopes = (rawptr*)calloc((usize)cap, @sizeof(rawptr));
-        if (self.scopes != null) self.cap = cap;
+        self.scopes = alloc<rawptr>((usize)cap);
+        if (self.scopes != null)
+        {
+            zero<rawptr>(self.scopes, (usize)cap);
+            self.cap = cap;
+        }
     }
 
     void deinit()
@@ -61,10 +63,10 @@ pub extend ScopeStack
         {
             self.len = self.len - 1;
             Scope* scope = (Scope*)self.scopes[self.len];
-            if (scope->symbols != null) free((rawptr)scope->symbols);
-            free((rawptr)scope);
+            if (scope->symbols != null) dealloc<Symbol>(scope->symbols);
+            dealloc<Scope>(scope);
         }
-        if (self.scopes != null) free((rawptr)self.scopes);
+        if (self.scopes != null) dealloc<rawptr>(self.scopes);
         self.scopes = null;
         self.len = 0;
         self.cap = 0;
@@ -84,24 +86,25 @@ pub extend ScopeStack
         {
             u32 newCap = self.cap * 2;
             if (newCap == 0) newCap = 4;
-            rawptr raw = realloc((rawptr)self.scopes, (usize)newCap * @sizeof(rawptr));
+            rawptr* raw = realloc<rawptr>(self.scopes, (usize)newCap);
             if (raw == null)
             {
-                self.errors = self.errors + 1;
+                self.errors++;
                 return false;
             }
-            self.scopes = (rawptr*)raw;
+            self.scopes = raw;
             self.cap = newCap;
         }
-        Scope* scope = (Scope*)calloc(1, @sizeof(Scope));
+        Scope* scope = alloc<Scope>(1);
         if (scope == null)
         {
-            self.errors = self.errors + 1;
+            self.errors++;
             return false;
         }
+        zero<Scope>(scope, 1);
         scope->parent = self.current();
         self.scopes[self.len] = (rawptr)scope;
-        self.len = self.len + 1;
+        self.len++;
         return true;
     }
 
@@ -109,13 +112,13 @@ pub extend ScopeStack
     {
         if (self.len == 0)
         {
-            self.errors = self.errors + 1;
+            self.errors++;
             return false;
         }
         self.len = self.len - 1;
         Scope* scope = (Scope*)self.scopes[self.len];
-        if (scope->symbols != null) free((rawptr)scope->symbols);
-        free((rawptr)scope);
+        if (scope->symbols != null) dealloc<Symbol>(scope->symbols);
+        dealloc<Scope>(scope);
         self.scopes[self.len] = null;
         return true;
     }
@@ -128,7 +131,7 @@ pub extend ScopeStack
         if (scope == null)
         {
             self.lastDeclFail = 2;
-            self.errors = self.errors + 1;
+            self.errors++;
             return false;
         }
         u32 i = 0;
@@ -141,29 +144,29 @@ pub extend ScopeStack
                  * the real merged declaration it points at */
                 if (scope->symbols[i].fileId != fileId)
                 {
-                    i = i + 1;
+                    i++;
                     continue;
                 }
                 if (scope->symbols[i].declaration.index == declaration.index) return true;
                 self.lastDeclFail = 1;
                 self.dupSymbol = scope->symbols + i;
-                self.errors = self.errors + 1;
+                self.errors++;
                 return false;
             }
-            i = i + 1;
+            i++;
         }
         if (scope->symbolsLen >= scope->symbolsCap)
         {
             u32 newCap = scope->symbolsCap * 2;
             if (newCap == 0) newCap = 4;
-            rawptr raw = realloc((rawptr)scope->symbols, (usize)newCap * @sizeof(Symbol));
+            Symbol* raw = realloc<Symbol>(scope->symbols, (usize)newCap);
             if (raw == null)
             {
                 self.lastDeclFail = 2;
-                self.errors = self.errors + 1;
+                self.errors++;
                 return false;
             }
-            scope->symbols = (Symbol*)raw;
+            scope->symbols = raw;
             scope->symbolsCap = newCap;
         }
         Symbol* symbol = scope->symbols + scope->symbolsLen;
@@ -173,7 +176,7 @@ pub extend ScopeStack
         symbol->declaration = declaration;
         symbol->flags = flags;
         symbol->fileId = fileId;
-        scope->symbolsLen = scope->symbolsLen + 1;
+        scope->symbolsLen++;
         return true;
     }
 
@@ -186,7 +189,7 @@ pub extend ScopeStack
             while (i < scope->symbolsLen)
             {
                 if (scope->symbols[i].name == name) return scope->symbols + i;
-                i = i + 1;
+                i++;
             }
             scope = scope->parent;
         }
@@ -210,7 +213,7 @@ pub extend ScopeStack
                     if (scope->symbols[i].fileId == fileId) return scope->symbols + i;
                     if (first == null) first = scope->symbols + i;
                 }
-                i = i + 1;
+                i++;
             }
             if (first != null) return first;
             scope = scope->parent;
@@ -234,9 +237,9 @@ pub extend ScopeStack
                 if (scope->symbols[i].name == name && n < max)
                 {
                     out[n] = scope->symbols + i;
-                    n = n + 1;
+                    n++;
                 }
-                i = i + 1;
+                i++;
             }
             scope = scope->parent;
         }
@@ -248,12 +251,12 @@ pub extend ScopeStack
         Symbol* symbol = self.lookup(name);
         if (symbol == null)
         {
-            self.errors = self.errors + 1;
+            self.errors++;
             return false;
         }
         if (symbol->kind != 1 || (symbol->flags & 1) != 0)
         {
-            self.errors = self.errors + 1;
+            self.errors++;
             return false;
         }
         symbol->flags = symbol->flags | 2;

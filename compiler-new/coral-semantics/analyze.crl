@@ -18,11 +18,8 @@ import mono::mono { MonoContext };
 import mono::collect;
 import mono::instantiate;
 import diag::engine { DiagnosticEngine };
+import(lib) std::mman { alloc, dealloc, realloc };
 extern("C") u64 write(i32 fd, u8* buf, u64 n);
-
-extern("C") rawptr malloc(usize size);
-extern("C") void free(rawptr ptr);
-extern("C") rawptr realloc(rawptr ptr, usize size);
 
 pub struct AnalyzeResult
 {
@@ -57,26 +54,26 @@ pub void freeUnit(CompileUnit* unit)
         u32 bi = 0;
         while (bi < unit.bufsLen)
         {
-            free(unit.bufs[bi]);
+            dealloc<u8>(unit.bufs[bi]);
             bi = bi + 1;
         }
-        free(unit.bufs);
+        dealloc<u8*>(unit.bufs);
         unit.bufs = null;
     }
-    if (unit.engineObj != null) { free(unit.engineObj); unit.engineObj = null; }
+    if (unit.engineObj != null) { dealloc<DiagnosticEngine>(unit.engineObj); unit.engineObj = null; }
     if (unit.mono != null) {
         unit.mono.deinit();
-        free(unit.mono);
+        dealloc<MonoContext>(unit.mono);
         unit.mono = null;
     }
     if (unit.sema != null) {
         unit.sema.deinit();
-        free(unit.sema);
+        dealloc<Sema>(unit.sema);
         unit.sema = null;
     }
     if (unit.ctx != null) {
         unit.ctx.deinit();
-        free(unit.ctx);
+        dealloc<AstContext>(unit.ctx);
         unit.ctx = null;
         unit.file = null;
     }
@@ -148,7 +145,7 @@ bool libBytesEq(u8* a, usize al, u8* b, usize bl)
 
 u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, str suffix)
 {
-    u8* p = (u8*)malloc(dirLen + 1 + segLen + suffix.len + 1);
+    u8* p = alloc<u8>(dirLen + 1 + segLen + suffix.len + 1);
     if (p == null) return null;
     usize k = 0;
     usize i = 0;
@@ -172,7 +169,7 @@ u8* libDir(u8* path)
         if (path[i] == 47)
         {
             if (i == 0) return null;
-            u8* d = (u8*)malloc(i + 1);
+            u8* d = alloc<u8>(i + 1);
             if (d == null) return null;
             usize k = 0;
             while (k < i) { d[k] = path[k]; k = k + 1; }
@@ -189,7 +186,7 @@ u8* libRead(u8* cpath, usize* outLen)
     Slice s = readFile(cpath, outLen);
     if (s.ptr == null || s.len == 0)
     {
-        if (s.ptr != null) free(s.ptr);
+        if (s.ptr != null) dealloc<u8>(s.ptr);
         return null;
     }
     return (u8*)s.ptr;
@@ -257,7 +254,7 @@ File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* di
     };
     parser.previous = parser.current;
     AstContext* c = L->ctx;
-    File* f = parser.parseFile(c.intern(cpath, libLen(cpath)));
+    File* f = parser.parseFile(c.intern(str::fromParts(cpath, libLen(cpath))));
     L->errors = L->errors + parser.errorCount();
     return f;
 }
@@ -278,10 +275,10 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
             u8* buf = libRead(cand, &len);
             if (buf != null)
             {
-                free(buf);
+                dealloc<u8>(buf);
                 return cand;
             }
-            free(cand);
+            dealloc<u8>(cand);
         }
         cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "/lib.crl");
         if (cand != null)
@@ -289,10 +286,10 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
             u8* buf = libRead(cand, &len);
             if (buf != null)
             {
-                free(buf);
+                dealloc<u8>(buf);
                 return cand;
             }
-            free(cand);
+            dealloc<u8>(cand);
         }
         return null;
     }
@@ -326,7 +323,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                             {
                                 InternEntry* target = L->ctx->interns + dd->kind.payload.ModReexport.path;
                                 u32 maxT = (u32)(target->len / 2) + 1;
-                                LibSeg* next = (LibSeg*)malloc(((usize)maxT + (usize)n) * @sizeof(LibSeg));
+                                LibSeg* next = alloc<LibSeg>((usize)maxT + (usize)n);
                                 if (next != null)
                                 {
                                     u32 got = libSplit(target->ptr, target->len, next, maxT);
@@ -338,10 +335,10 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                                         j = j + 1;
                                     }
                                     u8* r = libResolveSegs(L, next, got, sub, subLen, depth + 1);
-                                    free(next);
+                                    dealloc<LibSeg>(next);
                                     if (r != null)
                                     {
-                                        free(mpath);
+                                        dealloc<u8>(mpath);
                                         return r;
                                     }
                                 }
@@ -352,7 +349,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                 }
             }
         }
-        free(mpath);
+        dealloc<u8>(mpath);
     }
     /* no export entry (or its target failed) — descend as a directory */
     return libResolveSegs(L, segs + 1, n - 1, sub, subLen, depth + 1);
@@ -373,7 +370,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
             if (libBytesEq(L->modKeys[mi].ptr, L->modKeys[mi].len, nsPtr, nsLen))
             {
                 usize vl = L->modVals[mi].len;
-                u8* copy = (u8*)malloc(vl + 1);
+                u8* copy = alloc<u8>(vl + 1);
                 if (copy == null) return null;
                 usize vi = 0;
                 while (vi < vl) { copy[vi] = L->modVals[mi].ptr[vi]; vi = vi + 1; }
@@ -403,7 +400,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
                     libBytesEq(key.ptr + (key.len - nsLen), nsLen, nsPtr, nsLen))
                 {
                     Slice mv = L->modVals[mi];
-                    u8* copy = (u8*)malloc(mv.len + 1);
+                    u8* copy = alloc<u8>(mv.len + 1);
                     if (copy == null) return null;
                     usize vi = 0;
                     while (vi < mv.len) { copy[vi] = mv.ptr[vi]; vi = vi + 1; }
@@ -421,7 +418,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
         if (nsPtr[i] == 58 && nsPtr[i + 1] == 58) maxSegs = maxSegs + 1;
         i = i + 1;
     }
-    LibSeg* segs = (LibSeg*)malloc((usize)maxSegs * @sizeof(LibSeg));
+    LibSeg* segs = alloc<LibSeg>((usize)maxSegs);
     if (segs == null) return null;
     u32 n = libSplit(nsPtr, nsLen, segs, maxSegs);
     u8* result = null;
@@ -436,9 +433,9 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
             if (root1 != null)
             {
                 result = libResolveSegs(L, segs, n, root1, libLen(root1), 0);
-                free(root1);
+                dealloc<u8>(root1);
             }
-            free(up);
+            dealloc<u8>(up);
         }
     }
     /* `base` stays alive until the platform-root fallback below also
@@ -450,7 +447,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
         /* platform-first: <module>/<platform_root>/<rest> — neutral paths
          * resolve under the platform root before the base tree
          * (see coral-docs/builder_incomplete.md) */
-        LibSeg* psegs = (LibSeg*)malloc(((usize)n + (usize)L->platformRootSegsLen) * @sizeof(LibSeg));
+        LibSeg* psegs = alloc<LibSeg>((usize)n + (usize)L->platformRootSegsLen);
         if (psegs != null)
         {
             psegs[0] = segs[0];
@@ -472,11 +469,11 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
             result = libResolveSegs(L, psegs, k, "lib".ptr, 3, 0);
             if (result == null && base != null)
                 result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
-            free(psegs);
+            dealloc<LibSeg>(psegs);
         }
     }
-    free(segs);
-    if (base != null) free(base);
+    dealloc<LibSeg>(segs);
+    if (base != null) dealloc<u8>(base);
     return result;
 }
 
@@ -497,7 +494,7 @@ bool libPush(LibLoader* L, u8* path)
     if (L->loadedLen >= L->loadedCap)
     {
         u32 newCap = L->loadedCap * 2;
-        rawptr raw = realloc((rawptr)L->loaded, (usize)newCap * @sizeof(u8*));
+        rawptr raw = realloc<u8*>(L->loaded, (usize)newCap);
         if (raw == null) return false;
         L->loaded = (u8**)raw;
         L->loadedCap = newCap;
@@ -512,7 +509,7 @@ bool libPushFile(LibLoader* L, File* f)
     if (L->filesLen >= L->filesCap)
     {
         u32 newCap = L->filesCap * 2;
-        rawptr raw = realloc((rawptr)L->files, (usize)newCap * @sizeof(File*));
+        rawptr raw = realloc<File*>(L->files, (usize)newCap);
         if (raw == null) return false;
         L->files = (File**)raw;
         L->filesCap = newCap;
@@ -539,7 +536,7 @@ void libLoadModulePath(LibLoader* L, str ns)
     }
     if (libHas(L, resolved))
     {
-        free(resolved);
+        dealloc<u8>(resolved);
         return;
     }
     if (!libPush(L, resolved))
@@ -563,11 +560,11 @@ void libLoadModulePath(LibLoader* L, str ns)
     if (L->bufsLen >= L->bufsCap)
     {
         u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
-        rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * @sizeof(u8*));
+        rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
         if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
     }
     if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
-    else free(buf);
+    else dealloc<u8>(buf);
     L->bufsLen = L->bufsLen + 1;
     File* lf = libParse(L, buf, len, resolved, dg, fid);
     if (lf == null)
@@ -624,24 +621,24 @@ void libLoadModulePath(LibLoader* L, str ns)
                      u8* cand = libCandidate(dir, dirLen, ie->ptr, ie->len, ".crl");
                      if (cand != null)
                      {
-                         if (libHas(L, cand))
-                         {
-                             free(cand);
-                         }
-                         else
-                         {
-                             usize len = 0;
-                             u8* buf = libRead(cand, &len);
-                             if (buf == null)
-                             {
-                                 free(cand);
-                             }
-                             else if (!libPush(L, cand))
-                             {
-                                 L->errors = L->errors + 1;
-                                 free(cand);
-                                 free(buf);
-                             }
+                        if (libHas(L, cand))
+                        {
+                            dealloc<u8>(cand);
+                        }
+                        else
+                        {
+                            usize len = 0;
+                            u8* buf = libRead(cand, &len);
+                            if (buf == null)
+                            {
+                                dealloc<u8>(cand);
+                            }
+                            else if (!libPush(L, cand))
+                            {
+                                L->errors = L->errors + 1;
+                                dealloc<u8>(cand);
+                                dealloc<u8>(buf);
+                            }
                              else
                              {
                                  u32 fid = 0;
@@ -650,11 +647,11 @@ void libLoadModulePath(LibLoader* L, str ns)
                                  if (L->bufsLen >= L->bufsCap)
                                  {
                                      u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
-                                     rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * @sizeof(u8*));
+                                     rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
                                      if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
                                  }
                                  if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
-                                 else free(buf);
+                                 else dealloc<u8>(buf);
                                  L->bufsLen = L->bufsLen + 1;
                                  File* lf = libParse(L, buf, len, cand, dg, fid);
                                  if (lf == null)
@@ -741,10 +738,10 @@ void libLoadModulePath(LibLoader* L, str ns)
                      else
                      {
                          usize sl0 = 0;
-                         u8* sbuf0 = libRead(sib0, &sl0);
-                         if (sbuf0 == null) bareModule = true;
-                         else free(sbuf0);
-                         free(sib0);
+                        u8* sbuf0 = libRead(sib0, &sl0);
+                        if (sbuf0 == null) bareModule = true;
+                        else dealloc<u8>(sbuf0);
+                        dealloc<u8>(sib0);
                      }
                  }
                  if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath && !hasGroups && !bareModule)
@@ -791,14 +788,14 @@ void libLoadModulePath(LibLoader* L, str ns)
                  u32 targets = 1;
                  if (groupCount > 0)
                  {
-                     comps = (u8*)malloc(compsSize);
-                     tPtrs = (u8**)malloc(((usize)1 + (usize)groupCount) * @sizeof(u8*));
-                     tLens = (usize*)malloc(((usize)1 + (usize)groupCount) * @sizeof(usize));
-                     if (comps == null || tPtrs == null || tLens == null)
-                     {
-                         if (comps != null) free(comps);
-                         if (tPtrs != null) free(tPtrs);
-                         if (tLens != null) free(tLens);
+                    comps = alloc<u8>(compsSize);
+                    tPtrs = alloc<u8*>((usize)1 + (usize)groupCount);
+                    tLens = alloc<usize>((usize)1 + (usize)groupCount);
+                    if (comps == null || tPtrs == null || tLens == null)
+                    {
+                        if (comps != null) dealloc<u8>(comps);
+                        if (tPtrs != null) dealloc<u8*>(tPtrs);
+                        if (tLens != null) dealloc<usize>(tLens);
                          comps = null;
                          tPtrs = null;
                          tLens = null;
@@ -867,16 +864,16 @@ void libLoadModulePath(LibLoader* L, str ns)
                   u8** tOwned = null;
                   if (tPtrs == null)
                   {
-                      tPtrs = (u8**)malloc(@sizeof(u8*));
-                      tLens = (usize*)malloc(@sizeof(usize));
-                      tHard = (u8*)malloc(1);
-                      tOwned = (u8**)malloc(@sizeof(u8*));
+                      tPtrs = alloc<u8*>(1);
+                      tLens = alloc<usize>(1);
+                      tHard = alloc<u8>(1);
+                      tOwned = alloc<u8*>(1);
                       if (tPtrs == null || tLens == null || tHard == null || tOwned == null)
                       {
-                          if (tPtrs != null) free(tPtrs);
-                          if (tLens != null) free(tLens);
-                          if (tHard != null) free(tHard);
-                          if (tOwned != null) free(tOwned);
+                          if (tPtrs != null) dealloc<u8*>(tPtrs);
+                          if (tLens != null) dealloc<usize>(tLens);
+                          if (tHard != null) dealloc<u8>(tHard);
+                          if (tOwned != null) dealloc<u8*>(tOwned);
                           tPtrs = null;
                           tLens = null;
                           tHard = null;
@@ -887,15 +884,15 @@ void libLoadModulePath(LibLoader* L, str ns)
                   }
                   if (tPtrs == null)
                   {
-                      if (comps != null) free(comps);
+                      if (comps != null) dealloc<u8>(comps);
                       continue;
                   }
                   /* hard = missing file is an error; chased re-export
                    * targets are soft (a dead re-export may not exist here) */
                   if (tHard == null || tOwned == null)
                   {
-                      u8* nh = (u8*)malloc((usize)tCap);
-                      u8** no = (u8**)malloc(((usize)tCap) * @sizeof(u8*));
+                      u8* nh = alloc<u8>((usize)tCap);
+                      u8** no = alloc<u8*>((usize)tCap);
                       if (nh != null && no != null)
                       {
                           tHard = nh;
@@ -903,11 +900,11 @@ void libLoadModulePath(LibLoader* L, str ns)
                       }
                       else
                       {
-                          if (nh != null) free(nh);
-                          if (no != null) free(no);
-                          free(tPtrs);
-                          free(tLens);
-                          if (comps != null) free(comps);
+                          if (nh != null) dealloc<u8>(nh);
+                          if (no != null) dealloc<u8*>(no);
+                          dealloc<u8*>(tPtrs);
+                          dealloc<usize>(tLens);
+                          if (comps != null) dealloc<u8>(comps);
                           tPtrs = null;
                           continue;
                       }
@@ -955,7 +952,7 @@ void libLoadModulePath(LibLoader* L, str ns)
                           }
                           if (libHas(L, resolved))
                           {
-                              free(resolved);
+                              dealloc<u8>(resolved);
                           }
                           else if (!libPush(L, resolved))
                           {
@@ -974,11 +971,11 @@ void libLoadModulePath(LibLoader* L, str ns)
                                   if (L->bufsLen >= L->bufsCap)
                                   {
                                       u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
-                                      rawptr raw = realloc((rawptr)L->bufs, (usize)newCap * @sizeof(u8*));
+                                      rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
                                       if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
                                   }
                                   if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = buf;
-                                  else free(buf);
+                                  else dealloc<u8>(buf);
                                   L->bufsLen = L->bufsLen + 1;
                                   lf = libParse(L, buf, len, resolved, dg, fid);
                               }
@@ -1003,7 +1000,7 @@ void libLoadModulePath(LibLoader* L, str ns)
                                    * this import asked for when any alias
                                    * matches, else all aliases (the path names
                                    * the directory itself). Targets are soft. */
-                                  Str* rxAliases = (Str*)malloc(((usize)lf->declsLen + 1) * @sizeof(Str));
+                                  Str* rxAliases = alloc<Str>((usize)lf->declsLen + 1);
                                   u8* rxWant = null;
                                   u32 rxCount = 0;
                                   if (rxAliases != null)
@@ -1026,7 +1023,7 @@ void libLoadModulePath(LibLoader* L, str ns)
                                   }
                                   if (rxAliases != null && rxCount > 0)
                                   {
-                                      rxWant = (u8*)malloc((usize)rxCount);
+                                      rxWant = alloc<u8>((usize)rxCount);
                                       if (rxWant != null)
                                       {
                                           u32 a = 0;
@@ -1058,8 +1055,8 @@ void libLoadModulePath(LibLoader* L, str ns)
                                                               if (lc > 0 && lc + 2 < nl2)
                                                               {
                                                                   AstContext* ac = L->ctx;
-                                                                  Str pref = ac.intern(np2, lc);
-                                                                  Str tail = ac.intern(np2 + lc + 2, nl2 - (lc + 2));
+                                                                  Str pref = ac.intern(str::fromParts(np2, lc));
+                                                                  Str tail = ac.intern(str::fromParts(np2 + lc + 2, nl2 - (lc + 2)));
                                                                   if (pref == rxAliases[a] || tail == rxAliases[a]) rxWant[a] = 1;
                                                               }
                                                           }
@@ -1079,20 +1076,20 @@ void libLoadModulePath(LibLoader* L, str ns)
                                                   {
                                                       u32 nc = 16;
                                                       if (tCap != 0) nc = tCap * 2;
-                                                      u8** np = (u8**)realloc((rawptr)tPtrs, (usize)nc * @sizeof(u8*));
+                                                      u8** np = realloc<u8*>(tPtrs, (usize)nc);
                                                       if (np != null) tPtrs = np;
-                                                      usize* nl = (usize*)realloc((rawptr)tLens, (usize)nc * @sizeof(usize));
+                                                      usize* nl = realloc<usize>(tLens, (usize)nc);
                                                       if (nl != null) tLens = nl;
-                                                      u8* nhh = (u8*)realloc((rawptr)tHard, (usize)nc);
+                                                      u8* nhh = realloc<u8>(tHard, (usize)nc);
                                                       if (nhh != null) tHard = nhh;
-                                                      u8** noo = (u8**)realloc((rawptr)tOwned, (usize)nc * @sizeof(u8*));
+                                                      u8** noo = realloc<u8*>(tOwned, (usize)nc);
                                                       if (noo != null) tOwned = noo;
                                                       if (targets < nc) tCap = nc;
                                                   }
                                                   if (targets < tCap)
                                                   {
                                                       InternEntry* ae = L->ctx->interns + rxAliases[a];
-                                                      u8* nt = (u8*)malloc(targetLen + 2 + ae->len);
+                                                      u8* nt = alloc<u8>(targetLen + 2 + ae->len);
                                                       if (nt != null)
                                                       {
                                                           usize w = 0;
@@ -1113,26 +1110,26 @@ void libLoadModulePath(LibLoader* L, str ns)
                                           }
                                       }
                                   }
-                                  if (rxAliases != null) free(rxAliases);
-                                  if (rxWant != null) free(rxWant);
+                                  if (rxAliases != null) dealloc<Str>(rxAliases);
+                                  if (rxWant != null) dealloc<u8>(rxWant);
                               }
                           }
                       }
                       k = k + 1;
                   }
-                  if (comps != null) free(comps);
-                  if (tPtrs != null) free(tPtrs);
-                  if (tLens != null) free(tLens);
-                  if (tHard != null) free(tHard);
+                  if (comps != null) dealloc<u8>(comps);
+                  if (tPtrs != null) dealloc<u8*>(tPtrs);
+                  if (tLens != null) dealloc<usize>(tLens);
+                  if (tHard != null) dealloc<u8>(tHard);
                   if (tOwned != null)
                   {
                       u32 fi = 0;
                       while (fi < targets)
                       {
-                          if (tOwned[fi] != null) free(tOwned[fi]);
+                          if (tOwned[fi] != null) dealloc<u8>(tOwned[fi]);
                           fi = fi + 1;
                       }
-                      free(tOwned);
+                      dealloc<u8*>(tOwned);
                   }
              }
          }
@@ -1150,7 +1147,7 @@ bool libMerge(LibLoader* L, File* file)
         total = total + L->files[i]->declsLen;
         i = i + 1;
     }
-    NodeId* merged = (NodeId*)malloc((usize)total * @sizeof(NodeId));
+    NodeId* merged = alloc<NodeId>((usize)total);
     if (merged == null) return false;
     u32 k = 0;
     i = 0;
@@ -1175,7 +1172,7 @@ bool libMerge(LibLoader* L, File* file)
     AstContext* c = L->ctx;
     if (!c.track((rawptr)merged))
     {
-        free((rawptr)merged);
+        dealloc<NodeId>(merged);
         return false;
     }
     file->decls = merged;
@@ -1192,8 +1189,8 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
 {
     *outLen = 0;
     if (ctx == null || ctx->flagsLen == 0) return null;
-    Str platName = ctx.intern("platform".ptr, 8);
-    Str archName = ctx.intern("arch".ptr, 4);
+    Str platName = ctx.intern("platform");
+    Str archName = ctx.intern("arch");
     Str platVal = 0;
     Str archVal = 0;
     u32 fi = 0;
@@ -1211,7 +1208,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
     u32 segCount = slashes + 1;
     if (slashes == 0) segCount = 2;
     if (segCount > 4) segCount = 4;
-    LibSeg* segs = (LibSeg*)malloc((usize)segCount * @sizeof(LibSeg));
+    LibSeg* segs = alloc<LibSeg>((usize)segCount);
     if (segs == null) return null;
     u32 k = 0;
     if (slashes == 0)
@@ -1255,7 +1252,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
             pi = pi + 1;
         }
     }
-    if (k == 0) { free(segs); return null; }
+    if (k == 0) { dealloc<LibSeg>(segs); return null; }
     *outLen = k;
     return segs;
 }
@@ -1274,7 +1271,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         .monoErrors = 0,
     };
 
-    AstContext* ctx = (AstContext*)malloc(@sizeof(AstContext));
+    AstContext* ctx = alloc<AstContext>(1);
     if (ctx == null) {
         unit.parseErrors = 1;
         return unit;
@@ -1285,13 +1282,13 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
      * against build-time flags (see compile.crl / Options) */
     if (flagsN != null && nFlags > 0)
     {
-        Str* fns = (Str*)malloc((usize)nFlags * @sizeof(Str));
-        Str* fvs = (Str*)malloc((usize)nFlags * @sizeof(Str));
+        Str* fns = alloc<Str>((usize)nFlags);
+        Str* fvs = alloc<Str>((usize)nFlags);
         u32 fi = 0;
         while (fi < nFlags)
         {
-            fns[fi] = ctx.intern(flagsN[fi].ptr, flagsN[fi].len);
-            fvs[fi] = ctx.intern(flagsV[fi].ptr, flagsV[fi].len);
+            fns[fi] = ctx.intern(flagsN[fi].asStr());
+            fvs[fi] = ctx.intern(flagsV[fi].asStr());
             fi = fi + 1;
         }
         ctx->flagNames = fns;
@@ -1299,11 +1296,11 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         ctx->flagsLen = nFlags;
     }
 
-    IdentEntry* entries = (IdentEntry*)malloc(256 * @sizeof(IdentEntry));
+    IdentEntry* entries = alloc<IdentEntry>(256);
     if (entries == null) {
         unit.parseErrors = 1;
         ctx.deinit();
-        free(ctx);
+        dealloc<AstContext>(ctx);
         return unit;
     }
 
@@ -1311,7 +1308,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
     idents.init(entries, 256);
     idents.addKeywords();
 
-    DiagnosticEngine* engine = (DiagnosticEngine*)malloc(@sizeof(DiagnosticEngine));
+    DiagnosticEngine* engine = alloc<DiagnosticEngine>(1);
     unit.engineObj = engine;
     DiagnosticEngine __tmpEngine;
     __tmpEngine.init(src, src + len);
@@ -1351,11 +1348,11 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
     parser.previous = parser.current;
 
     /* real file path so the backend can mangle module paths from it */
-    Str pathStr = ctx.intern((u8*)"main", 4);
+    Str pathStr = ctx.intern("main");
     if (path != null) {
         usize plen = 0;
         while (path[plen] != 0) plen = plen + 1;
-        if (plen > 0) pathStr = ctx.intern(path, plen);
+        if (plen > 0) pathStr = ctx.intern(str::fromParts(path, plen));
     }
     File* file = parser.parseFile(pathStr);
     unit.parseErrors = parser.errorCount();
@@ -1414,7 +1411,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             u32 segCount = 1;
             usize pi = 0;
             while (pi < plen) { if (plat[pi] == 47) segCount = segCount + 1; pi = pi + 1; }
-            LibSeg* prSegs = (LibSeg*)malloc((usize)segCount * @sizeof(LibSeg));
+            LibSeg* prSegs = alloc<LibSeg>((usize)segCount);
             if (prSegs != null)
             {
                 u32 k = 0;
@@ -1440,7 +1437,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         else
         {
-            LibSeg* prSegs = (LibSeg*)malloc(2 * @sizeof(LibSeg));
+            LibSeg* prSegs = alloc<LibSeg>(2);
             if (prSegs != null)
             {
                 prSegs[0].ptr = "x86_64".ptr;
@@ -1452,10 +1449,10 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             }
         }
         }
-        loader.loaded = (u8**)malloc(8 * @sizeof(u8*));
+        loader.loaded = alloc<u8*>(8);
         loader.loadedLen = 0;
         loader.loadedCap = 8;
-        loader.files = (File**)malloc(8 * @sizeof(File*));
+        loader.files = alloc<File*>(8);
         loader.filesLen = 0;
         loader.filesCap = 8;
         loader.errors = 0;
@@ -1492,8 +1489,8 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
                 loader.errors = loader.errors + 1;
             }
         }
-        if (loader.loaded != null) free(loader.loaded);
-        if (loader.files != null) free(loader.files);
+        if (loader.loaded != null) dealloc<u8*>(loader.loaded);
+        if (loader.files != null) dealloc<File*>(loader.files);
         if (loader.errors > 0)
         {
             unit.parseErrors = unit.parseErrors + loader.errors;
@@ -1502,12 +1499,12 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
     }
 
     if (file != null && loadOk) {
-        Sema* sema = (Sema*)malloc(@sizeof(Sema));
-        MonoContext* mono = (MonoContext*)malloc(@sizeof(MonoContext));
+        Sema* sema = alloc<Sema>(1);
+        MonoContext* mono = alloc<MonoContext>(1);
         if (sema == null || mono == null) {
             unit.parseErrors = unit.parseErrors + 1;
-            if (sema != null) free(sema);
-            if (mono != null) free(mono);
+            if (sema != null) dealloc<Sema>(sema);
+            if (mono != null) dealloc<MonoContext>(mono);
         } else {
             sema.init(ctx, engine);
             sema.allowIntPtr = allowIntPtr;
@@ -1531,14 +1528,14 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
      * strings point into them (see freeUnit) */
     unit.bufs = loader.bufs;
     unit.bufsLen = loader.bufsLen;
-    if (loader.platformRootSegs != null) free(loader.platformRootSegs);
+    if (loader.platformRootSegs != null) dealloc<LibSeg>(loader.platformRootSegs);
 
-    free(entries);
+    dealloc<IdentEntry>(entries);
 
     if (unit.parseErrors > 0 || unit.semanticErrors > 0 || unit.monoErrors > 0) {
         freeUnit(&unit);            /* sema + mono (unit.ctx not set yet) */
         ctx.deinit();
-        free(ctx);
+        dealloc<AstContext>(ctx);
         return unit;
     }
 
@@ -1560,7 +1557,7 @@ AnalyzeResult analyze(u8* src, usize len)
     AstContext ctx;
     ctx.init(4096, 4096, 4096);
     
-    IdentEntry* entries = (IdentEntry*)malloc(256 * @sizeof(IdentEntry));
+    IdentEntry* entries = alloc<IdentEntry>(256);
     if (entries == null) {
         result.parseErrors = 1;
         ctx.deinit();
@@ -1597,7 +1594,7 @@ AnalyzeResult analyze(u8* src, usize len)
     };
     parser.previous = parser.current;
     
-    File* file = parser.parseFile(ctx.intern("frontend".ptr, 8));
+    File* file = parser.parseFile(ctx.intern("frontend"));
     Sema sema;
     sema.init(&ctx, &engine);
     sema.scopes.enter();
@@ -1621,6 +1618,6 @@ AnalyzeResult analyze(u8* src, usize len)
     mono.deinit();
     sema.deinit();
     ctx.deinit();
-    free(entries);
+    dealloc<IdentEntry>(entries);
     return result;
 }

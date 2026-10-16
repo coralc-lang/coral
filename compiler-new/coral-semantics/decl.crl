@@ -7,6 +7,7 @@ import context::context { InternEntry };
 import scope { Symbol, ScopeStack };
 import sema { Sema };
 import diag::code { ErrorCode };
+import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
@@ -20,6 +21,7 @@ pub extend Sema
         u8 kind = 0;
         Str name = 0;
         Ty typeNode = 0;
+        
         switch (decl->kind.tag)
         {
             DeclKind::Func => {
@@ -131,20 +133,46 @@ pub extend Sema
         if (decl->kind.tag == DeclKind::Func)
             return self.checkFunction(decl, 0);
         if (decl->kind.tag == DeclKind::Struct)
-            return self.checkMethods(decl->kind.payload.Struct.methods, decl->kind.payload.Struct.methodsLen, self.selfNamedType(decl->kind.payload.Struct.name, decl->kind.payload.Struct.genericParams, decl->kind.payload.Struct.genericParamsLen), decl->kind.payload.Struct.genericParams, decl->kind.payload.Struct.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.Struct.methods,
+                                     decl->kind.payload.Struct.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Struct.name,
+                                                        decl->kind.payload.Struct.genericParams,
+                                                        decl->kind.payload.Struct.genericParamsLen),
+                                     decl->kind.payload.Struct.genericParams,
+                                     decl->kind.payload.Struct.genericParamsLen);
         if (decl->kind.tag == DeclKind::Union)
-            return self.checkMethods(decl->kind.payload.Union.methods, decl->kind.payload.Union.methodsLen, self.selfNamedType(decl->kind.payload.Union.name, decl->kind.payload.Union.genericParams, decl->kind.payload.Union.genericParamsLen), decl->kind.payload.Union.genericParams, decl->kind.payload.Union.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.Union.methods,
+                                     decl->kind.payload.Union.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Union.name,
+                                                        decl->kind.payload.Union.genericParams,
+                                                        decl->kind.payload.Union.genericParamsLen),
+                                     decl->kind.payload.Union.genericParams,
+                                     decl->kind.payload.Union.genericParamsLen);
         if (decl->kind.tag == DeclKind::Trait)
-            return self.checkMethods(decl->kind.payload.Trait.methods, decl->kind.payload.Trait.methodsLen, self.selfNamedType(decl->kind.payload.Trait.name, decl->kind.payload.Trait.genericParams, decl->kind.payload.Trait.genericParamsLen), decl->kind.payload.Trait.genericParams, decl->kind.payload.Trait.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.Trait.methods,
+                                     decl->kind.payload.Trait.methodsLen,
+                                     self.selfNamedType(decl->kind.payload.Trait.name,
+                                                        decl->kind.payload.Trait.genericParams,
+                                                        decl->kind.payload.Trait.genericParamsLen),
+                                     decl->kind.payload.Trait.genericParams,
+                                     decl->kind.payload.Trait.genericParamsLen);
         if (decl->kind.tag == DeclKind::Variant)
-            return self.checkMethods(decl->kind.payload.Variant.methods, decl->kind.payload.Variant.methodsLen, self.selfNamedType(decl->kind.payload.Variant.name, decl->kind.payload.Variant.genericParams, decl->kind.payload.Variant.genericParamsLen), decl->kind.payload.Variant.genericParams, decl->kind.payload.Variant.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.Variant.methods,
+                                     decl->kind.payload.Variant.methodsLen,
+                                    self.selfNamedType(decl->kind.payload.Variant.name,
+                                                       decl->kind.payload.Variant.genericParams,
+                                                       decl->kind.payload.Variant.genericParamsLen),
+                                    decl->kind.payload.Variant.genericParams,
+                                    decl->kind.payload.Variant.genericParamsLen);
         if (decl->kind.tag == DeclKind::Extend)
         {
-            return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen, decl->kind.payload.Extend.selfType, decl->kind.payload.Extend.genericParams, decl->kind.payload.Extend.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen,
+                                     decl->kind.payload.Extend.selfType, decl->kind.payload.Extend.genericParams, decl->kind.payload.Extend.genericParamsLen);
         }
         if (decl->kind.tag == DeclKind::ExtendTrait)
         {
-            return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen, decl->kind.payload.ExtendTrait.selfType, decl->kind.payload.ExtendTrait.genericParams, decl->kind.payload.ExtendTrait.genericParamsLen);
+            return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen,
+                                    decl->kind.payload.ExtendTrait.selfType, decl->kind.payload.ExtendTrait.genericParams, decl->kind.payload.ExtendTrait.genericParamsLen);
         }
         return true;
     }
@@ -164,7 +192,7 @@ pub extend Sema
                 Ty typeNode = self.typeParamType(generic->name, genericIndex);
                 if (!self.scopes.declare(generic->name, 4, typeNode, genericId, 0, 0)) ok = false;
             }
-            genericIndex = genericIndex + 1;
+            genericIndex++;
         }
         /* legacy `extend Option<T>`: parameter names live in the self
          * type's generic args when no explicit list was given */
@@ -185,7 +213,7 @@ pub extend Sema
                         nid.index = 0;
                         self.scopes.declare(ae->kind.payload.Named.name, 4, typeNode, nid, 0, 0);
                     }
-                    a = a + 1;
+                    a++;
                 }
             }
         }
@@ -201,7 +229,7 @@ pub extend Sema
                     if (!self.checkFunction(method, selfType)) ok = false;
                 }
             }
-            i = i + 1;
+            i++;
         }
         self.scopes.leave();
         return ok;
@@ -219,7 +247,7 @@ pub extend Sema
             if ((symbols[i].flags & 2) != 0) return true;
             if (symbols[i].name == member) return true;
             if (symbols[i].alias != 0 && symbols[i].alias == member) return true;
-            i = i + 1;
+            i++;
         }
         return false;
     }
@@ -244,35 +272,36 @@ pub extend Sema
         InternEntry* se = self.ctx.interns + symbolName;
         usize last = 0;
         usize q = 0;
-        while (q + 1 < se->len)
+        while (q++ < se->len)
         {
-            if (se->ptr[q] == 58 && se->ptr[q + 1] == 58) last = q;
-            q = q + 1;
+            if (se->ptr[q] == 58 && se->ptr[q++] == 58) last = q;
+            q++;
         }
         if (last == 0) return base;
         InternEntry* pe = self.ctx.interns + base;
-        if (last > pe->len + 1)
+        if (last > pe->len++)
         {
             bool absolute = true;
             usize chk = 0;
             while (chk < pe->len)
             {
                 if (se->ptr[chk] != pe->ptr[chk]) { absolute = false; break; }
-                chk = chk + 1;
+                chk++;
             }
-            if (absolute && (se->ptr[pe->len] != 58 || se->ptr[pe->len + 1] != 58)) absolute = false;
-            if (absolute) return self.ctx.intern(se->ptr, last);
+            if (absolute && (se->ptr[pe->len] != 58 || se->ptr[pe->len++] != 58)) absolute = false;
+            if (absolute) return self.ctx.intern(str::fromParts(se->ptr, last));
         }
         usize n = pe->len + 2 + last;
-        u8* buf = (u8*)malloc(n);
+        u8* buf = alloc<u8>(n);
         if (buf == null) return base;
         usize k = 0;
-        while (k < pe->len) { buf[k] = pe->ptr[k]; k = k + 1; }
-        buf[k] = 58; buf[k + 1] = 58;
+        while (k < pe->len) { buf[k] = pe->ptr[k]; k++; }
+        
+        buf[k] = 58; buf[k++] = 58;
         usize m = 0;
-        while (m < last) { buf[k + 2 + m] = se->ptr[m]; m = m + 1; }
-        Str joined = self.ctx.intern(buf, n);
-        free((rawptr)buf);
+        while (m < last) { buf[k + 2 + m] = se->ptr[m]; m++; }
+        Str joined = self.ctx.intern(str::fromParts(buf, n));
+        dealloc<u8>(buf);
         return joined;
     }
 
@@ -294,14 +323,14 @@ pub extend Sema
         {
             usize segLen = pe->len - pi;
             usize q = pi;
-            while (q + 1 < pe->len)
+            while (q++ < pe->len)
             {
-                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) { segLen = q - pi; break; }
-                q = q + 1;
+                if (pe->ptr[q] == 58 && pe->ptr[q++] == 58) { segLen = q - pi; break; }
+                q++;
             }
             if (segLen == 0)
             {
-                pi = pi + 2;
+                pi += 2;
                 continue;
             }
             bool found = false;
@@ -309,7 +338,7 @@ pub extend Sema
             while (j + segLen <= fl)
             {
                 usize k = 0;
-                while (k < segLen && fp[j + k] == pe->ptr[pi + k]) k = k + 1;
+                while (k < segLen && fp[j + k] == pe->ptr[pi + k]) k++;
                 if (k == segLen)
                 {
                     bool leftOk = (j == 0) || fp[j - 1] == 47;
@@ -317,7 +346,7 @@ pub extend Sema
                     bool rightOk = (end >= fl) || fp[end] == 47 || fp[end] == 46;
                     if (leftOk && rightOk) { found = true; start = end; break; }
                 }
-                j = j + 1;
+                j++;
             }
             if (!found) return false;
             pi = pi + segLen + 2;
@@ -341,13 +370,13 @@ pub extend Sema
                 usize sl = se->len;
                 usize lastCol = 0;
                 usize q = 0;
-                while (q + 1 < sl)
+                while (q++ < sl)
                 {
-                    if (sp[q] == 58 && sp[q + 1] == 58) lastCol = q;
-                    q = q + 1;
+                    if (sp[q] == 58 && sp[q++] == 58) lastCol = q;
+                    q++;
                 }
                 if (lastCol > 0 && lastCol + 2 < sl)
-                    lookupName = self.ctx.intern(sp + lastCol + 2, sl - (lastCol + 2));
+                    lookupName = self.ctx.intern(str::fromParts(sp + lastCol + 2, sl - (lastCol + 2)));
                 /* merged files may declare the same name (libc's extern
                  * realloc vs mman's realloc<T>) — prefer the candidate whose
                  * file path matches this import's module path; plain lookup
@@ -356,7 +385,7 @@ pub extend Sema
                 if (symbol->name != 0 && decl->kind.payload.Import.path != 0)
                 {
                     Str modulePath = self.importSymbolModulePath(decl, symbol->name);
-                    Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                    Symbol** cands = alloc<Symbol*>(16);
                     if (cands != null)
                     {
                         u32 n = self.scopes.lookupAll(lookupName, cands, 16);
@@ -364,9 +393,9 @@ pub extend Sema
                         while (m < n)
                         {
                             if (self.importPathInFile(modulePath, cands[m]->fileId)) { real = cands[m]; break; }
-                            m = m + 1;
+                            m++;
                         }
-                        free((rawptr)cands);
+                        dealloc<Symbol*>(cands);
                     }
                 }
                 if (real == null) real = self.scopes.lookup(lookupName);
@@ -394,7 +423,7 @@ pub extend Sema
                 if (symbol->alias != 0 && symbol->alias != lookupName)
                     self.addAliasPair(symbol->alias, real->declaration);
             }
-            i = i + 1;
+            i++;
         }
         return true;
     }
@@ -415,13 +444,13 @@ pub extend Sema
             InternEntry* pe = self.ctx.interns + path;
             usize lastCol = 0;
             usize q = 0;
-            while (q + 1 < pe->len)
+            while (q++ < pe->len)
             {
-                if (pe->ptr[q] == 58 && pe->ptr[q + 1] == 58) lastCol = q;
-                q = q + 1;
+                if (pe->ptr[q] == 58 && pe->ptr[q++] == 58) lastCol = q;
+                q++;
             }
             if (lastCol > 0 && lastCol + 2 < pe->len)
-                modName = self.ctx.intern(pe->ptr + lastCol + 2, pe->len - (lastCol + 2));
+                modName = self.ctx.intern(str::fromParts(pe->ptr + lastCol + 2, pe->len - (lastCol + 2)));
             u32 impFileId = self.fileOf(id);
             if (!self.claimDirectImport(impFileId, modName))
             {
@@ -442,7 +471,7 @@ pub extend Sema
         {
             InternEntry* entry = self.ctx.interns + path;
             usize firstLen = 0;
-            while (firstLen < entry->len && entry->ptr[firstLen] != 58) firstLen = firstLen + 1;
+            while (firstLen < entry->len && entry->ptr[firstLen] != 58) firstLen++;
             if (firstLen == 0)
             {
                 self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "invalid import path");
@@ -450,7 +479,7 @@ pub extend Sema
             }
             if (!self.isRootSegment(entry->ptr, firstLen))
             {
-                Str first = self.ctx.intern(entry->ptr, firstLen);
+                Str first = self.ctx.intern(str::fromParts(entry->ptr, firstLen));
                 Symbol* symbol = self.scopes.lookup(first);
                 if (symbol == null)
                 {
@@ -469,13 +498,13 @@ pub extend Sema
                         {
                             usize memberStart = firstLen + 2;
                             usize memberLen = memberStart;
-                            while (memberLen < entry->len && entry->ptr[memberLen] != 58) memberLen = memberLen + 1;
+                            while (memberLen < entry->len && entry->ptr[memberLen] != 58) memberLen++;
                             if (memberLen <= memberStart)
                             {
                                 self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "invalid module member in import path");
                                 return false;
                             }
-                            Str member = self.ctx.intern(entry->ptr + memberStart, memberLen - memberStart);
+                            Str member = self.ctx.intern(str::fromParts(entry->ptr + memberStart, memberLen - memberStart));
                             if (!self.moduleExportsContain(resolved, member))
                             {
                                 self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "symbol not exported by module");
@@ -501,7 +530,7 @@ pub extend Sema
                         return false;
                     }
                 }
-                i = i + 1;
+                i++;
             }
         }
         return self.bindImportSymbols(id, decl, "symbol not found in imported module");
@@ -531,7 +560,7 @@ pub extend Sema
         /* builtin `str` namespace symbol — non-module kind so `str::…`
          * path calls route through findMethod on the str type instead of
          * the module-file resolution branch */
-        Str strName = self.ctx.intern("str".ptr, 3);
+        Str strName = self.ctx.intern("str");
         if (self.scopes.lookup(strName) == null)
         {
             NodeId noneId;
@@ -542,7 +571,7 @@ pub extend Sema
         while (i < file->declsLen)
         {
             self.checkDecl(file->decls[i], false);
-            i = i + 1;
+            i++;
         }
     }
 
@@ -553,7 +582,7 @@ pub extend Sema
         while (i < file->declsLen)
         {
             self.checkDecl(file->decls[i], true);
-            i = i + 1;
+            i++;
         }
     }
 }

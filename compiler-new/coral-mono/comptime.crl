@@ -26,10 +26,7 @@ import sem::scope { Symbol };
 import sem::member;
 import mono { MonoContext, MonoSubstitution };
 
-// extern("C") rawptr malloc(usize size);
-// extern("C") rawptr calloc(usize count, usize size);
-// extern("C") rawptr realloc(rawptr ptr, usize size);
-// extern("C") void free(rawptr ptr);
+import(lib) std::mman { alloc, dealloc, realloc, zero };
 
 /* CtVal.kind tags — the bootstrap does not emit file-scope scalar consts
  * (only array consts) or forward-declare non-variant enums before extend
@@ -62,7 +59,7 @@ pub struct CtEval
     u32 emittedLen;
     u32 emittedCap;
     bool failed;
-    u8* errMsg;
+    str errMsg;
     u32 depth;
     SourceLoc loc;
     Str variadicPackName;
@@ -105,7 +102,7 @@ pub extend CtEval
         self.emittedLen = 0;
         self.emittedCap = 0;
         self.failed = false;
-        self.errMsg = null;
+        self.errMsg = str::empty();
         self.depth = 0;
         self.loc.data = 0;
         self.variadicPackName = 0;
@@ -123,16 +120,16 @@ pub extend CtEval
 
     void dispose()
     {
-        if (self.bindings != null) free((rawptr)self.bindings);
-        if (self.emitted != null) free((rawptr)self.emitted);
-        if (self.declNames != null) free((rawptr)self.declNames);
+        if (self.bindings != null) dealloc<CtBinding>(self.bindings);
+        if (self.emitted != null) dealloc<NodeId>(self.emitted);
+        if (self.declNames != null) dealloc<Str>(self.declNames);
         self.bindings = null;
         self.emitted = null;
         self.declNames = null;
         u32 sd = 0;
         while (sd < self.sinkDepth)
         {
-            if (self.sinkBufs[sd] != null) free((rawptr)self.sinkBufs[sd]);
+            if (self.sinkBufs[sd] != null) dealloc<NodeId>(self.sinkBufs[sd]);
             sd = sd + 1;
         }
         self.sinkDepth = 0;
@@ -201,7 +198,7 @@ pub extend CtEval
         Sema* smT = self.mono.sema;
         if (smT != null) v.ty = smT.strType();
         if (n == 0) { v.sptr = null; v.slen = 0; return v; }
-        v.sptr = (u8*)malloc(n);
+        v.sptr = alloc<u8>(n);
         if (v.sptr == null) return v;
         usize i = 0;
         while (i < n) { v.sptr[i] = p[i]; i = i + 1; }
@@ -223,9 +220,9 @@ pub extend CtEval
         if (self.bindingsLen < self.bindingsCap) return true;
         u32 newCap = self.bindingsCap * 2;
         if (newCap == 0) newCap = 16;
-        rawptr raw = realloc((rawptr)self.bindings, (usize)newCap * @sizeof(CtBinding));
+        CtBinding* raw = realloc<CtBinding>(self.bindings, (usize)newCap);
         if (raw == null) { self.mono.errors = self.mono.errors + 1; return false; }
-        self.bindings = (CtBinding*)raw;
+        self.bindings = raw;
         self.bindingsCap = newCap;
         return true;
     }
@@ -235,9 +232,9 @@ pub extend CtEval
         if (self.emittedLen < self.emittedCap) return true;
         u32 newCap = self.emittedCap * 2;
         if (newCap == 0) newCap = 16;
-        rawptr raw = realloc((rawptr)self.emitted, (usize)newCap * @sizeof(NodeId));
+        NodeId* raw = realloc<NodeId>(self.emitted, (usize)newCap);
         if (raw == null) { self.mono.errors = self.mono.errors + 1; return false; }
-        self.emitted = (NodeId*)raw;
+        self.emitted = raw;
         self.emittedCap = newCap;
         return true;
     }
@@ -265,9 +262,9 @@ pub extend CtEval
         if (self.sinkLens[d] < self.sinkCaps[d]) return true;
         u32 newCap = self.sinkCaps[d] * 2;
         if (newCap == 0) newCap = 16;
-        rawptr raw = realloc((rawptr)self.sinkBufs[d], (usize)newCap * @sizeof(NodeId));
+        NodeId* raw = realloc<NodeId>(self.sinkBufs[d], (usize)newCap);
         if (raw == null) { self.mono.errors = self.mono.errors + 1; return false; }
-        self.sinkBufs[d] = (NodeId*)raw;
+        self.sinkBufs[d] = raw;
         self.sinkCaps[d] = newCap;
         return true;
     }
@@ -356,16 +353,16 @@ pub extend CtEval
         {
             u32 newCap = self.declNamesCap * 2;
             if (newCap == 0) newCap = 16;
-            rawptr raw = realloc((rawptr)self.declNames, (usize)newCap * @sizeof(Str));
+            Str* raw = realloc<Str>(self.declNames, (usize)newCap);
             if (raw == null) { self.mono.errors = self.mono.errors + 1; return; }
-            self.declNames = (Str*)raw;
+            self.declNames = raw;
             self.declNamesCap = newCap;
         }
         self.declNames[self.declNamesLen] = name;
         self.declNamesLen = self.declNamesLen + 1;
     }
 
-    void fail(u8* msg)
+    void fail(str msg)
     {
         if (self.failed) return;
         self.failed = true;
@@ -460,25 +457,25 @@ pub extend CtEval
         }
         /* 2. builtin keyword types (no symbols exist for these) */
         TypeKind k;
-        if (bn == self.internStr((u8*)"void", 4)) { k.tag = TypeKind::Void; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"bool", 4)) { k.tag = TypeKind::Bool; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"char", 4)) { k.tag = TypeKind::Char; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"str", 3)) { k.tag = TypeKind::Str; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"u8", 2)) { k.tag = TypeKind::U8; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"i8", 2)) { k.tag = TypeKind::I8; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"u16", 3)) { k.tag = TypeKind::U16; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"i16", 3)) { k.tag = TypeKind::I16; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"u32", 3)) { k.tag = TypeKind::U32; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"i32", 3)) { k.tag = TypeKind::I32; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"u64", 3)) { k.tag = TypeKind::U64; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"i64", 3)) { k.tag = TypeKind::I64; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"u128", 4)) { k.tag = TypeKind::U128; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"i128", 4)) { k.tag = TypeKind::I128; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"f32", 3)) { k.tag = TypeKind::F32; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"f64", 3)) { k.tag = TypeKind::F64; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"usize", 5)) { k.tag = TypeKind::Usize; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"isize", 5)) { k.tag = TypeKind::Isize; return self.kindSingleton(k); }
-        if (bn == self.internStr((u8*)"rawptr", 6)) { k.tag = TypeKind::Rawptr; return self.kindSingleton(k); }
+        if (bn == self.internStr("void")) { k.tag = TypeKind::Void; return self.kindSingleton(k); }
+        if (bn == self.internStr("bool")) { k.tag = TypeKind::Bool; return self.kindSingleton(k); }
+        if (bn == self.internStr("char")) { k.tag = TypeKind::Char; return self.kindSingleton(k); }
+        if (bn == self.internStr("str")) { k.tag = TypeKind::Str; return self.kindSingleton(k); }
+        if (bn == self.internStr("u8")) { k.tag = TypeKind::U8; return self.kindSingleton(k); }
+        if (bn == self.internStr("i8")) { k.tag = TypeKind::I8; return self.kindSingleton(k); }
+        if (bn == self.internStr("u16")) { k.tag = TypeKind::U16; return self.kindSingleton(k); }
+        if (bn == self.internStr("i16")) { k.tag = TypeKind::I16; return self.kindSingleton(k); }
+        if (bn == self.internStr("u32")) { k.tag = TypeKind::U32; return self.kindSingleton(k); }
+        if (bn == self.internStr("i32")) { k.tag = TypeKind::I32; return self.kindSingleton(k); }
+        if (bn == self.internStr("u64")) { k.tag = TypeKind::U64; return self.kindSingleton(k); }
+        if (bn == self.internStr("i64")) { k.tag = TypeKind::I64; return self.kindSingleton(k); }
+        if (bn == self.internStr("u128")) { k.tag = TypeKind::U128; return self.kindSingleton(k); }
+        if (bn == self.internStr("i128")) { k.tag = TypeKind::I128; return self.kindSingleton(k); }
+        if (bn == self.internStr("f32")) { k.tag = TypeKind::F32; return self.kindSingleton(k); }
+        if (bn == self.internStr("f64")) { k.tag = TypeKind::F64; return self.kindSingleton(k); }
+        if (bn == self.internStr("usize")) { k.tag = TypeKind::Usize; return self.kindSingleton(k); }
+        if (bn == self.internStr("isize")) { k.tag = TypeKind::Isize; return self.kindSingleton(k); }
+        if (bn == self.internStr("rawptr")) { k.tag = TypeKind::Rawptr; return self.kindSingleton(k); }
         /* named types (String, cchar, Hex, Spaces, …) — match an existing
          * non-generic entry; unknown names resolve to 0 so the caller can
          * try trait matching */
@@ -608,7 +605,7 @@ pub extend CtEval
         }
         while (end > off && p[end - 1] == 42) { stars = stars + 1; end = end - 1; }
         *plain = !isConst && stars == 0 && !isSlice;
-        Str bn = self.internStr(p + off, end - off);
+        Str bn = self.internStr(str::fromParts(p + off, end - off));
         Ty base = self.resolvePatBase(bn, loc);
         if (base == 0) return 0;
         TypeKind kw;
@@ -707,7 +704,7 @@ pub extend CtEval
         if (e->kind.tag == ExprKind::CharLit) return (u64)e->kind.payload.CharLit.value == val;
         if (e->kind.tag == ExprKind::BoolLit)
         {
-            u64 bv = e->kind.payload.BoolLit.flags & (u64)1;
+            u64 bv = (u64)e->kind.payload.BoolLit.flags & (u64)1;
             return bv == val;
         }
         return false;
@@ -759,7 +756,7 @@ pub extend CtEval
             Sema* sm2 = self.mono.sema;
             t = sm2.strType();
         }
-        u8* buf = (u8*)malloc(n * 2 + 2);
+        u8* buf = alloc<u8>(n * 2 + 2);
         if (buf == null) { self.mono.errors = self.mono.errors + 1; return NodeId{ .index = 0 }; }
         usize w = 0;
         buf[w] = 34; w = w + 1;
@@ -773,8 +770,8 @@ pub extend CtEval
             i = i + 1;
         }
         buf[w] = 34; w = w + 1;
-        Str s = self.internStr(buf, w);
-        free((rawptr)buf);
+        Str s = self.internStr(str::fromParts(buf, w));
+        dealloc<u8>(buf);
         return self.mkExpr(ExprKind::StringLit{ .value = s, .flags = 0 }, t);
     }
 
@@ -790,10 +787,9 @@ pub extend CtEval
         return s.boolType();
     }
 
-    Str internStr(u8* p, usize n)
+    Str internStr(str s)
     {
-        AstContext* c = self.mono.ast;
-        return c.intern(p, n);
+        return self.mono.ast.intern(s);
     }
 
     NodeId mkStmt(StmtKind kind)
@@ -864,22 +860,22 @@ pub extend CtEval
         Str bname = e->kind.payload.BuiltinCall.name;
         u32 n = e->kind.payload.BuiltinCall.argsLen;
         /* @compileError("msg") — reached during eval = hard error */
-        if (bname == self.internStr((u8*)"compileError", 12))
+        if (bname == self.internStr("compileError"))
         {
-            u8* msg = (u8*)"@compileError tripped";
+            str msg = "@compileError tripped";
             if (n > 0)
             {
                 u8* p = null;
                 usize pl = 0;
                 if (self.litStringBytes(e->kind.payload.BuiltinCall.args[0], &p, &pl))
                 {
-                    u8* copy = (u8*)malloc(pl + 1);
+                    u8* copy = alloc<u8>(pl + 1);
                     if (copy != null)
                     {
                         usize i = 0;
                         while (i < pl) { copy[i] = p[i]; i = i + 1; }
                         copy[pl] = 0;
-                        msg = copy;
+                        msg = str::fromParts(copy, pl);
                     }
                 }
             }
@@ -890,7 +886,7 @@ pub extend CtEval
          * value (a literal in scope, or a call-site literal bound for
          * this instance; runtime strings evaluate to kind 5 and stay
          * false) */
-        if (bname == self.internStr((u8*)"isFormatLiteral", 15))
+        if (bname == self.internStr("isFormatLiteral"))
         {
             if (n == 1)
             {
@@ -901,7 +897,7 @@ pub extend CtEval
         }
         /* @typeof(expr) — the type of a comptime-known value; for runtime
          * exprs the resolvedType is already on the node */
-        if (bname == self.internStr((u8*)"typeof", 6))
+        if (bname == self.internStr("typeof"))
         {
             if (n == 1)
             {
@@ -969,9 +965,10 @@ pub extend CtEval
             NodeId* newArgs = null;
             if (al > 0)
             {
-                newArgs = (NodeId*)calloc((usize)al, @sizeof(NodeId));
+                newArgs = alloc<NodeId>((usize)al);
                 if (newArgs != null)
                 {
+                    zero<NodeId>(newArgs, (usize)al);
                     u32 j = 0;
                     while (j < al)
                     {
@@ -994,7 +991,7 @@ pub extend CtEval
             }
             if (!rerooted)
             {
-                if (newArgs != null) free((rawptr)newArgs);
+                if (newArgs != null) dealloc<NodeId>(newArgs);
                 return self.makeNone();
             }
             Ty rt2 = e->resolvedType;
@@ -1004,7 +1001,7 @@ pub extend CtEval
                 NodeId nc = self.mkExpr(ExprKind::Call{ .callee = nf, .args = newArgs, .argsLen = al }, rt2);
                 if (nc.index != 0) return self.makeRt(nc, rt2);
             }
-            if (newArgs != null) free((rawptr)newArgs);
+            if (newArgs != null) dealloc<NodeId>(newArgs);
             return self.makeNone();
         }
         if (callee->kind.tag != ExprKind::Ident) return self.makeNone();
@@ -1016,8 +1013,9 @@ pub extend CtEval
         u32 argc = 0;
         if (rawArgs > 0)
         {
-            argv = (CtVal*)calloc((usize)(rawArgs + 8), @sizeof(CtVal));
+            argv = alloc<CtVal>((usize)(rawArgs + 8));
             if (argv == null) return self.makeNone();
+            zero<CtVal>(argv, (usize)(rawArgs + 8));
             u32 i = 0;
             while (i < rawArgs)
             {
@@ -1058,8 +1056,8 @@ pub extend CtEval
         /* depth guard */
         if (self.depth > 24)
         {
-            if (argv != null) free((rawptr)argv);
-            self.fail((u8*)"comptime: inline depth limit (24) — likely recursive comptime call");
+            if (argv != null) dealloc<CtVal>(argv);
+            self.fail("comptime: inline depth limit (24) — likely recursive comptime call");
             return self.makeNone();
         }
 
@@ -1113,9 +1111,10 @@ pub extend CtEval
                         if (pi < argc)
                         {
                             u32 rest = argc - pi;
-                            CtVal* elems = (CtVal*)calloc((usize)rest, @sizeof(CtVal));
+                            CtVal* elems = alloc<CtVal>((usize)rest);
                             if (elems != null)
                             {
+                                zero<CtVal>(elems, (usize)rest);
                                 u32 k = 0;
                                 while (k < rest) { elems[k] = argv[pi + k]; k = k + 1; }
                                 if (pp->name != 0)
@@ -1123,9 +1122,9 @@ pub extend CtEval
                                     self.bind(pp->name, self.makePack(elems, rest));
                                     self.variadicPackName = pp->name;
                                 }
-                                else free((rawptr)elems);
+                                else dealloc<CtVal>(elems);
                             }
-                            else free((rawptr)elems);
+                            else dealloc<CtVal>(elems);
                         }
                         else if (pp->name != 0)
                         {
@@ -1211,14 +1210,14 @@ pub extend CtEval
             self.continued = savedContinued;
             /* drop the inlined frame (keep outer bindings) */
             self.bindingsLen = savedLen;
-            if (argv != null) free((rawptr)argv);
+            if (argv != null) dealloc<CtVal>(argv);
             /* inlined functions return nothing useful to the caller here —
              * print's callees are all void */
             return self.makeNone();
         }
 
         /* not inlinable — emit a runtime call with whatever we have */
-        if (argv != null) free((rawptr)argv);
+        if (argv != null) dealloc<CtVal>(argv);
         return self.makeNone();
     }
 
@@ -1242,9 +1241,10 @@ pub extend CtEval
         NodeId* newArgs = null;
         if (al > 0)
         {
-            newArgs = (NodeId*)calloc((usize)al, @sizeof(NodeId));
+            newArgs = alloc<NodeId>((usize)al);
             if (newArgs != null)
             {
+                zero<NodeId>(newArgs, (usize)al);
                 u32 j = 0;
                 while (j < al)
                 {
@@ -1267,7 +1267,7 @@ pub extend CtEval
         }
         if (!rerooted)
         {
-            if (newArgs != null) free((rawptr)newArgs);
+            if (newArgs != null) dealloc<NodeId>(newArgs);
             return self.makeRt(id, e->resolvedType);
         }
         NodeId nm = self.mkExpr(ExprKind::MethodCall{
@@ -1277,7 +1277,7 @@ pub extend CtEval
             .argsLen = al
         }, e->resolvedType);
         if (nm.index != 0) return self.makeRt(nm, e->resolvedType);
-        if (newArgs != null) free((rawptr)newArgs);
+        if (newArgs != null) dealloc<NodeId>(newArgs);
         return self.makeRt(id, e->resolvedType);
     }
 
@@ -1319,9 +1319,9 @@ pub extend CtEval
                 CtVal obj = self.evalExpr(e->kind.payload.Field.obj);
                 if (obj.kind == 3)
                 {
-                    if (e->kind.payload.Field.field == self.internStr((u8*)"len", 3))
+                    if (e->kind.payload.Field.field == self.internStr("len"))
                         return self.makeInt((u64)obj.slen);
-                    if (e->kind.payload.Field.field == self.internStr((u8*)"ptr", 3))
+                    if (e->kind.payload.Field.field == self.internStr("ptr"))
                         return obj;
                 }
                 if (obj.kind == 5 && obj.rid.index != 0)
@@ -1363,7 +1363,7 @@ pub extend CtEval
                 CtVal obj = self.evalExpr(e->kind.payload.DerefField.obj);
                 if (obj.kind == 3)
                 {
-                    if (e->kind.payload.DerefField.field == self.internStr((u8*)"len", 3))
+                    if (e->kind.payload.DerefField.field == self.internStr("len"))
                         return self.makeInt((u64)obj.slen);
                 }
                 if (obj.kind == 5 && obj.rid.index != 0)
@@ -1763,9 +1763,10 @@ pub extend CtEval
                     u32 al = e->kind.payload.Call.argsLen;
                     bool rerooted = false;
                     NodeId* newArgs = null;
-                    if (al > 0) newArgs = (NodeId*)calloc((usize)al, @sizeof(NodeId));
+                    if (al > 0) newArgs = alloc<NodeId>((usize)al);
                     if (newArgs != null)
                     {
+                        zero<NodeId>(newArgs, (usize)al);
                         u32 j = 0;
                         while (j < al)
                         {
@@ -1824,7 +1825,7 @@ pub extend CtEval
                         };
                         toEmit = self.mkExpr(nk, e->resolvedType);
                     }
-                    else if (newArgs != null) free((rawptr)newArgs);
+                    else if (newArgs != null) dealloc<NodeId>(newArgs);
                     NodeId wrap = self.mkStmt(StmtKind::ExprStmt{ .expr = toEmit });
                     self.emit(wrap);
                 }
@@ -1977,8 +1978,9 @@ pub extend CtEval
 
     void promoteLoopAssigns(NodeId bodyId)
     {
-        Str* names = (Str*)calloc(8, @sizeof(Str));
+        Str* names = alloc<Str>(8);
         if (names == null) return;
+        zero<Str>(names, 8);
         u32 namesLen = 0;
         self.collectLoopAssigns(bodyId, names, &namesLen, 8);
         Sema* smP = self.mono.sema;
@@ -2001,7 +2003,7 @@ pub extend CtEval
             }
             i = i + 1;
         }
-        free((rawptr)names);
+        dealloc<Str>(names);
     }
 
     /* rewrite an expression reference onto its bound caller-side node
@@ -2326,8 +2328,8 @@ pub extend CtEval
             Str bindNameS = s->kind.payload.ForIn.bindName;
             Sema* smU8 = self.mono.sema;
             Ty u8t = smU8.u8Type();
-            u32 kb = 0;
-            while (kb < (usize)it.slen)
+            usize kb = 0;
+            while (kb < it.slen)
             {
                 u32 savedS = self.bindingsLen;
                 if (bindNameS != 0)

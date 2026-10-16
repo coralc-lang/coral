@@ -9,10 +9,8 @@ import mono { MonoContext, MonoDeclKind, MonoInstance, MonoInstanceKind, MonoSub
 import collect;
 import comptime { CtEval, ctEvalStmts };
 
-// extern("C") rawptr calloc(usize count, usize size);
-// extern("C") rawptr realloc(rawptr ptr, usize size);
-// extern("C") void free(rawptr ptr);
-// extern("C") i32 printf(rawptr fmt, ...);
+import(lib) std::mman { alloc, dealloc, zero };
+import(lib) platform::libc { printf };
 
 pub extend MonoContext
 {
@@ -20,12 +18,13 @@ pub extend MonoContext
     {
         u32 count = self.genericCount(declaration);
         if (count == 0) return null;
-        MonoSubstitution* result = (MonoSubstitution*)calloc((usize)count, @sizeof(MonoSubstitution));
+        MonoSubstitution* result = alloc<MonoSubstitution>((usize)count);
         if (result == null)
         {
             self.errors = self.errors + 1;
             return null;
         }
+        zero<MonoSubstitution>(result, (usize)count);
         u32 next = 0;
         Decl* decl = self.declAt(declaration);
         if (decl == null) return result;
@@ -181,8 +180,8 @@ pub extend MonoContext
         instance.tailLen = 0;
         if (tailLen > 0 && tailTypes != null && tailNodes != null)
         {
-            Ty* ttypes = (Ty*)malloc((usize)tailLen * @sizeof(Ty));
-            NodeId* tnodes = (NodeId*)malloc((usize)tailLen * @sizeof(NodeId));
+            Ty* ttypes = alloc<Ty>((usize)tailLen);
+            NodeId* tnodes = alloc<NodeId>((usize)tailLen);
             if (ttypes != null && tnodes != null)
             {
                 u32 k = 0;
@@ -198,14 +197,14 @@ pub extend MonoContext
             }
             else
             {
-                if (ttypes != null) free((rawptr)ttypes);
-                if (tnodes != null) free((rawptr)tnodes);
+                if (ttypes != null) dealloc<Ty>(ttypes);
+                if (tnodes != null) dealloc<NodeId>(tnodes);
             }
         }
         if (literalsLen > 0)
         {
-            Str* lnames = (Str*)malloc((usize)literalsLen * @sizeof(Str));
-            NodeId* lnodes = (NodeId*)malloc((usize)literalsLen * @sizeof(NodeId));
+            Str* lnames = alloc<Str>((usize)literalsLen);
+            NodeId* lnodes = alloc<NodeId>((usize)literalsLen);
             if (lnames != null && lnodes != null)
             {
                 u32 k = 0;
@@ -221,8 +220,8 @@ pub extend MonoContext
             }
             else
             {
-                if (lnames != null) free((rawptr)lnames);
-                if (lnodes != null) free((rawptr)lnodes);
+                if (lnames != null) dealloc<Str>(lnames);
+                if (lnodes != null) dealloc<NodeId>(lnodes);
             }
         }
         if (decl->kind.tag == DeclKind::Func) instance.body = decl->kind.payload.Func.body;
@@ -242,12 +241,13 @@ pub extend MonoContext
             instance.paramTypesLen = decl->kind.payload.Func.paramsLen;
             if (instance.paramTypesLen > 0)
             {
-                instance.paramTypes = (Ty*)calloc((usize)instance.paramTypesLen, @sizeof(Ty));
+                instance.paramTypes = alloc<Ty>((usize)instance.paramTypesLen);
                 if (instance.paramTypes == null)
                 {
                     self.errors = self.errors + 1;
                     return false;
                 }
+                zero<Ty>(instance.paramTypes, (usize)instance.paramTypesLen);
                 u32 i = 0;
                 while (i < instance.paramTypesLen)
                 {
@@ -302,7 +302,7 @@ pub extend MonoContext
             MonoInstance* instance = self.instances + instIdx;
             if (!self.validateInstance(instance))
             {
-                printf((u8*)"[mono] validateInstance FAILED decl=%d ret=%d\n", (i32)instance.declaration.index, (i32)instance.returnType);
+                printf(C"[mono] validateInstance FAILED decl=%d ret=%d\n", (i32)instance.declaration.index, (i32)instance.returnType);
                 self.errors = self.errors + 1;
             }
             /* re-collect the instance body with its substitutions active so
@@ -452,11 +452,12 @@ pub extend MonoContext
                          * every arg positionally, so the names only need to
                          * match what cgEmitParams declares */
                         u32 n = instance.packArity;
-                        CtVal* elems = (CtVal*)calloc((usize)n, @sizeof(CtVal));
-                        Str* names = (Str*)malloc((usize)n * @sizeof(Str));
-                        u8* sbuf = (u8*)malloc(32);
+                        CtVal* elems = alloc<CtVal>((usize)n);
+                        Str* names = alloc<Str>((usize)n);
+                        u8* sbuf = alloc<u8>(32);
                         if (elems != null && names != null && sbuf != null)
                         {
+                            zero<CtVal>(elems, (usize)n);
                             u32 k = 0;
                             while (k < n)
                             {
@@ -511,7 +512,7 @@ pub extend MonoContext
                                     dv = dv / 10;
                                 }
                                 while (dn > 0) { dn = dn - 1; sbuf[w] = sbuf[20 + dn]; w = w + 1; }
-                                Str nm = ct.internStr(sbuf, (usize)w);
+                                Str nm = ct.internStr(str::fromParts(sbuf, (usize)w));
                                 names[k] = nm;
                                 if (!folded)
                                 {
@@ -526,10 +527,10 @@ pub extend MonoContext
                         }
                         else
                         {
-                            if (elems != null) free((rawptr)elems);
-                            if (names != null) free((rawptr)names);
+                            if (elems != null) dealloc<CtVal>(elems);
+                            if (names != null) dealloc<Str>(names);
                         }
-                        free((rawptr)sbuf);
+                        dealloc<u8>(sbuf);
                     }
                 }
             }
@@ -537,7 +538,7 @@ pub extend MonoContext
         ct.evalStmt(instance.body);
         if (ct.failed)
         {
-            printf((u8*)"[mono] evalComptimeBody FAILED decl=%d name=%s msg=%s\n", (i32)instance.declaration.index, (rawptr)self.ast.interns[instance.name].ptr, (rawptr)ct.errMsg);
+            printf(C"[mono] evalComptimeBody FAILED decl=%d name=%s msg=%s\n", (i32)instance.declaration.index, self.ast.interns[instance.name].ptr, ct.errMsg.ptr);
             self.errors = self.errors + 1;
             ct.dispose();
             return;
@@ -546,7 +547,7 @@ pub extend MonoContext
          * author's own @compileError did not already fire (ct.failed) */
         if (ct.typeSwitchMissed)
         {
-            printf((u8*)"[mono] evalComptimeBody type-switch miss decl=%d msg=no switch arm matches the scrutinee type\n", (i32)instance.declaration.index);
+            printf(C"[mono] evalComptimeBody type-switch miss decl=%d msg=no switch arm matches the scrutinee type\n", (i32)instance.declaration.index);
             self.errors = self.errors + 1;
             ct.dispose();
             return;
@@ -556,9 +557,10 @@ pub extend MonoContext
          * fold into one different runtime stmt) */
         if (ct.emittedLen > 0)
         {
-            NodeId* out = (NodeId*)calloc((usize)ct.emittedLen, @sizeof(NodeId));
+            NodeId* out = alloc<NodeId>((usize)ct.emittedLen);
             if (out != null)
             {
+                zero<NodeId>(out, (usize)ct.emittedLen);
                 u32 k = 0;
                 while (k < ct.emittedLen) { out[k] = ct.emitted[k]; k = k + 1; }
                 AstContext* c = self.ast;

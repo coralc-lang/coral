@@ -9,7 +9,8 @@ import sem::sema { Sema };
 import sem::scope { Symbol, ScopeStack };
 import context::context { AstContext, InternEntry };
 
-// extern("C") i32 printf(rawptr fmt, ...); use ios::printlm
+import(lib) std::mman { alloc, dealloc, zero };
+import(lib) platform::libc { printf };
 
 pub extend MonoContext
 {
@@ -60,7 +61,7 @@ pub extend MonoContext
             ScopeStack* scopes = self.sema.scopes;
             if (scopes != null)
             {
-                Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                Symbol** cands = alloc<Symbol*>(16);
                 if (cands != null)
                 {
                     u32 n = scopes.lookupAll(name, cands, 16);
@@ -71,12 +72,12 @@ pub extend MonoContext
                             self.genericCount(cands[m]->declaration) == want)
                         {
                             NodeId found = cands[m]->declaration;
-                            free((rawptr)cands);
+                            dealloc<Symbol*>(cands);
                             return found;
                         }
                         m = m + 1;
                     }
-                    free((rawptr)cands);
+                    dealloc<Symbol*>(cands);
                 }
             }
         }
@@ -142,7 +143,7 @@ pub extend MonoContext
     {
         if (self.genericCount(declaration) != argumentsLen)
         {
-            printf((u8*)"[mono] enqueue mismatch decl=%d gcount=%d argsLen=%d\n", (i32)declaration.index, (i32)self.genericCount(declaration), (i32)argumentsLen);
+            printf(C"[mono] enqueue mismatch decl=%d gcount=%d argsLen=%d\n", (i32)declaration.index, (i32)self.genericCount(declaration), (i32)argumentsLen);
             self.errors = self.errors + 1;
             return false;
         }
@@ -191,8 +192,8 @@ pub extend MonoContext
         item.tailLen = 0;
         if (tailLen > 0 && tailTypes != null && tailNodes != null)
         {
-            Ty* ttypes = (Ty*)malloc((usize)tailLen * @sizeof(Ty));
-            NodeId* tnodes = (NodeId*)malloc((usize)tailLen * @sizeof(NodeId));
+            Ty* ttypes = alloc<Ty>((usize)tailLen);
+            NodeId* tnodes = alloc<NodeId>((usize)tailLen);
             if (ttypes != null && tnodes != null)
             {
                 u32 k = 0;
@@ -208,14 +209,14 @@ pub extend MonoContext
             }
             else
             {
-                if (ttypes != null) free((rawptr)ttypes);
-                if (tnodes != null) free((rawptr)tnodes);
+                if (ttypes != null) dealloc<Ty>(ttypes);
+                if (tnodes != null) dealloc<NodeId>(tnodes);
             }
         }
         if (literalsLen > 0)
         {
-            Str* lnames = (Str*)malloc((usize)literalsLen * @sizeof(Str));
-            NodeId* lnodes = (NodeId*)malloc((usize)literalsLen * @sizeof(NodeId));
+            Str* lnames = alloc<Str>((usize)literalsLen);
+            NodeId* lnodes = alloc<NodeId>((usize)literalsLen);
             if (lnames != null && lnodes != null)
             {
                 u32 k = 0;
@@ -231,8 +232,8 @@ pub extend MonoContext
             }
             else
             {
-                if (lnames != null) free((rawptr)lnames);
-                if (lnodes != null) free((rawptr)lnodes);
+                if (lnames != null) dealloc<Str>(lnames);
+                if (lnodes != null) dealloc<NodeId>(lnodes);
             }
         }
         self.workLen = self.workLen + 1;
@@ -261,7 +262,7 @@ pub extend MonoContext
                 if (self.activeSubsLen > 0 && self.activeSubs != null)
                 {
                     /* instance-body re-collection: `alloc<T>` becomes alloc<str> */
-                    Ty* subst = (Ty*)malloc((usize)gaLen * @sizeof(Ty));
+                    Ty* subst = alloc<Ty>((usize)gaLen);
                     if (subst != null)
                     {
                         u32 q = 0;
@@ -271,7 +272,7 @@ pub extend MonoContext
                             q = q + 1;
                         }
                         bool okE = self.enqueue(MonoDeclKind::TypeDecl, declId, subst, gaLen);
-                        free((rawptr)subst);
+                        dealloc<Ty>(subst);
                         if (!okE) return false;
                     }
                 }
@@ -332,12 +333,13 @@ pub extend MonoContext
          * and `println("{}", 42, x)` enqueues with argumentsLen=1. */
         Decl* gdecl = self.declAt(declaration);
         if (gdecl == null || gdecl->kind.tag != DeclKind::Func) return true;
-        Ty* arguments = (Ty*)calloc((usize)gcount, @sizeof(Ty));
+        Ty* arguments = alloc<Ty>((usize)gcount);
         if (arguments == null)
         {
             self.errors = self.errors + 1;
             return false;
         }
+        zero<Ty>(arguments, (usize)gcount);
         u32 next = 0;
         u32 namedCount = 0;
         u32 litCap = call->kind.payload.Call.argsLen;
@@ -345,16 +347,16 @@ pub extend MonoContext
         NodeId* litNodes = null;
         if (litCap > 0)
         {
-            litNames = (Str*)malloc((usize)litCap * @sizeof(Str));
-            litNodes = (NodeId*)malloc((usize)litCap * @sizeof(NodeId));
+            litNames = alloc<Str>((usize)litCap);
+            litNodes = alloc<NodeId>((usize)litCap);
         }
         u32 litsLen = 0;
         Ty* tailTypes = null;
         NodeId* tailNodes = null;
         if (litCap > 0)
         {
-            tailTypes = (Ty*)malloc((usize)litCap * @sizeof(Ty));
-            tailNodes = (NodeId*)malloc((usize)litCap * @sizeof(NodeId));
+            tailTypes = alloc<Ty>((usize)litCap);
+            tailNodes = alloc<NodeId>((usize)litCap);
         }
         u32 tailLen = 0;
         u32 p = 0;
@@ -487,11 +489,11 @@ pub extend MonoContext
         bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
                                   key, arity, litNames, litNodes, litsLen,
                                   tailTypes, tailNodes, tailLen);
-        if (litNames != null) free((rawptr)litNames);
-        if (litNodes != null) free((rawptr)litNodes);
-        if (tailTypes != null) free((rawptr)tailTypes);
-        if (tailNodes != null) free((rawptr)tailNodes);
-        free((rawptr)arguments);
+        if (litNames != null) dealloc<Str>(litNames);
+        if (litNodes != null) dealloc<NodeId>(litNodes);
+        if (tailTypes != null) dealloc<Ty>(tailTypes);
+        if (tailNodes != null) dealloc<NodeId>(tailNodes);
+        dealloc<Ty>(arguments);
         return ok;
     }
 

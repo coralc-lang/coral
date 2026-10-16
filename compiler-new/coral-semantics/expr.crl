@@ -9,9 +9,7 @@ import scope { Symbol };
 import member { MemberInfo };
 import sema { Sema };
 import diag::code { ErrorCode };
-
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
+import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
@@ -45,7 +43,7 @@ pub extend Sema
             NodeId ev = e.kind.payload.ArrayLiteral.elems[i];
             MemberInfo m = self.findMemberByIndex(ty, i);
             if (m.typeNode != 0) self.coerceArrayLit(ev, self.substituteFieldTy(m.typeNode, ty));
-            i = i + 1;
+            i++;
         }
     }
 
@@ -157,7 +155,7 @@ pub extend Sema
             if (!self.checkAssign(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
                     self.typeMismatchMsg("argument type", self.exprType(args[i]), te->kind.payload.FnPtr.params[i]));
-            i = i + 1;
+            i++;
         }
         self.setExprType(callId, te->kind.payload.FnPtr.returnType);
         return true;
@@ -230,7 +228,7 @@ pub extend Sema
             if (isSpread)
             {
                 if (!self.checkExpr(args[i])) return false;
-                i = i + 1;
+                i++;
                 continue;
             }
             if (i < paramsLen)
@@ -256,7 +254,7 @@ pub extend Sema
                     }
                 }
             }
-            i = i + 1;
+            i++;
         }
         /* explicit typeargs on the callee (`realloc<cchar>(p, n)`) — substitute
          * the generic params in the return type so downstream sees the
@@ -283,23 +281,24 @@ pub extend Sema
             InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
             if (i > 0) totalLen = totalLen + 2;
             totalLen = totalLen + e->len;
-            i = i + 1;
+            i++;
         }
-        u8* buf = (u8*)malloc(totalLen);
+        u8* buf = alloc<u8>(totalLen);
         if (buf == null) return 0;
         usize w = 0;
         i = 0;
+        
         while (i < keep)
         {
             Node* n = self.ctx.nodes + segs[i].index;
             InternEntry* e = self.ctx.interns + n->kind.payload.Expr.value.kind.payload.Ident.name;
-            if (i > 0) { buf[w] = 58; buf[w + 1] = 58; w = w + 2; }
+            if (i > 0) { buf[w] = 58; buf[w + 1] = 58; w += 2; }
             usize k = 0;
-            while (k < e->len) { buf[w] = e->ptr[k]; w = w + 1; k = k + 1; }
-            i = i + 1;
+            while (k < e->len) { buf[w] = e->ptr[k]; w++; k++; }
+            i++;
         }
-        Str out = self.ctx.intern(buf, w);
-        free((rawptr)buf);
+        Str out = self.ctx.intern(str::fromParts(buf, w));
+        dealloc<u8>(buf);
         return out;
     }
 
@@ -423,7 +422,7 @@ pub extend Sema
                         Ty want = tte->kind.payload.Tuple.elems[ti];
                         if (!self.assignCompatible(elemId, self.exprType(elemId), want)) { ok = false; break; }
                         self.setExprType(elemId, want);
-                        ti = ti + 1;
+                        ti++;
                     }
                     if (ok)
                     {
@@ -550,9 +549,9 @@ pub extend Sema
         if (n->kind.tag != NodeKind::Expr) return false;
         Expr* e = &n->kind.payload.Expr.value;
         if (e->kind.tag == ExprKind::Field)
-            return e->kind.payload.Field.field == self.ctx.intern((u8*)"payload", 7);
+            return e->kind.payload.Field.field == self.ctx.intern("payload");
         if (e->kind.tag == ExprKind::DerefField)
-            return e->kind.payload.DerefField.field == self.ctx.intern((u8*)"payload", 7);
+            return e->kind.payload.DerefField.field == self.ctx.intern("payload");
         return false;
     }
 
@@ -607,7 +606,7 @@ pub extend Sema
             if (te->kind.tag == TypeKind::Pointer &&
                 n->kind.tag == NodeKind::Expr &&
                 n->kind.payload.Expr.value.kind.tag == ExprKind::Ident &&
-                n->kind.payload.Expr.value.kind.payload.Ident.name == self.ctx.intern((u8*)"self", 4))
+                n->kind.payload.Expr.value.kind.payload.Ident.name == self.ctx.intern("self"))
             {
                 /* `self = x` writes through the implicit self pointer in the C backend */
                 return te->kind.payload.Pointer.base;
@@ -1015,7 +1014,7 @@ pub extend Sema
                 while (i < expr->kind.payload.Call.argsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.Call.args[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 Node* calleeNode = self.ctx.nodes + expr->kind.payload.Call.callee.index;
                 if (calleeNode->kind.tag == NodeKind::Expr &&
@@ -1068,7 +1067,7 @@ pub extend Sema
                                 if (!self.assignCompatible(expr->kind.payload.Call.args[kk], self.exprType(expr->kind.payload.Call.args[kk]), want))
                                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
                             }
-                            kk = kk + 1;
+                            kk++;
                         }
                         self.setExprType(id, self.substituteFieldTy(md->kind.payload.Func.returnType, ownerTy));
                         return true;
@@ -1117,7 +1116,7 @@ pub extend Sema
                             Str modPath = self.modulePathPrefix(segs, segCount);
                             if (modPath != 0)
                             {
-                                Symbol** cands = (Symbol**)malloc(16 * @sizeof(Symbol*));
+                                Symbol** cands = alloc<Symbol*>(16);
                                 if (cands != null)
                                 {
                                     u32 n = self.scopes.lookupAll(fname, cands, 16);
@@ -1125,9 +1124,9 @@ pub extend Sema
                                     while (m < n)
                                     {
                                         if (self.importPathInFile(modPath, cands[m]->fileId)) { fsym = cands[m]; break; }
-                                        m = m + 1;
+                                        m++;
                                     }
-                                    free((rawptr)cands);
+                                    dealloc<Symbol*>(cands);
                                 }
                             }
                             if (fsym == null) fsym = self.lookupAt(fname, id);
@@ -1165,7 +1164,7 @@ pub extend Sema
                                 if (!self.assignCompatible(expr->kind.payload.Call.args[jj], self.exprType(expr->kind.payload.Call.args[jj]), pp->typeNode))
                                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
                             }
-                            jj = jj + 1;
+                            jj++;
                         }
                         self.setExprType(id, md->kind.payload.Func.returnType);
                         return true;
@@ -1202,7 +1201,7 @@ pub extend Sema
                             while (ai < expr->kind.payload.MethodCall.argsLen)
                             {
                                 if (!self.checkExpr(expr->kind.payload.MethodCall.args[ai])) return false;
-                                ai = ai + 1;
+                                ai++;
                             }
                             return self.checkFnPtrCall(id, fnField.typeNode, expr->kind.payload.MethodCall.args, expr->kind.payload.MethodCall.argsLen);
                         }
@@ -1254,7 +1253,7 @@ pub extend Sema
                                     self.typeMismatchMsg("method argument type", self.exprType(argId), want));
                         }
                     }
-                    i = i + 1;
+                    i++;
                 }
                 self.setExprType(id, self.substituteFieldTy(methodDecl->kind.payload.Func.returnType, recvTy));
                 return true;
@@ -1598,7 +1597,7 @@ pub extend Sema
                             vv = decl->kind.payload.Variant.variants + v;
                             break;
                         }
-                        v = v + 1;
+                        v++;
                     }
                     if (vv == null)
                     {
@@ -1629,7 +1628,7 @@ pub extend Sema
                                 ft = vv->fieldTypes[k];
                                 break;
                             }
-                            k = k + 1;
+                            k++;
                         }
                         if (ft == 0)
                         {
@@ -1650,7 +1649,7 @@ pub extend Sema
                                 self.typeMismatchMsg("field type", actual, expected));
                     }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
-                        i = i + 1;
+                        i++;
                     }
                     self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
                     return true;
@@ -1682,7 +1681,7 @@ pub extend Sema
                                 self.typeMismatchMsg("struct field type", actual, expected));
                     }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
-                    i = i + 1;
+                    i++;
                 }
                 self.setExprType(id, expr->kind.payload.StructLiteral.typeNode);
                 return true;
@@ -1692,7 +1691,7 @@ pub extend Sema
                 while (i < expr->kind.payload.ArrayLiteral.elemsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.ArrayLiteral.elems[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 return true;
             },
@@ -1701,7 +1700,7 @@ pub extend Sema
                 while (i < expr->kind.payload.StaticCall.argsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.StaticCall.args[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 Ty ownerTy = self.namedType(expr->kind.payload.StaticCall.typeName);
                 MemberInfo methodInfo = self.findMethod(ownerTy, expr->kind.payload.StaticCall.method);
@@ -1742,7 +1741,7 @@ pub extend Sema
                                     self.typeMismatchMsg("static method argument type", self.exprType(sarg), param->typeNode));
                         }
                     }
-                    i = i + 1;
+                    i++;
                 }
                 self.setExprType(id, methodDecl->kind.payload.Func.returnType);
                 return true;
@@ -1752,7 +1751,7 @@ pub extend Sema
                 while (i < expr->kind.payload.BuiltinCall.argsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.BuiltinCall.args[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 Str bname = expr->kind.payload.BuiltinCall.name;
                 /* @compileError("msg") — a hard compile-time error carrying
@@ -1761,7 +1760,7 @@ pub extend Sema
                  * sema must NOT flag it during the blanket walk of all
                  * arms — otherwise `else => { @compileError(...) }` fires
                  * even when a prior arm matched. */
-                if (bname == self.ctx.intern((u8*)"compileError", 12))
+                if (bname == self.ctx.intern("compileError"))
                 {
                     if (self.comptimeDepth > 0)
                     {
@@ -1769,7 +1768,7 @@ pub extend Sema
                         self.setExprType(id, self.boolType());
                         return true;
                     }
-                    u8* msgPtr = (u8*)"@compileError tripped";
+                    str msgPtr = "@compileError tripped";
                     usize msgLen = 21;
                     NodeId msgNodeId;
                     msgNodeId.index = 0;
@@ -1784,21 +1783,21 @@ pub extend Sema
                             Str litStr = mn->kind.payload.Expr.value.kind.payload.StringLit.value;
                             if (litStr != 0 && litStr < self.ctx.internsLen)
                             {
-                                msgPtr = self.ctx.interns[litStr].ptr;
+                                msgPtr = str::fromParts(self.ctx.interns[litStr].ptr, self.ctx.interns[litStr].len);
                                 msgLen = self.ctx.interns[litStr].len;
                             }
                         }
                     }
-                    u8* msgBuf = (u8*)malloc(msgLen + 1);
-                    u32 cpI = 0;
-                    while (cpI < msgLen) { msgBuf[cpI] = msgPtr[cpI]; cpI = cpI + 1; }
+                    u8* msgBuf = alloc<u8>(msgLen + 1);
+                    usize cpI = 0;
+                    while (cpI < msgLen) { msgBuf[cpI] = msgPtr.ptr[cpI]; cpI = cpI++; }
                     msgBuf[msgLen] = 0;
                     (usize)self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, str::fromParts(msgBuf, (usize)msgLen));
                     return false;
                 }
                 /* @isFormatLiteral(expr) — true only when the given
                  * argument is a string literal (comptime path gate). */
-                if (bname == self.ctx.intern((u8*)"isFormatLiteral", 15))
+                if (bname == self.ctx.intern("isFormatLiteral"))
                 {
                     bool lit = false;
                     if (expr->kind.payload.BuiltinCall.argsLen == 1)
@@ -1818,7 +1817,7 @@ pub extend Sema
                 /* @typeof(x) — the type of x, only inside comptime blocks,
                  * and only on a type name, a variable, or a literal
                  * (int/float/bool/null/str). not on arbitrary expressions. */
-                if (bname == self.ctx.intern((u8*)"typeof", 6))
+                if (bname == self.ctx.intern("typeof"))
                 {
                     if (self.comptimeDepth == 0)
                     {
@@ -1882,13 +1881,13 @@ pub extend Sema
                 while (i < expr->kind.payload.TupleExpr.elemsLen)
                 {
                     if (!self.checkExpr(expr->kind.payload.TupleExpr.elems[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 /* type the literal as a tuple of the element types */
                 u32 n = expr->kind.payload.TupleExpr.elemsLen;
                 if (n > 0)
                 {
-                    Ty* elems = (Ty*)malloc((usize)n * @sizeof(Ty));
+                    Ty* elems = alloc<Ty>((usize)n);
                     if (elems != null)
                     {
                         u32 j = 0;
@@ -1898,7 +1897,7 @@ pub extend Sema
                             Ty et = self.exprType(expr->kind.payload.TupleExpr.elems[j]);
                             if (et == 0) allTyped = false;
                             elems[j] = et;
-                            j = j + 1;
+                            j++;
                         }
                         if (allTyped)
                         {
@@ -1915,7 +1914,7 @@ pub extend Sema
                 while (i < expr->kind.payload.BlockExpr.stmtsLen)
                 {
                     if (!self.checkStmt(expr->kind.payload.BlockExpr.stmts[i])) return false;
-                    i = i + 1;
+                    i++;
                 }
                 if (!self.checkExpr(expr->kind.payload.BlockExpr.result)) return false;
                 Ty bty = self.exprType(expr->kind.payload.BlockExpr.result);
@@ -1992,7 +1991,7 @@ pub extend Sema
                     while (p < switchCase->patternsLen)
                     {
                         if (!self.checkExpr(switchCase->patterns[p])) ok = false;
-                        p = p + 1;
+                        p++;
                     }
                     if (switchCase->guard.index != 0)
                     {
@@ -2034,7 +2033,7 @@ pub extend Sema
                         if (resultTy == 0) resultTy = bodyTy;
                         else if (!self.compatible(bodyTy, resultTy)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "switch arm types do not match");
                     }
-                    i = i + 1;
+                    i++;
                 }
                 self.setExprType(id, resultTy);
                 return ok;
