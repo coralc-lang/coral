@@ -94,6 +94,35 @@ Another opencode instance works this tree — re-read files before editing.
     consts, BCryptGenRandom entropy, representation types); linux lib.crl
     comment synced → byte-identical.
   - Re-verified by orchestrator: all 14 changed files check_crl PASS.
+- [x] char (utf32) std support:
+  - `core/char_util.crl`: charIsValid/IsAscii/IsDigit/IsAlpha/IsAlnum/
+    IsUpper/IsLower/IsSpace/IsControl/IsPrint, charToUpper/ToLower (ASCII
+    bounds honest), charToU32/FromU32/TryFromU32 (rejects surrogates,
+    >U+10FFFF), charEncodeUtf8 (strict, 0=invalid), charDecodeUtf8
+    (bounded, U+FFFD policy).
+  - `core/str.crl`: str::nextCodepoint(usize* idx, char* out),
+    str::codepointCount().
+  - `std::text::string`: String::pushCodepoint/nextCodepoint/
+    codepointCount (both platforms, byte-identical).
+  - `std::text::utf8`: nextChar → Option<char> (None = input exhausted
+    only), encodeChar → String.
+  - `std::fmt`: formatChar.
+  - ios.crl internals: `char` prong in _fprintOne + {:d}/{:x}/{:b} for
+    char — `println("{}", c)` now works; NO pub signature changes (ios
+    pub sigs verified identical both platforms, attribute-stripped).
+  - Policies: decode = U+FFFD replacement + 1-byte advance; encode =
+    strict at core, U+FFFD substitution at convenience layers.
+  - No full Unicode tables (ASCII-only, documented in code) — deliberate.
+  - check_crl PASS; runtime-verified 40+ assertions (compile+run probes).
+
+## Known pre-existing bugs (found during char work, NOT ours, NOT fixed)
+
+- **`vaprint` silence bug** — va-args print variant emits nothing; reproduces
+  at HEAD (owned by io/** historically).
+- **io/fs C-codegen typedef ordering** — breaks linking programs that pull
+  `std::io` lib reexports; reproduces at HEAD. `import(lib) std::io::ios`
+  alone links fine.
+- `.probe/io*.crl` stale vs Result-based fs API (.probe off-limits).
 
 ## In progress / next up
 
@@ -126,12 +155,7 @@ AsmObject dynamic ELF/COFF shdrs; `.section` arbitrary, `.comm/.lcomm/
 - object.crl string-table OOB.
 - GOTPCREL not relaxed/rejected.
 
-### 8. char (utf32) std support — NEXT AGENT
-Survey lib/core/{cchar,char_util,str}.crl + std text/{string,utf8} + fmt;
-fill gaps: classification (isAlpha/isDigit/isSpace/...), case (ASCII min),
-char↔utf8 encode/decode with invalid-sequence policy, codepoint validity
-(≤0x10FFFF, no surrogates), String codepoint iteration if absent, fmt
-char printing (no ios.crl signature changes). Platform parity required.
+### 8. char (utf32) std support — DONE (see Completed)
 
 ### 9. Wrap-up — LATER
 - Audit WallVM codegen mnemonic list vs assembler coverage.

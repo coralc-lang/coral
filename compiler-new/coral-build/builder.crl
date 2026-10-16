@@ -1,39 +1,37 @@
 import arena { Arena };
 import ast { CrlbNode, CrlbNodeKind, Value, ValueArray, nodeKindName };
 import common::slice { Slice };
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc, realloc };
 
-extern("C") i32 printf(u8* fmt, ...);
-extern("C") i32 open(u8* path, i32 flags, i32 mode);
-extern("C") i32 read(i32 fd, u8* buf, usize len);
-extern("C") i32 write(i32 fd, u8* buf, usize len);
+extern("C") i32 printf(const cchar* fmt, ...);
+extern("C") i32 open(const cchar* path, i32 flags, i32 mode);
+extern("C") i32 read(i32 fd, cchar* buf, usize len);
+extern("C") i32 write(i32 fd, const cchar* buf, usize len);
 extern("C") i32 close(i32 fd);
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
-extern("C") void free(rawptr ptr);
 extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
-extern("C") usize strlen(u8* s);
+extern("C") usize strlen(const cchar* s);
 extern("C") i64 syscall(i64 num, ...);
-/* getenv: declared by <stdlib.h> in the generated C — same as analyze.crl,
- * no coral-level extern (a redeclaration would conflict with the header) */
+extern("C") cchar* getenv(const cchar* name);
 
 // small helpers
 
-pub bool bEq(Slice a, u8* b, usize bl)
+pub bool bEq(Slice a, str b)
 {
-    if (a.len != bl) return false;
+    if (a.len != b.len) return false;
     usize i = 0;
-    while (i < bl)
+    while (i < b.len)
     {
-        if (a.ptr[i] != b[i]) return false;
+        if (a.ptr[i] != b.ptr[i]) return false;
         i = i + 1;
     }
     return true;
 }
 
-bool bEndsWith(Slice a, u8* suffix, usize sl)
+bool bEndsWith(Slice a, str suffix)
 {
-    if (a.len < sl) return false;
-    return bEq(Slice::from(a.ptr + (a.len - sl), sl), suffix, sl);
+    if (a.len < suffix.len) return false;
+    return bEq(Slice::from(a.ptr + (a.len - suffix.len), suffix.len), suffix);
 }
 
 pub u8* bCStr(Arena* a, Slice s)
@@ -95,12 +93,12 @@ u64 bFnv(u64 h, u8* data, usize len)
     return h;
 }
 
-usize bApp(u8* buf, usize cap, usize* len, u8* src, usize n)
+usize bApp(u8* buf, usize cap, usize* len, str src)
 {
     usize i = 0;
-    while (i < n && *len < cap)
+    while (i < src.len && *len < cap)
     {
-        buf[*len] = src[i];
+        buf[*len] = src.ptr[i];
         *len = *len + 1;
         i = i + 1;
     }
@@ -121,7 +119,7 @@ Slice bReadFile(Arena* a, u8* cpath, usize* outLen)
     i32 fd = open(cpath, 0, 0);
     if (fd < 0) return Slice::from(null, 0);
     usize cap = 65536;
-    u8* buf = (u8*)malloc(cap);
+    u8* buf = alloc<u8>(cap);
     if (buf == null)
     {
         close(fd);
@@ -132,7 +130,7 @@ Slice bReadFile(Arena* a, u8* cpath, usize* outLen)
     {
         if (len >= cap)
         {
-            u8* fresh = (u8*)realloc(buf, cap * 2);
+            u8* fresh = realloc<u8>(buf, cap * 2);
             if (fresh == null) break;
             buf = fresh;
             cap = cap * 2;
@@ -145,12 +143,12 @@ Slice bReadFile(Arena* a, u8* cpath, usize* outLen)
     u8* copy = (u8*)a.alloc(len + 1, 1);
     if (copy == null)
     {
-        free(buf);
+        dealloc<u8>(buf);
         return Slice::from(null, 0);
     }
     memcpy(copy, buf, len);
     copy[len] = 0;
-    free(buf);
+    dealloc<u8>(buf);
     *outLen = len;
     return Slice::from(copy, len);
 }
@@ -166,7 +164,7 @@ pub DirEnt* bListDir(Arena* a, u8* cpath, u32* outLen)
     *outLen = 0;
     i32 fd = open(cpath, 0, 0);
     if (fd < 0) return null;
-    u8* buf = (u8*)malloc(65536);
+    u8* buf = alloc<u8>(65536);
     if (buf == null)
     {
         close(fd);
@@ -176,7 +174,7 @@ pub DirEnt* bListDir(Arena* a, u8* cpath, u32* outLen)
     u32 cap = 64;
     if (arr == null)
     {
-        free(buf);
+        dealloc<u8>(buf);
         close(fd);
         return null;
     }
@@ -216,7 +214,7 @@ pub DirEnt* bListDir(Arena* a, u8* cpath, u32* outLen)
             off = off + (i64)reclen;
         }
     }
-    free(buf);
+    dealloc<u8>(buf);
     close(fd);
     *outLen = len;
     return arr;

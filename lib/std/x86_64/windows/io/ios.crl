@@ -3,6 +3,7 @@ import(lib) platform::win32 { GetStdHandle, WriteFile };
 import(lib) std::mman { copy };
 import(lib) std::text::string { String };
 import(lib) core::limits { INT64_MAX, INT64_MIN };
+import(lib) core::char_util;
 
 // One stack-buffered output context per print call, every helper appends
 // here and the call issues a single WriteFile when it flushes.
@@ -119,14 +120,14 @@ i32 _fprintUnsigned(_Buf* out, u64 v, u32 base, bool prefix)
     return (i32)n;
 }
 
-#[[inline]] static i32 _fprintI8(_Buf* out, i8 v) { return _fprintSigned(out, (i64)v, 10); }
-#[[inline]] static i32 _fprintI16(_Buf* out, i16 v) { return _fprintSigned(out, (i64)v, 10); }
-#[[inline]] static i32 _fprintI32(_Buf* out, i32 v) { return _fprintSigned(out, (i64)v, 10); }
-#[[inline]] static i32 _fprintI64(_Buf* out, i64 v) { return _fprintSigned(out, v, 10); }
-#[[inline]] static i32 _fprintU8(_Buf* out, u8 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
-#[[inline]] static i32 _fprintU16(_Buf* out, u16 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
-#[[inline]] static i32 _fprintU32(_Buf* out, u32 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
-#[[inline]] static i32 _fprintU64(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 10, false); }
+#[[inline]] i32 _fprintI8(_Buf* out, i8 v) { return _fprintSigned(out, (i64)v, 10); }
+#[[inline]] i32 _fprintI16(_Buf* out, i16 v) { return _fprintSigned(out, (i64)v, 10); }
+#[[inline]] i32 _fprintI32(_Buf* out, i32 v) { return _fprintSigned(out, (i64)v, 10); }
+#[[inline]] i32 _fprintI64(_Buf* out, i64 v) { return _fprintSigned(out, v, 10); }
+#[[inline]] i32 _fprintU8(_Buf* out, u8 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
+#[[inline]] i32 _fprintU16(_Buf* out, u16 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
+#[[inline]] i32 _fprintU32(_Buf* out, u32 v) { return _fprintUnsigned(out, (u64)v, 10, false); }
+#[[inline]] i32 _fprintU64(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 10, false); }
 
 i32 _fprintF32(_Buf* out, f32 v)
 {
@@ -152,16 +153,36 @@ i32 _fprintF64(_Buf* out, f64 v)
     return len;
 }
 
-#[[inline]] static i32 _fprintBool(_Buf* out, bool v)
+#[[inline]]
+i32 _fprintBool(_Buf* out, bool v)
 {
     if (v) { _pbytes(out, C"true", 4u); return 4; }
     else { _pbytes(out, C"false", 5u); return 5; }
 }
 
-#[[inline]] static i32 _fprintChar(_Buf* out, u8 v)
+#[[inline]]
+i32 _fprintChar(_Buf* out, u8 v)
 {
     _pbyte(out, v);
     return 1;
+}
+
+// A coral `char` is a Unicode scalar value — UTF-8 encode into the
+// buffer; invalid codepoints (surrogates, above U+10FFFF) print as
+// U+FFFD, the replacement policy of core::char_util.
+i32 _fprintCodepoint(_Buf* out, char c)
+{
+    u8 buf[4];
+    u32 n = char_util::charEncodeUtf8(c, buf);
+    if (n == 0)
+    {
+        _pbyte(out, (u8)0xEF);
+        _pbyte(out, (u8)0xBB);
+        _pbyte(out, (u8)0xBD);
+        return 3;
+    }
+    _pbytes(out, buf, (usize)n);
+    return (i32)n;
 }
 
 #[[inline]]
@@ -184,13 +205,13 @@ i32 _fprintBytes(_Buf* out, const cchar* ptr, usize len) {
     return (i32)len;
 }
 
-#[[inline]] static void _fprintNewline(_Buf* out) { _pbyte(out, '\n'); }
+#[[inline]] void _fprintNewline(_Buf* out) { _pbyte(out, '\n'); }
 
 // nothing retained between calls - flush is a no-op, as before.
-#[[inline]] static void _fprintFlush(i32 fd) { (void)fd; }
+#[[inline]] void _fprintFlush(i32 fd) { (void)fd; }
 #[[inline]] pub void flush() { _fprintFlush(1); }
-#[[inline]] static i32 _fprintHex(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 16, true); }
-#[[inline]] static i32 _fprintBin(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 2, true); }
+#[[inline]] i32 _fprintHex(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 16, true); }
+#[[inline]] i32 _fprintBin(_Buf* out, u64 v) { return _fprintUnsigned(out, v, 2, true); }
 
 // Fixed, %.*f with the old precision clamp; the stack buffer covers
 // ±1.8e308 (309 digits) + '.' + 1000 decimals + sign + NUL.
@@ -212,7 +233,7 @@ i32 _fprintFixed(_Buf* out, f64 value, u64 precision)
 // taking the same args still requires stack setup
 // in the surrent ir. maybe ill add an optimization for it
 
-#[[inline]] static i32 _sysReadByte() { return getchar(); }
+#[[inline]] i32 _sysReadByte() { return getchar(); }
 
 usize _sysReadLine(u8* buf, usize maxBytes)
 {
@@ -254,6 +275,7 @@ void _fprintOne<comptime T>(_Buf* out, T val)
             f64 => { _fprintF64(out, (f64)val); return; },
             bool => { _fprintBool(out, (bool)val); return; },
             cchar => { _fprintChar(out, (cchar)val); return; },
+            char => { _fprintCodepoint(out, (char)val); return; },
             
             const cchar* => {
                 _fprintCstr(out, (const cchar*)val);
@@ -349,7 +371,8 @@ void _fprintIter<comptime T>(_Buf* out, T val)
     }
 }
 
-// {:d}/{:x}/{:b} are integer-only — a non-integer argument is a compile error.
+// {:d}/{:x}/{:b} are integer-only — a non-integer argument is a compile
+// error. char is accepted and renders its codepoint numerically.
 i32 _fprintInt<comptime T>(_Buf* out, T val, u32 base)
 {
     comptime
@@ -364,6 +387,7 @@ i32 _fprintInt<comptime T>(_Buf* out, T val, u32 base)
             u16 => { return _fprintUnsigned(out, (u64)val, base, false); },
             u32 => { return _fprintUnsigned(out, (u64)val, base, false); },
             u64 => { return _fprintUnsigned(out, (u64)val, base, false); },
+            char => { return _fprintUnsigned(out, (u64)(u32)val, base, false); },
             else => { @compileError("print: integer specifier requires an integer argument"); }
         }
     }

@@ -12,11 +12,11 @@ import build::builder {
 };
 import args { Options };
 import io { sliceCStr };
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc };
 
-extern("C") i32 printf(u8* fmt, ...);
-extern("C") usize strlen(u8* s);
-extern("C") rawptr malloc(usize size);
-extern("C") void free(rawptr p);
+extern("C") i32 printf(const cchar* fmt, ...);
+extern("C") usize strlen(const cchar* s);
 extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
 
 struct MapArr
@@ -76,13 +76,13 @@ bool mInList(Slice name, Slice* list, u32 len)
 // locate the first `modules = [` array and its closing ']' (quote/comment aware)
 bool mFindModules(Slice raw, MapArr* out)
 {
-    u8* kw = (u8*)"modules";
+    str kw = "modules";
     usize i = 0;
     usize open = 0;
     bool foundOpen = false;
     while (i < raw.len)
     {
-        if (mHasAt(raw, i, kw, 7))
+        if (mHasAt(raw, i, kw.ptr, kw.len))
         {
             bool okBefore = i == 0 || !mIdentChar(raw.ptr[i - 1]);
             usize j = i + 7;
@@ -201,7 +201,7 @@ void mWalk(Arena* a, Slice root, Slice rel, Slice* found, u32* foundLen, u32 cap
     u32 i = 0;
     while (i < n)
     {
-        Slice nm = Slice::from(ents[i].name, strlen(ents[i].name));
+        Slice nm = Slice::from(ents[i].name, strlen((const cchar*)ents[i].name));
         bool hidden = nm.len > 0 && nm.ptr[0] == 46;
         if (!hidden && !mInList(nm, skips, skipLen))
         {
@@ -224,9 +224,9 @@ void mWalk(Arena* a, Slice root, Slice rel, Slice* found, u32* foundLen, u32 cap
                 if (libP != null)
                 {
                     usize lp = bJoin(libP, dirLen + nm.len + 12, Slice::from(dirC, dirLen), nm);
-                    u8* suf = (u8*)"/lib.crl";
+                    str suf = "/lib.crl";
                     usize s = 0;
-                    while (s < 8 && lp + s + 1 < dirLen + nm.len + 12)
+                    while (s < suf.len && lp + s + 1 < dirLen + nm.len + 12)
                     {
                         libP[lp + s] = suf[s];
                         s = s + 1;
@@ -273,12 +273,12 @@ void mSort(Slice* arr, u32 len)
     }
 }
 
-void mAppend(u8* buf, usize* len, u8* src, usize n)
+void mAppend(u8* buf, usize* len, str src)
 {
     usize i = 0;
-    while (i < n)
+    while (i < src.len)
     {
-        buf[*len] = src[i];
+        buf[*len] = src.ptr[i];
         *len = *len + 1;
         i = i + 1;
     }
@@ -297,7 +297,7 @@ void mAppendSpaces(u8* buf, usize* len, usize n)
 
 bool mSplice(Options* opts, Arena* a, Slice raw, MapArr* arr, Slice* adds, u32 addLen)
 {
-    u8* insert = (u8*)malloc(raw.len + 4096);
+    u8* insert = alloc<u8>(raw.len + 4096);
     if (insert == null) return false;
     usize ilen = 0;
     u32 i = 0;
@@ -306,49 +306,49 @@ bool mSplice(Options* opts, Arena* a, Slice raw, MapArr* arr, Slice* adds, u32 a
         if (arr->multiline)
         {
             mAppendSpaces(insert, &ilen, arr->eiLen);
-            mAppend(insert, &ilen, (u8*)"# \"", 3);
-            mAppend(insert, &ilen, adds[i].ptr, adds[i].len);
-            mAppend(insert, &ilen, (u8*)"\",\n", 3);
+            mAppend(insert, &ilen, "# \"");
+            mAppend(insert, &ilen, adds[i].asStr());
+            mAppend(insert, &ilen, "\",\n");
         }
         else
         {
-            mAppend(insert, &ilen, (u8*)"\n", 1);
+            mAppend(insert, &ilen, "\n");
             mAppendSpaces(insert, &ilen, arr->modsIndent + 4);
-            mAppend(insert, &ilen, (u8*)"# \"", 3);
-            mAppend(insert, &ilen, adds[i].ptr, adds[i].len);
-            mAppend(insert, &ilen, (u8*)"\",\n", 3);
+            mAppend(insert, &ilen, "# \"");
+            mAppend(insert, &ilen, adds[i].asStr());
+            mAppend(insert, &ilen, "\",\n");
             mAppendSpaces(insert, &ilen, arr->modsIndent);
         }
         i = i + 1;
     }
 
     usize total = raw.len + ilen;
-    u8* buf = (u8*)malloc(total + 1);
+    u8* buf = alloc<u8>(total + 1);
     if (buf == null)
     {
-        free(insert);
+        dealloc<u8>(insert);
         return false;
     }
     memcpy(buf, raw.ptr, arr->insPos);
     memcpy(buf + arr->insPos, insert, ilen);
     memcpy(buf + arr->insPos + ilen, raw.ptr + arr->insPos, raw.len - arr->insPos);
-    free(insert);
+    dealloc<u8>(insert);
     u8* pathC = sliceCStr(opts->buildFile);
     if (pathC == null)
     {
-        free(buf);
+        dealloc<u8>(buf);
         return false;
     }
     bool ok = bWriteFile(pathC, buf, total);
-    free(buf);
+    dealloc<u8>(buf);
     return ok;
 }
 
 pub i32 runMap(Options* opts, CrlbNode* root, Arena* a, Slice raw)
 {
     CrlbNode* build = null;
-    u32 i = 0;
-    while (i < (usize)root.children.len)
+    usize i = 0;
+    while (i < root.children.len)
     {
         CrlbNode* c = root.children.data + i;
         if (c.kind == CrlbNodeKind::Build)
@@ -360,54 +360,54 @@ pub i32 runMap(Options* opts, CrlbNode* root, Arena* a, Slice raw)
     }
     if (build == null)
     {
-        printf((u8*)"coralc: no build block in build file\n");
+        printf(C"coralc: no build block in build file\n");
         return 2;
     }
     Slice rootDir;
-    if (!bFieldStr(build, Slice::from((u8*)"root", 4), &rootDir))
+    if (!bFieldStr(build, Slice::fromStr("root"), &rootDir))
     {
-        printf((u8*)"coralc: build block has no root\n");
+        printf(C"coralc: build block has no root\n");
         return 2;
     }
 
     MapArr arr;
     if (!mFindModules(raw, &arr))
     {
-        printf((u8*)"coralc: no modules = [...] in build file\n");
+        printf(C"coralc: no modules = [...] in build file\n");
         return 2;
     }
 
     Slice* skips = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
-    u32 skipLen = bFieldList(build, Slice::from((u8*)"skip", 4), a, skips, 512);
+    u32 skipLen = bFieldList(build, Slice::fromStr("skip"), a, skips, 512);
 
     Slice* found = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
     u32 foundLen = 0;
-    mWalk(a, rootDir, Slice::from((u8*)"", 0), found, &foundLen, 512, skips, skipLen);
+    mWalk(a, rootDir, Slice::fromStr(""), found, &foundLen, 512, skips, skipLen);
     mSort(found, foundLen);
 
     Slice* adds = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
     u32 addLen = 0;
     i = 0;
-    while (i < foundLen)
+    while (i < (usize)foundLen)
     {
         if (!mListed(raw, arr.open + 1, arr.close, found[i]))
         {
             adds[addLen] = found[i];
             addLen = addLen + 1;
-            printf((u8*)"+ added   %s\n", bCStr(a, found[i]));
+            printf(C"+ added   %s\n", bCStr(a, found[i]));
         }
         i = i + 1;
     }
 
     if (opts->dryRun)
     {
-        printf((u8*)"~ dry run, build file not written\n");
+        printf(C"~ dry run, build file not written\n");
         return 0;
     }
 
     if (addLen > 0 && !mSplice(opts, a, raw, &arr, adds, addLen))
     {
-        printf((u8*)"coralc: failed to write build file\n");
+        printf(C"coralc: failed to write build file\n");
         return 1;
     }
 

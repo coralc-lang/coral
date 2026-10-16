@@ -24,12 +24,10 @@ import ast {
     pat { Pat, PatKind }
 };
 
-
+import(lib) std::mman { alloc, dealloc, realloc, zero };
 
 // use platform libc, and then for allocations, i will refactor the whole allocator to use std::mman::alloc
 // extern("C") usize strlen(u8* s);
-// extern("C") rawptr malloc(usize size);
-// extern("C") rawptr realloc(rawptr p, usize size);
 // extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
 
 pub struct CodegenResult
@@ -671,7 +669,7 @@ void cgAddLocal(Codegen* cg, Str name)
     if (cg.localNamesLen >= cg.localNamesCap)
     {
         u32 nc = cg.localNamesCap == 0 ? 16 : cg.localNamesCap * 2;
-        Str* np = (Str*)realloc((rawptr)cg.localNames, (usize)nc * 4);
+        Str* np = realloc<Str>(cg.localNames, (usize)nc);
         if (np == null) return;
         cg.localNames = np;
         cg.localNamesCap = nc;
@@ -1120,8 +1118,9 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
     Ty* want = null;
     if (gcount > 0)
     {
-        want = (Ty*)calloc((usize)gcount, @sizeof(Ty));
+        want = alloc<Ty>((usize)gcount);
         if (want == null) { cgError(cg, "out of memory"); return Slice::from(null, 0); }
+        zero<Ty>(want, (usize)gcount);
         cg.mono.inferCallArgs(declId, args, argsLen, cg.subs, cg.subsLen, want);
     }
     u32 total = 0;
@@ -1156,7 +1155,7 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
         }
         i = i + 1;
     }
-    if (want != null) free((rawptr)want);
+    if (want != null) dealloc<Ty>(want);
     if (total == 0) return Slice::from(null, 0);
     u32 pick = firstTotal;
     if (keyPick != 0) pick = keyPick - 1;
@@ -1277,7 +1276,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
         /* inside an instance body the callee's explicit args may be the
          * template's own params (`dealloc<T>` in realloc<cchar>) — resolve
          * them through the current substitutions before instance matching */
-        gbuf = (Ty*)malloc((usize)glen * @sizeof(Ty));
+        gbuf = alloc<Ty>((usize)glen);
         if (gbuf != null)
         {
             u32 gi = 0;
@@ -1325,7 +1324,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
             *found = true;
             *outRet = inst.returnType;
             if (outDecl != null) *outDecl = inst.declaration;
-            if (gbuf != null) free((rawptr)gbuf);
+            if (gbuf != null) dealloc<Ty>(gbuf);
             return cgMangleS(cg, inst.declaration,
                              cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), alias);
         }
@@ -1362,13 +1361,13 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
             *found = true;
             *outRet = inst.returnType;
             if (outDecl != null) *outDecl = inst.declaration;
-            if (gbuf != null) free((rawptr)gbuf);
+            if (gbuf != null) dealloc<Ty>(gbuf);
             return cgMangleS(cg, inst.declaration,
                              cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
         }
     }
     if (declId.index != 0 && outDecl != null) *outDecl = declId;
-    if (gbuf != null) free((rawptr)gbuf);
+    if (gbuf != null) dealloc<Ty>(gbuf);
     return Slice::from(null, 0);
 }
 
@@ -3290,7 +3289,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             Str iname = e.kind.payload.Ident.name;
             /* self is a pointer parameter — an lvalue assignment to it
              * writes through the pointer */
-            if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern("self".ptr, 4)) {
+            if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern("self")) {
                 stP(&cg.ebuf, "*(");
                 stPS(&cg.ebuf, cgIdent(cg, iname));
                 stCh(&cg.ebuf, ')');
@@ -4673,7 +4672,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     /* bound names: fresh set per function — params and `self` are
      * locals (Ident refs to them stay raw) */
     cg.localNamesLen = 0;
-    if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern("self".ptr, 4));
+    if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern("self"));
     {
         u32 pi = 0;
         while (pi < dd.kind.payload.Func.paramsLen)
