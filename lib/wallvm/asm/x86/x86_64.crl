@@ -6,7 +6,7 @@
 // go to the AVX table first (full-name match, no suffix splitting), then
 // the legacy table. Entry points: encodeLine (one line, no object) and
 // assembleText (whole unit into an AsmObject with symbols + relocs).
-import(lib) wallvm::asm::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError, AsmLexer, parseAttLine };
+import(lib) wallvm::asm::common { AsmLine, AsmOperand, AsmOpKind, AsmParseError, AsmLexer, parseAttLine, asmOperandEmpty };
 import(lib) wallvm::asm::x86::common { X86Reg, X86RegClass, lookupReg, isVectorReg, AsmBytes, X86Rex, encodeMem, encodeRegReg };
 import(lib) wallvm::asm::x86::obj { AsmObject, AsmSymbol, AsmRelocKind, asmAddReloc, asmFindOrAddSym, asmFindSym };
 import(lib) wallvm::asm::x86::x86_avx { EncodeCtx, ctxNew, tryVecTable };
@@ -517,6 +517,23 @@ bool emitUserPrefixes(EncodeCtx* ctx, AsmLine* line)
     return true;
 }
 
+// segment override bytes ride on operands (%fs:0x10 → 0x64 first). Legacy
+// prefixes interleave freely with lock/rep/66/67 but must precede REX;
+// one call at the top of matchAndEncode covers every path (AVX/SSE
+// return before emitUserPrefixes ever runs, so seg must not live there).
+bool emitSegPrefixes(EncodeCtx* ctx, AsmLine* line)
+{
+    AsmBytes* out = ctx.out;
+    for (u32 i = 0; i < line.nops; i++)
+    {
+        if (line.ops[i].seg != 0)
+        {
+            if (!out.u8b(line.ops[i].seg)) return false;
+        }
+    }
+    return true;
+}
+
 bool emitOpcode(EncodeCtx* ctx, FormRow* row, u8 size)
 {
     AsmBytes* out = ctx.out;
@@ -568,6 +585,17 @@ void scanRmRex(EncodeCtx* ctx, AsmOperand* rm, X86Reg* rmReg)
     }
 }
 
+// strip an @PLT/@GOTPCREL tail from a symbol name for reloc purposes —
+// defined before every reloc-writing site that feeds it
+str stripAt(str s)
+{
+    for (usize i = 0; i < s.len; i++)
+    {
+        if (s.ptr[i] == (u8)'@') return str::fromParts(s.ptr, i);
+    }
+    return s;
+}
+
 // write ModRM(+SIB+disp) for an rm operand with the given reg field.
 // Prefixes/REX are the caller's job and must already be flushed. Symbol
 // displacements require %rip and record a PC32 reloc on the object.
@@ -611,7 +639,7 @@ bool emitRm(EncodeCtx* ctx, AsmOperand* rm, X86Reg* rmReg, u8 regField, u32 immT
         if (rm.hasSym && ctx.obj != null)
         {
             u64 at = out.len >= 4 ? out.len - 4 : 0;
-            if (!asmAddReloc(ctx.obj, at, rm.sym, AsmRelocKind::RelPc32,
+            if (!asmAddReloc(ctx.obj, at, stripAt(rm.sym), AsmRelocKind::RelPc32,
                              rm.disp - 4 - (i64)immTail, ctx.sec))
             {
                 err.msg = "too many relocations";
@@ -637,7 +665,7 @@ bool emitImmOrSym(EncodeCtx* ctx, AsmOperand* src, u32 bytes, AsmParseError* err
         u64 at = out.len;
         if (!out.immv(imm, bytes)) return false;
         u8 rk = bytes == 8 ? (u8)AsmRelocKind::RelAbs64 : (u8)AsmRelocKind::RelAbs32;
-        if (!asmAddReloc(ctx.obj, at, src.sym, rk, imm, ctx.sec))
+        if (!asmAddReloc(ctx.obj, at, stripAt(src.sym), rk, imm, ctx.sec))
         {
             err.msg = "too many relocations";
             return false;
@@ -866,21 +894,12 @@ bool encodeWithRow(AsmLine* line, FormRow* row, u8 size, EncodeCtx* ctx, AsmPars
     return true;
 }
 
-// strip an @PLT/@GOTPCREL tail from a symbol name for reloc purposes
-str stripAt(str s)
-{
-    for (usize i = 0; i < s.len; i++)
-    {
-        if (s.ptr[i] == (u8)'@') return str::fromParts(s.ptr, i);
-    }
-    return s;
-}
-
 // record a PC-relative reloc for a symbolic branch target at the current
 // output position, or resolve a backward local reference directly. The
-// in-place field holds the -4 addend (reloc is from the disp field, the
-// CPU reads from the end of the instruction).
-bool emitSymRel(EncodeCtx* ctx, str symName, u8 kind, AsmParseError* err)
+// in-place field holds the addend-4 (reloc is from the disp field, the
+// CPU reads from the end of the instruction); `addend` carries a parsed
+// sym+N/sym-N expression (`jmp foo+8`).
+bool emitSymRel(EncodeCtx* ctx, str symName, i64 addend, u8 kind, AsmParseError* err)
 {
     AsmBytes* out = ctx.out;
     if (ctx.obj == null)
@@ -888,29 +907,65 @@ bool emitSymRel(EncodeCtx* ctx, str symName, u8 kind, AsmParseError* err)
         err.msg = "symbolic branch needs an object";
         return false;
     }
+    i64 field = addend - 4;
     i32 si = asmFindSym(ctx.obj, symName);
     if (si >= 0)
     {
         AsmSymbol* s = &ctx.obj.syms[si];
         if (s.defined && s.section == ctx.sec)
         {
-            i64 disp = (i64)s.value - (i64)(out.len + 4);
+            i64 disp = (i64)s.value + addend - (i64)(out.len + 4);
             return out.immv(disp, 4);
         }
     }
     u64 at = out.len;
-    if (!asmAddReloc(ctx.obj, at, symName, kind, -4, ctx.sec))
+    if (!asmAddReloc(ctx.obj, at, symName, kind, field, ctx.sec))
     {
         err.msg = "too many relocations";
         return false;
     }
-    return out.immv(-4, 4);
+    return out.immv(field, 4);
+}
+
+// '*' marker on a symbolic/numeric branch target: the target names an
+// address in MEMORY, not a relative displacement — lower it to a Mem
+// operand (rip+symbol per this file's symbolic-mem convention, absolute
+// addressing for a plain number) and let the FF /digit row encode it.
+// GAS: `call *foo` → FF 15 rel32 (PIE) / FF 14 25 abs32, `call *0x10`
+// → FF 14 25 imm32, `jmp *foo` → FF /4 with the same operand shapes.
+bool encodeIndirectRel(str base, AsmLine* line, u8 ext, EncodeCtx* ctx, AsmParseError* err)
+{
+    AsmOperand* t = &line.ops[0];
+    AsmOperand m = asmOperandEmpty();
+    m.kind = AsmOpKind::Mem;
+    if (!t.text.isEmpty())
+    {
+        m.rip = true;
+        m.hasSym = true;
+        m.sym = t.text;
+    }
+    else
+    {
+        m.hasDisp = true;
+        m.disp = t.imm;
+    }
+    AsmLine tmp = *line;
+    tmp.ops[0] = m;
+    tmp.nops = 1;
+    FormRow row = FormRow { .base = base, .sizeMask = 0, .sig = FS_RM,
+                            .op = 0xFF, .op2 = 0, .ext = ext,
+                            .immW = 0, .signExtIb = false, .forceW = false,
+                            .noW = true, .pfx = 0 };
+    return encodeWithRow(&tmp, &row, 0, ctx, err);
 }
 
 // match a parsed line against the tables; returns false with err set
 pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
 {
     AsmBytes* out = ctx.out;
+
+    // %fs:/… overrides first, ahead of every other prefix byte
+    if (!emitSegPrefixes(ctx, line)) return false;
 
     // vector encodings match full mnemonics (vaddpd must not split into
     // vaddp + d) — try the AVX table before any suffix handling
@@ -1125,7 +1180,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
             // symbolic target: near form only, PC32 reloc
             if (!out.u8b(0x0F)) return false;
             if (!out.u8b((u8)(0x80 + cc))) return false;
-            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPc32, err);
+            return emitSymRel(ctx, stripAt(t.text), t.imm, AsmRelocKind::RelPc32, err);
         }
         i64 target = t.imm;
         // short form is 2 bytes, near form 6
@@ -1188,7 +1243,7 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
             if (op.hasSym && tctx.obj != null)
             {
                 u64 at = tmp.len >= 4 ? tmp.len - 4 : 0;
-                if (!asmAddReloc(tctx.obj, at, op.sym, AsmRelocKind::RelPc32, op.disp - 4, tctx.sec))
+                if (!asmAddReloc(tctx.obj, at, stripAt(op.sym), AsmRelocKind::RelPc32, op.disp - 4, tctx.sec))
                 {
                     tmp.deinit();
                     err.msg = "too many relocations";
@@ -1236,27 +1291,31 @@ pub bool matchAndEncode(AsmLine* line, EncodeCtx* ctx, AsmParseError* err)
         return encodeWithRow(line, &row, size, ctx, err);
     }
 
-    // call to a label or a relative target
+    // call to a label or a relative target; with the '*' marker the
+    // target is loaded from memory instead (FF /2)
     if (base.equals("call") && line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel)
     {
         AsmOperand* t = &line.ops[0];
+        if (t.indirect) return encodeIndirectRel(base, line, 2, ctx, err);
         if (!out.u8b(0xE8)) return false;
         if (!t.text.isEmpty())
         {
-            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPlt32, err);
+            return emitSymRel(ctx, stripAt(t.text), t.imm, AsmRelocKind::RelPlt32, err);
         }
         // instruction-start-relative target; the disp is from the end
         return out.immv(t.imm - 5, 4);
     }
 
-    // jmp: symbol → near + PC32; numeric → short EB when it fits
+    // jmp: symbol → near + PC32; numeric → short EB when it fits;
+    // '*' marker → memory-indirect FF /4
     if (base.equals("jmp") && line.nops == 1 && line.ops[0].kind == AsmOpKind::Rel)
     {
         AsmOperand* t = &line.ops[0];
+        if (t.indirect) return encodeIndirectRel(base, line, 4, ctx, err);
         if (!t.text.isEmpty())
         {
             if (!out.u8b(0xE9)) return false;
-            return emitSymRel(ctx, stripAt(t.text), AsmRelocKind::RelPc32, err);
+            return emitSymRel(ctx, stripAt(t.text), t.imm, AsmRelocKind::RelPc32, err);
         }
         i64 shortRel = t.imm - 2;
         if (shortRel >= -128 && shortRel <= 127)
@@ -1591,7 +1650,7 @@ bool emitDataLits(AsmLine* line, AsmObject* obj, i32 sec, u32 width, AsmParseErr
     {
         lx.skipSpace();
         if (lx.done()) break;
-        if (isAlpha(lx.peek()) || lx.peek() == (u8)'_')
+        if (isAlpha(lx.peek()) || lx.peek() == (u8)'_' || lx.peek() == (u8)'.')
         {
             str name = lx.lexIdent();
             if (name.isEmpty()) { err.msg = "bad symbol in data literal"; err.lineNo = line.lineNo; return false; }

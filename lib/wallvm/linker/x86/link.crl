@@ -10,7 +10,7 @@ import(lib) std::vec { Vec };
 import(lib) std::text::string { String };
 import(lib) std::result { Result };
 import(lib) std::mman { alloc, dealloc };
-import(lib) std::io::fs { fileOpen, fileClose, fileRead, fileWrite, fileSeek, File, SEEK_SET, SEEK_END };
+import(lib) std::io::fs { fileOpen, fileClose, fileRead, fileWrite, fileSeek, File, IoError, SEEK_SET, SEEK_END };
 import elf { EM_X86_64, EM_386 };
 import object { ObjFile, parseObject };
 import resolve { GlobalDef, resolveSyms };
@@ -154,28 +154,32 @@ pub struct Linker
 
 bool _readFile(str path, Vec<u8>* out, String* err)
 {
-    File f = fileOpen(path, "rb");
-    if ((i32)f < 0)
+    Result<File, IoError> fo = fileOpen(path, "rb");
+    if (fo.isErr())
     {
         err->pushView("linker: cannot open ");
         err->pushView(path);
         return false;
     }
-    i64 sz = (i64)fileSeek(f, 0, SEEK_END);
+    File f = fo.unwrap();
+    Result<isize, IoError> sized = fileSeek(f, 0, SEEK_END);
     fileSeek(f, 0, SEEK_SET);
-    if (sz < 0)
+    if (sized.isErr())
     {
         fileClose(f);
         err->pushView("linker: cannot size ");
         err->pushView(path);
         return false;
     }
+    i64 sz = (i64)sized.unwrap();
     usize n = (usize)sz;
     u8* tmp = alloc<u8>(n > 0 ? n : 1);
     usize got = 0;
     while (got < n)
     {
-        isize r = fileRead(f, tmp + got, n - got);
+        Result<isize, IoError> rr = fileRead(f, tmp + got, n - got);
+        if (rr.isErr()) break;
+        isize r = rr.unwrap();
         if (r <= 0) break;
         got += (usize)r;
     }
@@ -196,17 +200,26 @@ bool _readFile(str path, Vec<u8>* out, String* err)
 
 bool _writeFile(str path, const u8* data, usize len, String* err)
 {
-    File f = fileOpen(path, "wb");
-    if ((i32)f < 0)
+    Result<File, IoError> fo = fileOpen(path, "wb");
+    if (fo.isErr())
     {
         err->pushView("linker: cannot create ");
         err->pushView(path);
         return false;
     }
+    File f = fo.unwrap();
     usize off = 0;
     while (off < len)
     {
-        isize r = fileWrite(f, data + off, len - off);
+        Result<isize, IoError> wr = fileWrite(f, data + off, len - off);
+        if (wr.isErr())
+        {
+            fileClose(f);
+            err->pushView("linker: write failed on ");
+            err->pushView(path);
+            return false;
+        }
+        isize r = wr.unwrap();
         if (r <= 0)
         {
             fileClose(f);

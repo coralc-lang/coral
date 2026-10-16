@@ -1,6 +1,8 @@
 import(lib) platform::libc { snprintf };
-import(lib) platform::win32 { CreateFileA, CloseHandle, DeleteFileA, MoveFileA, RemoveDirectoryA, GetTickCount, GetTempPathA, GetTempFileNameA };
+import(lib) platform::win32 { CreateFileA, CloseHandle, DeleteFileA, MoveFileA, RemoveDirectoryA, GetTickCount, GetTempPathA, GetTempFileNameA, GetLastError };
 import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 const u32 GENERIC_READ = 0x80000000u;
 const u32 GENERIC_WRITE = 0x40000000u;
 const u32 FILE_SHARE_READ = 0x1u;
@@ -52,24 +54,39 @@ pub struct TempFile
     String path;
     bool autoDelete;
 
-    static TempFile create(str prefix, str suffix)
+    static Result<TempFile, IoError> create(str prefix, str suffix)
     {
         // mkstemp -> GetTempPathA + GetTempFileNameA (creates the
         // file), then MoveFileA into "<prefix><hex>" shape.
         u8 tmpDir[_TMP_PATH_MAX];
         u32 dirLen = GetTempPathA((u32)_TMP_PATH_MAX, (cchar*)tmpDir);
         if (dirLen == 0u || dirLen >= (u32)_TMP_PATH_MAX)
-            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
+            return Result<TempFile, IoError>::Err { .error = IoError::os("GetTempPathA") };
 
         String wanted = String::new();
         u8 gen[_TMP_PATH_MAX];
         bool havePath = false;
+        // which call bailed, with its code (captured before any cleanup
+        // call below could overwrite the last-error slot)
+        i32 failCode = 0;
+        str failOp = "GetTempFileNameA";
         for (u32 attempt = 0; attempt < 8u && !havePath; attempt++)
         {
             // uUnique 0, the API picks a free name and creates the file.
-            if (GetTempFileNameA((const cchar*)tmpDir, C"tmp", 0u, (cchar*)gen) == 0u) break;
+            if (GetTempFileNameA((const cchar*)tmpDir, C"tmp", 0u, (cchar*)gen) == 0u)
+            {
+                failCode = (i32)GetLastError();
+                failOp = "GetTempFileNameA";
+                break;
+            }
             str hex = _uniqHex(gen);
-            if (hex.len == 0) { DeleteFileA((const cchar*)gen); break; }
+            if (hex.len == 0)
+            {
+                failCode = (i32)GetLastError();
+                failOp = "GetTempFileNameA";
+                DeleteFileA((const cchar*)gen);
+                break;
+            }
             wanted.clear();
             wanted.appendView(str::fromParts(tmpDir, (usize)dirLen));
             wanted.appendView(prefix);
@@ -78,12 +95,16 @@ pub struct TempFile
             if (MoveFileA((const cchar*)gen, (const cchar*)wanted.asCstr()))
                 havePath = true;
             else
+            {
+                failCode = (i32)GetLastError();
+                failOp = "MoveFileA";
                 DeleteFileA((const cchar*)gen); // target exists; retry with a fresh hex
+            }
         }
         if (!havePath)
         {
             wanted.free();
-            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
+            return Result<TempFile, IoError>::Err { .error = IoError::Os { .code = failCode, .op = failOp } };
         }
 
         // mkstemp's returned descriptor was O_RDWR; open the file back.
@@ -93,11 +114,12 @@ pub struct TempFile
                                null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
         if (h == INVALID_HANDLE_VALUE)
         {
+            i32 code = (i32)GetLastError();
             DeleteFileA((const cchar*)wanted.asCstr());
             wanted.free();
-            return TempFile { .fd = INVALID_HANDLE_VALUE, .path = String::new(), .autoDelete = false };
+            return Result<TempFile, IoError>::Err { .error = IoError::Os { .code = code, .op = "CreateFileA" } };
         }
-        return TempFile { .fd = h, .path = wanted, .autoDelete = true };
+        return Result<TempFile, IoError>::Ok { .value = TempFile { .fd = h, .path = wanted, .autoDelete = true } };
     }
 
     void dispose()
@@ -121,14 +143,14 @@ pub struct TempDir
     String path;
     bool autoDelete;
 
-    static TempDir create(str prefix)
+    static Result<TempDir, IoError> create(str prefix)
     {
         // mkdtemp -> GetTempPathA + generated name + CreateDirectoryA,
         // retried while taken (mkdir EEXIST == CreateDirectoryA false).
         u8 tmpDir[_TMP_PATH_MAX];
         u32 dirLen = GetTempPathA((u32)_TMP_PATH_MAX, (cchar*)tmpDir);
         if (dirLen == 0u || dirLen >= (u32)_TMP_PATH_MAX)
-            return TempDir { .path = String::new(), .autoDelete = false };
+            return Result<TempDir, IoError>::Err { .error = IoError::os("GetTempPathA") };
 
         String out = String::new();
         u32 salt = GetTickCount();
@@ -139,10 +161,12 @@ pub struct TempDir
             out.appendView(prefix);
             _appendHex(&out, salt + attempt);
             if (CreateDirectoryA((const cchar*)out.asCstr(), null))
-                return TempDir { .path = out, .autoDelete = true };
+                return Result<TempDir, IoError>::Ok { .value = TempDir { .path = out, .autoDelete = true } };
         }
+        // capture before out.free() could overwrite the slot
+        i32 code = (i32)GetLastError();
         out.free();
-        return TempDir { .path = String::new(), .autoDelete = false };
+        return Result<TempDir, IoError>::Err { .error = IoError::Os { .code = code, .op = "CreateDirectoryA" } };
     }
 
     void dispose()

@@ -6,12 +6,12 @@
  * help line; the engine resolves the location against the right file.
  */
 
+import(lib) std::mman { alloc };
+import(lib) std::vec { Vec };
+import(lib) platform::libc { write };
 import code { ErrorCode, codeStr };
 import error { render };
 import ast::id { SourceLoc, locFile, locLine, locCol };
-
-// extern("C") i32 printf(u8* fmt, ...);
-// extern("C") i32 write(i32 fd, u8* buf, usize len);
 
 pub struct DiagnosticEngine
 {
@@ -25,12 +25,10 @@ pub struct DiagnosticEngine
     usize parserErrors;
     u8* bufStart;
     u8* bufEnd;
-    Vec<str> filePaths; // u8** filePaths;
-    usize* filePathLens;
-    u8** fileBufs;
-    u8** fileBufEnds;
+    Vec<str> filePaths;
+    Vec<u8*> fileBufs;
+    Vec<u8*> fileBufEnds;
     u32 fileCount;
-    u32 fileCap;
 
     void init(u8* bufStart, u8* bufEnd)
     {
@@ -44,12 +42,10 @@ pub struct DiagnosticEngine
             .parserErrors = 0,
             .bufStart = bufStart,
             .bufEnd = bufEnd,
-            .filePaths = Vec<str>::new();
-            .filePathLens = null,
-            .fileBufs = null,
-            .fileBufEnds = null,
+            .filePaths = Vec<str>::new(),
+            .fileBufs = Vec<u8*>::new(),
+            .fileBufEnds = Vec<u8*>::new(),
             .fileCount = 0,
-            .fileCap = 0,
         };
     }
 
@@ -62,60 +58,25 @@ pub struct DiagnosticEngine
     bool tooManyErrors() { return self.errorLimit != 0 && self.errors > self.errorLimit; }
 
     // register a source file; returns its file id
-    u32 addFile(str path, u8* bufStart, u8* bufEnd) // (u8* path, usize pathLen 
+    u32 addFile(u8* path, usize pathLen, u8* bufStart, u8* bufEnd)
     {
-        if (self.fileCount >= self.fileCap)
-        {
-            u32 newCap = self.fileCap == 0 ? 8 : self.fileCap * 2;
-            Vec<str> np = Vec<str>::withCap((usize)newCap * @sizeof(str)); // u8** np = (u8**)malloc((usize)newCap * @sizeof(u8*));
-            usize* nl = (usize*)malloc((usize)newCap * @sizeof(usize));
-            u8** nb = (u8**)malloc((usize)newCap * @sizeof(u8*));
-            u8** ne = (u8**)malloc((usize)newCap * @sizeof(u8*));
-            if (np == null || nl == null || nb == null || ne == null)
-            {
-                if (np != null) free((rawptr)np);
-                if (nl != null) free((rawptr)nl);
-                if (nb != null) free((rawptr)nb);
-                if (ne != null) free((rawptr)ne);
-                return 0;
-            }
-            u32 i = 0;
-            while (i < self.fileCount)
-            {
-                np[i] = self.filePaths[i];
-                nl[i] = self.filePathLens[i];
-                nb[i] = self.fileBufs[i];
-                ne[i] = self.fileBufEnds[i];
-                i = i + 1;
-            }
-            if (self.filePaths != null) free((rawptr)self.filePaths);
-            if (self.filePathLens != null) free((rawptr)self.filePathLens);
-            if (self.fileBufs != null) free((rawptr)self.fileBufs);
-            if (self.fileBufEnds != null) free((rawptr)self.fileBufEnds);
-            self.filePaths = np;
-            self.filePathLens = nl;
-            self.fileBufs = nb;
-            self.fileBufEnds = ne;
-            self.fileCap = newCap;
-        }
         u32 id = self.fileCount;
         /* copy the path — the lib loader frees its candidate paths while
          * this table lives for the whole compile */
-        u8* pcopy = (u8*)malloc(pathLen + 1);
+        u8* pcopy = alloc<u8>(pathLen + 1);
         if (pcopy != null)
         {
             usize pi = 0;
             while (pi < pathLen) { pcopy[pi] = path[pi]; pi = pi + 1; }
             pcopy[pathLen] = 0;
-            self.filePaths[id] = pcopy;
+            self.filePaths.push(str::fromParts(pcopy, pathLen));
         }
         else
         {
-            self.filePaths[id] = path;
+            self.filePaths.push(str::fromParts(path, pathLen));
         }
-        self.filePathLens[id] = pathLen;
-        self.fileBufs[id] = bufStart;
-        self.fileBufEnds[id] = bufEnd;
+        self.fileBufs.push(bufStart);
+        self.fileBufEnds.push(bufEnd);
         self.fileCount = self.fileCount + 1;
         return id;
     }
@@ -127,8 +88,8 @@ pub struct DiagnosticEngine
         u32 line = locLine(loc);
         u32 col = locCol(loc);
         if (file >= self.fileCount) return self.bufStart;
-        u8* buf = self.fileBufs[file];
-        u8* end = self.fileBufEnds[file];
+        u8* buf = self.fileBufs.at((usize)file);
+        u8* end = self.fileBufEnds.at((usize)file);
         if (buf == null) return null;
         if (line == 0) return buf;
         u32 curLine = 1;
@@ -136,19 +97,19 @@ pub struct DiagnosticEngine
         while (p < end && curLine < line)
         {
             if (p[0] == 10) curLine = curLine + 1;
-            p = p + 1;
+            p++;
         }
         if (col == 0) col = 1;
         u32 c = 1;
         while (p < end && c < col && p[0] != 10 && p[0] != 13)
         {
-            p = p + 1;
-            c = c + 1;
+            p++;
+            c++;
         }
         return p;
     }
 
-    void emitError(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    void emitError(ErrorCode code, SourceLoc loc, str msg, str help)
     {
         self.errors = self.errors + 1;
         if (self.tooManyErrors())
@@ -156,14 +117,15 @@ pub struct DiagnosticEngine
             if (!self.limitNotified)
             {
                 self.limitNotified = true;
-                write(2, "note: too many errors emitted, stopping now (use -ferror-limit=0 to disable)\n", 77);
+                str note = "note: too many errors emitted, stopping now (use -ferror-limit=0 to disable)\n";
+                write(2, note.ptr, note.len);
             }
             return;
         }
         self.renderAt(code, "error", loc, msg, help);
     }
 
-    void emitWarning(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    void emitWarning(ErrorCode code, SourceLoc loc, str msg, str help)
     {
         self.warnings = self.warnings + 1;
         if (self.tooManyErrors()) return;
@@ -173,42 +135,42 @@ pub struct DiagnosticEngine
     /* report a diagnostic permitted by an escape-hatch flag (e.g.
      * --allow-int-ptr): rendered like an error but not counted, so the
      * build still succeeds; -w silences the rendering */
-    void emitAllowed(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    void emitAllowed(ErrorCode code, SourceLoc loc, str msg, str help)
     {
         self.renderAt(code, "error", loc, msg, help);
     }
 
-    void emitNote(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    void emitNote(ErrorCode code, SourceLoc loc, str msg, str help)
     {
         self.renderAt(code, "note", loc, msg, help);
     }
 
-    void emitFatal(ErrorCode code, SourceLoc loc, u8* msg, u8* help)
+    void emitFatal(ErrorCode code, SourceLoc loc, str msg, str help)
     {
         self.errors = self.errors + 1;
         self.renderAt(code, "fatal error", loc, msg, help);
     }
 
-    void renderAt(ErrorCode code, u8* level, SourceLoc loc, u8* msg, u8* help)
+    void renderAt(ErrorCode code, str level, SourceLoc loc, str msg, str help)
     {
         if (self.silenced) return;
         u32 file = locFile(loc);
         if (file >= self.fileCount)
         {
             /* unknown file (e.g. uninitialized file id) — no position to show */
-            render(codeStr(code), level, msg, null, 0, 0, 0, null, 0, 0, null, 0, help);
+            render(codeStr(code), level, msg, str::empty(), 0, 0, str::empty(), 0, str::empty(), help);
             return;
         }
         u8* ptr = self.locPtr(loc);
         if (ptr == null)
         {
-            render(codeStr(code), level, msg, null, 0, 0, 0, null, 0, 0, null, 0, help);
+            render(codeStr(code), level, msg, str::empty(), 0, 0, str::empty(), 0, str::empty(), help);
             return;
         }
         u32 line = locLine(loc);
         u32 col = locCol(loc);
-        u8* fileBuf = self.fileBufs[file];
-        u8* fileEnd = self.fileBufEnds[file];
+        u8* fileBuf = self.fileBufs.at((usize)file);
+        u8* fileEnd = self.fileBufEnds.at((usize)file);
 
         u8* lineStart = ptr;
         while (lineStart > fileBuf)
@@ -229,8 +191,7 @@ pub struct DiagnosticEngine
         usize lineLen = (usize)(lineEnd - lineStart);
 
         /* the line before the error, for context */
-        u8* prevText = null;
-        usize prevTextLen = 0;
+        str prevText = str::empty();
         usize prevLineNo = 0;
         if (line > 1 && lineStart > fileBuf)
         {
@@ -242,16 +203,15 @@ pub struct DiagnosticEngine
                 usize plen = (usize)(prevEnd - prevStart);
                 /* trim a trailing \r */
                 if (plen > 0 && prevStart[plen - 1] == 13) plen = plen - 1;
-                prevText = prevStart;
-                prevTextLen = plen;
-                prevLineNo = line - 1;
+                prevText = str::fromParts(prevStart, plen);
+                prevLineNo = line - (usize)1;
             }
         }
 
-        render(codeStr(code), level, msg,
-               self.filePaths[file], self.filePathLens[file],
+        render(codeStr(code), toView(level), toView(msg),
+               self.filePaths.at((usize)file),
                line, col,
-               prevText, prevTextLen, prevLineNo,
-               lineStart, lineLen, help);
+               prevText, prevLineNo,
+               str::fromParts(lineStart, lineLen), toView(help));
     }
 }

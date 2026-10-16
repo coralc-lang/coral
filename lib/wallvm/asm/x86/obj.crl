@@ -105,6 +105,10 @@ pub i32 asmFindOrAddSym(AsmObject* o, str name)
 pub bool asmAddReloc(AsmObject* o, u64 offset, str symbol, u8 kind, i64 addend, i32 section)
 {
     if (o.nrelocs >= ASM_MAX_RELOCS) return false;
+    // reference guarantees the name exists in the symbol table: without
+    // this, a reloc to a not-yet-defined (or external) name dies at write
+    // time as "relocation to unknown symbol"
+    if (asmFindOrAddSym(o, symbol) < 0) return false;
     u32 i = o.nrelocs;
     o.relocs[i] = AsmReloc {
         .offset = offset, .symbol = symbol, .kind = kind,
@@ -340,7 +344,10 @@ pub bool emitElf(AsmObject* o, AsmBytes* out, AsmParseError* err)
     for (u32 si = 1; si < nsymsTotal; si++)
     {
         AsmSymbol* s = &o.syms[order[si]];
-        u8 bind = s.weak ? 2 : (s.global ? 1 : 0);
+        // undefined names are externals for the linker (STB_GLOBAL) even
+        // without .globl — a forward local that gets defined later lands
+        // here as defined+non-global and stays STB_LOCAL
+        u8 bind = s.weak ? 2 : ((s.global || !s.defined) ? 1 : 0);
         u8 typ = s.isFunc ? 2 : (s.defined ? 1 : 0);
         u16 shndx = 0;
         if (s.defined) shndx = s.section == 2 ? 2 : 1;
@@ -500,7 +507,9 @@ pub bool emitCoff(AsmObject* o, AsmBytes* out, AsmParseError* err)
         i16 secnum = 0;
         if (s.defined) secnum = s.section == 2 ? 2 : 1;
         u16 typ = s.isFunc ? 0x20 : 0; // function descriptor
-        u8 cls = (s.global || s.weak) ? 2 : 3; // external : static
+        // undefined → external (2), matching GAS; forward locals that get
+        // defined later stay static (3)
+        u8 cls = (s.global || s.weak || !s.defined) ? 2 : 3; // external : static
         if (!out.u32b(value)) return false;
         if (!out.u16b((u16)secnum)) return false;
         if (!out.u16b(typ)) return false;

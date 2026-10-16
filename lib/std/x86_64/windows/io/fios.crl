@@ -1,12 +1,14 @@
 import(lib) platform::libc { fopen, fclose, fwrite, fread, feof, ferror, fflush };
 import(lib) std::mman { copy };
 import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 
 // distinct wrapper over a FILE*, a bare rawptr can't be passed in its place
 // by accident — callers have to cast it explicitly.
 pub distinct FileHandle = rawptr;
 
-pub FileHandle fileOpen(str path, str mode)
+pub Result<FileHandle, IoError> fileOpen(str path, str mode)
 {
     u8 pathBuf[4096];
     u8 modeBuf[16];
@@ -16,29 +18,59 @@ pub FileHandle fileOpen(str path, str mode)
     copy<u8>(modeBuf, (u8*)mode.ptr, mlen);
     pathBuf[plen] = 0;
     modeBuf[mlen] = 0;
-    return (FileHandle)fopen(pathBuf, modeBuf);
+    rawptr h = fopen(pathBuf, modeBuf);
+    if (h == null) return Result<FileHandle, IoError>::Err { .error = IoError::os("fopen") };
+    return Result<FileHandle, IoError>::Ok { .value = (FileHandle)h };
 }
 
 #[[inline]] pub void fileClose(FileHandle fh) { fclose((rawptr)fh); }
-#[[inline]] pub usize fileWrite(FileHandle fh, str data) { return fwrite(data.ptr, 1u, data.len, (rawptr)fh); }
-#[[inline]] pub usize fileRead(FileHandle fh, u8* buf, usize maxLen) { return fread(buf, 1u, maxLen, (rawptr)fh); }
+
+// short write means the stream hit an error (errno was set by fwrite)
+pub Result<usize, IoError> fileWrite(FileHandle fh, str data)
+{
+    usize n = fwrite(data.ptr, 1u, data.len, (rawptr)fh);
+    if (n < data.len) return Result<usize, IoError>::Err { .error = IoError::os("fwrite") };
+    return Result<usize, IoError>::Ok { .value = n };
+}
+
+// 0 at EOF is the normal answer; only a short read with ferror set is Err
+pub Result<usize, IoError> fileRead(FileHandle fh, u8* buf, usize maxLen)
+{
+    usize n = fread(buf, 1u, maxLen, (rawptr)fh);
+    if (n < maxLen && ferror((rawptr)fh) != 0)
+        return Result<usize, IoError>::Err { .error = IoError::os("fread") };
+    return Result<usize, IoError>::Ok { .value = n };
+}
+
 #[[inline]] pub bool fileEof(FileHandle fh) { return feof((rawptr)fh) != 0; }
 #[[inline]] pub bool fileError(FileHandle fh) { return ferror((rawptr)fh) != 0; }
 #[[inline]] pub void fileFlush(FileHandle fh){ fflush((rawptr)fh); }
-#[[inline]] pub usize fileWriteString(FileHandle fh, const String* s) { return fwrite(s->ptr, 1u, s->len, (rawptr)fh); }
 
-pub bool fileReadAll(str path, String* out)
+pub Result<usize, IoError> fileWriteString(FileHandle fh, const String* s)
 {
-    FileHandle fh = fileOpen(path, "rb");
-    if (fh == (FileHandle)0) return false;
+    usize n = fwrite(s->ptr, 1u, s->len, (rawptr)fh);
+    if (n < s->len) return Result<usize, IoError>::Err { .error = IoError::os("fwrite") };
+    return Result<usize, IoError>::Ok { .value = n };
+}
+
+pub Result<bool, IoError> fileReadAll(str path, String* out)
+{
+    Result<FileHandle, IoError> fo = fileOpen(path, "rb");
+    if (fo.isErr()) return Result<bool, IoError>::Err { .error = fo.unwrapErr() };
+    FileHandle fh = fo.unwrap();
     u8 chunk[4096];
     while (true)
     {
-        usize n = fileRead(fh, chunk, 4096u);
+        Result<usize, IoError> rr = fileRead(fh, chunk, 4096u);
+        if (rr.isErr())
+        {
+            fileClose(fh);
+            return Result<bool, IoError>::Err { .error = rr.unwrapErr() };
+        }
+        usize n = rr.unwrap();
         if (n == 0u) break;
         out->pushView(str::fromParts(chunk, n));
     }
-    bool ok = !fileError(fh);
     fileClose(fh);
-    return ok;
+    return Result<bool, IoError>::Ok { .value = true };
 }

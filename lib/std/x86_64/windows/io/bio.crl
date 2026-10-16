@@ -1,4 +1,6 @@
 import(lib) platform::win32 { ReadFile, WriteFile, SetFilePointerA };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 
 // POSIX whence values double as Win32 FILE_BEGIN/CURRENT (same numbers).
 const i32 SEEK_SET = 0;
@@ -14,7 +16,10 @@ pub struct FileReader
         return FileReader { .fd = fd };
     }
 
-    bool readBytes(u8* dst, u64 n)
+    // reads exactly n bytes; Err on a read error (GetLastError) or an
+    // EOF before n bytes. The typed readers below ignore the outcome
+    // and yield 0-filled buffers — check readBytes when it matters.
+    Result<bool, IoError> readBytes(u8* dst, u64 n)
     {
         u64 total = 0;
         while (total < n)
@@ -22,11 +27,12 @@ pub struct FileReader
             u64 remain = n - total;
             u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
             u32 got = 0;
-            if (!ReadFile(self.fd, (cchar*)(dst + total), want, &got, null)) return false;
-            if (got == 0) return false; // EOF before n bytes
+            if (!ReadFile(self.fd, (cchar*)(dst + total), want, &got, null))
+                return Result<bool, IoError>::Err { .error = IoError::os("ReadFile") };
+            if (got == 0) return Result<bool, IoError>::Err { .error = IoError::Eof { .op = "read" } };
             total += (u64)got;
         }
-        return true;
+        return Result<bool, IoError>::Ok { .value = true };
     }
 
     #[[inline]]
@@ -127,7 +133,9 @@ pub struct FileWriter
     #[[inline]]
     void writeU8(u8 v) { self.writeBytes(&v, 1); }
 
-    bool writeBytes(const u8* src, u64 n)
+    // writes exactly n bytes; Err on a write error (GetLastError) or a
+    // zero-byte write. The typed writers below ignore the outcome.
+    Result<bool, IoError> writeBytes(const u8* src, u64 n)
     {
         u64 total = 0;
         while (total < n)
@@ -135,11 +143,12 @@ pub struct FileWriter
             u64 remain = n - total;
             u32 want = remain > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)remain;
             u32 put = 0;
-            if (!WriteFile(self.fd, (const cchar*)(src + total), want, &put, null)) return false;
-            if (put == 0) return false;
+            if (!WriteFile(self.fd, (const cchar*)(src + total), want, &put, null))
+                return Result<bool, IoError>::Err { .error = IoError::os("WriteFile") };
+            if (put == 0) return Result<bool, IoError>::Err { .error = IoError::Os { .code = 0, .op = "write" } };
             total += (u64)put;
         }
-        return true;
+        return Result<bool, IoError>::Ok { .value = true };
     }
 
     void writeU16Le(u16 v)

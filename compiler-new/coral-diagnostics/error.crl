@@ -17,95 +17,55 @@
  *     │      ╰─ try `coralc --explain SYN-1002` for more information
  */
 
-extern("C") i32 write(i32 fd, u8* buf, usize len);
-extern("C") i32 isatty(i32 fd);
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr realloc(rawptr p, usize size);
-extern("C") void free(rawptr p);
+import(lib) platform::libc { write, isatty };
+import(lib) std::text::string { String };
 
 /*  buffer */
 
-struct Out
-{
-    u8* p;
-    usize len;
-    usize cap;
-}
-
-void outInit(Out* o)
-{
-    o->p = (u8*)malloc(128);
-    o->len = 0;
-    o->cap = o->p != null ? 128 : 0;
-}
-
-void outEnsure(Out* o, usize need)
-{
-    if (o->len + need <= o->cap) return;
-    usize nc = o->cap == 0 ? 256 : o->cap * 2;
-    while (nc < o->len + need) nc = nc * 2;
-    u8* np = (u8*)realloc((rawptr)o->p, nc);
-    if (np == null) return;
-    o->p = np;
-    o->cap = nc;
-}
-
-void outByte(Out* o, u8 c)
-{
-    outEnsure(o, 1);
-    if (o->len < o->cap)
+extend String {
+    void outBytes(str s)
     {
-        o->p[o->len] = c;
-        o->len = o->len + 1;
+        if (self.len == 0) return;
+        self.pushView(s);
     }
-}
 
-void outBytes(Out* o, u8* s, usize n)
-{
-    if (s == null || n == 0) return;
-    outEnsure(o, n);
-    if (o->len + n <= o->cap)
+    void outUint(usize v)
     {
-        usize i = 0;
-        while (i < n)
+        if (v == 0) { self.pushByte(48); return; }
+        /* emit digits most-significant first: find the largest power of 10 <= v */
+        usize div = 1;
+        while (v / div >= 10) div = div * 10;
+        while (div > 0)
         {
-            o->p[o->len + i] = s[i];
-            i = i + 1;
+            usize d = (v / div) % 10;
+            self.pushByte((u8)(48 + d));
+            div = div / 10;
         }
-        o->len = o->len + n;
     }
-}
-
-void outStr(Out* o, u8* s)
-{
-    if (s == null) return;
-    usize n = 0;
-    while (s[n] != 0) n = n + 1;
-    outBytes(o, s, n);
-}
-
-void outUint(Out* o, usize v)
-{
-    if (v == 0) { outByte(o, 48); return; }
-    /* emit digits most-significant first: find the largest power of 10 <= v */
-    usize div = 1;
-    while (v / div >= 10) div = div * 10;
-    while (div > 0)
+    
+    /* right-align `v` in a field of width `w` */
+    void outPad(usize v, usize w)
     {
-        usize d = (v / div) % 10;
-        outByte(o, (u8)(48 + d));
-        div = div / 10;
+        usize d = 1;
+        usize t = v;
+        while (t >= 10) { t = t / 10; d = d + 1; }
+        while (d < w) { self.pushByte(32); d = d + 1; }
+        self.outUint(v);
     }
-}
 
-/* right-align `v` in a field of width `w` */
-void outPad(Out* o, usize v, usize w)
-{
-    usize d = 1;
-    usize t = v;
-    while (t >= 10) { t = t / 10; d = d + 1; }
-    while (d < w) { outByte(o, 32); d = d + 1; }
-    outUint(o, v);
+    void colorOn(bool use, str seq)
+    {
+        if (!use) return;
+        self.pushByte(27);
+        self.pushView(seq);
+    }
+    
+    void colorOff(bool use)
+    {
+        if (!use) return;
+        self.pushByte(27);
+        self.pushView("[0m");
+    }
 }
 
 usize digits(usize v)
@@ -117,112 +77,83 @@ usize digits(usize v)
 
 /* colouring */
 
-void colorOn(Out* o, bool use, u8* seq)
-{
-    if (!use) return;
-    outByte(o, 27);
-    outStr(o, seq);
-}
-
-void colorOff(Out* o, bool use)
-{
-    if (!use) return;
-    outByte(o, 27);
-    outStr(o, (u8*)"[0m");
-}
-
 /* default help */
 
-u8* strEq(u8* a, u8* b)
+pub str helpFor(str code)
 {
-    /* returns a if equal, else null — used as a chained comparison helper */
-    if (a == null || b == null) return null;
-    usize i = 0;
-    while (a[i] != 0 && b[i] != 0)
-    {
-        if (a[i] != b[i]) return null;
-        i = i + 1;
-    }
-    if (a[i] != b[i]) return null;
-    return a;
-}
-
-pub u8* helpFor(u8* code)
-{
-    if (code == null) return null;
-    if (strEq(code, (u8*)"LEX-0001") != null) return (u8*)"remove the stray character, or escape it if it belongs in a literal";
-    if (strEq(code, (u8*)"LEX-0002") != null) return (u8*)"close the string with a matching quote";
-    if (strEq(code, (u8*)"LEX-0003") != null) return (u8*)"close the character literal with a matching quote";
-    if (strEq(code, (u8*)"LEX-0004") != null) return (u8*)"close the comment with its terminator";
-    if (strEq(code, (u8*)"LEX-0005") != null) return (u8*)"valid escapes are \\n \\r \\t \\\\ \\' \\\" \\0 \\xNN";
-    if (strEq(code, (u8*)"LEX-0006") != null) return (u8*)"use digits in the matching base, then an optional suffix";
-    if (strEq(code, (u8*)"LEX-0007") != null) return (u8*)"this character cannot start a token";
-    if (strEq(code, (u8*)"PAR-0001") != null) return (u8*)"a closing delimiter or required token is missing; check the surrounding grammar";
-    if (strEq(code, (u8*)"PAR-0002") != null) return (u8*)"an expression is required at this position";
-    if (strEq(code, (u8*)"PAR-0003") != null) return (u8*)"a type name is required at this position";
-    if (strEq(code, (u8*)"PAR-0004") != null) return (u8*)"a declaration here must be a function, var, const, struct or a type";
-    if (strEq(code, (u8*)"PAR-0005") != null) return (u8*)"expected a statement";
-    if (strEq(code, (u8*)"PAR-0006") != null) return (u8*)"the file ended before this construct was closed";
-    if (strEq(code, (u8*)"PAR-0007") != null) return (u8*)"only variables, fields and paths can be assigned to";
-    if (strEq(code, (u8*)"PAR-0008") != null) return (u8*)"each modifier (pub, extern, ...) may appear only once";
-    if (strEq(code, (u8*)"PAR-0009") != null) return (u8*)"statements and declarations end with ';'";
-    if (strEq(code, (u8*)"PAR-0010") != null) return (u8*)"conditions must be explicit — move the assignment out of the condition";
-    if (strEq(code, (u8*)"PAR-0011") != null) return (u8*)"an import path is a bare name (sibling file) or a module path such as name::item";
-    if (strEq(code, (u8*)"TC-0001") != null) return (u8*)"check the spelling, or import the module that declares this name";
-    if (strEq(code, (u8*)"TC-0002") != null) return (u8*)"convert one side with an explicit cast, or fix the operand types";
-    if (strEq(code, (u8*)"TC-0003") != null) return (u8*)"check the number and types of arguments against the declaration";
-    if (strEq(code, (u8*)"TC-0004") != null) return (u8*)"rename one of the duplicate declarations";
-    if (strEq(code, (u8*)"TC-0005") != null) return (u8*)"this cast is not allowed between these types";
-    if (strEq(code, (u8*)"TC-0006") != null) return (u8*)"the type has no member with this name";
-    if (strEq(code, (u8*)"TC-0007") != null) return (u8*)"internal type-checker failure — please report this";
-    if (strEq(code, (u8*)"TC-0008") != null) return (u8*)"assign only to variables, fields and elements — constants cannot be reassigned";
-    if (strEq(code, (u8*)"CG-0001") != null) return (u8*)"this construct cannot be lowered to the current target";
-    if (strEq(code, (u8*)"CG-0002") != null) return (u8*)"internal codegen failure — please report this";
-    if (strEq(code, (u8*)"DRV-0001") != null) return (u8*)"check the path, or pass an existing file";
-    if (strEq(code, (u8*)"DRV-0002") != null) return (u8*)"run `coralc --help` for the list of accepted flags";
-    if (strEq(code, (u8*)"DRV-0003") != null) return (u8*)"the compiler could not allocate memory";
-    return null;
+    if (code.len == 0) return str::empty();
+    if (code.equals("L0001")) return "remove the stray character, or escape it if it belongs in a literal";
+    if (code.equals("L0002")) return "close the string with a matching quote";
+    if (code.equals("L0003")) return "close the character literal with a matching quote";
+    if (code.equals("L0004")) return "close the comment with its terminator";
+    if (code.equals("L0005")) return "valid escapes are \\n \\r \\t \\\\ \\' \\\" \\0 \\xNN";
+    if (code.equals("L0006")) return "use digits in the matching base, then an optional suffix";
+    if (code.equals("L0007")) return "this character cannot start a token";
+    if (code.equals("P0001")) return "a closing delimiter or required token is missing; check the surrounding grammar";
+    if (code.equals("P0002")) return "an expression is required at this position";
+    if (code.equals("P0003")) return "a type name is required at this position";
+    if (code.equals("P0004")) return "a declaration here must be a function, var, const, struct or a type";
+    if (code.equals("P0005")) return "expected a statement";
+    if (code.equals("P0006")) return "the file ended before this construct was closed";
+    if (code.equals("P0007")) return "only variables, fields and paths can be assigned to";
+    if (code.equals("P0008")) return "each modifier (pub, extern, ...) may appear only once";
+    if (code.equals("P0009")) return "statements and declarations end with ';'";
+    if (code.equals("P0010")) return "conditions must be explicit — move the assignment out of the condition";
+    if (code.equals("P0011")) return "an import path is a bare name (sibling file) or a module path such as name::item";
+    if (code.equals("T0001")) return "check the spelling, or import the module that declares this name";
+    if (code.equals("T0002")) return "convert one side with an explicit cast, or fix the operand types";
+    if (code.equals("T0003")) return "check the number and types of arguments against the declaration";
+    if (code.equals("T0004")) return "rename one of the duplicate declarations";
+    if (code.equals("T0005")) return "this cast is not allowed between these types";
+    if (code.equals("T0006")) return "the type has no member with this name";
+    if (code.equals("T0007")) return "internal type-checker failure — please report this";
+    if (code.equals("T0008")) return "assign only to variables, fields and elements — constants cannot be reassigned";
+    if (code.equals("G0001")) return "this construct cannot be lowered to the current target";
+    if (code.equals("G0002")) return "internal codegen failure — please report this";
+    if (code.equals("D0001")) return "check the path, or pass an existing file";
+    if (code.equals("D0002")) return "run `coralc --help` for the list of accepted flags";
+    if (code.equals("D0003")) return "the compiler could not allocate memory";
+    return str::empty();
 }
 
 /*  render */
 
-pub void render(u8* code, u8* level, u8* msg,
-                u8* file, usize fileLen,
-                usize line, usize col,
-                u8* prevText, usize prevTextLen, usize prevLineNo,
-                u8* lineText, usize lineTextLen, u8* help)
+pub void render(str code, str level, str msg,
+                str file, usize line, usize col,
+                str prevText, usize prevLineNo,
+                str lineText, str help)
 {
-    if (msg == null) msg = (u8*)"diagnostic";
-    if (level == null) level = (u8*)"error";
-    if (code == null) code = (u8*)"";
-    bool hasLoc = file != null;
-    if (file == null) { file = (u8*)"unknown"; fileLen = 7; }
-    if (help == null) help = helpFor(code);
+    if (msg.len == 0) msg = "diagnostic";
+    if (level.len == 0) level = "error";
+    if (code.len == 0) code = "";
+    bool hasLoc = file.len > 0;
+    if (file.len == 0) file = "unknown";
+    if (help.len == 0) help = helpFor(code);
 
     bool use = isatty(2) == 1;
-    bool hasCode = code[0] != 0;
+    bool hasCode = code.len > 0;
 
-    Out o;
-    outInit(&o);
+    String o = String::new();
 
     /* header: error[CODE]: message */
-    u8* lvlSeq = (u8*)"[1;31m";
-    if (level[0] == 119) lvlSeq = (u8*)"[33m";       /* w... = warning */
-    else if (level[0] != 101) lvlSeq = (u8*)"[36m";  /* note / other */
-    colorOn(&o, use, lvlSeq);
-    outStr(&o, level);
-    colorOff(&o, use);
-    if (hasCode)
-    {
-        colorOn(&o, use, (u8*)"[35m");
-        outByte(&o, 91);
-        outStr(&o, code);
-        outByte(&o, 93);
-        colorOff(&o, use);
+    str lvlSeq = "[1;31m";
+    if (level.ptr[0] == 119) lvlSeq = "[33m";       /* w... = warning */
+    else if (level.ptr[0] != 101) lvlSeq = "[36m";  /* note / other */
+    o.colorOn(use, lvlSeq);
+    o.outBytes(level);
+    o.colorOff(use);
+    
+    if (hasCode) {
+        o.colorOn(use, "[35m");
+        o.pushByte(91);
+        o.outBytes(code);
+        o.pushByte(93);
+        o.colorOff(use);
     }
-    outStr(&o, (u8*)": ");
-    outStr(&o, msg);
-    outByte(&o, 10);
+    
+    o.outBytes(": ");
+    o.outBytes(msg);
+    o.pushByte(10);
 
     usize caretSpaces = 0;
     usize s = 0;
@@ -230,20 +161,20 @@ pub void render(u8* code, u8* level, u8* msg,
     /* location line */
     if (hasLoc)
     {
-    colorOn(&o, use, (u8*)"[90m");
-    outStr(&o, (u8*)"  ┌─► ");
-    colorOff(&o, use);
-    outBytes(&o, file, fileLen);
-    outByte(&o, 58);
-    outUint(&o, line);
-    outByte(&o, 58);
-    outUint(&o, col);
-    outByte(&o, 10);
+    o.colorOn(use, "[90m");
+    o.outBytes("  ┌─► ");
+    o.colorOff(use);
+    o.outBytes(file);
+    o.pushByte(58);
+    o.outUint(line);
+    o.pushByte(58);
+    o.outUint(col);
+    o.pushByte(10);
 
     /* blank gutter */
-    colorOn(&o, use, (u8*)"[90m");
-    outStr(&o, (u8*)"  │\n");
-    colorOff(&o, use);
+    o.colorOn(use, "[90m");
+    o.outBytes("  │\n");
+    o.colorOff(use);
 
     /* source context: the line before (if any) and the error line */
     usize numW = digits(line);
@@ -254,61 +185,61 @@ pub void render(u8* code, u8* level, u8* msg,
     }
     if (numW < 2) numW = 2;
 
-    if (prevLineNo != 0 && prevText != null && prevTextLen > 0)
+    if (prevLineNo != 0 && prevText.len > 0)
     {
-        colorOn(&o, use, (u8*)"[90m");
-        outStr(&o, (u8*)"  │ ");
-        colorOff(&o, use);
+        o.colorOn(use, "[90m");
+        o.outBytes("  │ ");
+        o.colorOff(use);
         outPad(&o, prevLineNo, numW);
-        colorOn(&o, use, (u8*)"[90m");
-        outStr(&o, (u8*)" │ ");
-        colorOff(&o, use);
-        outBytes(&o, prevText, prevTextLen);
-        outByte(&o, 10);
+        o.colorOn(use, "[90m");
+        o.outBytes(" │ ");
+        o.colorOff(use);
+        o.outBytes(prevText);
+        o.pushByte(10);
     }
 
-    colorOn(&o, use, (u8*)"[90m");
-    outStr(&o, (u8*)"  │ ");
-    colorOff(&o, use);
+    o.colorOn(use, "[90m");
+    o.outBytes("  │ ");
+    o.colorOff(use);
     outPad(&o, line, numW);
-    colorOn(&o, use, (u8*)"[90m");
-    outStr(&o, (u8*)" │ ");
-    colorOff(&o, use);
-    if (lineText != null && lineTextLen > 0) outBytes(&o, lineText, lineTextLen);
-    outByte(&o, 10);
+    o.colorOn(use, "[90m");
+    o.outBytes(" │ ");
+    o.colorOff(use);
+    if (lineText.len > 0) o.outBytes(lineText);
+    o.pushByte(10);
 
     /* caret under the error column — the source line starts at 4 + numW + 3 */
     usize prefixLen = 4 + numW + 3;
     if (prefixLen + col > 4) caretSpaces = prefixLen + col - 4;
-    colorOn(&o, use, (u8*)"[90m");
-    outStr(&o, (u8*)"  |");
-    colorOff(&o, use);
+    o.colorOn(use, "[90m");
+    o.outBytes("  |");
+    o.colorOff(use);
     s = 0;
-    while (s < caretSpaces) { outByte(&o, 32); s = s + 1; }
-    colorOn(&o, use, (u8*)"[1;31m");
-    outStr(&o, (u8*)"▲");
-    colorOff(&o, use);
-    outByte(&o, 10);
+    while (s < caretSpaces) { o.pushByte(32); s = s + 1; }
+    o.colorOn(use, "[1;31m");
+    o.outBytes("▲");
+    o.colorOff(use);
+    o.pushByte(10);
     }
 
     /* help line */
-    if (help != null)
+    if (help.len > 0)
     {
         if (hasLoc)
         {
-            colorOn(&o, use, (u8*)"[90m");
-            outStr(&o, (u8*)"  │");
-            colorOff(&o, use);
+            o.colorOn(use, "[90m");
+            o.outBytes("  │");
+            o.colorOff(use);
             s = 0;
-            while (s < caretSpaces) { outByte(&o, 32); s = s + 1; }
-            colorOn(&o, use, (u8*)"[90m");
-            outStr(&o, (u8*)"╰─ ");
-            colorOff(&o, use);
+            while (s < caretSpaces) { o.pushByte(32); s = s + 1; }
+            o.colorOn(use, "[90m");
+            o.outBytes("╰─ ");
+            o.colorOff(use);
         }
-        colorOn(&o, use, (u8*)"[36m");
-        outStr(&o, help);
-        colorOff(&o, use);
-        outByte(&o, 10);
+        o.colorOn(use, "[36m");
+        o.outBytes(help);
+        o.colorOff(use);
+        o.pushByte(10);
     }
 
     /* explain line */
@@ -316,23 +247,22 @@ pub void render(u8* code, u8* level, u8* msg,
     {
         if (hasLoc)
         {
-            colorOn(&o, use, (u8*)"[90m");
-            outStr(&o, (u8*)"  │");
-            colorOff(&o, use);
+            o.colorOn(use, "[90m");
+            o.outBytes("  │");
+            o.colorOff(use);
             s = 0;
-            while (s < caretSpaces) { outByte(&o, 32); s = s + 1; }
-            colorOn(&o, use, (u8*)"[90m");
-            outStr(&o, (u8*)"╰─ ");
-            colorOff(&o, use);
+            while (s < caretSpaces) { o.pushByte(32); s = s + 1; }
+            o.colorOn(use, "[90m");
+            o.outBytes("╰─ ");
+            o.colorOff(use);
         }
-        colorOn(&o, use, (u8*)"[90m");
-        outStr(&o, (u8*)"try `coralc --explain ");
-        outStr(&o, code);
-        outStr(&o, (u8*)"` for more information");
-        colorOff(&o, use);
-        outByte(&o, 10);
+        o.colorOn(use, "[90m");
+        o.outBytes("try `coralc --explain ");
+        o.outBytes(code);
+        o.outBytes("` for more information");
+        o.colorOff(use);
+        o.pushByte(10);
     }
 
-    write(2, o.p, o.len);
-    if (o.p != null) free((rawptr)o.p);
+    write(2, o.ptr, o.len);
 }

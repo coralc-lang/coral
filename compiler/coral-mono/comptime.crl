@@ -413,7 +413,7 @@ pub extend CtEval
      * time), so type switches resolve the name here — Zig-style, at
      * comptime: builtin keywords, named types, and the `const T*` / `T*`
      * source-text forms resolve as types; anything unresolvable falls
-     * back to Rust-style trait matching (`any toStr` → the receiver
+     * back to Rust-style trait matching (`rerooted toStr` → the receiver
      * implements a `toStr` method). */
     bool strBytes(Str s, u8** outPtr, usize* outLen)
     {
@@ -591,7 +591,7 @@ pub extend CtEval
     /* the Ty a name-like switch pattern denotes, spelled exactly (leading
      * `const`, trailing `*`s and `[]` included) — 0 when the name does not
      * resolve to a type. `*plain` reports a bare, undecorated name (the
-     * shape a trait pattern like `any toStr` must have). */
+     * shape a trait pattern like `rerooted toStr` must have). */
     Ty typeFromNameText(Str name, SourceLoc loc, bool* plain)
     {
         *plain = false;
@@ -644,7 +644,7 @@ pub extend CtEval
         Ty base = self.typeFromNameText(name, loc, &plain);
         if (base == 0)
         {
-            /* trait pattern: `any toStr` / a bare trait-name arm — the
+            /* trait pattern: `rerooted toStr` / a bare trait-name arm — the
              * receiver implements the method */
             if (plain)
             {
@@ -970,12 +970,12 @@ pub extend CtEval
              * re-rooted (the caller emits it); an unchanged runtime call
              * returns none so the normal emit path handles it. */
             CtVal rv = self.evalExpr(callee->kind.payload.Field.obj);
-            bool any = false;
+            bool rerooted = false;
             NodeId newObj = callee->kind.payload.Field.obj;
             if (rv.kind == 5 && rv.rid.index != 0 && rv.rid.index != newObj.index)
             {
                 newObj = rv.rid;
-                any = true;
+                rerooted = true;
             }
             u32 al = e->kind.payload.Call.argsLen;
             NodeId* newArgs = null;
@@ -993,18 +993,18 @@ pub extend CtEval
                         if (av.kind == 5 && av.rid.index != 0 && av.rid.index != an.index)
                         {
                             newArgs[j] = av.rid;
-                            any = true;
+                            rerooted = true;
                         }
                         else if (av.kind == 1 || av.kind == 2)
                         {
                             NodeId nn = self.valToNode(av);
-                            if (nn.index != 0 && nn.index != an.index) { newArgs[j] = nn; any = true; }
+                            if (nn.index != 0 && nn.index != an.index) { newArgs[j] = nn; rerooted = true; }
                         }
                         j = j + 1;
                     }
                 }
             }
-            if (!any)
+            if (!rerooted)
             {
                 if (newArgs != null) free((rawptr)newArgs);
                 return self.makeNone();
@@ -1153,7 +1153,7 @@ pub extend CtEval
                         /* infer a generic type param from this argument so
                          * the callee's `switch (@typeof(T))` folds on the
                          * argument's own type (`_fprintOne<comptime T>(out,
-                         * val)` → T = typeof(val)); the binding shadows any
+                         * val)` → T = typeof(val)); the binding shadows rerooted
                          * same-named outer binding for the callee frame */
                         if (pi < argc)
                         {
@@ -1243,12 +1243,12 @@ pub extend CtEval
     {
         if (e->kind.tag != ExprKind::MethodCall) return self.makeNone();
         CtVal rv = self.evalExpr(e->kind.payload.MethodCall.receiver);
-        bool any = false;
+        bool rerooted = false;
         NodeId newObj = e->kind.payload.MethodCall.receiver;
         if (rv.kind == 5 && rv.rid.index != 0 && rv.rid.index != newObj.index)
         {
             newObj = rv.rid;
-            any = true;
+            rerooted = true;
         }
         u32 al = e->kind.payload.MethodCall.argsLen;
         NodeId* newArgs = null;
@@ -1266,18 +1266,18 @@ pub extend CtEval
                     if (av.kind == 5 && av.rid.index != 0 && av.rid.index != an.index)
                     {
                         newArgs[j] = av.rid;
-                        any = true;
+                        rerooted = true;
                     }
                     else if (av.kind == 1 || av.kind == 2)
                     {
                         NodeId nn = self.valToNode(av);
-                        if (nn.index != 0 && nn.index != an.index) { newArgs[j] = nn; any = true; }
+                        if (nn.index != 0 && nn.index != an.index) { newArgs[j] = nn; rerooted = true; }
                     }
                     j = j + 1;
                 }
             }
         }
-        if (!any)
+        if (!rerooted)
         {
             if (newArgs != null) free((rawptr)newArgs);
             return self.makeRt(id, e->resolvedType);
@@ -1523,7 +1523,7 @@ pub extend CtEval
             },
             StmtKind::Break, StmtKind::Continue => {
                 /* inside an unrolled comptime loop the flag halts the body;
-                 * the loop owner clears it. outside any loop keep it
+                 * the loop owner clears it. outside rerooted loop keep it
                  * as runtime code */
                 if (self.loopDepth > 0)
                 {
@@ -1773,7 +1773,7 @@ pub extend CtEval
                 {
                     NodeId toEmit = eid;
                     u32 al = e->kind.payload.Call.argsLen;
-                    bool any = false;
+                    bool rerooted = false;
                     NodeId* newArgs = null;
                     if (al > 0) newArgs = (NodeId*)calloc((usize)al, @sizeof(NodeId));
                     if (newArgs != null)
@@ -1801,7 +1801,7 @@ pub extend CtEval
                                         if (nnp != null && nnp->kind.tag == NodeKind::Expr && ort != 0)
                                             nnp->kind.payload.Expr.value.resolvedType = ort;
                                         newArgs[j] = nn;
-                                        any = true;
+                                        rerooted = true;
                                     }
                                 }
                                 else if (av.kind == 3)
@@ -1811,7 +1811,7 @@ pub extend CtEval
                                      * str slice) */
                                     Ty ort = anp->kind.payload.Expr.value.resolvedType;
                                     NodeId nn = self.mkStrLitTy(av.sptr, av.slen, ort);
-                                    if (nn.index != 0) { newArgs[j] = nn; any = true; }
+                                    if (nn.index != 0) { newArgs[j] = nn; rerooted = true; }
                                 }
                                 else if (av.kind == 5 && av.rid.index != 0 && av.rid.index != an.index)
                                 {
@@ -1821,13 +1821,13 @@ pub extend CtEval
                                      * caller-side node so the reference
                                      * resolves */
                                     newArgs[j] = av.rid;
-                                    any = true;
+                                    rerooted = true;
                                 }
                             }
                             j = j + 1;
                         }
                     }
-                    if (any)
+                    if (rerooted)
                     {
                         ExprKind nk = ExprKind::Call{
                             .callee = e->kind.payload.Call.callee,
@@ -2204,7 +2204,7 @@ pub extend CtEval
                 e0 = e0 + 1;
             }
             /* pass 2: loose matching — alias/underlying resolution,
-             * usize≡u64, trait arms (`any toStr`), type params */
+             * usize≡u64, trait arms (`rerooted toStr`), type params */
             u32 i = 0;
             while (i < s->kind.payload.Switch.casesLen)
             {
@@ -2449,7 +2449,7 @@ pub extend CtEval
     }
 }
 
-/* the entry: evaluate a comptime block (or any stmt list) with the given
+/* the entry: evaluate a comptime block (or rerooted stmt list) with the given
  * bindings already installed; returns emitted runtime stmts in ct.emitted */
 pub void ctEvalStmts(CtEval* ct, NodeId* stmts, u32 stmtsLen)
 {

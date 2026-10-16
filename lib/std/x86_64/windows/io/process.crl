@@ -1,6 +1,8 @@
 import(lib) std::vec { Vec };
 import(lib) std::mman { alloc, dealloc, zero };
-import(lib) platform::win32 { ReadFile, WriteFile, CloseHandle, ExitProcess, WaitForSingleObject, CreatePipe, CreateProcessA, SetHandleInformation, GetExitCodeProcess, PeekNamedPipe };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
+import(lib) platform::win32 { ReadFile, WriteFile, CloseHandle, ExitProcess, WaitForSingleObject, CreatePipe, CreateProcessA, SetHandleInformation, GetExitCodeProcess, PeekNamedPipe, GetLastError };
 
 // POSIX process model -> Win32, pipes + CreateProcessA.
 
@@ -147,7 +149,7 @@ i32 _drainPipe(rawptr h, u8* buf, usize cap)
 
 // fork+dup2+execvp -> one CreateProcessA, three pipes, child ends
 // inheritable into STARTUPINFOA's std handles.
-pub Process spawn(str cmd, Vec<str>* args)
+pub Result<Process, IoError> spawn(str cmd, Vec<str>* args)
 {
     rawptr stdinRead = null;
     rawptr stdinWrite = null;
@@ -167,13 +169,15 @@ pub Process spawn(str cmd, Vec<str>* args)
         !CreatePipe(&stdoutRead, &stdoutWrite, (rawptr)&sa, 0) ||
         !CreatePipe(&stderrRead, &stderrWrite, (rawptr)&sa, 0))
     {
+        // capture before CloseHandle overwrites the last-error slot
+        u32 code = GetLastError();
         if (stdinRead != null) CloseHandle(stdinRead);
         if (stdinWrite != null) CloseHandle(stdinWrite);
         if (stdoutRead != null) CloseHandle(stdoutRead);
         if (stdoutWrite != null) CloseHandle(stdoutWrite);
         if (stderrRead != null) CloseHandle(stderrRead);
         if (stderrWrite != null) CloseHandle(stderrWrite);
-        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
+        return Result<Process, IoError>::Err { .error = IoError::Os { .code = (i32)code, .op = "CreatePipe" } };
     }
 
     // CreatePipe marks both ends inheritable — clear HANDLE_FLAG_INHERIT
@@ -182,10 +186,11 @@ pub Process spawn(str cmd, Vec<str>* args)
         !SetHandleInformation(stdoutRead, HANDLE_FLAG_INHERIT, 0) ||
         !SetHandleInformation(stderrRead, HANDLE_FLAG_INHERIT, 0))
     {
+        u32 code = GetLastError();
         CloseHandle(stdinRead); CloseHandle(stdinWrite);
         CloseHandle(stdoutRead); CloseHandle(stdoutWrite);
         CloseHandle(stderrRead); CloseHandle(stderrWrite);
-        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
+        return Result<Process, IoError>::Err { .error = IoError::Os { .code = (i32)code, .op = "SetHandleInformation" } };
     }
 
     // execvp(program, argv) -> lpApplicationName + a command line built
@@ -229,10 +234,11 @@ pub Process spawn(str cmd, Vec<str>* args)
 
     if (!ok)
     {
+        u32 code = GetLastError();
         CloseHandle(stdinRead); CloseHandle(stdinWrite);
         CloseHandle(stdoutRead); CloseHandle(stdoutWrite);
         CloseHandle(stderrRead); CloseHandle(stderrWrite);
-        return Process { .pid = -1, .hProcess = null, .stdinFd = null, .stdoutFd = null, .stderrFd = null };
+        return Result<Process, IoError>::Err { .error = IoError::Os { .code = (i32)code, .op = "CreateProcessA" } };
     }
 
     // the child keeps its own inherited copies of the child ends; the
@@ -242,27 +248,33 @@ pub Process spawn(str cmd, Vec<str>* args)
     CloseHandle(stderrWrite);
     CloseHandle(pi.hThread);
 
-    return Process {
-        .pid = (i32)pi.dwProcessId,
-        .hProcess = pi.hProcess,
-        .stdinFd = stdinWrite,
-        .stdoutFd = stdoutRead,
-        .stderrFd = stderrRead
+    return Result<Process, IoError>::Ok {
+        .value = Process {
+            .pid = (i32)pi.dwProcessId,
+            .hProcess = pi.hProcess,
+            .stdinFd = stdinWrite,
+            .stdoutFd = stdoutRead,
+            .stderrFd = stderrRead
+        }
     };
 }
 
-pub ProcessResult waitFor(Process* p)
+pub Result<ProcessResult, IoError> waitFor(Process* p)
 {
     if (p->hProcess == null) {
-        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
+        // already waited (or spawn never produced a handle) — like
+        // waitpid's ECHILD on a reaped pid, but with no errno to give.
+        return Result<ProcessResult, IoError>::Err { .error = IoError::BadUsage { .msg = "process already waited" } };
     }
     // waitpid -> WaitForSingleObject(INFINITE) + GetExitCodeProcess.
     u32 wr = WaitForSingleObject(p->hProcess, INFINITE);
     if (wr != WAIT_OBJECT_0) {
-        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
+        return Result<ProcessResult, IoError>::Err { .error = IoError::Os { .code = (i32)GetLastError(), .op = "WaitForSingleObject" } };
     }
     u32 code = 0;
     bool got = GetExitCodeProcess(p->hProcess, &code);
+    // capture before the CloseHandle calls below overwrite the slot
+    u32 errCode = GetLastError();
     _closeIoFd(&p->stdinFd);
     _closeIoFd(&p->stdoutFd);
     _closeIoFd(&p->stderrFd);
@@ -272,41 +284,45 @@ pub ProcessResult waitFor(Process* p)
     p->hProcess = null;
     if (!got)
     {
-        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
+        return Result<ProcessResult, IoError>::Err { .error = IoError::Os { .code = (i32)errCode, .op = "GetExitCodeProcess" } };
     }
     // FLAG, no wait-status word on Win32 — signaled/termSignal stay 0,
     // the raw exit code carries everything.
-    return ProcessResult { .exitCode = (i32)code, .signaled = false, .termSignal = 0 };
+    return Result<ProcessResult, IoError>::Ok { .value = ProcessResult { .exitCode = (i32)code, .signaled = false, .termSignal = 0 } };
 }
 
-pub isize writeStdin(Process* p, const cchar* data, usize len)
+pub Result<isize, IoError> writeStdin(Process* p, const cchar* data, usize len)
 {
-    if (p->stdinFd == null) return -1;
+    if (p->stdinFd == null) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "pipe closed" } };
     u32 written = 0;
-    if (!WriteFile(p->stdinFd, data, (u32)len, &written, null)) return -1;
-    return (isize)written;
+    if (!WriteFile(p->stdinFd, data, (u32)len, &written, null))
+        return Result<isize, IoError>::Err { .error = IoError::os("WriteFile") };
+    return Result<isize, IoError>::Ok { .value = (isize)written };
 }
 
-pub isize readStdout(Process* p, u8* buf, usize maxLen)
+pub Result<isize, IoError> readStdout(Process* p, u8* buf, usize maxLen)
 {
-    if (p->stdoutFd == null) return -1;
+    if (p->stdoutFd == null) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "pipe closed" } };
     u32 n = 0;
-    if (!ReadFile(p->stdoutFd, (cchar*)buf, (u32)maxLen, &n, null)) return -1;
-    return (isize)n;
+    if (!ReadFile(p->stdoutFd, (cchar*)buf, (u32)maxLen, &n, null))
+        return Result<isize, IoError>::Err { .error = IoError::os("ReadFile") };
+    return Result<isize, IoError>::Ok { .value = (isize)n };
 }
 
-pub isize readStderr(Process* p, u8* buf, usize maxLen)
+pub Result<isize, IoError> readStderr(Process* p, u8* buf, usize maxLen)
 {
-    if (p->stderrFd == null) return -1;
+    if (p->stderrFd == null) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "pipe closed" } };
     u32 n = 0;
-    if (!ReadFile(p->stderrFd, (cchar*)buf, (u32)maxLen, &n, null)) return -1;
-    return (isize)n;
+    if (!ReadFile(p->stderrFd, (cchar*)buf, (u32)maxLen, &n, null))
+        return Result<isize, IoError>::Err { .error = IoError::os("ReadFile") };
+    return Result<isize, IoError>::Ok { .value = (isize)n };
 }
 
-pub i32 run(str cmd, Vec<str>* args)
+pub Result<i32, IoError> run(str cmd, Vec<str>* args)
 {
-    Process p = spawn(cmd, args);
-    if (p.pid < 0) return -1;
+    Result<Process, IoError> sr = spawn(cmd, args);
+    if (sr.isErr()) return Result<i32, IoError>::Err { .error = sr.unwrapErr() };
+    Process p = sr.unwrap();
     _closeIoFd(&p.stdinFd);
     // the old poll() loop, ported, neither pipe waited on while the
     // other fills. PeekNamedPipe = poll, wait(0) = child exit, remainder
@@ -333,8 +349,9 @@ pub i32 run(str cmd, Vec<str>* args)
         }
         if (!gotData && !exited) WaitForSingleObject(p.hProcess, 1);
     }
-    ProcessResult r = waitFor(&p);
-    return r.exitCode;
+    Result<ProcessResult, IoError> wr = waitFor(&p);
+    if (wr.isErr()) return Result<i32, IoError>::Err { .error = wr.unwrapErr() };
+    return Result<i32, IoError>::Ok { .value = wr.unwrap().exitCode };
 }
 
 pub void exit(i32 code)

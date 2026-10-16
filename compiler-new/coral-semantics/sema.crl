@@ -196,16 +196,16 @@ pub extend Sema
         self.errors = self.errors + 1;
     }
 
-    void semaError(ErrorCode code, SourceLoc loc, u8* msg)
+    void semaError(ErrorCode code, SourceLoc loc, str msg)
     {
         self.addError();
         if (self.diag == null) return;
-        self.diag.emitError(code, loc, msg, null);
+        self.diag.emitError(code, loc, msg, "");
     }
 
     /* emit a diagnostic without counting again — used when the failing
      * operation (e.g. scopes.declare) already incremented the counter */
-    void semaErrorCounted(ErrorCode code, NodeId id, u8* msg)
+    void semaErrorCounted(ErrorCode code, NodeId id, str msg)
     {
         if (self.diag == null) return;
         SourceLoc loc;
@@ -215,10 +215,10 @@ pub extend Sema
             Node* node = self.ctx.nodes + id.index;
             loc = node->loc;
         }
-        self.diag.emitError(code, loc, msg, null);
+        self.diag.emitError(code, loc, msg, "");
     }
 
-    void semaErrorNode(ErrorCode code, NodeId id, u8* msg)
+    void semaErrorNode(ErrorCode code, NodeId id, str msg)
     {
         SourceLoc loc;
         loc.data = 0;
@@ -230,41 +230,33 @@ pub extend Sema
         self.semaError(code, loc, msg);
     }
 
-    /* "<prefix><interned name>" as a fresh cstr — diagnostics name the
-     * offending identifier instead of a bare generic message */
-    u8* nameMsg(u8* prefix, Str name)
+    /* "<prefix><interned name>" — diagnostics name the offending
+     * identifier instead of a bare generic message */
+    str nameMsg(str prefix, Str name)
     {
-        usize pl = 0;
-        while (prefix[pl] != 0) pl = pl + 1;
         InternEntry* ie = self.ctx.interns + name;
-        u8* m = (u8*)malloc(pl + ie->len + 1);
+        u8* m = (u8*)malloc(prefix.len + ie->len);
         if (m == null) return prefix;
         usize i = 0;
-        while (i < pl) { m[i] = prefix[i]; i = i + 1; }
+        while (i < prefix.len) { m[i] = prefix.ptr[i]; i = i + 1; }
         i = 0;
-        while (i < ie->len) { m[pl + i] = ie->ptr[i]; i = i + 1; }
-        m[pl + ie->len] = 0;
-        return m;
+        while (i < ie->len) { m[prefix.len + i] = ie->ptr[i]; i = i + 1; }
+        return str::fromParts(m, prefix.len + ie->len);
     }
 
-    /* "<prefix><interned name><suffix>" as a fresh cstr */
-    u8* nameMsgS(u8* prefix, Str name, u8* suffix)
+    /* "<prefix><interned name><suffix>" */
+    str nameMsgS(str prefix, Str name, str suffix)
     {
-        usize pl = 0;
-        while (prefix[pl] != 0) pl = pl + 1;
-        usize sl = 0;
-        while (suffix[sl] != 0) sl = sl + 1;
         InternEntry* ie = self.ctx.interns + name;
-        u8* m = (u8*)malloc(pl + ie->len + sl + 1);
+        u8* m = (u8*)malloc(prefix.len + ie->len + suffix.len);
         if (m == null) return prefix;
         usize i = 0;
-        while (i < pl) { m[i] = prefix[i]; i = i + 1; }
+        while (i < prefix.len) { m[i] = prefix.ptr[i]; i = i + 1; }
         i = 0;
-        while (i < ie->len) { m[pl + i] = ie->ptr[i]; i = i + 1; }
+        while (i < ie->len) { m[prefix.len + i] = ie->ptr[i]; i = i + 1; }
         i = 0;
-        while (i < sl) { m[pl + ie->len + i] = suffix[i]; i = i + 1; }
-        m[pl + ie->len + sl] = 0;
-        return m;
+        while (i < suffix.len) { m[prefix.len + ie->len + i] = suffix.ptr[i]; i = i + 1; }
+        return str::fromParts(m, prefix.len + ie->len + suffix.len);
     }
 
     /* append to a fixed diagnostic buffer (truncates, never overflows) */
@@ -406,11 +398,11 @@ pub extend Sema
     }
 
     /* "argument `name`: got `<from>`, expected `<to>`" */
-    u8* paramMismatchMsg(Str paramName, Ty fromTy, Ty toTy)
+    str paramMismatchMsg(Str paramName, Ty fromTy, Ty toTy)
     {
         u8* fb = (u8*)malloc(128);
         u8* tb = (u8*)malloc(128);
-        if (fb == null || tb == null) return (u8*)"argument type mismatch";
+        if (fb == null || tb == null) return "argument type mismatch";
         self.tySpelling(fromTy, fb, 128);
         self.tySpelling(toTy, tb, 128);
         InternEntry* pe = self.ctx.interns + paramName;
@@ -419,7 +411,7 @@ pub extend Sema
         usize tl = 0;
         while (tb[tl] != 0) tl = tl + 1;
         u8* m = (u8*)malloc(pe->len + fl + tl + 40);
-        if (m == null) { free(fb); free(tb); return (u8*)"argument type mismatch"; }
+        if (m == null) { free(fb); free(tb); return "argument type mismatch"; }
         usize n = 0;
         usize i = 0;
         u8* p1 = (u8*)"argument `";
@@ -438,23 +430,20 @@ pub extend Sema
         i = 0;
         while (i < tl) { m[n] = tb[i]; n = n + 1; i = i + 1; }
         m[n] = 96; n = n + 1;
-        m[n] = 0;
         free(fb);
         free(tb);
-        return m;
+        return str::fromParts(m, n);
     }
 
-    /* "<what>: got `<from>`, expected `<to>`" — frees nothing; caller
-     * passes the result straight to semaErrorNode (engine copies it) */
-    u8* typeMismatchMsg(u8* what, Ty fromTy, Ty toTy)
+    /* "<what>: got `<from>`, expected `<to>`" */
+    str typeMismatchMsg(str what, Ty fromTy, Ty toTy)
     {
         u8* fb = (u8*)malloc(128);
         u8* tb = (u8*)malloc(128);
         if (fb == null || tb == null) return what;
         self.tySpelling(fromTy, fb, 128);
         self.tySpelling(toTy, tb, 128);
-        usize wl = 0;
-        while (what[wl] != 0) wl = wl + 1;
+        usize wl = what.len;
         usize fl = 0;
         while (fb[fl] != 0) fl = fl + 1;
         usize tl = 0;
@@ -463,7 +452,7 @@ pub extend Sema
         if (m == null) { free(fb); free(tb); return what; }
         usize n = 0;
         usize i = 0;
-        while (i < wl) { m[n] = what[i]; n = n + 1; i = i + 1; }
+        while (i < wl) { m[n] = what.ptr[i]; n = n + 1; i = i + 1; }
         u8* mid = (u8*)": got `";
         i = 0;
         while (mid[i] != 0) { m[n] = mid[i]; n = n + 1; i = i + 1; }
@@ -475,22 +464,21 @@ pub extend Sema
         i = 0;
         while (i < tl) { m[n] = tb[i]; n = n + 1; i = i + 1; }
         m[n] = 96; n = n + 1;
-        m[n] = 0;
         free(fb);
         free(tb);
-        return m;
+        return str::fromParts(m, n);
     }
 
     /* duplicate declaration: name it and note where the first one is */
     void dupDeclDiag(Str name, NodeId id)
     {
         self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id,
-            self.nameMsgS((u8*)"duplicate declaration of `", name, (u8*)"`"));
+            self.nameMsgS("duplicate declaration of `", name, "`"));
         if (self.scopes.dupSymbol != null && self.scopes.dupSymbol->declaration.index != 0 && self.diag != null)
         {
             Node* prev = self.ctx.nodes + self.scopes.dupSymbol->declaration.index;
             self.diag.emitNote(ErrorCode::SemaDuplicateDecl, prev->loc,
-                self.nameMsgS((u8*)"previous declaration of `", name, (u8*)"` is here"), null);
+                self.nameMsgS("previous declaration of `", name, "` is here"), "");
         }
     }
 }

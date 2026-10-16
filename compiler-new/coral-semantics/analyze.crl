@@ -272,7 +272,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         /* existence probe only — the file is re-read by the loader later,
          * and nothing here interns into this buffer, so it can be freed */
         usize len = 0;
-        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, ".crl", 4);
+        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)".crl", 4);
         if (cand != null)
         {
             u8* buf = libRead(cand, &len);
@@ -283,7 +283,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
             }
             free(cand);
         }
-        cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "/lib.crl", 8);
+        cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"/lib.crl", 8);
         if (cand != null)
         {
             u8* buf = libRead(cand, &len);
@@ -296,10 +296,10 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         }
         return null;
     }
-    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "", 0);
+    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"", 0);
     if (sub == null) return null;
     usize subLen = dirLen + 1 + segs[0].len;
-    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, "/lib.crl", 8);
+    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"/lib.crl", 8);
     if (mpath != null)
     {
         usize mlen = 0;
@@ -382,6 +382,37 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
             }
             mi = mi + 1;
         }
+        /* bare file name: `import io` finds the first registered
+         * `folder::io` (the bootstrap searches module dirs in sorted
+         * order; the table lists module files in that same order) */
+        bool bareName = true;
+        usize bq = 0;
+        while (bq + 1 < nsLen)
+        {
+            if (nsPtr[bq] == 58 && nsPtr[bq + 1] == 58) { bareName = false; break; }
+            bq = bq + 1;
+        }
+        if (bareName && nsLen > 0)
+        {
+            mi = 0;
+            while (mi < L->modLen)
+            {
+                Slice key = L->modKeys[mi];
+                if (key.len > nsLen + 2 &&
+                    key.ptr[key.len - nsLen - 2] == 58 && key.ptr[key.len - nsLen - 1] == 58 &&
+                    libBytesEq(key.ptr + (key.len - nsLen), nsLen, nsPtr, nsLen))
+                {
+                    Slice mv = L->modVals[mi];
+                    u8* copy = (u8*)malloc(mv.len + 1);
+                    if (copy == null) return null;
+                    usize vi = 0;
+                    while (vi < mv.len) { copy[vi] = mv.ptr[vi]; vi = vi + 1; }
+                    copy[mv.len] = 0;
+                    return copy;
+                }
+                mi = mi + 1;
+            }
+        }
     }
     u32 maxSegs = 1;
     usize i = 0;
@@ -398,10 +429,10 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     if (base != null)
     {
         usize bl = libLen(base);
-        u8* up = libCandidate(base, bl, "..", 2, "/..", 3);
+        u8* up = libCandidate(base, bl, (u8*)"..", 2, (u8*)"/..", 3);
         if (up != null)
         {
-            u8* root1 = libCandidate(up, libLen(up), "lib", 3, "", 0);
+            u8* root1 = libCandidate(up, libLen(up), (u8*)"lib", 3, (u8*)"", 0);
             if (root1 != null)
             {
                 result = libResolveSegs(L, segs, n, root1, libLen(root1), 0);
@@ -498,9 +529,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
     u8* resolved = libResolve(L, nsPtr, nsLen);
     if (resolved == null)
     {
-        write(2, "coral: cannot resolve import(lib) ", 34);
+        write(2, (u8*)"coral: cannot resolve import(lib) ", 34);
         write(2, nsPtr, nsLen);
-        write(2, "\n", 1);
+        write(2, (u8*)"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -518,9 +549,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
     u8* buf = libRead(resolved, &len);
     if (buf == null)
     {
-        write(2, "coral: cannot read import(lib) file ", 36);
+        write(2, (u8*)"coral: cannot read import(lib) file ", 36);
         write(2, resolved, libLen(resolved));
-        write(2, "\n", 1);
+        write(2, (u8*)"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -539,9 +570,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
     File* lf = libParse(L, buf, len, resolved, dg, fid);
     if (lf == null)
     {
-        write(2, "coral: cannot read import(lib) file ", 36);
+        write(2, (u8*)"coral: cannot read import(lib) file ", 36);
         write(2, resolved, libLen(resolved));
-        write(2, "\n", 1);
+        write(2, (u8*)"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -673,7 +704,48 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                          cq = cq + 1;
                      }
                  }
-                 if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath)
+                 bool hasGroups = false;
+                 {
+                     u32 gi = 0;
+                     while (gi < dd->kind.payload.Import.symbolsLen)
+                     {
+                         Str gn = dd->kind.payload.Import.symbols[gi].name;
+                         if (gn != 0)
+                         {
+                             InternEntry* ge = L->ctx->interns + gn;
+                             usize gq = 0;
+                             while (gq + 1 < ge->len)
+                             {
+                                 if (ge->ptr[gq] == 58 && ge->ptr[gq + 1] == 58) { hasGroups = true; break; }
+                                 gq = gq + 1;
+                             }
+                         }
+                         if (hasGroups) break;
+                         gi = gi + 1;
+                     }
+                 }
+                 bool bareModule = false;
+                 if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath && !hasGroups && f->path != 0)
+                 {
+                     InternEntry* pe0 = L->ctx->interns + dd->kind.payload.Import.path;
+                     InternEntry* fe0 = L->ctx->interns + f->path;
+                     u8* dir0 = libDir(fe0->ptr);
+                     u8* sib0 = null;
+                     if (dir0 != null) sib0 = libCandidate(dir0, libLen(dir0), pe0->ptr, pe0->len, ".crl", 4);
+                     if (sib0 == null)
+                     {
+                         bareModule = true;
+                     }
+                     else
+                     {
+                         usize sl0 = 0;
+                         u8* sbuf0 = libRead(sib0, &sl0);
+                         if (sbuf0 == null) bareModule = true;
+                         else free(sbuf0);
+                         free(sib0);
+                     }
+                 }
+                 if ((dd->kind.payload.Import.flags & 1) == 0 && !colonPath && !hasGroups && !bareModule)
                  {
                      i = i + 1;
                      continue;
@@ -749,17 +821,39 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                                  }
                                  if (lastCol > 0 && lastCol + 2 < se->len)
                                  {
+                                     bool absolute = lastCol > nsLen + 1;
+                                     if (absolute)
+                                     {
+                                         usize c = 0;
+                                         while (c < nsLen)
+                                         {
+                                             if (se->ptr[c] != nsPtr[c]) { absolute = false; break; }
+                                             c = c + 1;
+                                         }
+                                         if (absolute && (se->ptr[nsLen] != 58 || se->ptr[nsLen + 1] != 58)) absolute = false;
+                                     }
                                      u8* dst = comps + off;
                                      usize d = 0;
-                                     while (d < nsLen) { dst[d] = nsPtr[d]; d = d + 1; }
-                                     dst[nsLen] = 58;
-                                     dst[nsLen + 1] = 58;
-                                     d = 0;
-                                     while (d < lastCol) { dst[nsLen + 2 + d] = se->ptr[d]; d = d + 1; }
-                                     tPtrs[targets] = dst;
-                                     tLens[targets] = nsLen + 2 + lastCol;
-                                     targets = targets + 1;
-                                     off = off + nsLen + 2 + lastCol;
+                                     if (absolute)
+                                     {
+                                         while (d < lastCol) { dst[d] = se->ptr[d]; d = d + 1; }
+                                         tPtrs[targets] = dst;
+                                         tLens[targets] = lastCol;
+                                         targets = targets + 1;
+                                         off = off + lastCol;
+                                     }
+                                     else
+                                     {
+                                         while (d < nsLen) { dst[d] = nsPtr[d]; d = d + 1; }
+                                         dst[nsLen] = 58;
+                                         dst[nsLen + 1] = 58;
+                                         d = 0;
+                                         while (d < lastCol) { dst[nsLen + 2 + d] = se->ptr[d]; d = d + 1; }
+                                         tPtrs[targets] = dst;
+                                         tLens[targets] = nsLen + 2 + lastCol;
+                                         targets = targets + 1;
+                                         off = off + nsLen + 2 + lastCol;
+                                     }
                                  }
                              }
                              si = si + 1;
@@ -823,6 +917,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                       tOwned[zi] = null;
                       zi = zi + 1;
                   }
+                  if (bareModule) tHard[0] = 0;
                   tPtrs[0] = nsPtr;
                   tLens[0] = nsLen;
                   u32 k = 0;
@@ -933,7 +1028,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                                       if (rxWant != null)
                                       {
                                           u32 a = 0;
-                                          u32 any = 0;
+                                          u32 anyMatch = 0;
                                           while (a < rxCount)
                                           {
                                               rxWant[a] = 0;
@@ -970,13 +1065,13 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                                                       s2 = s2 + 1;
                                                   }
                                               }
-                                              if (rxWant[a] != 0) any = 1;
+                                              if (rxWant[a] != 0) anyMatch = 1;
                                               a = a + 1;
                                           }
                                           a = 0;
                                           while (a < rxCount)
                                           {
-                                              if (symCount == 0 || any == 0 || rxWant[a] != 0)
+                                              if (symCount == 0 || anyMatch == 0 || rxWant[a] != 0)
                                               {
                                                   if (targets >= tCap)
                                                   {
@@ -1317,7 +1412,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             u32 segCount = 1;
             usize pi = 0;
             while (pi < plen) { if (plat[pi] == 47) segCount = segCount + 1; pi = pi + 1; }
-            LibSeg* prSegs = (LibSeg*)malloc(segCount * sizeof(LibSeg));
+            LibSeg* prSegs = (LibSeg*)malloc(segCount * @sizeof(LibSeg));
             if (prSegs != null)
             {
                 u32 k = 0;
@@ -1343,7 +1438,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         else
         {
-            LibSeg* prSegs = (LibSeg*)malloc(2 * sizeof(LibSeg));
+            LibSeg* prSegs = (LibSeg*)malloc(2 * @sizeof(LibSeg));
             if (prSegs != null)
             {
                 prSegs[0].ptr = (u8*)"x86_64";
@@ -1391,7 +1486,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             libLoadSiblingImports(&loader, file);
             if (loader.errors == 0 && !libMerge(&loader, file))
             {
-                write(2, "coral: failed to merge import(lib) decls\n", 41);
+                write(2, (u8*)"coral: failed to merge import(lib) decls\n", 41);
                 loader.errors = loader.errors + 1;
             }
         }
@@ -1500,7 +1595,7 @@ AnalyzeResult analyze(u8* src, usize len)
     };
     parser.previous = parser.current;
     
-    File* file = parser.parseFile(ctx.intern("frontend", 8));
+    File* file = parser.parseFile(ctx.intern((u8*)"frontend", 8));
     Sema sema;
     sema.init(&ctx, &engine);
     sema.scopes.enter();
