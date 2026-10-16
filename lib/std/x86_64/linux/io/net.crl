@@ -1,4 +1,6 @@
 import(lib) platform::libc { close, socket, connect, bind, listen, accept, send, recv, sendto, recvfrom, setsockopt, htonl, htons };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 
 const i32 AF_INET = 2;
 const i32 SOCK_STREAM = 1;
@@ -54,13 +56,17 @@ void _zeroSockaddr(sockaddr_in* a)
 
 pub distinct TcpSocket = i32;
 
-pub TcpSocket tcpConnect(str ip, u16 port)
+pub Result<TcpSocket, IoError> tcpConnect(str ip, u16 port)
 {
     i32 fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd < 0) return (TcpSocket)(-1);
+    if (fd < 0) return Result<TcpSocket, IoError>::Err { .error = IoError::os("socket") };
 
     u32 ipAddr;
-    if (!_parseIp(ip, &ipAddr)) { close(fd); return (TcpSocket)(-1); }
+    if (!_parseIp(ip, &ipAddr))
+    {
+        close(fd);
+        return Result<TcpSocket, IoError>::Err { .error = IoError::BadUsage { .msg = "invalid ip address" } };
+    }
 
     sockaddr_in addr;
     _zeroSockaddr(&addr);
@@ -71,15 +77,15 @@ pub TcpSocket tcpConnect(str ip, u16 port)
     if (connect(fd, (const rawptr)&addr, 16) < 0)
     {
         close(fd);
-        return (TcpSocket)(-1);
+        return Result<TcpSocket, IoError>::Err { .error = IoError::os("connect") };
     }
-    return (TcpSocket)fd;
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)fd };
 }
 
-pub TcpSocket tcpListen(u16 port)
+pub Result<TcpSocket, IoError> tcpListen(u16 port)
 {
     i32 fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd < 0) return (TcpSocket)(-1);
+    if (fd < 0) return Result<TcpSocket, IoError>::Err { .error = IoError::os("socket") };
 
     // source bug, this was a 5-argument call to sendto (which takes 6);
     // the shape is setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, ...) — fixed.
@@ -91,41 +97,54 @@ pub TcpSocket tcpListen(u16 port)
     addr.sinFamily = AF_INET;
     addr.sinPort = htons(port);
     addr.sinAddr = htonl(0u);
-    if (bind(fd, (const rawptr)&addr, 16) < 0) { close(fd); return (TcpSocket)(-1); }
-    if (listen(fd, 128) < 0) { close(fd); return (TcpSocket)(-1); }
-    return (TcpSocket)fd;
+    if (bind(fd, (const rawptr)&addr, 16) < 0)
+    {
+        close(fd);
+        return Result<TcpSocket, IoError>::Err { .error = IoError::os("bind") };
+    }
+    if (listen(fd, 128) < 0)
+    {
+        close(fd);
+        return Result<TcpSocket, IoError>::Err { .error = IoError::os("listen") };
+    }
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)fd };
 }
 
-pub TcpSocket tcpAccept(TcpSocket server)
+pub Result<TcpSocket, IoError> tcpAccept(TcpSocket server)
 {
     sockaddr_in addr;
     i32 addrLen = 16;
     i32 fd = accept((i32)server, (rawptr)&addr, &addrLen);
-    return (TcpSocket)fd;
+    if (fd < 0) return Result<TcpSocket, IoError>::Err { .error = IoError::os("accept") };
+    return Result<TcpSocket, IoError>::Ok { .value = (TcpSocket)fd };
 }
 
-pub isize tcpSend(TcpSocket sock, const u8* buf, usize len)
+// Err only on a send error; a short count (Ok) means the peer closed
+pub Result<isize, IoError> tcpSend(TcpSocket sock, const u8* buf, usize len)
 {
     usize sent = 0;
     while (sent < len)
     {
         i64 n = send((i32)sock, buf + sent, len - sent, 0);
-        if (n <= 0) return n < 0 ? n : (isize)sent;
+        if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("send") };
+        if (n == 0) break;
         sent += (usize)n;
     }
-    return (isize)sent;
+    return Result<isize, IoError>::Ok { .value = (isize)sent };
 }
 
-pub isize tcpRecv(TcpSocket sock, u8* buf, usize len)
+// Err only on a recv error; Ok(0) means the peer closed
+pub Result<isize, IoError> tcpRecv(TcpSocket sock, u8* buf, usize len)
 {
     usize got = 0;
     while (got < len)
     {
         i64 n = recv((i32)sock, buf + got, len - got, 0);
-        if (n <= 0) return n < 0 ? n : (isize)got;
+        if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("recv") };
+        if (n == 0) break;
         got += (usize)n;
     }
-    return (isize)got;
+    return Result<isize, IoError>::Ok { .value = (isize)got };
 }
 
 pub void tcpClose(TcpSocket sock)
@@ -138,39 +157,48 @@ pub struct UdpSocket
     i32 fd;
 }
 
-pub UdpSocket udpSocket()
+pub Result<UdpSocket, IoError> udpSocket()
 {
-    return UdpSocket { .fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
+    i32 fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return Result<UdpSocket, IoError>::Err { .error = IoError::os("socket") };
+    return Result<UdpSocket, IoError>::Ok { .value = UdpSocket { .fd = fd } };
 }
 
-pub bool udpBind(UdpSocket* s, u16 port)
+pub Result<bool, IoError> udpBind(UdpSocket* s, u16 port)
 {
-    if (s->fd < 0) return false;
+    if (s->fd < 0) return Result<bool, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
     sockaddr_in addr;
     _zeroSockaddr(&addr);
     addr.sinFamily = AF_INET;
     addr.sinPort = htons(port);
     addr.sinAddr = htonl(0u);
-    return bind(s->fd, (const rawptr)&addr, 16) == 0;
+    if (bind(s->fd, (const rawptr)&addr, 16) != 0)
+        return Result<bool, IoError>::Err { .error = IoError::os("bind") };
+    return Result<bool, IoError>::Ok { .value = true };
 }
 
-pub isize udpSendTo(UdpSocket* s, const u8* buf, usize len, str ip, u16 port)
+pub Result<isize, IoError> udpSendTo(UdpSocket* s, const u8* buf, usize len, str ip, u16 port)
 {
-    if (s->fd < 0) return -1;
+    if (s->fd < 0) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
     u32 ipAddr;
-    if (!_parseIp(ip, &ipAddr)) return -1;
+    if (!_parseIp(ip, &ipAddr))
+        return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "invalid ip address" } };
     sockaddr_in addr;
     _zeroSockaddr(&addr);
     addr.sinFamily = AF_INET;
     addr.sinPort = htons(port);
     addr.sinAddr = ipAddr;
-    return sendto(s->fd, buf, len, 0, (const rawptr)&addr, 16);
+    isize n = sendto(s->fd, buf, len, 0, (const rawptr)&addr, 16);
+    if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("sendto") };
+    return Result<isize, IoError>::Ok { .value = n };
 }
 
-pub isize udpRecvFrom(UdpSocket* s, u8* buf, usize len)
+pub Result<isize, IoError> udpRecvFrom(UdpSocket* s, u8* buf, usize len)
 {
-    if (s->fd < 0) return -1;
-    return recvfrom(s->fd, buf, len, 0, null, null);
+    if (s->fd < 0) return Result<isize, IoError>::Err { .error = IoError::BadUsage { .msg = "socket not open" } };
+    isize n = recvfrom(s->fd, buf, len, 0, null, null);
+    if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("recvfrom") };
+    return Result<isize, IoError>::Ok { .value = n };
 }
 
 pub void udpClose(UdpSocket* s)

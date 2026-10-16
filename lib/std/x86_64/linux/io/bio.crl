@@ -1,4 +1,6 @@
 import(lib) platform::libc { read, write, lseek };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 
 const i32 SEEK_SET = 0;
 const i32 SEEK_CUR = 1;
@@ -12,16 +14,20 @@ pub struct FileReader
         return FileReader { .fd = fd };
     }
 
-    bool readBytes(u8* dst, u64 n)
+    // reads exactly n bytes; Err on a read error (errno) or an EOF
+    // before n bytes. The typed readers below ignore the outcome and
+    // yield 0-filled buffers — check readBytes when it matters.
+    Result<bool, IoError> readBytes(u8* dst, u64 n)
     {
         u64 total = 0;
         while (total < n)
         {
             i64 r = read(self.fd, dst + total, n - total);
-            if (r <= 0) return false;
+            if (r < 0) return Result<bool, IoError>::Err { .error = IoError::os("read") };
+            if (r == 0) return Result<bool, IoError>::Err { .error = IoError::Eof { .op = "read" } };
             total += (u64)r;
         }
-        return true;
+        return Result<bool, IoError>::Ok { .value = true };
     }
 
     #[[inline]]
@@ -47,7 +53,7 @@ pub struct FileReader
         self.readBytes(b, 8);
         u64 v = 0;
         for (u32 j = 0; j < 8; j++)
-            v |= (u64)b[j] << (8u * j);
+            v |= (u64)b[j] << (8u * (u64)j);
         return v;
     }
 
@@ -80,7 +86,7 @@ pub struct FileReader
         self.readBytes(b, 8);
         u64 v = 0;
         for (u32 j = 0; j < 8; j++)
-            v |= (u64)b[j] << (8u * (7u - j));
+            v |= (u64)b[j] << (8u * (7u - (u64)j));
         return v;
     }
 
@@ -113,16 +119,19 @@ pub struct FileWriter
     #[[inline]]
     void writeU8(u8 v) { self.writeBytes(&v, 1); }
 
-    bool writeBytes(const u8* src, u64 n)
+    // writes exactly n bytes; Err on a write error (errno) or a
+    // zero-byte write. The typed writers below ignore the outcome.
+    Result<bool, IoError> writeBytes(const u8* src, u64 n)
     {
         u64 total = 0;
         while (total < n)
         {
             i64 r = write(self.fd, src + total, n - total);
-            if (r <= 0) return false;
+            if (r < 0) return Result<bool, IoError>::Err { .error = IoError::os("write") };
+            if (r == 0) return Result<bool, IoError>::Err { .error = IoError::Os { .code = 0, .op = "write" } };
             total += (u64)r;
         }
-        return true;
+        return Result<bool, IoError>::Ok { .value = true };
     }
 
     void writeU16Le(u16 v)
@@ -147,7 +156,7 @@ pub struct FileWriter
     {
         u8 b[8];
         for (u32 j = 0; j < 8; j++)
-            b[j] = (u8)(v >> (8u * j));
+            b[j] = (u8)(v >> (8u * (u64)j));
         self.writeBytes(b, 8);
     }
 
@@ -182,7 +191,7 @@ pub struct FileWriter
     {
         u8 b[8];
         for (u32 j = 0; j < 8; j++)
-            b[j] = (u8)(v >> (8u * (7u - j)));
+            b[j] = (u8)(v >> (8u * (7u - (u64)j)));
         self.writeBytes(b, 8);
     }
 

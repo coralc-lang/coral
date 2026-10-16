@@ -34,10 +34,18 @@ import mutex { Mutex };
 import thread { ConditionVar };
 import threadpool { ThreadPool };
 import(lib) std::mman { alloc, dealloc };
+import(lib) std::option { Option };
+import(lib) std::result { Result };
 import(lib) platform::libc {
     getcontext, makecontext, swapcontext, gettimeofday, pthread_cond_timedwait, printf
 };
 import(lib) core::cchar { cchar };
+
+pub variant AsyncError
+{
+    OutsideFiber { str msg; },
+    NullFuture { str msg; }
+}
 
 // glibc x86_64 stack_t, probe numbers: ss_sp 0, ss_flags 8, ss_size 16,
 // sizeof 24.
@@ -424,17 +432,18 @@ i32 _step(bool allowWait)
 
 // Spawn fn+arg on a fresh (or recycled) fiber. The returned future is a join
 // handle — await(spawn(...)) waits for fn to return; since fn is void it
-// carries no payload (my judgment call, null is the result).
-pub Future* spawn(void(rawptr) fn, rawptr arg)
+// carries no payload (my judgment call, null is the result). None — null fn,
+// or the fiber/future could not be allocated.
+pub Option<Future*> spawn(void(rawptr) fn, rawptr arg)
 {
-    if (fn == null) return null;
+    if (fn == null) return Option<Future*>::None;
     Future* join = _newFuture();
-    if (join == null) return null;
+    if (join == null) return Option<Future*>::None;
     Fiber* f = _acquireFiber();
     if (f == null)
     {
         dealloc<Future>(join);
-        return null;
+        return Option<Future*>::None;
     }
     f->fn = fn;
     f->arg = arg;
@@ -447,21 +456,22 @@ pub Future* spawn(void(rawptr) fn, rawptr arg)
     _pushReady(f);
     _sched.cond.signal(); // a driver parked with an empty queue must see it
     _unlock();
-    return join;
+    return Option<Future*>::Some { .value = join };
 }
 
 // Suspend the calling fiber until f is ready, then return its result.
-// There is nowhere to suspend to outside a fiber, so this diagnoses itself
-// (message on stdout) and returns null; await(null) also returns null.
-pub rawptr await(Future* f)
+// There is nowhere to suspend to outside a fiber, so that diagnoses itself
+// (message on stdout) and returns Err; await on a null future is Err too.
+// Ok(null) is a legitimate result — join futures resolve with a null payload.
+pub Result<rawptr, AsyncError> await(Future* f)
 {
     Fiber* cur = _activeFiber;
     if (cur == null)
     {
-        printf((const cchar*)C"coral async: await() called outside a fiber, returning null\n");
-        return null;
+        printf((const cchar*)C"coral async: await() called outside a fiber\n");
+        return Result<rawptr, AsyncError>::Err { .error = AsyncError::OutsideFiber { .msg = "await() called outside a fiber" } };
     }
-    if (f == null) return null;
+    if (f == null) return Result<rawptr, AsyncError>::Err { .error = AsyncError::NullFuture { .msg = "await() called with a null future" } };
     _lock();
     while (f->state == FUTURE_PENDING)
     {
@@ -475,19 +485,20 @@ pub rawptr await(Future* f)
     }
     rawptr r = f->result;
     _unlock();
-    return r;
+    return Result<rawptr, AsyncError>::Ok { .value = r };
 }
 
 // Timer awaitable — await(sleep(ms)) suspends the fiber for at least ms.
-pub Future* sleep(u64 ms)
+// None — the future or timer entry could not be allocated.
+pub Option<Future*> sleep(u64 ms)
 {
     Future* f = _newFuture();
-    if (f == null) return null;
+    if (f == null) return Option<Future*>::None;
     TimerEntry* t = alloc<TimerEntry>(1);
     if (t == null)
     {
         dealloc<Future>(f);
-        return null;
+        return Option<Future*>::None;
     }
     t->fut = f;
     t->deadlineMs = _nowMs() + ms;
@@ -504,7 +515,7 @@ pub Future* sleep(u64 ms)
     else prev->next = t;
     _sched.cond.signal(); // a driver already waiting must re-measure its timeout
     _unlock();
-    return f;
+    return Option<Future*>::Some { .value = f };
 }
 
 // Drive fibers until every spawned fiber has finished, true, or until the
@@ -545,18 +556,18 @@ pub void runOnce()
 // Offload fn+arg to an existing thread pool; the future resolves when the
 // pool finishes and an awaiting fiber always resumes on the driver thread
 // (the pool thread only completes the future under the scheduler lock).
-// My judgment call on failure — returns null if the job could not be queued
-// (bad args, OOM, or a stopped pool) instead of an early-resolved future.
-pub Future* poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
+// None if the job could not be queued (bad args, OOM, or a stopped pool)
+// instead of an early-resolved future.
+pub Option<Future*> poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
 {
-    if (pool == null || fn == null) return null;
+    if (pool == null || fn == null) return Option<Future*>::None;
     Future* f = _newFuture();
-    if (f == null) return null;
+    if (f == null) return Option<Future*>::None;
     PoolJob* job = alloc<PoolJob>(1);
     if (job == null)
     {
         dealloc<Future>(f);
-        return null;
+        return Option<Future*>::None;
     }
     job->fn = fn;
     job->arg = arg;
@@ -574,9 +585,9 @@ pub Future* poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
         _unlock();
         dealloc<PoolJob>(job);
         dealloc<Future>(f);
-        return null;
+        return Option<Future*>::None;
     }
-    return f;
+    return Option<Future*>::Some { .value = f };
 }
 
 // Channel of rawptr values, buffered (capacity > 0) or rendezvous
@@ -650,14 +661,15 @@ pub struct AsyncChannel
         return false;
     }
 
-    Future* recv()
+    // None — the receive future could not be allocated.
+    Option<Future*> recv()
     {
         _lock();
         Future* f = _newFuture();
         if (f == null)
         {
             _unlock();
-            return null;
+            return Option<Future*>::None;
         }
         if (self.count > 0u)
         {
@@ -666,7 +678,7 @@ pub struct AsyncChannel
             self.count = self.count - 1u;
             _completeLocked(f, v);
             _unlock();
-            return f;
+            return Option<Future*>::Some { .value = f };
         }
         if (self.recvTail != null)
         {
@@ -679,7 +691,7 @@ pub struct AsyncChannel
             self.recvTail = f;
         }
         _unlock();
-        return f;
+        return Option<Future*>::Some { .value = f };
     }
 }
 

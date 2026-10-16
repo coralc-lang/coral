@@ -1,5 +1,12 @@
 import(lib) std::text::string { String };
+import(lib) std::result { Result };
 import(lib) std::math::random { nextU64 };
+
+pub variant ParseError
+{
+    Syntax { str msg; u32 line; u32 col; },
+    Semantic { str msg; }
+}
 
 pub struct Uuid
 {
@@ -50,11 +57,13 @@ pub struct Uuid
         return s;
     }
 
-    static Uuid fromString(str s)
+    // Strict: hex digits separated by optional '-' dashes, exactly 32 hex
+    // digits in total. Anything else is a syntax error.
+    static Result<Uuid, ParseError> fromString(str s)
     {
         Uuid u = Uuid::zero();
         u64 byteIdx = 0;
-        for (usize i = 0; i < s.len && byteIdx < 16; i++)
+        for (usize i = 0; i < s.len; i++)
         {
             u8 c = s.ptr[i];
             if (c == '-') continue;
@@ -62,12 +71,16 @@ pub struct Uuid
             if (c >= '0' && c <= '9') val = c - '0';
             else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
             else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-            else continue;
+            else return Result<Uuid, ParseError>::Err { .error = ParseError::Syntax { .msg = "invalid character in UUID", .line = 0, .col = 0 } };
+            if (byteIdx >= 16)
+                return Result<Uuid, ParseError>::Err { .error = ParseError::Syntax { .msg = "UUID too long", .line = 0, .col = 0 } };
             if (byteIdx % 2 == 0) u.bytes[byteIdx / 2] = val << 4;
             else u.bytes[byteIdx / 2] |= val;
             byteIdx++;
         }
-        return u;
+        if (byteIdx != 16)
+            return Result<Uuid, ParseError>::Err { .error = ParseError::Syntax { .msg = "UUID must contain 32 hex digits", .line = 0, .col = 0 } };
+        return Result<Uuid, ParseError>::Ok { .value = u };
     }
 
     bool eq(Uuid other)
@@ -91,7 +104,7 @@ pub String uuidV4()
     return u.toString();
 }
 
-pub Uuid parseUuid(str s)
+pub Result<Uuid, ParseError> parseUuid(str s)
 {
     return Uuid::fromString(s);
 }

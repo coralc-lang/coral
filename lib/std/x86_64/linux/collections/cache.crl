@@ -1,6 +1,7 @@
-import hashmap { HashMap };
+import hashmap { HashMap, CollectionError };
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::option { Option };
+import(lib) std::result { Result };
 
 pub struct CacheEntry<K, V>
 {
@@ -73,44 +74,53 @@ pub struct Cache<K, V>
         dealloc<CacheEntry<K, V>>(old);
     }
 
-    void insert(K key, V value)
+    Result<V, CollectionError> insert(K key, V value)
     {
-        CacheEntry<K, V>** entryPtr = self.map.getPtr(key);
-        if (entryPtr != null)
+        Option<CacheEntry<K, V>*> entryPtr = self.map.getPtr(key);
+        if (entryPtr.isSome())
         {
-            CacheEntry<K, V>* existing = *entryPtr;
+            CacheEntry<K, V>* existing = entryPtr.unwrap();
             existing->value = value;
             self._moveToFront(existing);
-            return;
+            return Result<V, CollectionError>::Ok { .value = value };
         }
         CacheEntry<K, V>* entry = alloc<CacheEntry<K, V>>(1);
+        if (entry == null)
+            return Result<V, CollectionError>::Err { .error = CollectionError::AllocFailed { .msg = "Cache entry allocation failed" } };
         entry->key = key;
         entry->value = value;
         entry->prev = null;
+        entry->next = null;
+        Result<CacheEntry<K, V>*, CollectionError> ins = self.map.insert(key, entry);
+        if (ins.isErr())
+        {
+            dealloc<CacheEntry<K, V>>(entry);
+            return Result<V, CollectionError>::Err { .error = ins.unwrapErr() };
+        }
         entry->next = self.head;
         if (self.head != null) self.head->prev = entry;
         self.head = entry;
         if (self.tail == null) self.tail = entry;
-        self.map.insert(key, entry);
         if (self.map.count() > self.maxSize) self._evict();
+        return Result<V, CollectionError>::Ok { .value = value };
     }
 
     Option<V> get(K key)
     {
-        CacheEntry<K, V>** entryPtr = self.map.getPtr(key);
-        if (entryPtr == null) return Option<V>::None;
-        CacheEntry<K, V>* entry = *entryPtr;
+        Option<CacheEntry<K, V>*> entryPtr = self.map.getPtr(key);
+        if (entryPtr.isNone()) return Option<V>::None;
+        CacheEntry<K, V>* entry = entryPtr.unwrap();
         self._moveToFront(entry);
         return Option<V>::Some { .value = entry->value };
     }
 
-    V* getPtr(K key)
+    Option<V*> getPtr(K key)
     {
-        CacheEntry<K, V>** entryPtr = self.map.getPtr(key);
-        if (entryPtr == null) return null;
-        CacheEntry<K, V>* entry = *entryPtr;
+        Option<CacheEntry<K, V>*> entryPtr = self.map.getPtr(key);
+        if (entryPtr.isNone()) return Option<V*>::None;
+        CacheEntry<K, V>* entry = entryPtr.unwrap();
         self._moveToFront(entry);
-        return &entry->value;
+        return Option<V*>::Some { .value = &entry->value };
     }
 
     bool contains(K key)
@@ -120,9 +130,9 @@ pub struct Cache<K, V>
 
     void remove(K key)
     {
-        CacheEntry<K, V>** entryPtr = self.map.getPtr(key);
-        if (entryPtr == null) return;
-        CacheEntry<K, V>* entry = *entryPtr;
+        Option<CacheEntry<K, V>*> entryPtr = self.map.getPtr(key);
+        if (entryPtr.isNone()) return;
+        CacheEntry<K, V>* entry = entryPtr.unwrap();
         if (entry->prev != null) entry->prev->next = entry->next;
         if (entry->next != null) entry->next->prev = entry->prev;
         if (entry == self.head) self.head = entry->next;

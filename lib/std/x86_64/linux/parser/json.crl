@@ -217,7 +217,10 @@ struct _ParseCtx
                     if (code < 0x80) s.pushChar((u8)code);
                     else if (code < 0x800) { s.pushChar((u8)(0xC0 | (code >> 6))); s.pushChar((u8)(0x80 | (code & 0x3F))); }
                     else if (code < 0x10000) { s.pushChar((u8)(0xE0 | (code >> 12))); s.pushChar((u8)(0x80 | ((code >> 6) & 0x3F))); s.pushChar((u8)(0x80 | (code & 0x3F))); }
-                    else { s.pushChar((u8)(0xF0 | (code >> 18))); s.pushChar((u8)(0x80 | ((code >> 12) & 0x3F))); s.pushChar((u8)(0x80 | ((code >> 6) & 0x3F))); s.pushChar((u8)(0x80 | (code & 0x3F))); }
+                    else { s.pushChar((u8)(0xF0 | (code >> 18)));
+                        s.pushChar((u8)(0x80 | ((code >> 12) & 0x3F)));
+                        s.pushChar((u8)(0x80 | ((code >> 6) & 0x3F)));
+                        s.pushChar((u8)(0x80 | (code & 0x3F))); }
                 }
                 else s.pushChar(esc);
             }
@@ -308,7 +311,7 @@ struct _ParseCtx
                 fv = strtod(tmp, &end);
                 if (end != tmp + tpos)
                 {
-                    self.error = true;
+                    self.fail("invalid number");
                     return JsonValue::nullVal();
                 }
                 return JsonValue::f64Val(neg ? -fv : fv);
@@ -316,7 +319,7 @@ struct _ParseCtx
             if (neg) return JsonValue::i64Val(-(i64)intVal);
             return JsonValue::i64Val((i64)intVal);
         }
-        self.error = true;
+        self.fail("unexpected token");
         return JsonValue::nullVal();
     }
 
@@ -332,7 +335,7 @@ struct _ParseCtx
             arr.arrVal.push(elem);
             u8 c = self.next();
             if (c == ']') break;
-            if (c != ',') { self.error = true; arr.dispose(); return JsonValue::nullVal(); }
+            if (c != ',') { self.fail("expected ',' or ']'"); arr.dispose(); return JsonValue::nullVal(); }
         }
         return arr;
     }
@@ -353,7 +356,7 @@ struct _ParseCtx
             obj.objVal.push(pair);
             u8 c = self.next();
             if (c == '}') break;
-            if (c != ',') { self.error = true; obj.dispose(); return JsonValue::nullVal(); }
+            if (c != ',') { self.fail("expected ',' or '}'"); obj.dispose(); return JsonValue::nullVal(); }
         }
         return obj;
     }
@@ -448,23 +451,36 @@ void _serialize(JsonValue* v, String* out)
     }
 }
 
-pub bool parseJson(str input, JsonValue* out)
+pub Result<JsonValue, ParseError> parseJson(str input)
 {
     _ParseCtx ctx = _ParseCtx {
         .ptr = (const u8*)input.ptr,
         .len = input.len,
         .pos = 0,
         .error = false,
-        .errMsg = String::new()
+        .errMsg = "invalid JSON",
+        .line = 0,
+        .col = 0
     };
 
     JsonValue v = ctx.parseValue();
-    if (ctx.error) { v.dispose(); ctx.errMsg.free(); *out = JsonValue::nullVal(); return false; }
+    if (ctx.error)
+    {
+        v.dispose();
+        return Result<JsonValue, ParseError>::Err {
+            .error = ParseError::Syntax { .msg = ctx.errMsg, .line = ctx.line, .col = ctx.col }
+        };
+    }
     ctx.skipSpace();
-    if (ctx.pos != ctx.len) { v.dispose(); ctx.errMsg.free(); *out = JsonValue::nullVal(); return false; }
-    ctx.errMsg.free();
-    *out = v;
-    return true;
+    if (ctx.pos != ctx.len)
+    {
+        v.dispose();
+        ctx.fail("trailing characters after JSON value");
+        return Result<JsonValue, ParseError>::Err {
+            .error = ParseError::Syntax { .msg = ctx.errMsg, .line = ctx.line, .col = ctx.col }
+        };
+    }
+    return Result<JsonValue, ParseError>::Ok { .value = v };
 }
 
 pub String serialize(JsonValue* v)

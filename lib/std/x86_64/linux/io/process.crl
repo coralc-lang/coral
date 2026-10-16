@@ -1,5 +1,7 @@
 import(lib) std::vec { Vec };
 import(lib) std::mman { alloc, copy };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 import(lib) platform::libc { pipe, fork, dup2, execvp, waitpid, poll, read, write, close, _exit };
 
 pub struct Process
@@ -29,7 +31,7 @@ void _closeIoFd(i32* fd)
     if (*fd >= 0) { close(*fd); *fd = -1; }
 }
 
-pub Process spawn(str cmd, Vec<str>* args)
+pub Result<Process, IoError> spawn(str cmd, Vec<str>* args)
 {
     i32 stdinPipe[2];
     i32 stdoutPipe[2];
@@ -42,7 +44,7 @@ pub Process spawn(str cmd, Vec<str>* args)
         _closeIoFd(&stdinPipe[0]); _closeIoFd(&stdinPipe[1]);
         _closeIoFd(&stdoutPipe[0]); _closeIoFd(&stdoutPipe[1]);
         _closeIoFd(&stderrPipe[0]); _closeIoFd(&stderrPipe[1]);
-        return Process { .pid = -1, .stdinFd = -1, .stdoutFd = -1, .stderrFd = -1 };
+        return Result<Process, IoError>::Err { .error = IoError::os("pipe") };
     }
 
     i32 pid = fork();
@@ -51,9 +53,7 @@ pub Process spawn(str cmd, Vec<str>* args)
         close(stdinPipe[0]); close(stdinPipe[1]);
         close(stdoutPipe[0]); close(stdoutPipe[1]);
         close(stderrPipe[0]); close(stderrPipe[1]);
-        // source left the other three fields uninitialized here; -1 matches
-        // the pipe-failure path above
-        return Process { .pid = -1, .stdinFd = -1, .stdoutFd = -1, .stderrFd = -1 };
+        return Result<Process, IoError>::Err { .error = IoError::os("fork") };
     }
 
     if (pid == 0)
@@ -93,22 +93,24 @@ pub Process spawn(str cmd, Vec<str>* args)
     close(stdoutPipe[1]);
     close(stderrPipe[1]);
 
-    return Process
-    {
-        .pid = pid,
-        .stdinFd = stdinPipe[1],
-        .stdoutFd = stdoutPipe[0],
-        .stderrFd = stderrPipe[0]
+    return Result<Process, IoError>::Ok {
+        .value = Process
+        {
+            .pid = pid,
+            .stdinFd = stdinPipe[1],
+            .stdoutFd = stdoutPipe[0],
+            .stderrFd = stderrPipe[0]
+        }
     };
 }
 
-pub ProcessResult waitFor(Process* p)
+pub Result<ProcessResult, IoError> waitFor(Process* p)
 {
     i32 status;
     i32 rc = waitpid(p->pid, &status, 0);
     if (rc < 0)
     {
-        return ProcessResult { .exitCode = -1, .signaled = false, .termSignal = 0 };
+        return Result<ProcessResult, IoError>::Err { .error = IoError::os("waitpid") };
     }
     _closeIoFd(&p->stdinFd);
     _closeIoFd(&p->stdoutFd);
@@ -116,30 +118,37 @@ pub ProcessResult waitFor(Process* p)
 
     if (status & 0x7F)
     {
-        return ProcessResult { .exitCode = -1, .signaled = true, .termSignal = status & 0x7F };
+        return Result<ProcessResult, IoError>::Ok { .value = ProcessResult { .exitCode = -1, .signaled = true, .termSignal = status & 0x7F } };
     }
-    return ProcessResult { .exitCode = (status >> 8) & 0xFF, .signaled = false, .termSignal = 0 };
+    return Result<ProcessResult, IoError>::Ok { .value = ProcessResult { .exitCode = (status >> 8) & 0xFF, .signaled = false, .termSignal = 0 } };
 }
 
-pub isize writeStdin(Process* p, const cchar* data, usize len)
+pub Result<isize, IoError> writeStdin(Process* p, const cchar* data, usize len)
 {
-    return write(p->stdinFd, data, len);
+    isize n = write(p->stdinFd, data, len);
+    if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("write") };
+    return Result<isize, IoError>::Ok { .value = n };
 }
 
-pub isize readStdout(Process* p, u8* buf, usize maxLen)
+pub Result<isize, IoError> readStdout(Process* p, u8* buf, usize maxLen)
 {
-    return read(p->stdoutFd, buf, maxLen);
+    isize n = read(p->stdoutFd, buf, maxLen);
+    if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("read") };
+    return Result<isize, IoError>::Ok { .value = n };
 }
 
-pub isize readStderr(Process* p, u8* buf, usize maxLen)
+pub Result<isize, IoError> readStderr(Process* p, u8* buf, usize maxLen)
 {
-    return read(p->stderrFd, buf, maxLen);
+    isize n = read(p->stderrFd, buf, maxLen);
+    if (n < 0) return Result<isize, IoError>::Err { .error = IoError::os("read") };
+    return Result<isize, IoError>::Ok { .value = n };
 }
 
-pub i32 run(str cmd, Vec<str>* args)
+pub Result<i32, IoError> run(str cmd, Vec<str>* args)
 {
-    Process p = spawn(cmd, args);
-    if (p.pid < 0) return -1;
+    Result<Process, IoError> sr = spawn(cmd, args);
+    if (sr.isErr()) return Result<i32, IoError>::Err { .error = sr.unwrapErr() };
+    Process p = sr.unwrap();
     _closeIoFd(&p.stdinFd);
     // poll both pipes so the child never blocks writing while the parent
     // waits for the other pipe
@@ -164,8 +173,9 @@ pub i32 run(str cmd, Vec<str>* args)
             }
         }
     }
-    ProcessResult r = waitFor(&p);
-    return r.exitCode;
+    Result<ProcessResult, IoError> wr = waitFor(&p);
+    if (wr.isErr()) return Result<i32, IoError>::Err { .error = wr.unwrapErr() };
+    return Result<i32, IoError>::Ok { .value = wr.unwrap().exitCode };
 }
 
 pub void exit(i32 code)

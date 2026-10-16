@@ -1,5 +1,13 @@
 import(lib) std::text::string { String };
 import(lib) std::vec { Vec };
+import(lib) std::option { Option };
+import(lib) std::result { Result };
+
+pub variant ParseError
+{
+    Syntax { str msg; u32 line; u32 col; },
+    Semantic { str msg; }
+}
 
 pub struct XmlAttribute
 {
@@ -72,24 +80,24 @@ pub struct XmlNode
         return false;
     }
 
-    str getAttr(str name)
+    Option<str> getAttr(str name)
     {
         for (usize i = 0; i < self.attrs.count(); i++)
         {
             if (self.attrs.at(i).name.asView().equals(name))
-                return self.attrs.at(i).value.asView();
+                return Option<str>::Some { .value = self.attrs.at(i).value.asView() };
         }
-        return "";
+        return Option<str>::None;
     }
 
-    XmlNode* firstChild(str tagName)
+    Option<XmlNode*> firstChild(str tagName)
     {
         for (usize i = 0; i < self.children.count(); i++)
         {
             if (self.children.at(i).tag.asView().equals(tagName))
-                return self.children.atPtr(i);
+                return Option<XmlNode*>::Some { .value = self.children.atPtr(i) };
         }
-        return null;
+        return Option<XmlNode*>::None;
     }
 }
 
@@ -99,6 +107,24 @@ struct _XmlParser
     usize len;
     usize pos;
     bool error;
+    str errMsg;
+    u32 line;
+    u32 col;
+
+    void fail(str msg)
+    {
+        if (self.error) return;
+        self.error = true;
+        self.errMsg = msg;
+        u32 ln = 1;
+        usize lineStart = 0;
+        for (usize i = 0; i < self.pos && i < self.len; i++)
+        {
+            if (self.data[i] == '\n') { ln++; lineStart = i + 1; }
+        }
+        self.line = ln;
+        self.col = (u32)(self.pos - lineStart) + 1u;
+    }
 
     void skipSpace()
     {
@@ -126,7 +152,7 @@ struct _XmlParser
 
     bool expect(u8 ch)
     {
-        if (self.next() != ch) { self.error = true; return false; }
+        if (self.next() != ch) { self.fail("unexpected character"); return false; }
         return true;
     }
 
@@ -140,7 +166,7 @@ struct _XmlParser
                 self.pos++;
             else break;
         }
-        if (self.pos == start) { self.error = true; return String::new(); }
+        if (self.pos == start) { self.fail("expected name"); return String::new(); }
         return String::from(str::fromParts(self.data + start, self.pos - start));
     }
 
@@ -148,7 +174,7 @@ struct _XmlParser
     {
         String s = String::new();
         u8 quote = self.next();
-        if (quote != '"' && quote != '\'') { self.error = true; return s; }
+        if (quote != '"' && quote != '\'') { self.fail("expected '\"' or '\''"); return s; }
         while (self.pos < self.len)
         {
             u8 c = self.data[self.pos++];
@@ -158,7 +184,7 @@ struct _XmlParser
                 usize ampPos = self.pos - 1;
                 usize entStart = self.pos;
                 while (self.pos < self.len && self.data[self.pos] != ';') self.pos++;
-                if (self.pos >= self.len) { self.error = true; return s; }
+                if (self.pos >= self.len) { self.fail("unterminated entity"); return s; }
                 self.pos++;
                 str ent = str::fromParts((const u8*)(self.data + entStart), self.pos - entStart - 1);
                 if (ent.equals("lt")) s.pushChar('<');
@@ -174,7 +200,7 @@ struct _XmlParser
             }
             else s.pushChar((u8)c);
         }
-        self.error = true;
+        self.fail("unterminated attribute value");
         return s;
     }
 
@@ -195,7 +221,7 @@ struct _XmlParser
                 }
                 self.pos++;
             }
-            self.error = true;
+            self.fail("unterminated processing instruction");
             return node;
         }
 
@@ -214,10 +240,10 @@ struct _XmlParser
                     }
                     self.pos++;
                 }
-                self.error = true;
+                self.fail("unterminated comment");
                 return node;
             }
-            self.error = true;
+            self.fail("unsupported declaration");
             return node;
         }
 
@@ -234,7 +260,7 @@ struct _XmlParser
             XmlAttribute attr;
             attr.name = self.parseName();
             if (self.error) { node.dispose(); attr.name.free(); return XmlNode::element(""); }
-            if (self.next() != '=') { self.error = true; node.dispose(); attr.name.free(); return XmlNode::element(""); }
+            if (self.next() != '=') { self.fail("expected '='"); node.dispose(); attr.name.free(); return XmlNode::element(""); }
             attr.value = self.parseQuotedString();
             if (self.error) { node.dispose(); attr.name.free(); attr.value.free(); return XmlNode::element(""); }
             node.attrs.push(attr);
@@ -260,7 +286,7 @@ struct _XmlParser
                 if (self.error) { endTag.free(); node.dispose(); return XmlNode::element(""); }
                 bool match = endTag.equals(node.tag.asView());
                 endTag.free();
-                if (!match) { self.error = true; node.dispose(); return XmlNode::element(""); }
+                if (!match) { self.fail("mismatched end tag"); node.dispose(); return XmlNode::element(""); }
                 self.skipSpace();
                 if (!self.expect('>')) { node.dispose(); return XmlNode::element(""); }
                 return node;
@@ -285,7 +311,7 @@ struct _XmlParser
                         if (self.pos >= self.len)
                         {
                             text.free();
-                            self.error = true;
+                            self.fail("unterminated entity");
                             node.dispose();
                             return XmlNode::element("");
                         }
@@ -307,22 +333,32 @@ struct _XmlParser
                 text.free();
             }
         }
-        self.error = true;
+        self.fail("unexpected end of input");
         node.dispose();
         return XmlNode::element("");
     }
 }
 
-pub bool parseXml(str input, XmlNode* out)
+pub Result<XmlNode, ParseError> parseXml(str input)
 {
     _XmlParser p = _XmlParser {
         .data = (const u8*)input.ptr,
         .len = input.len,
         .pos = 0,
-        .error = false
+        .error = false,
+        .errMsg = "invalid XML",
+        .line = 0,
+        .col = 0
     };
-    *out = p.parseElement();
-    return !p.error;
+    XmlNode node = p.parseElement();
+    if (p.error)
+    {
+        node.dispose();
+        return Result<XmlNode, ParseError>::Err {
+            .error = ParseError::Syntax { .msg = p.errMsg, .line = p.line, .col = p.col }
+        };
+    }
+    return Result<XmlNode, ParseError>::Ok { .value = node };
 }
 
 pub String serializeXml(XmlNode* node)

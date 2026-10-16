@@ -1,6 +1,8 @@
 import(lib) platform::libc { mkstemp, close, unlink, mkdtemp, rmdir };
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) std::text::string { String };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
 
 pub struct TempFile
 {
@@ -8,7 +10,7 @@ pub struct TempFile
     String path;
     bool autoDelete;
 
-    static TempFile create(str prefix, str suffix)
+    static Result<TempFile, IoError> create(str prefix, str suffix)
     {
         String tmpl = String::new();
         tmpl.appendView("/tmp/");
@@ -20,21 +22,23 @@ pub struct TempFile
         if (buf == null)
         {
             tmpl.free();
-            return TempFile { .fd = -1, .path = String::new(), .autoDelete = false };
+            return Result<TempFile, IoError>::Err { .error = IoError::BadUsage { .msg = "out of memory" } };
         }
         copy<u8>(buf, (u8*)tmpl.asView().ptr, tmpl.len);
         buf[tmpl.len] = 0;
 
         i32 fd = mkstemp(buf);
-        String actualPath;
-        if (fd >= 0)
-            actualPath = String::from(str::fromParts(buf, tmpl.len));
-        else
-            actualPath = String::new();
+        if (fd < 0)
+        {
+            dealloc<u8>(buf);
+            tmpl.free();
+            return Result<TempFile, IoError>::Err { .error = IoError::os("mkstemp") };
+        }
+        String actualPath = String::from(str::fromParts(buf, tmpl.len));
         dealloc<u8>(buf);
         tmpl.free();
 
-        return TempFile { .fd = fd, .path = actualPath, .autoDelete = true };
+        return Result<TempFile, IoError>::Ok { .value = TempFile { .fd = fd, .path = actualPath, .autoDelete = true } };
     }
 
     void dispose()
@@ -58,7 +62,7 @@ pub struct TempDir
     String path;
     bool autoDelete;
 
-    static TempDir create(str prefix)
+    static Result<TempDir, IoError> create(str prefix)
     {
         String tmpl = String::new();
         tmpl.appendView("/tmp/");
@@ -69,21 +73,23 @@ pub struct TempDir
         if (buf == null)
         {
             tmpl.free();
-            return TempDir { .path = String::new(), .autoDelete = false };
+            return Result<TempDir, IoError>::Err { .error = IoError::BadUsage { .msg = "out of memory" } };
         }
         copy<u8>(buf, (u8*)tmpl.asView().ptr, tmpl.len);
         buf[tmpl.len] = 0;
 
         u8* result = mkdtemp(buf);
-        String actualPath;
-        if (result != null)
-            actualPath = String::from(str::fromParts(buf, tmpl.len));
-        else
-            actualPath = String::new();
+        if (result == null)
+        {
+            dealloc<u8>(buf);
+            tmpl.free();
+            return Result<TempDir, IoError>::Err { .error = IoError::os("mkdtemp") };
+        }
+        String actualPath = String::from(str::fromParts(buf, tmpl.len));
         dealloc<u8>(buf);
         tmpl.free();
 
-        return TempDir { .path = actualPath, .autoDelete = true };
+        return Result<TempDir, IoError>::Ok { .value = TempDir { .path = actualPath, .autoDelete = true } };
     }
 
     void dispose()

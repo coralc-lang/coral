@@ -6,12 +6,21 @@
 // Shape and conventions follow parser/toml.crl.
 // wrote this by hand, the block parsing took a couple of shitty passes to get right.
 //
-// Usage, CrbManifest m = CrbManifest::new();
-//        if (!parseCrlb(src, &m)) { /* m holds partial state — dispose it */ }
-//        CrbBuild* b = m.findBuild("std");  // b->extends, b->get("root")
+// Usage, Result<CrbManifest, ParseError> r = parseCrlb(src);
+//        if (r.isErr()) { /* r.unwrapErr() carries msg/line */ }
+//        CrbManifest m = r.unwrap();
+//        Option<CrbBuild*> b = m.findBuild("std");  // b->unwrap()->extends, get("root")
 //        m.dispose();   // or rely on @drop
 import string { String };
 import(lib) std::vec { Vec };
+import(lib) std::option { Option };
+import(lib) std::result { Result };
+
+pub variant ParseError
+{
+    Syntax { str msg; u32 line; u32 col; },
+    Semantic { str msg; }
+}
 
 pub enum CrbKind
 {
@@ -73,14 +82,14 @@ pub struct CrbBuild
     String extends;   // empty when the block carries no extends clause
     Vec<CrbEntry> entries;
 
-    CrbValue* get(str key)
+    Option<CrbValue*> get(str key)
     {
         for (usize i = 0; i < self.entries.count(); i++)
         {
             if (self.entries.at(i).key.asView().equals(key))
-                return &self.entries.atPtr(i)->value;
+                return Option<CrbValue*>::Some { .value = &self.entries.atPtr(i)->value };
         }
-        return null;
+        return Option<CrbValue*>::None;
     }
 
     void dispose()
@@ -109,24 +118,24 @@ pub struct CrbManifest
         };
     }
 
-    CrbValue* get(str key)
+    Option<CrbValue*> get(str key)
     {
         for (usize i = 0; i < self.top.count(); i++)
         {
             if (self.top.at(i).key.asView().equals(key))
-                return &self.top.atPtr(i)->value;
+                return Option<CrbValue*>::Some { .value = &self.top.atPtr(i)->value };
         }
-        return null;
+        return Option<CrbValue*>::None;
     }
 
-    CrbBuild* findBuild(str name)
+    Option<CrbBuild*> findBuild(str name)
     {
         for (usize i = 0; i < self.builds.count(); i++)
         {
             if (self.builds.at(i).name.asView().equals(name))
-                return &self.builds.atPtr(i);
+                return Option<CrbBuild*>::Some { .value = &self.builds.atPtr(i) };
         }
-        return null;
+        return Option<CrbBuild*>::None;
     }
 
     void dispose()
@@ -150,6 +159,19 @@ struct _CrbParser
     usize pos;
     usize line;
     bool error;
+    str errMsg;
+
+    void fail(str msg)
+    {
+        if (self.error) return;
+        self.error = true;
+        self.errMsg = msg;
+    }
+
+    ParseError err()
+    {
+        return ParseError::Syntax { .msg = self.errMsg, .line = (u32)self.line, .col = 0 };
+    }
 
     void skipLine()
     {
@@ -186,11 +208,11 @@ struct _CrbParser
     String parseIdent()
     {
         usize start = self.pos;
-        if (self.pos >= self.len) { self.error = true; return String::new(); }
+        if (self.pos >= self.len) { self.fail("unexpected end of input"); return String::new(); }
         u8 c = self.data[self.pos];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'))
         {
-            self.error = true;
+            self.fail("expected identifier");
             return String::new();
         }
         while (self.pos < self.len)
@@ -206,25 +228,25 @@ struct _CrbParser
     String parseBasicString()
     {
         String s = String::new();
-        if (self.next() != '\"') { self.error = true; return s; }
+        if (self.next() != '\"') { self.fail("expected '\"'"); return s; }
         while (self.pos < self.len)
         {
             u8 c = self.data[self.pos++];
             if (c == '\"') return s;
             if (c == '\\')
             {
-                if (self.pos >= self.len) { self.error = true; return s; }
+                if (self.pos >= self.len) { self.fail("unterminated string"); return s; }
                 u8 esc = self.data[self.pos++];
                 if (esc == 'n') s.pushChar('\n');
                 else if (esc == 't') s.pushChar('\t');
                 else if (esc == 'r') s.pushChar('\r');
                 else if (esc == '\"') s.pushChar('\"');
                 else if (esc == '\\') s.pushChar('\\');
-                else { self.error = true; return s; }
+                else { self.fail("invalid escape sequence"); return s; }
             }
             else s.pushChar((u8)c);
         }
-        self.error = true;
+        self.fail("unterminated string");
         return s;
     }
 
@@ -245,7 +267,7 @@ struct _CrbParser
                 self.data[self.pos] == 't' && self.data[self.pos+1] == 'r' &&
                 self.data[self.pos+2] == 'u' && self.data[self.pos+3] == 'e')
             { self.pos += 4; return CrbValue::boolVal(true); }
-            self.error = true;
+            self.fail("invalid literal, expected 'true'");
             return CrbValue::boolVal(false);
         }
         if (c == 'f')
@@ -255,7 +277,7 @@ struct _CrbParser
                 self.data[self.pos+2] == 'l' && self.data[self.pos+3] == 's' &&
                 self.data[self.pos+4] == 'e')
             { self.pos += 5; return CrbValue::boolVal(false); }
-            self.error = true;
+            self.fail("invalid literal, expected 'false'");
             return CrbValue::boolVal(false);
         }
         if (c == '[') return self.parseArray();
@@ -269,33 +291,33 @@ struct _CrbParser
             while (self.pos < self.len && self.data[self.pos] >= '0' && self.data[self.pos] <= '9')
             {
                 u64 d = (u64)(self.data[self.pos] - '0');
-                if (intVal > (limit - d) / 10u) { self.error = true; return CrbValue::boolVal(false); }
+                if (intVal > (limit - d) / 10u) { self.fail("integer out of range"); return CrbValue::boolVal(false); }
                 intVal = intVal * 10 + d;
                 self.pos++;
             }
-            if (neg && self.pos == start + 1) { self.error = true; return CrbValue::boolVal(false); }
+            if (neg && self.pos == start + 1) { self.fail("expected digit after '-'"); return CrbValue::boolVal(false); }
             if (neg) return CrbValue::intVal(-(i64)intVal);
             return CrbValue::intVal((i64)intVal);
         }
-        self.error = true;
+        self.fail("unexpected token");
         return CrbValue::boolVal(false);
     }
 
     CrbValue parseArray()
     {
         CrbValue arr = CrbValue::listVal();
-        if (self.next() != '[') { self.error = true; arr.dispose(); return CrbValue::boolVal(false); }
+        if (self.next() != '[') { self.fail("expected '['"); arr.dispose(); return CrbValue::boolVal(false); }
         for (;;)
         {
             u8 c = self.peek();
             if (c == ']') { self.pos++; return arr; }
-            if (c == 0) { self.error = true; arr.dispose(); return CrbValue::boolVal(false); }
+            if (c == 0) { self.fail("unterminated array"); arr.dispose(); return CrbValue::boolVal(false); }
             CrbValue elem = self.parseValue();
             if (self.error) { elem.dispose(); arr.dispose(); return CrbValue::boolVal(false); }
             arr.listVal.push(elem);
             c = self.peek();
             if (c == ',') { self.pos++; continue; }
-            self.error = true;
+            self.fail("expected ',' or ']'");
             arr.dispose();
             return CrbValue::boolVal(false);
         }
@@ -305,10 +327,10 @@ struct _CrbParser
     {
         String key = self.parseIdent();
         if (self.error) { key.free(); return false; }
-        if (self.next() != '=') { key.free(); self.error = true; return false; }
+        if (self.next() != '=') { key.free(); self.fail("expected '='"); return false; }
         CrbValue val = self.parseValue();
         if (self.error) { key.free(); val.dispose(); return false; }
-        if (self.next() != ';') { key.free(); val.dispose(); self.error = true; return false; }
+        if (self.next() != ';') { key.free(); val.dispose(); self.fail("expected ';'"); return false; }
         CrbEntry e = CrbEntry { .key = key, .value = val };
         into->push(e);
         return true;
@@ -339,7 +361,7 @@ struct _CrbParser
         }
         if (!hasExt) self.pos = save;
 
-        if (self.next() != '{') { name.free(); ext.free(); self.error = true; return false; }
+        if (self.next() != '{') { name.free(); ext.free(); self.fail("expected '{'"); return false; }
 
         CrbBuild b = CrbBuild {
             .name = name,
@@ -353,23 +375,25 @@ struct _CrbParser
         {
             u8 cc = self.peek();
             if (cc == '}') { self.pos++; return true; }
-            if (cc == 0) { self.error = true; return false; }
+            if (cc == 0) { self.fail("unexpected end of input in build block"); return false; }
             if (!self.parseAssign(into)) return false;
         }
     }
 }
 
-// Returns false on a syntax error. On failure `out` holds whatever was
-// parsed so far — the caller must dispose it either way.
-pub bool parseCrlb(str input, CrbManifest* out)
+// Returns Ok with the parsed manifest. On a syntax error the partial manifest
+// is disposed internally and Err carries msg/line.
+pub Result<CrbManifest, ParseError> parseCrlb(str input)
 {
     _CrbParser p = _CrbParser {
         .data = (const u8*)input.ptr,
         .len = input.len,
         .pos = 0,
         .line = 1,
-        .error = false
+        .error = false,
+        .errMsg = "invalid crlb"
     };
+    CrbManifest manifest = CrbManifest::new();
 
     while (p.pos < p.len)
     {
@@ -377,24 +401,24 @@ pub bool parseCrlb(str input, CrbManifest* out)
         if (c == 0) break;
 
         String key = p.parseIdent();
-        if (p.error) { key.free(); return false; }
+        if (p.error) { key.free(); manifest.dispose(); return Result<CrbManifest, ParseError>::Err { .error = p.err() }; }
 
         if (key.asView().equals("build"))
         {
             key.free();
-            if (!p.parseBuildBlock(out)) return false;
+            if (!p.parseBuildBlock(&manifest)) { manifest.dispose(); return Result<CrbManifest, ParseError>::Err { .error = p.err() }; }
             continue;
         }
 
-        if (p.next() != '=') { key.free(); p.error = true; return false; }
+        if (p.next() != '=') { key.free(); p.fail("expected '='"); manifest.dispose(); return Result<CrbManifest, ParseError>::Err { .error = p.err() }; }
         CrbValue val = p.parseValue();
-        if (p.error) { key.free(); val.dispose(); return false; }
-        if (p.next() != ';') { key.free(); val.dispose(); p.error = true; return false; }
+        if (p.error) { key.free(); val.dispose(); manifest.dispose(); return Result<CrbManifest, ParseError>::Err { .error = p.err() }; }
+        if (p.next() != ';') { key.free(); val.dispose(); p.fail("expected ';'"); manifest.dispose(); return Result<CrbManifest, ParseError>::Err { .error = p.err() }; }
         CrbEntry e = CrbEntry { .key = key, .value = val };
-        out->top.push(e);
+        manifest.top.push(e);
     }
 
-    return !p.error;
+    return Result<CrbManifest, ParseError>::Ok { .value = manifest };
 }
 
 // @drop is the inbuilt drop trait in the new dialect — nothing else to

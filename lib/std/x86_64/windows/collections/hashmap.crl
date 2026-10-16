@@ -1,6 +1,12 @@
 import(lib) std::mman { alloc, dealloc, zero };
 import(lib) std::option { Option };
+import(lib) std::result { Result };
 import vec { Vec };
+
+pub variant CollectionError
+{
+    AllocFailed { str msg; }
+}
 
 pub struct HashMapEntry<K, V>
 {
@@ -44,12 +50,14 @@ pub struct HashMap<K, V>
     #[[inline]]
     usize count() {  return self.len; }
 
-    void insert(K key, V value)
+    Result<V, CollectionError> insert(K key, V value)
     {
         if (self.len * 2 >= self.cap)
         {
             usize newCap = self.cap * 2;
             HashMapEntry<K, V>* newEntries = alloc<HashMapEntry<K, V>>(newCap);
+            if (newEntries == null)
+                return Result<V, CollectionError>::Err { .error = CollectionError::AllocFailed { .msg = "HashMap resize allocation failed" } };
             zero<HashMapEntry<K, V>>(newEntries, newCap);
             for (usize i = 0; i < self.cap; i++)
             {
@@ -73,7 +81,7 @@ pub struct HashMap<K, V>
             if (self.eqFn(self.entries[h].key, key))
             {
                 self.entries[h].value = value;
-                return;
+                return Result<V, CollectionError>::Ok { .value = value };
             }
             h = (h + 1) % self.cap;
         }
@@ -81,6 +89,7 @@ pub struct HashMap<K, V>
         self.entries[h].value = value;
         self.entries[h].occupied = true;
         self.len++;
+        return Result<V, CollectionError>::Ok { .value = value };
     }
 
     Option<V> get(K key)
@@ -111,18 +120,18 @@ pub struct HashMap<K, V>
         return false;
     }
 
-    V* getPtr(K key)
+    Option<V*> getPtr(K key)
     {
         usize h = self.hashFn(key) % self.cap;
         usize start = h;
         while (self.entries[h].occupied)
         {
             if (self.eqFn(self.entries[h].key, key))
-                return &self.entries[h].value;
+                return Option<V*>::Some { .value = &self.entries[h].value };
             h = (h + 1) % self.cap;
             if (h == start) break;
         }
-        return null;
+        return Option<V*>::None;
     }
 
     void remove(K key)

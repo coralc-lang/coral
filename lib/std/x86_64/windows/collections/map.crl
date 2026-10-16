@@ -1,5 +1,11 @@
 import(lib) std::mman { alloc, dealloc };
 import(lib) std::option { Option };
+import(lib) std::result { Result };
+
+pub variant CollectionError
+{
+    AllocFailed { str msg; }
+}
 
 pub struct MapEntry<K, V>
 {
@@ -15,13 +21,15 @@ pub struct Map<K, V>
     MapEntry<K, V>* root;
     usize len;
     i32(K, K) cmpFn;
+    bool failed; // set by _insert when a node allocation fails
 
     static Map<K, V> new(i32(K, K) cmp)
     {
         return Map<K, V> {
             .root = null,
             .len = 0,
-            .cmpFn = cmp
+            .cmpFn = cmp,
+            .failed = false
         };
     }
 
@@ -42,9 +50,14 @@ pub struct Map<K, V>
         return self.len == 0;
     }
 
-    void insert(K key, V value)
+    // On AllocFailed the tree keeps its previous contents (no node is added).
+    Result<V, CollectionError> insert(K key, V value)
     {
+        self.failed = false;
         self.root = self._insert(self.root, key, value);
+        if (self.failed)
+            return Result<V, CollectionError>::Err { .error = CollectionError::AllocFailed { .msg = "Map node allocation failed" } };
+        return Result<V, CollectionError>::Ok { .value = value };
     }
 
     Option<V> get(K key)
@@ -54,11 +67,11 @@ pub struct Map<K, V>
         return Option<V>::None;
     }
 
-    V* getPtr(K key)
+    Option<V*> getPtr(K key)
     {
         MapEntry<K, V>* n = self._find(self.root, key);
-        if (n != null) return &n->value;
-        return null;
+        if (n != null) return Option<V*>::Some { .value = &n->value };
+        return Option<V*>::None;
     }
 
     bool contains(K key)
@@ -128,6 +141,11 @@ pub struct Map<K, V>
         if (n == null)
         {
             MapEntry<K, V>* newNode = alloc<MapEntry<K, V>>(1);
+            if (newNode == null)
+            {
+                self.failed = true;
+                return null;
+            }
             newNode->key = key;
             newNode->value = value;
             newNode->height = 0;
