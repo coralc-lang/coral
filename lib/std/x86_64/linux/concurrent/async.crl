@@ -44,7 +44,8 @@ import(lib) core::cchar { cchar };
 pub variant AsyncError
 {
     OutsideFiber { str msg; },
-    NullFuture { str msg; }
+    NullFuture { str msg; },
+    SpawnFailed { str msg; }
 }
 
 // glibc x86_64 stack_t, probe numbers: ss_sp 0, ss_flags 8, ss_size 16,
@@ -432,18 +433,21 @@ i32 _step(bool allowWait)
 
 // Spawn fn+arg on a fresh (or recycled) fiber. The returned future is a join
 // handle — await(spawn(...)) waits for fn to return; since fn is void it
-// carries no payload (my judgment call, null is the result). None — null fn,
-// or the fiber/future could not be allocated.
-pub Option<Future*> spawn(void(rawptr) fn, rawptr arg)
+// carries no payload (my judgment call, null is the result).
+// Err(SpawnFailed) — null fn, or the fiber/future could not be allocated;
+// the message says which.
+pub Result<Future*, AsyncError> spawn(void(rawptr) fn, rawptr arg)
 {
-    if (fn == null) return Option<Future*>::None;
+    if (fn == null)
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() called with a null fn" } };
     Future* join = _newFuture();
-    if (join == null) return Option<Future*>::None;
+    if (join == null)
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() join future allocation failed" } };
     Fiber* f = _acquireFiber();
     if (f == null)
     {
         dealloc<Future>(join);
-        return Option<Future*>::None;
+        return Result<Future*, AsyncError>::Err { .error = AsyncError::SpawnFailed { .msg = "spawn() fiber stack allocation failed" } };
     }
     f->fn = fn;
     f->arg = arg;
@@ -456,7 +460,7 @@ pub Option<Future*> spawn(void(rawptr) fn, rawptr arg)
     _pushReady(f);
     _sched.cond.signal(); // a driver parked with an empty queue must see it
     _unlock();
-    return Option<Future*>::Some { .value = join };
+    return Result<Future*, AsyncError>::Ok { .value = join };
 }
 
 // Suspend the calling fiber until f is ready, then return its result.

@@ -2,6 +2,7 @@ import(lib) platform::win32 { CreateFileA, CloseHandle, ReadFile, WriteFile, Cre
 import(lib) std::mman { alloc, dealloc, copy };
 import(lib) std::text::string { String };
 import(lib) std::result { Result };
+import(lib) std::option { Option };
 import fios;
 
 // Shared error type for the whole io subsystem (fs is the lowest module
@@ -210,7 +211,9 @@ i64 _ftNsec(u64 ft)
     return (i64)((ft - 116444736000000000u) % 10000000u) * 100;
 }
 
-pub Result<bool, IoError> statPath(str path, Stat* out)
+// None when the path does not stat — ENOENT (absence) is the common
+// answer here; `out` is filled only on Some.
+pub Option<bool> statPath(str path, Stat* out)
 {
     u8 pbuf[4096];
     usize plen = path.len < 4095 ? path.len : 4095;
@@ -220,7 +223,7 @@ pub Result<bool, IoError> statPath(str path, Stat* out)
     // stat(), GetFileAttributesExA level 0 (GetFileExInfoStandard).
     u8 info[64];
     if (!GetFileAttributesExA((const cchar*)pbuf, 0u, (rawptr)info))
-        return Result<bool, IoError>::Err { .error = IoError::os("GetFileAttributesExA") };
+        return Option<bool>::None;
 
     u32 attrs = _u32At(info, 0);
     u64 created = _u64At(info, 4);
@@ -254,7 +257,7 @@ pub Result<bool, IoError> statPath(str path, Stat* out)
     out->reserved[0] = 0;
     out->reserved[1] = 0;
     out->reserved[2] = 0;
-    return Result<bool, IoError>::Ok { .value = true };
+    return Option<bool>::Some { .value = true };
 }
 
 pub FileType getFileType(const Stat* s)
@@ -491,7 +494,7 @@ pub Result<bool, IoError> createDirRecursive(str path, i32 mode)
 {
     if (path.len == 0) return Result<bool, IoError>::Err { .error = IoError::BadUsage { .msg = "empty path" } };
     Stat st;
-    if (statPath(path, &st).isOk()) return Result<bool, IoError>::Ok { .value = true }; // already exists
+    if (statPath(path, &st).isSome()) return Result<bool, IoError>::Ok { .value = true }; // already exists
     // find parent and recurse first
     u32 lastSlash = 0;
     bool hasSlash = false;

@@ -1,4 +1,5 @@
-import mman { alloc, dealloc };
+import mman { alloc, dealloc, AllocError };
+import(lib) std::result { Result };
 
 struct RefCount
 {
@@ -10,12 +11,26 @@ pub struct SharedPtr<T>
     T* ptr;
     RefCount* rc;
 
-    void init(T value)
+    // Err(AllocFailed) — the pointee or the refcount block could not be
+    // allocated; the SharedPtr is left empty (isValid() false, dispose() a
+    // no-op) and nothing is dereferenced.
+    Result<bool, AllocError> init(T value)
     {
         self.ptr = alloc<T>(1);
-        *self.ptr = value;
         self.rc = alloc<RefCount>(1);
+        if (self.ptr == null || self.rc == null)
+        {
+            if (self.ptr != null) { dealloc<T>(self.ptr); }
+            if (self.rc != null) { dealloc<RefCount>(self.rc); }
+            self.ptr = null;
+            self.rc = null;
+            return Result<bool, AllocError>::Err {
+                .error = AllocError::AllocFailed { .msg = "SharedPtr pointee or refcount allocation failed" }
+            };
+        }
+        *self.ptr = value;
         self.rc.count = 1;
+        return Result<bool, AllocError>::Ok { .value = true };
     }
 
     void dispose()
