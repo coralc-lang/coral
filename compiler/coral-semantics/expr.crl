@@ -91,6 +91,29 @@ pub extend Sema
         if (expr->kind.tag == ExprKind::Field)
         {
             if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+            NodeId fieldObj = expr->kind.payload.Field.obj;
+            if (self.isPayloadAccessNode(fieldObj))
+            {
+                Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field)) return false;
+                    self.setExprType(id, self.stripType(baseTy));
+                    return true;
+                }
+            }
+            else if (self.isVariantCaseAccess(fieldObj))
+            {
+                NodeId payloadId = self.fieldAccessObj(fieldObj);
+                Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                    if (ft == 0) return false;
+                    self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                    return true;
+                }
+            }
             MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
             if (member.typeNode == 0) return false;
             self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
@@ -531,9 +554,53 @@ pub extend Sema
      * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
      * non-fatal). Returns false only for ordinary mismatches — the
      * caller then emits its generic message on the same node. */
+    /* `x.payload` access node (inside a field chain) */
+    bool isPayloadAccessNode(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field)
+            return e->kind.payload.Field.field == self.ctx.intern((u8*)"payload", 7);
+        if (e->kind.tag == ExprKind::DerefField)
+            return e->kind.payload.DerefField.field == self.ctx.intern((u8*)"payload", 7);
+        return false;
+    }
+
+    Str fieldAccessName(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.field;
+        return e->kind.payload.DerefField.field;
+    }
+
+    NodeId fieldAccessObj(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.obj;
+        return e->kind.payload.DerefField.obj;
+    }
+
+    /* `x.payload.Case.field` leaf: the object access is `x.payload.Case` */
+    bool isVariantCaseAccess(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::Field && e->kind.tag != ExprKind::DerefField) return false;
+        return self.isPayloadAccessNode(self.fieldAccessObj(objId));
+    }
+
     bool checkAssign(NodeId value, Ty fromTy, Ty targetTy)
     {
         if (self.assignCompatible(value, fromTy, targetTy)) return true;
+        /* `kind.tag = V::Case` — a bare variant case into the tag int; the
+         * backend writes the ordinal */
+        if (self.integerType(self.stripType(targetTy)) && self.isVariantNamedTy(fromTy)) return true;
         if (self.intToPtrAssign(value, fromTy, targetTy))
         {
             self.intToPtrDiag(value);
@@ -569,6 +636,18 @@ pub extend Sema
         Ty rightType = self.exprType(right);
         if (leftType == 0) leftType = rightType;
         if (rightType == 0) rightType = leftType;
+        /* `v.tag == V::Case` — a variant value compared against its tag
+         * int; the backend lowers the case side to the ordinal */
+        if (self.integerType(leftType) && self.isVariantNamedTy(rightType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
+        if (self.integerType(rightType) && self.isVariantNamedTy(leftType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
         /* `p - q` with both sides pointers — byte distance (usize); the
          * pointer-preserving rule below only covers `p - i` */
         if (isSub && self.pointerLike(leftType) && self.pointerLike(rightType))
@@ -1194,6 +1273,37 @@ pub extend Sema
             },
             ExprKind::Field => {
                 if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.Field.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
                 if (member.typeNode == 0)
                 {
@@ -1205,6 +1315,37 @@ pub extend Sema
             },
             ExprKind::DerefField => {
                 if (!self.checkExpr(expr->kind.payload.DerefField.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.DerefField.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.DerefField.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.DerefField.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.DerefField.obj), expr->kind.payload.DerefField.field);
                 if (member.typeNode == 0)
                 {

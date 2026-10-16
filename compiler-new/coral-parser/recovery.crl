@@ -1,11 +1,9 @@
 
+import(lib) std::text::string { String };
 import common::token { Token, TokenKind };
 import diag::code { ErrorCode };
 import diag::engine { DiagnosticEngine };
 import base { Parser };
-
-extern("C") rawptr malloc(usize size);
-extern("C") void free(rawptr ptr);
 
 pub extend Parser
 {
@@ -17,8 +15,8 @@ pub extend Parser
     void endSpeculation() { if (self.specDepth != 0) self.specDepth = self.specDepth - 1; }
     void beginRecovery() { self.panicMode = self.panicMode | 0x40000000; }
     void endRecovery() { self.panicMode = self.panicMode & 0xbfffffff; }
-    void reportCurrentError(ErrorCode code, u8* msg) { self.reportError(code, self.current, msg); }
-    void reportAllocFailed() { self.reportError(ErrorCode::DriverOutOfMemory, self.current, (u8*)"out of memory while parsing"); }
+    void reportCurrentError(ErrorCode code, str msg) { self.reportError(code, self.current, msg); }
+    void reportAllocFailed() { self.reportError(ErrorCode::DriverOutOfMemory, self.current, "out of memory while parsing"); }
 
     void addError()
     {
@@ -27,7 +25,7 @@ pub extend Parser
             self.panicMode = (self.panicMode & 0xc0000000) | (count + 1);
     }
 
-    void reportError(ErrorCode code, Token token, u8* msg)
+    void reportError(ErrorCode code, Token token, str msg)
     {
         if (self.isSpeculating()) return;
         self.addError();
@@ -37,7 +35,7 @@ pub extend Parser
         diag.emitError(code, self.tokenLoc(token), msg, null);
     }
 
-    u8* expectedTokenText(TokenKind kind)
+    str expectedTokenText(TokenKind kind)
     {
         switch (kind)
         {
@@ -63,41 +61,25 @@ pub extend Parser
     {
         if (self.current.kind == TokenKind::Eof)
         {
-            self.reportError(ErrorCode::ParseUnexpectedEof, self.current, (u8*)"unexpected end of file");
+            self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
             return;
         }
-        /* "expected ';', found 'x'" — built on the heap, freed after the
-         * diagnostic has been rendered (reportError uses it synchronously) */
-        u8* base = self.expectedTokenText(kind);
-        usize bl = 0;
-        while (base[bl] != 0) bl = bl + 1;
+        /* "expected ';', found 'x'" — built with String; reportError renders
+         * the view synchronously, the buffer dies with the scope */
+        str base = self.expectedTokenText(kind);
         Token t = self.current;
         usize tl = t.data.len;
         if (tl > 64) tl = 64;
-        u8* buf = (u8*)malloc(bl + tl + 24);
-        if (buf == null)
+        String sb = String::from(base);
+        if (sb.ptr == null)
         {
             self.reportError(ErrorCode::ParseExpectedToken, t, base);
             return;
         }
-        usize n = 0;
-        usize i = 0;
-        while (i < bl) { buf[n] = base[i]; n = n + 1; i = i + 1; }
-        buf[n] = 44; n = n + 1;              /* , */
-        buf[n] = 32; n = n + 1;              /* space */
-        buf[n] = 102; n = n + 1;             /* f */
-        buf[n] = 111; n = n + 1;             /* o */
-        buf[n] = 117; n = n + 1;             /* u */
-        buf[n] = 110; n = n + 1;             /* n */
-        buf[n] = 100; n = n + 1;             /* d */
-        buf[n] = 32; n = n + 1;              /* space */
-        buf[n] = 39; n = n + 1;              /* \' */
-        i = 0;
-        while (i < tl) { buf[n] = t.data.ptr[i]; n = n + 1; i = i + 1; }
-        buf[n] = 39; n = n + 1;              /* \' */
-        buf[n] = 0;
-        self.reportError(ErrorCode::ParseExpectedToken, t, buf);
-        free(buf);
+        sb.pushView(", found '");
+        sb.pushView(str::fromParts(t.data.ptr, tl));
+        sb.pushByte(39);                     /* \' */
+        self.reportError(ErrorCode::ParseExpectedToken, t, sb.asView());
     }
 
     bool isRecoveryBoundary(TokenKind kind)
@@ -113,7 +95,7 @@ pub extend Parser
         u32 braceDepth = 0;
         u32 parenDepth = 0;
         u32 bracketDepth = 0;
-        u32 startLine = self.current.line;
+        usize startLine = self.current.line;
         while (!self.atEnd())
         {
             TokenKind kind = self.current.kind;

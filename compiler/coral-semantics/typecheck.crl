@@ -353,9 +353,49 @@ pub extend Sema
         }
     }
 
+    /* typedefs (Str = u32, Ty = u32, ...) are transparent for scalar
+     * compatibility — they lower to their C base types */
+    Ty resolveScalarAlias(Ty t)
+    {
+        u32 guard = 0;
+        while (t != 0 && guard < 32)
+        {
+            guard = guard + 1;
+            TypeEntry* entry = self.ctx.types + t;
+            if (entry->kind.tag == TypeKind::Const || entry->kind.tag == TypeKind::Comptime)
+            {
+                if (entry->kind.tag == TypeKind::Const) t = entry->kind.payload.Const.base;
+                else t = entry->kind.payload.Comptime.base;
+                continue;
+            }
+            if (entry->kind.tag != TypeKind::Named) return t;
+            if (entry->kind.payload.Named.genericArgsLen != 0) return t;
+            Symbol* symbol = self.lookupType(entry->kind.payload.Named.name, entry->loc);
+            if (symbol == null || symbol->declaration.index == 0) return t;
+            Node* declNode = self.ctx.nodes + symbol->declaration.index;
+            if (declNode->kind.tag != NodeKind::Decl) return t;
+            Decl* decl = &declNode->kind.payload.Decl.value;
+            if (decl->kind.tag == DeclKind::TypeAlias)
+            {
+                if (decl->kind.payload.TypeAlias.target == 0) return t;
+                t = decl->kind.payload.TypeAlias.target;
+                continue;
+            }
+            if (decl->kind.tag == DeclKind::Distinct)
+            {
+                if (decl->kind.payload.Distinct.baseType == 0) return t;
+                t = decl->kind.payload.Distinct.baseType;
+                continue;
+            }
+            return t;
+        }
+        return t;
+    }
+
     u32 intWidth(Ty t)
     {
         if (t == 0) return 0;
+        t = self.resolveScalarAlias(t);
         TypeEntry* entry = self.ctx.types + t;
         switch (entry->kind.tag)
         {
@@ -374,6 +414,7 @@ pub extend Sema
     bool intSigned(Ty t)
     {
         if (t == 0) return false;
+        t = self.resolveScalarAlias(t);
         TypeEntry* entry = self.ctx.types + t;
         switch (entry->kind.tag)
         {
@@ -385,6 +426,7 @@ pub extend Sema
     bool integerType(Ty typeNode)
     {
         if (typeNode == 0) return false;
+        typeNode = self.resolveScalarAlias(typeNode);
         TypeEntry* entry = self.ctx.types + typeNode;
         if (entry->kind.tag == TypeKind::U8 || entry->kind.tag == TypeKind::U16 || entry->kind.tag == TypeKind::U32 || entry->kind.tag == TypeKind::U64 || entry->kind.tag == TypeKind::U128 || entry->kind.tag == TypeKind::I8 || entry->kind.tag == TypeKind::I16 || entry->kind.tag == TypeKind::I32 || entry->kind.tag == TypeKind::I64 || entry->kind.tag == TypeKind::I128 || entry->kind.tag == TypeKind::Usize || entry->kind.tag == TypeKind::Isize || entry->kind.tag == TypeKind::Char) return true;
         /* `cchar` is the C ABI byte type (Named); it participates in integer
@@ -397,6 +439,7 @@ pub extend Sema
     bool floatType(Ty typeNode)
     {
         if (typeNode == 0) return false;
+        typeNode = self.resolveScalarAlias(typeNode);
         TypeEntry* entry = self.ctx.types + typeNode;
         return entry->kind.tag == TypeKind::F32 || entry->kind.tag == TypeKind::F64;
     }
@@ -846,6 +889,11 @@ pub extend Sema
     {
         if (from == 0 || to == 0) return true;
         if (self.sameType(from, to)) return true;
+
+        /* see through typedefs before the structural rules below */
+        Ty rf = self.resolveScalarAlias(from);
+        Ty rt = self.resolveScalarAlias(to);
+        if (rf != from || rt != to) return self.compatible(rf, rt);
 
         TypeEntry* source = self.ctx.types + from;
         TypeEntry* target = self.ctx.types + to;

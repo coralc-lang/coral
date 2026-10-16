@@ -81,6 +81,29 @@ pub extend Sema
         if (expr->kind.tag == ExprKind::Field)
         {
             if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+            NodeId fieldObj = expr->kind.payload.Field.obj;
+            if (self.isPayloadAccessNode(fieldObj))
+            {
+                Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field)) return false;
+                    self.setExprType(id, self.stripType(baseTy));
+                    return true;
+                }
+            }
+            else if (self.isVariantCaseAccess(fieldObj))
+            {
+                NodeId payloadId = self.fieldAccessObj(fieldObj);
+                Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                if (self.isVariantNamedTy(baseTy))
+                {
+                    Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                    if (ft == 0) return false;
+                    self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                    return true;
+                }
+            }
             MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
             if (member.typeNode == 0) return false;
             self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
@@ -133,7 +156,7 @@ pub extend Sema
         {
             if (!self.checkAssign(args[i], self.exprType(args[i]), te->kind.payload.FnPtr.params[i]))
                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
-                    self.typeMismatchMsg((u8*)"argument type", self.exprType(args[i]), te->kind.payload.FnPtr.params[i]));
+                    self.typeMismatchMsg("argument type", self.exprType(args[i]), te->kind.payload.FnPtr.params[i]));
             i = i + 1;
         }
         self.setExprType(callId, te->kind.payload.FnPtr.returnType);
@@ -228,7 +251,7 @@ pub extend Sema
                                     self.paramMismatchMsg(param->name, self.exprType(args[i]), want));
                             else
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, args[i],
-                                    self.typeMismatchMsg((u8*)"argument type", self.exprType(args[i]), want));
+                                    self.typeMismatchMsg("argument type", self.exprType(args[i]), want));
                         }
                     }
                 }
@@ -359,10 +382,8 @@ pub extend Sema
             Node* node = self.ctx.nodes + value.index;
             loc = node->loc;
         }
-        u8* msg = (u8*)"cannot assign an integer to a pointer";
-        u8* help = (u8*)"use `null` for a null pointer, or cast the integer explicitly";
-        if (self.allowIntPtr) self.diag.emitAllowed(ErrorCode::SemaIntToPtr, loc, msg, help);
-        else self.semaError(ErrorCode::SemaIntToPtr, loc, msg);
+        if (self.allowIntPtr) self.diag.emitAllowed(ErrorCode::SemaIntToPtr, loc, "cannot assign an integer to a pointer", "use `null` for a null pointer, or cast the integer explicitly");
+        else self.semaError(ErrorCode::SemaIntToPtr, loc, "cannot assign an integer to a pointer");
     }
 
     bool assignCompatible(NodeId value, Ty fromTy, Ty targetTy)
@@ -521,9 +542,53 @@ pub extend Sema
      * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
      * non-fatal). Returns false only for ordinary mismatches — the
      * caller then emits its generic message on the same node. */
+    /* `x.payload` access node (inside a field chain) */
+    bool isPayloadAccessNode(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field)
+            return e->kind.payload.Field.field == self.ctx.intern((u8*)"payload", 7);
+        if (e->kind.tag == ExprKind::DerefField)
+            return e->kind.payload.DerefField.field == self.ctx.intern((u8*)"payload", 7);
+        return false;
+    }
+
+    Str fieldAccessName(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.field;
+        return e->kind.payload.DerefField.field;
+    }
+
+    NodeId fieldAccessObj(NodeId id)
+    {
+        Node* n = self.ctx.nodes + id.index;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.obj;
+        return e->kind.payload.DerefField.obj;
+    }
+
+    /* `x.payload.Case.field` leaf: the object access is `x.payload.Case` */
+    bool isVariantCaseAccess(NodeId objId)
+    {
+        if (objId.index == 0) return false;
+        Node* n = self.ctx.nodes + objId.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::Field && e->kind.tag != ExprKind::DerefField) return false;
+        return self.isPayloadAccessNode(self.fieldAccessObj(objId));
+    }
+
     bool checkAssign(NodeId value, Ty fromTy, Ty targetTy)
     {
         if (self.assignCompatible(value, fromTy, targetTy)) return true;
+        /* `kind.tag = V::Case` — a bare variant case into the tag int; the
+         * backend writes the ordinal */
+        if (self.integerType(self.stripType(targetTy)) && self.isVariantNamedTy(fromTy)) return true;
         if (self.intToPtrAssign(value, fromTy, targetTy))
         {
             self.intToPtrDiag(value);
@@ -559,6 +624,18 @@ pub extend Sema
         Ty rightType = self.exprType(right);
         if (leftType == 0) leftType = rightType;
         if (rightType == 0) rightType = leftType;
+        /* `v.tag == V::Case` — a variant value compared against its tag
+         * int; the backend lowers the case side to the ordinal */
+        if (self.integerType(leftType) && self.isVariantNamedTy(rightType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
+        if (self.integerType(rightType) && self.isVariantNamedTy(leftType))
+        {
+            self.setExprType(id, self.i32Type());
+            return true;
+        }
         /* `p - q` with both sides pointers — byte distance (usize); the
          * pointer-preserving rule below only covers `p - i` */
         if (isSub && self.pointerLike(leftType) && self.pointerLike(rightType))
@@ -603,7 +680,7 @@ pub extend Sema
             if (lCLit && !rLit && self.integerType(rightType)) { self.setExprType(id, rightType); return true; }
             if (rCLit && !lLit && self.integerType(leftType)) { self.setExprType(id, leftType); return true; }
             self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
-                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
             self.setExprType(id, leftType);
             return true;
         }
@@ -615,7 +692,7 @@ pub extend Sema
             if (lFLit && !rFLit) { self.setExprType(id, rightType); return true; }
             if (rFLit && !lFLit) { self.setExprType(id, leftType); return true; }
             self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
-                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
             self.setExprType(id, leftType);
             return true;
         }
@@ -650,7 +727,7 @@ pub extend Sema
             if (right.index != 0 && self.isIntLitNode(right) && self.floatType(leftType))
             { self.setExprType(id, leftType); return true; }
             self.semaErrorNode(ErrorCode::SemaTypeMismatch, id,
-                self.typeMismatchMsg((u8*)"binary operand types", leftType, rightType));
+                self.typeMismatchMsg("binary operand types", leftType, rightType));
         }
         self.setExprType(id, leftType);
         return true;
@@ -1174,7 +1251,7 @@ pub extend Sema
                                     self.paramMismatchMsg(param->name, self.exprType(argId), want));
                             else
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, argId,
-                                    self.typeMismatchMsg((u8*)"method argument type", self.exprType(argId), want));
+                                    self.typeMismatchMsg("method argument type", self.exprType(argId), want));
                         }
                     }
                     i = i + 1;
@@ -1184,6 +1261,37 @@ pub extend Sema
             },
             ExprKind::Field => {
                 if (!self.checkExpr(expr->kind.payload.Field.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.Field.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.Field.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.Field.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
                 if (member.typeNode == 0)
                 {
@@ -1195,6 +1303,37 @@ pub extend Sema
             },
             ExprKind::DerefField => {
                 if (!self.checkExpr(expr->kind.payload.DerefField.obj)) return false;
+                NodeId fieldObj = expr->kind.payload.DerefField.obj;
+                if (self.isPayloadAccessNode(fieldObj))
+                {
+                    Ty baseTy = self.exprType(self.fieldAccessObj(fieldObj));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        if (!self.variantHasCase(baseTy, expr->kind.payload.DerefField.field))
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown variant case in payload");
+                            return false;
+                        }
+                        self.setExprType(id, self.stripType(baseTy));
+                        return true;
+                    }
+                }
+                else if (self.isVariantCaseAccess(fieldObj))
+                {
+                    NodeId payloadId = self.fieldAccessObj(fieldObj);
+                    Ty baseTy = self.exprType(self.fieldAccessObj(payloadId));
+                    if (self.isVariantNamedTy(baseTy))
+                    {
+                        Ty ft = self.findVariantCaseFieldTy(baseTy, self.fieldAccessName(fieldObj), expr->kind.payload.DerefField.field);
+                        if (ft == 0)
+                        {
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on variant case");
+                            return false;
+                        }
+                        self.setExprType(id, self.substituteFieldTy(ft, baseTy));
+                        return true;
+                    }
+                }
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.DerefField.obj), expr->kind.payload.DerefField.field);
                 if (member.typeNode == 0)
                 {
@@ -1335,7 +1474,7 @@ pub extend Sema
                 Ty atgt = self.assignTargetType(expr->kind.payload.Assign.target);
                 if (!self.checkAssign(av, self.exprType(av), atgt))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
-                        self.typeMismatchMsg((u8*)"assignment", self.exprType(av), atgt));
+                        self.typeMismatchMsg("assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignAdd => {
@@ -1347,7 +1486,7 @@ pub extend Sema
                 if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
                     !self.checkAssign(av, self.exprType(av), atgt))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
-                        self.typeMismatchMsg((u8*)"compound assignment", self.exprType(av), atgt));
+                        self.typeMismatchMsg("compound assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignSub => {
@@ -1358,7 +1497,7 @@ pub extend Sema
                 if (!self.intToPtrAssign(av, self.exprType(av), atgt) &&
                     !self.checkAssign(av, self.exprType(av), atgt))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, av,
-                        self.typeMismatchMsg((u8*)"compound assignment", self.exprType(av), atgt));
+                        self.typeMismatchMsg("compound assignment", self.exprType(av), atgt));
                 return true;
             },
             ExprKind::AssignMul => {
@@ -1435,7 +1574,7 @@ pub extend Sema
                     Symbol* symbol = self.lookupType(te->kind.payload.Named.name, te->loc);
                     if (symbol == null || symbol->declaration.index == 0)
                     {
-                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, self.nameMsg((u8*)"unknown type name: ", te->kind.payload.Named.name));
+                        self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, self.nameMsg("unknown type name: ", te->kind.payload.Named.name));
                         return false;
                     }
                     Node* dn = self.ctx.nodes + symbol->declaration.index;
@@ -1508,7 +1647,7 @@ pub extend Sema
                                 self.paramMismatchMsg(fieldName, actual, expected));
                         else
                             self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
-                                self.typeMismatchMsg((u8*)"field type", actual, expected));
+                                self.typeMismatchMsg("field type", actual, expected));
                     }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                         i = i + 1;
@@ -1540,7 +1679,7 @@ pub extend Sema
                                 self.paramMismatchMsg(litNames[i], actual, expected));
                         else
                             self.semaErrorNode(ErrorCode::SemaTypeMismatch, valueId,
-                                self.typeMismatchMsg((u8*)"struct field type", actual, expected));
+                                self.typeMismatchMsg("struct field type", actual, expected));
                     }
                     if (actual == 0) self.coerceArrayLit(valueId, expected);
                     i = i + 1;
@@ -1600,7 +1739,7 @@ pub extend Sema
                                     self.paramMismatchMsg(param->name, self.exprType(sarg), param->typeNode));
                             else
                                 self.semaErrorNode(ErrorCode::SemaTypeMismatch, sarg,
-                                    self.typeMismatchMsg((u8*)"static method argument type", self.exprType(sarg), param->typeNode));
+                                    self.typeMismatchMsg("static method argument type", self.exprType(sarg), param->typeNode));
                         }
                     }
                     i = i + 1;
@@ -1654,7 +1793,7 @@ pub extend Sema
                     u32 cpI = 0;
                     while (cpI < msgLen) { msgBuf[cpI] = msgPtr[cpI]; cpI = cpI + 1; }
                     msgBuf[msgLen] = 0;
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msgBuf);
+                    (usize)self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, str::fromParts(msgBuf, (usize)msgLen));
                     return false;
                 }
                 /* @isFormatLiteral(expr) — true only when the given

@@ -146,9 +146,9 @@ bool libBytesEq(u8* a, usize al, u8* b, usize bl)
     return true;
 }
 
-u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, u8* suffix, usize suffixLen)
+u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, str suffix)
 {
-    u8* p = (u8*)malloc(dirLen + 1 + segLen + suffixLen + 1);
+    u8* p = (u8*)malloc(dirLen + 1 + segLen + suffix.len + 1);
     if (p == null) return null;
     usize k = 0;
     usize i = 0;
@@ -157,7 +157,7 @@ u8* libCandidate(u8* dir, usize dirLen, u8* seg, usize segLen, u8* suffix, usize
     i = 0;
     while (i < segLen) { p[k] = seg[i]; k = k + 1; i = i + 1; }
     i = 0;
-    while (i < suffixLen) { p[k] = suffix[i]; k = k + 1; i = i + 1; }
+    while (i < suffix.len) { p[k] = suffix.ptr[i]; k = k + 1; i = i + 1; }
     p[k] = 0;
     return p;
 }
@@ -272,7 +272,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         /* existence probe only — the file is re-read by the loader later,
          * and nothing here interns into this buffer, so it can be freed */
         usize len = 0;
-        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)".crl", 4);
+        u8* cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, ".crl");
         if (cand != null)
         {
             u8* buf = libRead(cand, &len);
@@ -283,7 +283,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
             }
             free(cand);
         }
-        cand = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"/lib.crl", 8);
+        cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "/lib.crl");
         if (cand != null)
         {
             u8* buf = libRead(cand, &len);
@@ -296,10 +296,10 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         }
         return null;
     }
-    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"", 0);
+    u8* sub = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "");
     if (sub == null) return null;
-    usize subLen = dirLen + 1 + segs[0].len;
-    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, segs[0].len, (u8*)"/lib.crl", 8);
+    usize subLen = dirLen + 1 + (usize)segs[0].len;
+    u8* mpath = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, "/lib.crl");
     if (mpath != null)
     {
         usize mlen = 0;
@@ -322,11 +322,11 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
                         if (dd->kind.tag == DeclKind::ModReexport && dd->kind.payload.ModReexport.path != 0)
                         {
                             InternEntry* entry = L->ctx->interns + dd->kind.payload.ModReexport.alias;
-                            if (libBytesEq(entry->ptr, entry->len, segs[1].ptr, segs[1].len))
+                            if (libBytesEq(entry->ptr, entry->len, segs[1].ptr, (usize)segs[1].len))
                             {
                                 InternEntry* target = L->ctx->interns + dd->kind.payload.ModReexport.path;
                                 u32 maxT = (u32)(target->len / 2) + 1;
-                                LibSeg* next = (LibSeg*)malloc(((usize)maxT + n) * @sizeof(LibSeg));
+                                LibSeg* next = (LibSeg*)malloc(((usize)maxT + (usize)n) * @sizeof(LibSeg));
                                 if (next != null)
                                 {
                                     u32 got = libSplit(target->ptr, target->len, next, maxT);
@@ -429,10 +429,10 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     if (base != null)
     {
         usize bl = libLen(base);
-        u8* up = libCandidate(base, bl, (u8*)"..", 2, (u8*)"/..", 3);
+        u8* up = libCandidate(base, bl, "..".ptr, 2, "/..");
         if (up != null)
         {
-            u8* root1 = libCandidate(up, libLen(up), (u8*)"lib", 3, (u8*)"", 0);
+            u8* root1 = libCandidate(up, libLen(up), "lib".ptr, 3, "");
             if (root1 != null)
             {
                 result = libResolveSegs(L, segs, n, root1, libLen(root1), 0);
@@ -444,13 +444,13 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     /* `base` stays alive until the platform-root fallback below also
      * probes it (it was freed here first — use-after-free) */
     if (result == null)
-        result = libResolveSegs(L, segs, n, (u8*)"lib", 3, 0);
+        result = libResolveSegs(L, segs, n, "lib".ptr, 3, 0);
     if (result == null && L->platformRootSegsLen > 0 && n > 1)
     {
         /* platform-first: <module>/<platform_root>/<rest> — neutral paths
          * resolve under the platform root before the base tree
          * (see coral-docs/builder_incomplete.md) */
-        LibSeg* psegs = (LibSeg*)malloc(((usize)1 + L->platformRootSegsLen + (n - 1)) * @sizeof(LibSeg));
+        LibSeg* psegs = (LibSeg*)malloc(((usize)n + (usize)L->platformRootSegsLen) * @sizeof(LibSeg));
         if (psegs != null)
         {
             psegs[0] = segs[0];
@@ -469,7 +469,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
                 k = k + 1;
                 m = m + 1;
             }
-            result = libResolveSegs(L, psegs, k, (u8*)"lib", 3, 0);
+            result = libResolveSegs(L, psegs, k, "lib".ptr, 3, 0);
             if (result == null && base != null)
                 result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
             free(psegs);
@@ -524,14 +524,16 @@ bool libPushFile(LibLoader* L, File* f)
 
 /* resolve + load one import(lib)-style module — used for the builtin `str`
  * prelude that every unit merges */
-void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
+void libLoadModulePath(LibLoader* L, str ns)
 {
+    u8* nsPtr = ns.ptr;
+    usize nsLen = ns.len;
     u8* resolved = libResolve(L, nsPtr, nsLen);
     if (resolved == null)
     {
-        write(2, (u8*)"coral: cannot resolve import(lib) ", 34);
+        write(2, C"coral: cannot resolve import(lib) ", 34);
         write(2, nsPtr, nsLen);
-        write(2, (u8*)"\n", 1);
+        write(2, C"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -549,9 +551,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
     u8* buf = libRead(resolved, &len);
     if (buf == null)
     {
-        write(2, (u8*)"coral: cannot read import(lib) file ", 36);
+        write(2, C"coral: cannot read import(lib) file ", 36);
         write(2, resolved, libLen(resolved));
-        write(2, (u8*)"\n", 1);
+        write(2, C"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -570,9 +572,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
     File* lf = libParse(L, buf, len, resolved, dg, fid);
     if (lf == null)
     {
-        write(2, (u8*)"coral: cannot read import(lib) file ", 36);
+        write(2, C"coral: cannot read import(lib) file ", 36);
         write(2, resolved, libLen(resolved));
-        write(2, (u8*)"\n", 1);
+        write(2, C"\n", 1);
         L->errors = L->errors + 1;
         return;
     }
@@ -619,7 +621,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                  }
                  if (sibling)
                  {
-                     u8* cand = libCandidate(dir, dirLen, ie->ptr, ie->len, ".crl", 4);
+                     u8* cand = libCandidate(dir, dirLen, ie->ptr, ie->len, ".crl");
                      if (cand != null)
                      {
                          if (libHas(L, cand))
@@ -657,9 +659,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                                  File* lf = libParse(L, buf, len, cand, dg, fid);
                                  if (lf == null)
                                  {
-                                     write(2, "coral: cannot parse sibling import ", 34);
+                                     write(2, C"coral: cannot parse sibling import ", 34);
                                      write(2, cand, libLen(cand));
-                                     write(2, "\n", 1);
+                                     write(2, C"\n", 1);
                                      L->errors = L->errors + 1;
                                  }
                                  else
@@ -731,7 +733,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                      InternEntry* fe0 = L->ctx->interns + f->path;
                      u8* dir0 = libDir(fe0->ptr);
                      u8* sib0 = null;
-                     if (dir0 != null) sib0 = libCandidate(dir0, libLen(dir0), pe0->ptr, pe0->len, ".crl", 4);
+                     if (dir0 != null) sib0 = libCandidate(dir0, libLen(dir0), pe0->ptr, pe0->len, ".crl");
                      if (sib0 == null)
                      {
                          bareModule = true;
@@ -790,8 +792,8 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                  if (groupCount > 0)
                  {
                      comps = (u8*)malloc(compsSize);
-                     tPtrs = (u8**)malloc(((usize)1 + groupCount) * @sizeof(u8*));
-                     tLens = (usize*)malloc(((usize)1 + groupCount) * @sizeof(usize));
+                     tPtrs = (u8**)malloc(((usize)1 + (usize)groupCount) * @sizeof(u8*));
+                     tLens = (usize*)malloc(((usize)1 + (usize)groupCount) * @sizeof(usize));
                      if (comps == null || tPtrs == null || tLens == null)
                      {
                          if (comps != null) free(comps);
@@ -892,7 +894,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                    * targets are soft (a dead re-export may not exist here) */
                   if (tHard == null || tOwned == null)
                   {
-                      u8* nh = (u8*)malloc(tCap);
+                      u8* nh = (u8*)malloc((usize)tCap);
                       u8** no = (u8**)malloc(((usize)tCap) * @sizeof(u8*));
                       if (nh != null && no != null)
                       {
@@ -931,25 +933,25 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                            if (tHard[k] != 0)
                            {
                                if ((dd->kind.payload.Import.flags & 1) != 0)
-                                   write(2, "coral: cannot resolve import(lib) ", 34);
+                                   write(2, C"coral: cannot resolve import(lib) ", 34);
                                else
-                                   write(2, "coral: cannot resolve import ", 28);
+                                   write(2, C"coral: cannot resolve import ", 28);
                                write(2, target, targetLen);
-                               write(2, "\n", 1);
+                               write(2, C"\n", 1);
                                /* with a module table present, name the
                                 * likely cause: an unlisted module */
                                if (L->modKeys != null && L->modLen > 0)
-                                   write(2, "  note: not in the module table; check modules/aliases in the build file\n", 73);
+                                   write(2, C"  note: not in the module table; check modules/aliases in the build file\n", 73);
                                L->errors = L->errors + 1;
                            }
                        }
                       else
                       {
-                          if (getenv((u8*)"CORAL_TRACE_LOAD") != null)
+                          if (getenv(C"CORAL_TRACE_LOAD") != null)
                           {
-                              write(2, "coral: load ", 12);
+                              write(2, C"coral: load ", 12);
                               write(2, resolved, libLen(resolved));
-                              write(2, "\n", 1);
+                              write(2, C"\n", 1);
                           }
                           if (libHas(L, resolved))
                           {
@@ -982,9 +984,9 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                               }
                               if (lf == null)
                               {
-                                  write(2, "coral: cannot read import(lib) file ", 36);
+                                  write(2, C"coral: cannot read import(lib) file ", 36);
                                   write(2, resolved, libLen(resolved));
-                                  write(2, "\n", 1);
+                                  write(2, C"\n", 1);
                                   L->errors = L->errors + 1;
                               }
                               else
@@ -1024,7 +1026,7 @@ void libLoadModulePath(LibLoader* L, u8* nsPtr, usize nsLen)
                                   }
                                   if (rxAliases != null && rxCount > 0)
                                   {
-                                      rxWant = (u8*)malloc(rxCount);
+                                      rxWant = (u8*)malloc((usize)rxCount);
                                       if (rxWant != null)
                                       {
                                           u32 a = 0;
@@ -1190,8 +1192,8 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
 {
     *outLen = 0;
     if (ctx == null || ctx->flagsLen == 0) return null;
-    Str platName = ctx.intern((u8*)"platform", 8);
-    Str archName = ctx.intern((u8*)"arch", 4);
+    Str platName = ctx.intern("platform".ptr, 8);
+    Str archName = ctx.intern("arch".ptr, 4);
     Str platVal = 0;
     Str archVal = 0;
     u32 fi = 0;
@@ -1209,7 +1211,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
     u32 segCount = slashes + 1;
     if (slashes == 0) segCount = 2;
     if (segCount > 4) segCount = 4;
-    LibSeg* segs = (LibSeg*)malloc(segCount * @sizeof(LibSeg));
+    LibSeg* segs = (LibSeg*)malloc((usize)segCount * @sizeof(LibSeg));
     if (segs == null) return null;
     u32 k = 0;
     if (slashes == 0)
@@ -1227,7 +1229,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
         }
         else
         {
-            segs[0].ptr = (u8*)"x86_64";
+            segs[0].ptr = "x86_64".ptr;
             segs[0].len = 6;
         }
         segs[1].ptr = pe->ptr;
@@ -1283,8 +1285,8 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
      * against build-time flags (see compile.crl / Options) */
     if (flagsN != null && nFlags > 0)
     {
-        Str* fns = (Str*)malloc(nFlags * @sizeof(Str));
-        Str* fvs = (Str*)malloc(nFlags * @sizeof(Str));
+        Str* fns = (Str*)malloc((usize)nFlags * @sizeof(Str));
+        Str* fvs = (Str*)malloc((usize)nFlags * @sizeof(Str));
         u32 fi = 0;
         while (fi < nFlags)
         {
@@ -1316,7 +1318,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
     __tmpEngine.errorLimit = errorLimit;
     __tmpEngine.silenced = silenced;
 
-    u8* mainPath = (u8*)"main";
+    u8* mainPath = "main".ptr;
     usize mainPathLen = 4;
     if (path != null)
     {
@@ -1404,7 +1406,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         if (loader.platformRootSegs == null)
         {
-        u8* plat = getenv((u8*)"CORAL_PLATFORM");
+        u8* plat = getenv(C"CORAL_PLATFORM");
         usize plen = 0;
         while (plat != null && plat[plen] != 0) plen = plen + 1;
         if (plat != null && plen > 0)
@@ -1412,7 +1414,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             u32 segCount = 1;
             usize pi = 0;
             while (pi < plen) { if (plat[pi] == 47) segCount = segCount + 1; pi = pi + 1; }
-            LibSeg* prSegs = (LibSeg*)malloc(segCount * @sizeof(LibSeg));
+            LibSeg* prSegs = (LibSeg*)malloc((usize)segCount * @sizeof(LibSeg));
             if (prSegs != null)
             {
                 u32 k = 0;
@@ -1441,9 +1443,9 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             LibSeg* prSegs = (LibSeg*)malloc(2 * @sizeof(LibSeg));
             if (prSegs != null)
             {
-                prSegs[0].ptr = (u8*)"x86_64";
+                prSegs[0].ptr = "x86_64".ptr;
                 prSegs[0].len = 6;
-                prSegs[1].ptr = (u8*)"linux";
+                prSegs[1].ptr = "linux".ptr;
                 prSegs[1].len = 5;
                 loader.platformRootSegs = prSegs; // seems kinda hardcoded. there will be more 
                 loader.platformRootSegsLen = 2;   // host platforms and more target archs
@@ -1472,12 +1474,12 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
              * --no-prelude skips all of it for minimal single-file tests */
             if (!noPrelude)
             {
-                libLoadModulePath(&loader, (u8*)"core::str", 9);
-                libLoadModulePath(&loader, (u8*)"std::io::ios", 12);
-                libLoadModulePath(&loader, (u8*)"std::text::string", 17);
-                libLoadModulePath(&loader, (u8*)"std::option", 11);
+                libLoadModulePath(&loader, "core::str");
+                libLoadModulePath(&loader, "std::io::ios");
+                libLoadModulePath(&loader, "std::text::string");
+                libLoadModulePath(&loader, "std::option");
                 /* std::result skipped: result.crl:94 `Ok { error }` field bug + isErr/isOk resolve fail (never loaded in default builds) */
-                libLoadModulePath(&loader, (u8*)"std::vec", 8);
+                libLoadModulePath(&loader, "std::vec");
                 /* std::collections::arr NOT preloaded: Arr<T, N> uses a
                  * generic param as array size, which the parser rejects
                  * (type.crl:140 resolves sizes to u32 at parse time) */
@@ -1486,7 +1488,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             libLoadSiblingImports(&loader, file);
             if (loader.errors == 0 && !libMerge(&loader, file))
             {
-                write(2, (u8*)"coral: failed to merge import(lib) decls\n", 41);
+                write(2, C"coral: failed to merge import(lib) decls\n", 41);
                 loader.errors = loader.errors + 1;
             }
         }
@@ -1595,7 +1597,7 @@ AnalyzeResult analyze(u8* src, usize len)
     };
     parser.previous = parser.current;
     
-    File* file = parser.parseFile(ctx.intern((u8*)"frontend", 8));
+    File* file = parser.parseFile(ctx.intern("frontend".ptr, 8));
     Sema sema;
     sema.init(&ctx, &engine);
     sema.scopes.enter();

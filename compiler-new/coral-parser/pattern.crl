@@ -1,4 +1,5 @@
 
+import(lib) std::mman { alloc };
 import common::token { Token, TokenKind };
 import diag::code { ErrorCode };
 import context::context { AstContext, NodeListBuilder, StrListBuilder };
@@ -29,7 +30,7 @@ pub extend Parser
         {
             self.advance(); /* any */
             Token tTok = self.expect(TokenKind::Ident);
-            Str tn = self.ctx.intern(tTok.data.ptr, tTok.data.len);
+            Str tn = self.ctx.intern(tTok.data.asStr());
             /* stored as a nominal pattern naming `any <trait>` — semantic
              * refinement plus codegen-on-AnyTrait is a later todo */
             return self.storePat(PatKind::Ident{ .name = tn });
@@ -39,8 +40,8 @@ pub extend Parser
             /* `const T*` style pattern-name: read a type prefix and turn it
              * into a nominal pattern storing its source text (the pattern
              * selector in control flow will be this text). */
-            u8* buf = (u8*)malloc(256);
-            u32 bpos = 0;
+            u8* buf = alloc<u8>(256);
+            usize bpos = 0;
             /* current is TokenKind::Const */
             while (true)
             {
@@ -68,12 +69,12 @@ pub extend Parser
                 }
                 if (bpos + tk2.data.len < 255)
                 {
-                    u32 qq2 = 0;
+                    usize qq2 = 0;
                     while (qq2 < tk2.data.len) buf[bpos++] = tk2.data.ptr[qq2++];
                 }
             }
             buf[bpos] = 0;
-            Str nameStr = self.ctx.intern(buf, bpos);
+            Str nameStr = self.ctx.intern(str::fromParts(buf, bpos));
             return self.storePat(PatKind::Ident{ .name = nameStr });
         }
         if (k == TokenKind::Ident ||
@@ -84,7 +85,7 @@ pub extend Parser
             k == TokenKind::Usize || k == TokenKind::Isize || k == TokenKind::Rawptr || k == TokenKind::Str)
         {
             Token first = self.advance();
-            Str firstName = self.ctx.intern(first.data.ptr, first.data.len);
+            Str firstName = self.ctx.intern(first.data.asStr());
             /* a name immediately MASTERed by pointer/ref/array or
              * generic markers again denotes a type-prefix pattern: 'T*',
              * 'const*', 'T<T>', '...' collect text up to this branch
@@ -92,11 +93,11 @@ pub extend Parser
             if (self.current.kind == TokenKind::Star || self.current.kind == TokenKind::Ampersand ||
                 self.current.kind == TokenKind::LBracket || self.current.kind == TokenKind::Less)
             {
-                u8* buf = (u8*)malloc(256);
-                u32 ppos = 0;
+                u8* buf = alloc<u8>(256);
+                usize ppos = 0;
                 /* prefix with firstName words */
                 if (0) {}
-                u32 i0 = 0;
+                usize i0 = 0;
                 while (i0 < first.data.len) buf[ppos++] = first.data.ptr[i0++];
                 while (true)
                 {
@@ -116,18 +117,18 @@ pub extend Parser
                     Token tk2 = self.advance();
                     if (ppos > 0 && tk2.kind != TokenKind::Star && tk2.kind != TokenKind::RParen && tk2.kind != TokenKind::RBracket && tk2.kind != TokenKind::Greater && tk2.kind != TokenKind::Comma)
                         buf[ppos++] = ' ';
-                    u32 j0 = 0;
+                    usize j0 = 0;
                     while (j0 < tk2.data.len) buf[ppos++] = tk2.data.ptr[j0++];
                 }
                 buf[ppos] = 0;
-                Str nameStr = self.ctx.intern(buf, ppos);
+                Str nameStr = self.ctx.intern(str::fromParts(buf, ppos));
                 return self.storePat(PatKind::Ident{ .name = nameStr });
             }
 
             if (self.match(TokenKind::ColonColon))
             {
                 Token second = self.expect(TokenKind::Ident);
-                Str secondName = self.ctx.intern(second.data.ptr, second.data.len);
+                Str secondName = self.ctx.intern(second.data.asStr());
                 if (self.current.kind == TokenKind::LBrace)
                 {
                     self.advance();
@@ -137,7 +138,7 @@ pub extend Parser
                     {
                         self.match(TokenKind::Dot);
                         Token field = self.expect(TokenKind::Ident);
-                        Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                        Str fieldName = self.ctx.intern(field.data.asStr());
                         if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
                         if (!self.match(TokenKind::Comma)) break;
                     }
@@ -157,7 +158,7 @@ pub extend Parser
                 {
                     self.match(TokenKind::Dot);
                     Token field = self.expect(TokenKind::Ident);
-                    Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                    Str fieldName = self.ctx.intern(field.data.asStr());
                     if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
                     if (!self.match(TokenKind::Comma)) break;
                 }
@@ -200,10 +201,10 @@ pub extend Parser
         }
         if (self.isRecoveryBoundary(self.current.kind))
         {
-            self.reportCurrentError(ErrorCode::ParseExpectedExpr, (u8*)"expected switch pattern");
+            self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
             return self.noneNode();
         }
-        self.reportCurrentError(ErrorCode::ParseExpectedExpr, (u8*)"expected switch pattern");
+        self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
         self.advance();
         return self.noneNode();
     }

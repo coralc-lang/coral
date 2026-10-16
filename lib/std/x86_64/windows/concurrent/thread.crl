@@ -1,4 +1,5 @@
 import mutex { Mutex };
+import(lib) std::result { Result };
 import(lib) platform::win32 { CreateThread, WaitForSingleObject, GetExitCodeThread, CloseHandle, GetProcessHeap, HeapAlloc, HeapFree, GetCurrentThreadId, ExitThread, InitializeConditionVariable, SleepConditionVariableCS, WakeConditionVariable, WakeAllConditionVariable };
 
 const u32 INFINITE = 0xFFFFFFFF;
@@ -43,14 +44,24 @@ u32 _threadEntry(rawptr p)
     rawptr result = ctx->fn(ctx->arg);
     HeapFree(GetProcessHeap(), 0, ctx);
         // FLAG, 64-bit return value -> u32 Win32 exit code.
-    return (u32)(usize)result;
+    return (usize)result;
 }
 
-pub Thread threadCreate(rawptr(rawptr) fn, rawptr arg)
+pub variant ThreadError
 {
+    CreateFailed { str msg; }
+}
+
+// Err(CreateFailed) — null fn, ThreadCtx allocation failed, or CreateThread
+// failed (the message says which); Ok — the join handle for the new thread.
+pub Result<Thread, ThreadError> threadCreate(rawptr(rawptr) fn, rawptr arg)
+{
+    if (fn == null)
+        return Result<Thread, ThreadError>::Err { .error = ThreadError::CreateFailed { .msg = "threadCreate() called with a null fn" } };
     // two rawptrs (fn + arg), 16B on x64
     ThreadCtx* ctx = (ThreadCtx*)HeapAlloc(GetProcessHeap(), 0, 16);
-    if (ctx == null) return (Thread)0;
+    if (ctx == null)
+        return Result<Thread, ThreadError>::Err { .error = ThreadError::CreateFailed { .msg = "threadCreate() ThreadCtx allocation failed" } };
     ctx->fn = fn;
     ctx->arg = arg;
     u32 tid;
@@ -58,9 +69,9 @@ pub Thread threadCreate(rawptr(rawptr) fn, rawptr arg)
     if (h == null)
     {
         HeapFree(GetProcessHeap(), 0, ctx);
-        return (Thread)0;
+        return Result<Thread, ThreadError>::Err { .error = ThreadError::CreateFailed { .msg = "threadCreate() CreateThread failed" } };
     }
-    return (Thread)h;
+    return Result<Thread, ThreadError>::Ok { .value = (Thread)h };
 }
 
 pub bool threadJoin(Thread t, rawptr* retval)
@@ -88,7 +99,7 @@ pub void threadExit(rawptr retval)
 {
     // FLAG, truncated to u32; called from inside a threadCreate entry it
     // also leaks the ThreadCtx (the trampoline never resumes).
-    ExitThread((u32)(usize)retval);
+    ExitThread((usize)retval);
 }
 
 pub Thread threadCurrent()

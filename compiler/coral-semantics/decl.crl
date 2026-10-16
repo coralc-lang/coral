@@ -103,11 +103,39 @@ pub extend Sema
          * would only repeat the declaration (and re-count its failure) */
         if (name != 0 && !bodies)
         {
+            /* a C-style prototype plus its later definition is one
+             * function, not a duplicate — the backend emits the prototype
+             * for mutual recursion */
+            bool protoPair = false;
+            if (kind == 2)
+            {
+                Symbol* prev = self.scopes.lookup(name);
+                if (prev != null && prev->declaration.index != 0 && prev->fileId == self.fileOf(id))
+                {
+                    Node* pn = self.ctx.nodes + prev->declaration.index;
+                    if (pn->kind.tag == NodeKind::Decl)
+                    {
+                        Decl* pd = &pn->kind.payload.Decl.value;
+                        if (pd->kind.tag == DeclKind::Func &&
+                            ((pd->kind.payload.Func.flags & 8) == 0 ||
+                             (decl->kind.payload.Func.flags & 8) == 0))
+                            protoPair = true;
+                    }
+                }
+            }
             if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags, self.fileOf(id)) &&
-                self.scopes.lastDeclFail == 1)
+                self.scopes.lastDeclFail == 1 && !protoPair)
                 self.dupDeclDiag(name, id);
         }
-        if (!bodies) return true;
+        if (!bodies)
+        {
+            /* the method registry must be complete before any body runs:
+             * merged modules put extends in files checked later, and calls
+             * cross module boundaries freely */
+            if (decl->kind.tag == DeclKind::Extend || decl->kind.tag == DeclKind::ExtendTrait)
+                self.addExtend(id);
+            return true;
+        }
         if (decl->kind.tag == DeclKind::Func)
             return self.checkFunction(decl, 0);
         if (decl->kind.tag == DeclKind::Struct)
@@ -120,12 +148,10 @@ pub extend Sema
             return self.checkMethods(decl->kind.payload.Variant.methods, decl->kind.payload.Variant.methodsLen, self.selfNamedType(decl->kind.payload.Variant.name, decl->kind.payload.Variant.genericParams, decl->kind.payload.Variant.genericParamsLen), decl->kind.payload.Variant.genericParams, decl->kind.payload.Variant.genericParamsLen);
         if (decl->kind.tag == DeclKind::Extend)
         {
-            self.addExtend(id);
             return self.checkMethods(decl->kind.payload.Extend.methods, decl->kind.payload.Extend.methodsLen, decl->kind.payload.Extend.selfType, decl->kind.payload.Extend.genericParams, decl->kind.payload.Extend.genericParamsLen);
         }
         if (decl->kind.tag == DeclKind::ExtendTrait)
         {
-            self.addExtend(id);
             return self.checkMethods(decl->kind.payload.ExtendTrait.methods, decl->kind.payload.ExtendTrait.methodsLen, decl->kind.payload.ExtendTrait.selfType, decl->kind.payload.ExtendTrait.genericParams, decl->kind.payload.ExtendTrait.genericParamsLen);
         }
         return true;

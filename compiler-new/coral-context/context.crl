@@ -5,16 +5,14 @@
  * Follows Clang's ASTContext + BumpPtrAllocator design.
  */
 
-import ast::id { Str, SourceLoc, NodeId };
-import ast::types { Ty, TypeEntry, TypeKind };
-import ast::node { Node, NodeKind };
-import ast::decl { File, VariantVariant };
-import ast::stmt { SwitchCase };
-
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr calloc(usize count, usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
-extern("C") void free(rawptr ptr);
+import(lib) std::mman { alloc, dealloc, realloc, zero };
+import ast {
+    id { Str, SourceLoc, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { File, VariantVariant },
+    stmt { SwitchCase }
+};
 
 pub struct InternEntry
 {
@@ -73,7 +71,7 @@ pub struct AstContext
     u32 ownedLen;
     u32 ownedCap;
     u32 error;
-    u8* targetArch;
+    str targetArch;
     Str* flagNames;
     Str* flagValues;
     u32 flagsLen;
@@ -94,7 +92,7 @@ pub struct AstContext
             .ownedLen = 0,
             .ownedCap = 0,
             .error = 0,
-            .targetArch = (u8*)"x86_64",
+            .targetArch = flag (arch) { x86_64 => { "x86_64" }, Arm64 => { "Arm64" }, else => { "x86_64" } },
             .flagNames = null,
             .flagValues = null,
             .flagsLen = 0
@@ -105,9 +103,10 @@ pub struct AstContext
             usize bytes = 0;
             if (self.byteCount(internCap, @sizeof(InternEntry), &bytes))
             {
-                self.interns = (InternEntry*)calloc(1, bytes);
+                self.interns = (InternEntry*)alloc<u8>(bytes);
                 if (self.interns != null)
                 {
+                    zero<u8>((u8*)self.interns, bytes);
                     self.internsCap = internCap;
                     self.internsLen = 1;
                 }
@@ -122,14 +121,13 @@ pub struct AstContext
             usize bytes = 0;
             if (self.byteCount(typeCap, @sizeof(TypeEntry), &bytes))
             {
-                self.types = (TypeEntry*)calloc(1, bytes);
-                if (self.types != null)
-                {
+                self.types = (TypeEntry*)alloc<u8>(bytes);
+                if (self.types != null) {
+                    zero<u8>((u8*)self.types, bytes);
                     self.typesCap = typeCap;
                     self.typesLen = 1;
                 }
-                else
-                {
+                else {
                     self.setError();
                 }
             }
@@ -139,14 +137,13 @@ pub struct AstContext
             usize bytes = 0;
             if (self.byteCount(nodeCap, @sizeof(Node), &bytes))
             {
-                self.nodes = (Node*)calloc(1, bytes);
-                if (self.nodes != null)
-                {
+                self.nodes = (Node*)alloc<u8>(bytes);
+                if (self.nodes != null) {
+                    zero<u8>((u8*)self.nodes, bytes);
                     self.nodesCap = nodeCap;
                     self.nodesLen = 1;
                 }
-                else
-                {
+                else {
                     self.setError();
                 }
             }
@@ -158,13 +155,14 @@ pub struct AstContext
         u32 i = 0;
         while (i < self.ownedLen)
         {
-            if (self.owned[i] != null) free(self.owned[i]);
+            if (self.owned[i] != null) dealloc<u8>((u8*)self.owned[i]);
             i = i + 1;
         }
-        if (self.owned != null) free(self.owned);
-        if (self.interns != null) free(self.interns);
-        if (self.types != null) free(self.types);
-        if (self.nodes != null) free(self.nodes);
+        if (self.owned != null) dealloc<rawptr>(self.owned);
+        if (self.interns != null) dealloc<InternEntry>(self.interns);
+        if (self.types != null) dealloc<TypeEntry>(self.types);
+        if (self.nodes != null) dealloc<Node>(self.nodes);
+        
         self.interns = null;
         self.internsLen = 0;
         self.internsCap = 0;
@@ -180,17 +178,15 @@ pub struct AstContext
         self.error = 0;
     }
 
-    bool streq(u8* a, usize aLen, u8* b, usize bLen)
+    bool streq(str a, str b)
     {
-        if (aLen != bLen) return false;
-        if (aLen == 0) return true;
-        if (a == null || b == null) return false;
+        if (a.len != b.len) return false;
+        if (a.len == 0) return true;
+        if (a.ptr == null || b.ptr == null) return false;
         usize i = 0;
-        while (i < aLen)
+        while (i < a.len)
         {
-            u8* ap = a + i;
-            u8* bp = b + i;
-            if (ap[0] != bp[0]) return false;
+            if (a.ptr[i] != b.ptr[i]) return false;
             i = i + 1;
         }
         return true;
@@ -238,7 +234,7 @@ pub struct AstContext
         }
         usize bytes = 0;
         if (!self.byteCount(nextCap, elementSize, &bytes)) return null;
-        rawptr result = realloc(data, bytes);
+        rawptr result = realloc<u8>((u8*)data, bytes);
         if (result == null)
         {
             self.setError();
@@ -383,7 +379,7 @@ pub struct AstContext
         }
         usize bytes = 0;
         if (!self.byteCount(nextCap, elementSize, &bytes)) return null;
-        rawptr result = malloc(bytes);
+        rawptr result = alloc<u8>(bytes);
         if (result == null)
         {
             self.setError();
@@ -408,9 +404,9 @@ pub struct AstContext
         return result;
     }
 
-    u32 intern(u8* ptr, usize len)
+    u32 intern(str s)
     {
-        if (len == 0 || ptr == null) return 0;
+        if (s.len == 0 || s.ptr == null) return 0;
         if (self.error != 0) return 0;
         if (!self.ensureInterns()) return 0;
 
@@ -418,7 +414,7 @@ pub struct AstContext
         while (i < self.internsLen)
         {
             InternEntry* e = self.interns + i;
-            if (self.streq(e.ptr, e.len, ptr, len))
+            if (self.streq(str::fromParts(e.ptr, e.len), s))
             {
                 return e.id;
             }
@@ -432,23 +428,23 @@ pub struct AstContext
         /* copy the bytes — callers free their buffers after parsing
          * (lib loader candidate paths) while entries live as long as
          * the context, so the table must own its strings */
-        u8* copy = (u8*)malloc(len + 1);
+        u8* copy = alloc<u8>(s.len + 1);
         if (copy == null)
         {
             self.setError();
             return 0;
         }
         usize ci = 0;
-        while (ci < len) { copy[ci] = ptr[ci]; ci = ci + 1; }
-        copy[len] = 0;
+        while (ci < s.len) { copy[ci] = s.ptr[ci]; ci = ci + 1; }
+        copy[s.len] = 0;
         if (!self.track((rawptr)copy))
         {
-            free(copy);
+            dealloc<u8>(copy);
             return 0;
         }
         InternEntry* e = self.interns + self.internsLen;
         e.ptr = copy;
-        e.len = len;
+        e.len = s.len;
         e.id = self.internsLen;
         self.internsLen = self.internsLen + 1;
         return e.id;
@@ -503,7 +499,7 @@ pub struct AstContext
         b->cap = 0;
         if (result != null && !self.track((rawptr)result))
         {
-            free((rawptr)result);
+            dealloc<NodeId>(result);
             return null;
         }
         return result;
@@ -540,7 +536,7 @@ pub struct AstContext
         b->cap = 0;
         if (result != null && !self.track((rawptr)result))
         {
-            free((rawptr)result);
+            dealloc<Str>(result);
             return null;
         }
         return result;
@@ -577,7 +573,7 @@ pub struct AstContext
         b->cap = 0;
         if (result != null && !self.track((rawptr)result))
         {
-            free((rawptr)result);
+            dealloc<Ty>(result);
             return null;
         }
         return result;
@@ -614,7 +610,7 @@ pub struct AstContext
         b->cap = 0;
         if (result != null && !self.track((rawptr)result))
         {
-            free((rawptr)result);
+            dealloc<SwitchCase>(result);
             return null;
         }
         return result;
@@ -651,7 +647,7 @@ pub struct AstContext
         b->cap = 0;
         if (result != null && !self.track((rawptr)result))
         {
-            free((rawptr)result);
+            dealloc<VariantVariant>(result);
             return null;
         }
         return result;
@@ -661,7 +657,7 @@ pub struct AstContext
     {
         if (size == 0) return null;
         if (self.error != 0) return null;
-        rawptr ptr = malloc(size);
+        rawptr ptr = alloc<u8>(size);
         if (ptr == null)
         {
             self.setError();
@@ -669,7 +665,7 @@ pub struct AstContext
         }
         if (!self.track(ptr))
         {
-            free(ptr);
+            dealloc<u8>((u8*)ptr);
             return null;
         }
         return ptr;

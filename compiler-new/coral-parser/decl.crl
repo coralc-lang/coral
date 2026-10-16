@@ -24,12 +24,14 @@ pub extend Parser
 {
     NodeId storeDecl(DeclKind kind)
     {
-        Decl d;
-        d.kind = kind;
-        d.loc = self.tokenLoc(self.previous);
-        d.attrs = null;
-        d.attrsLen = 0;
-        return self.storeNode(NodeKind::Decl{ .value = d });
+        return self.storeNode(NodeKind::Decl{
+            .value = Decl { 
+                .kind = kind,
+                .loc = self.tokenLoc(self.previous),
+                .attrs = null,
+                .attrsLen = 0
+            }
+        });
     }
 
     NodeId storeParam(Param value)
@@ -112,6 +114,7 @@ pub extend Parser
                 self.restore(m);
                 if (!tupleRet) return self.parseStructDecl(isPub);
             },
+            
             TokenKind::Enum => { return self.parseEnumDecl(isPub); },
             TokenKind::Variant => { return self.parseVariantDecl(isPub); },
             TokenKind::Union => { return self.parseUnionDecl(isPub); },
@@ -133,6 +136,7 @@ pub extend Parser
                 if (fnAfterConst) return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, true);
                 return self.parseConstDecl(isPub);
             },
+            
             TokenKind::Var => { return self.parseVarDecl(isPub); },
             TokenKind::Typedef => { return self.parseTypedefDecl(); },
             TokenKind::Distinct => { return self.parseDistinctDecl(); },
@@ -146,7 +150,7 @@ pub extend Parser
         if (isExtern || isStatic || self.isTypeStart())
             return self.parseFuncOrVarDecl(isPub, isExtern, isStatic, isConst);
 
-        self.reportCurrentError(ErrorCode::ParseExpectedDecl, (u8*)"expected a declaration: a function, var, const, struct or a type");
+        self.reportCurrentError(ErrorCode::ParseExpectedDecl, "expected a declaration: a function, var, const, struct or a type here");
         if (!self.atEnd()) self.advance();
         return self.noneNode();
     }
@@ -189,69 +193,72 @@ pub extend Parser
     {
         if (ty == 0 || genericCount == 0) return;
         TypeEntry* entry = self.ctx.types + ty;
-        if (entry->kind.tag == TypeKind::Named)
+        switch (entry->kind.tag)
         {
-            Str nm = entry->kind.payload.Named.name;
-            u32 g = 0;
-            while (g < genericCount)
-            {
-                Node* gn = self.ctx.nodes + genericValues[g].index;
-                if (gn->kind.tag == NodeKind::GenericParam)
+            TypeKind::Named => {
+                Str nm = entry->kind.payload.Named.name;
+                u32 g = 0;
+                while (g < genericCount)
                 {
-                    if (gn->kind.payload.GenericParam.value.name == nm)
+                    Node* gn = self.ctx.nodes + genericValues[g].index;
+                    if (gn->kind.tag == NodeKind::GenericParam)
                     {
-                        entry->kind = TypeKind::TypeParam { .name = nm, .index = g };
-                        return;
+                        if (gn->kind.payload.GenericParam.value.name == nm)
+                        {
+                            entry->kind = TypeKind::TypeParam { .name = nm, .index = g };
+                            return;
+                        }
                     }
+                    g++;
                 }
-                g = g + 1;
+                u32 i = 0;
+                while (i < entry->kind.payload.Named.genericArgsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.Named.genericArgs[i], genericValues, genericCount);
+                    i = i + 1;
+                }
+                return;
+            },
+        
+            TypeKind::Pointer => {
+                self.rebindTypeParams(entry->kind.payload.Pointer.base, genericValues, genericCount);
+                return;
+            },
+            TypeKind::Const => {
+                self.rebindTypeParams(entry->kind.payload.Const.base, genericValues, genericCount);
+                return;
+            },
+            TypeKind::Comptime => {
+                self.rebindTypeParams(entry->kind.payload.Comptime.base, genericValues, genericCount);
+                return;
+            },
+            TypeKind::Slice => {
+                self.rebindTypeParams(entry->kind.payload.Slice.base, genericValues, genericCount);
+                return;
+            },
+            TypeKind::Array => {
+                self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
+                return;
             }
-            u32 i = 0;
-            while (i < entry->kind.payload.Named.genericArgsLen)
-            {
-                self.rebindTypeParams(entry->kind.payload.Named.genericArgs[i], genericValues, genericCount);
-                i = i + 1;
+            TypeKind::FnPtr => {
+                self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);
+                u32 p = 0;
+                while (p < entry->kind.payload.FnPtr.paramsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.FnPtr.params[p], genericValues, genericCount);
+                    p = p + 1;
+                }
+                return;
+            },
+            TypeKind::Tuple => {
+                u32 e = 0;
+                while (e < entry->kind.payload.Tuple.elemsLen)
+                {
+                    self.rebindTypeParams(entry->kind.payload.Tuple.elems[e], genericValues, genericCount);
+                    e = e + 1;
+                }
+                return;
             }
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Pointer) {
-            self.rebindTypeParams(entry->kind.payload.Pointer.base, genericValues, genericCount);
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Const) {
-            self.rebindTypeParams(entry->kind.payload.Const.base, genericValues, genericCount);
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Comptime) {
-            self.rebindTypeParams(entry->kind.payload.Comptime.base, genericValues, genericCount);
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Slice) {
-            self.rebindTypeParams(entry->kind.payload.Slice.base, genericValues, genericCount);
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Array) {
-            self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
-            return;
-        }
-        if (entry->kind.tag == TypeKind::FnPtr) {
-            self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);
-            u32 p = 0;
-            while (p < entry->kind.payload.FnPtr.paramsLen)
-            {
-                self.rebindTypeParams(entry->kind.payload.FnPtr.params[p], genericValues, genericCount);
-                p = p + 1;
-            }
-            return;
-        }
-        if (entry->kind.tag == TypeKind::Tuple) {
-            u32 e = 0;
-            while (e < entry->kind.payload.Tuple.elemsLen)
-            {
-                self.rebindTypeParams(entry->kind.payload.Tuple.elems[e], genericValues, genericCount);
-                e = e + 1;
-            }
-            return;
         }
     }
 
@@ -278,6 +285,7 @@ pub extend Parser
         if (isExtern) flags = flags | 2;
         if (isStatic) flags = flags | 4;
         if (isConst) flags = flags | 16;
+        
         if (self.current.kind == TokenKind::LParen) {
             self.advance();
             NodeListBuilder params;
@@ -306,23 +314,31 @@ pub extend Parser
                     self.rebindTypeParams(pn->kind.payload.Param.value.typeNode, genericValues, genericCount);
                     self.rebindTypeParams(pn->kind.payload.Param.value.typeNode, self.outerGenerics, self.outerGenericsLen);
                 }
-                pi = pi + 1;
+                pi++;
             }
             NodeId body = self.noneNode();
             if (!self.match(TokenKind::Semicolon)) {
                 body = self.parseBlock();
                 flags = flags | 8;
             }
-            return self.storeDecl(DeclKind::Func{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .params = paramValues, .paramsLen = paramCount, .returnType = retType, .body = body, .flags = flags });
+            return self.storeDecl(DeclKind::Func{
+                .name = name, .genericParams = genericValues,
+                .genericParamsLen = genericCount, .params = paramValues,
+                .paramsLen = paramCount, .returnType = retType,
+                .body = body, .flags = flags
+            });
         }
+        
         NodeId value = self.noneNode();
         Ty varType = self.parseDeclaratorArray(retType);
+        
         if (self.match(TokenKind::Equal)) {
             value = self.parseInitExpr();
             self.expect(TokenKind::Semicolon);
         } else {
             self.expect(TokenKind::Semicolon);
         }
+        
         varType = self.inferArrayFromInit(varType, value);
         return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = varType, .value = value, .flags = flags });
     }
@@ -349,7 +365,7 @@ pub extend Parser
             if (!self.ctx.nodeListAppend(params, param)) self.reportAllocFailed();
             if (!self.match(TokenKind::Comma)) break;
         }
-        if (!self.consumeGreater()) self.reportCurrentError(ErrorCode::ParseExpectedToken, (u8*)"expected '>' to close generic parameters");
+        if (!self.consumeGreater()) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected '>' to close generic parameters");
     }
 
     NodeId parseFuncDecl()
@@ -801,7 +817,7 @@ pub extend Parser
                 {
                     buf[0] = '@';
                     u32 i = 0;
-                    while (i < traitTok.data.len) { buf[i + 1] = traitTok.data.ptr[i]; i = i + 1; }
+                    while (i < (usize)traitTok.data.len) { buf[i + 1] = traitTok.data.ptr[i]; i = i + 1; }
                     /* intern keeps the pointer — the buffer lives as long as the context */
                     if (!self.ctx.track((rawptr)buf)) self.reportAllocFailed();
                     traitName = self.ctx.intern(buf, traitTok.data.len + 1);
@@ -868,7 +884,7 @@ pub extend Parser
             if (typeNode != 0) typeNode = self.parseDeclaratorArray(typeNode);
             nameId = self.ctx.intern(name.data.ptr, name.data.len);
         }
-        if (nameId == 0) self.reportCurrentError(ErrorCode::ParseExpectedToken, (u8*)"expected a constant name");
+        if (nameId == 0) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a constant name");
         self.expect(TokenKind::Equal);
         NodeId value = self.parseInitExpr();
         self.expect(TokenKind::Semicolon);
@@ -1238,7 +1254,7 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, (u8*)"expected an import path: a bare name or a module path");
+            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, "expected an import path: a bare name or a module path");
             self.advance();
         }
         else path = self.parseNamespacePath();
@@ -1266,7 +1282,7 @@ pub extend Parser
         Str path = 0;
         if (self.current.kind == TokenKind::String)
         {
-            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, (u8*)"expected an import path: a bare name or a module path");
+            self.reportCurrentError(ErrorCode::ParseInvalidImportPath, "expected an import path: a bare name or a module path");
             self.advance();
         }
         else path = self.parseNamespacePath();

@@ -75,10 +75,10 @@ void stPut(Stream* s, u8* data, usize n)
     s.p[s.len] = 0;
 }
 
-void stP(Stream* s, u8* cstr)
+void stP(Stream* s, str text)
 {
-    if (cstr == null) return;
-    stPut(s, cstr, strlen(cstr));
+    if (text.ptr == null) return;
+    stPut(s, text.ptr, text.len);
 }
 
 void stPS(Stream* s, Slice v)
@@ -134,7 +134,7 @@ void stNL(Stream* s, u32 ind)
     stCh(s, '\n');
     u32 i = 0;
     while (i < ind) {
-        stP(s, (u8*)"    ");
+        stP(s, "    ");
         i = i + 1;
     }
 }
@@ -189,7 +189,7 @@ pub struct Codegen
     u32 ind;
 }
 
-void cgError(Codegen* cg, u8* msg)
+void cgError(Codegen* cg, str msg)
 {
     cg.errors = cg.errors + 1;
     if (cg.sema != null)
@@ -209,7 +209,7 @@ u32 cgLabel(Codegen* cg)
 u32 cgNewTemp(Codegen* cg, Slice ty, u32 arrLen)
 {
     if (cg.tempsLen >= cg.tempsCap) {
-        cgError(cg, (u8*)"temp capacity exceeded");
+        cgError(cg, "temp capacity exceeded");
         return 0;
     }
     u32 t = cg.tempsLen;
@@ -222,7 +222,7 @@ u32 cgNewTemp(Codegen* cg, Slice ty, u32 arrLen)
 Slice cgTempName(Codegen* cg, u32 t)
 {
     usize start = cg.tybuf.len;
-    stP(&cg.tybuf, (u8*)"__t");
+    stP(&cg.tybuf, "__t");
     stU64(&cg.tybuf, (u64)t);
     return stTail(&cg.tybuf, start);
 }
@@ -329,7 +329,7 @@ Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
 
 void cgWriteHex(Stream* s, u64 v)
 {
-    u8* digits = (u8*)"0123456789abcdef";
+    str digits = "0123456789abcdef";
     i32 sh = 60;
     bool started = false;
     while (sh >= 0)
@@ -337,7 +337,7 @@ void cgWriteHex(Stream* s, u64 v)
         u32 d = (u32)((v >> (u64)sh) & 15);
         if (d != 0 || started || sh == 0)
         {
-            stCh(s, digits[d]);
+            stCh(s, digits.ptr[d]);
             started = true;
         }
         sh = sh - 4;
@@ -360,7 +360,7 @@ Slice cgInstanceNameV(Codegen* cg, Str name, Ty* args, u32 argsLen, u64 valueKey
     }
     if (valueKey != 0)
     {
-        stP(&cg.tybuf, (u8*)"_v");
+        stP(&cg.tybuf, "_v");
         cgWriteHex(&cg.tybuf, valueKey);
     }
     return stTail(&cg.tybuf, st);
@@ -418,7 +418,7 @@ Str cgDeclOwnName(Decl* dd)
 bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
 {
     if (name.ptr == null || name.len == 0) return true;
-    if (slEqU8(name, (u8*)"main", 4)) return true;
+    if (slEqU8(name, "main")) return true;
     if (cgIsCrtFn(0, name)) return true;
     if (declId.index != 0)
     {
@@ -460,7 +460,7 @@ Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
         path[pathLen - 2] == 114 && path[pathLen - 1] == 108)
         pathLen = pathLen - 4;
     Stream s = stNew(cg.arena, 96);
-    stP(&s, (u8*)"crl__");
+    stP(&s, "crl__");
     /* a "/lib/" anywhere (or a leading "lib/") → lib + path under lib/ */
     bool isLib = false;
     usize libPos = 0;
@@ -482,7 +482,7 @@ Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
     }
     if (isLib)
     {
-        stP(&s, (u8*)"lib__");
+        stP(&s, "lib__");
         usize i = libPos;
         usize segStart = i;
         bool firstSeg = true;
@@ -503,7 +503,7 @@ Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
     }
     else
     {
-        stP(&s, (u8*)"loc__");
+        stP(&s, "loc__");
         /* the last '/' splits the parent dir from the file stem */
         usize lastSlash = pathLen;
         usize i = 0;
@@ -565,7 +565,7 @@ NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
     while (i < cg.file.declsLen)
     {
         Node* d = cg.ctx->nodes + cg.file.decls[i].index;
-        if (d.kind.tag == NodeKind::Decl && d.kind.payload.Decl.value.kind.tag == tag)
+        if (d.kind.tag == NodeKind::Decl && (u32)d.kind.payload.Decl.value.kind.tag == tag)
         {
             Decl* dd = &d.kind.payload.Decl.value;
             if (cgDeclOwnName(dd) == name)
@@ -596,7 +596,7 @@ NodeId cgFindTypeDecl(Codegen* cg, Str name, u32 refFile)
         if (d.kind.tag == NodeKind::Decl)
         {
             Decl* dd = &d.kind.payload.Decl.value;
-            u32 tag = dd.kind.tag;
+            u32 tag = (u32)dd.kind.tag;
             bool isTy = tag == DeclKind::Struct || tag == DeclKind::Enum ||
                         tag == DeclKind::Variant || tag == DeclKind::Union ||
                         tag == DeclKind::TypeAlias || tag == DeclKind::Distinct;
@@ -707,6 +707,104 @@ bool cgSliceEq(Slice a, Slice b)
     return true;
 }
 
+bool cgStrFieldIs(Codegen* cg, Str s, str lit)
+{
+    Slice t = cgIntern(cg, s);
+    if (t.len != lit.len) return false;
+    usize i = 0;
+    while (i < lit.len)
+    {
+        if (t.ptr[i] != lit.ptr[i]) return false;
+        i++;
+    }
+    return true;
+}
+
+/* `x.payload` access node inside a field chain */
+bool cgIsPayloadAccess(Codegen* cg, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag == ExprKind::Field)
+        return cgStrFieldIs(cg, e->kind.payload.Field.field, "payload");
+    if (e->kind.tag == ExprKind::DerefField)
+        return cgStrFieldIs(cg, e->kind.payload.DerefField.field, "payload");
+    return false;
+}
+
+NodeId cgFieldAccessObj(Codegen* cg, NodeId id)
+{
+    Node* n = cgNode(cg, id);
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.obj;
+    return e->kind.payload.DerefField.obj;
+}
+
+/* `V::Case` as a bare value: the C form is the ordinal of the case;
+ * false when the path is not a variant case */
+bool cgVariantCaseIdx(Codegen* cg, NodeId id, u64* outIdx)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag != ExprKind::Path) return false;
+    if (e->kind.payload.Path.segmentsLen != 2) return false;
+    Node* s0n = cgNode(cg, e->kind.payload.Path.segments[0]);
+    Node* s1n = cgNode(cg, e->kind.payload.Path.segments[1]);
+    if (s0n.kind.tag != NodeKind::Expr || s1n.kind.tag != NodeKind::Expr) return false;
+    if (s0n.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return false;
+    if (s1n.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return false;
+    Str root = s0n.kind.payload.Expr.value.kind.payload.Ident.name;
+    Str member = s1n.kind.payload.Expr.value.kind.payload.Ident.name;
+    NodeId vd = cgFindDecl(cg, root, (u32)DeclKind::Variant);
+    if (vd.index == 0) return false;
+    Node* dn = cgNode(cg, vd);
+    Decl* dd = &dn.kind.payload.Decl.value;
+    u32 v = 0;
+    while (v < dd.kind.payload.Variant.variantsLen)
+    {
+        if (dd.kind.payload.Variant.variants[v].name == member)
+        {
+            *outIdx = (u64)v;
+            return true;
+        }
+        v = v + 1;
+    }
+    return false;
+}
+
+Slice cgU64Text(Codegen* cg, u64 v)
+{
+    usize s = cg.ebuf.len;
+    stU64(&cg.ebuf, v);
+    return stTail(&cg.ebuf, s);
+}
+
+/* assignment RHS: `x.tag = V::Case` writes the ordinal; other variant-case
+ * uses keep the struct form */
+Slice cgAssignValue(Codegen* cg, NodeId target, NodeId value)
+{
+    Node* tn = cgNode(cg, target);
+    if (tn.kind.tag == NodeKind::Expr)
+    {
+        Expr* te = &tn.kind.payload.Expr.value;
+        bool tagTarget = false;
+        if (te->kind.tag == ExprKind::Field &&
+            cgStrFieldIs(cg, te->kind.payload.Field.field, "tag")) tagTarget = true;
+        if (te->kind.tag == ExprKind::DerefField &&
+            cgStrFieldIs(cg, te->kind.payload.DerefField.field, "tag")) tagTarget = true;
+        if (tagTarget)
+        {
+            u64 cidx = 0;
+            if (cgVariantCaseIdx(cg, value, &cidx)) return cgU64Text(cg, cidx);
+        }
+    }
+    return cgExpr(cg, value);
+}
+
 NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
 {
     NodeId none;
@@ -732,8 +830,8 @@ NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
  * its C typedef name (`_coral_str`), everything else by its ident */
 Slice cgOwnerSpelling(Codegen* cg, Slice owner)
 {
-    if (cgSliceEq(owner, Slice::from((u8*)"str", 3)))
-        return Slice::from((u8*)"_coral_str", 10);
+    if (cgSliceEq(owner, Slice::fromStr("str")))
+        return Slice::fromStr("_coral_str");
     return owner;
 }
 
@@ -903,7 +1001,7 @@ NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
     while (i < cg.file.declsLen)
     {
         Node* d = cg.ctx->nodes + cg.file.decls[i].index;
-        if (d.kind.tag == NodeKind::Decl && d.kind.payload.Decl.value.kind.tag == tag)
+        if (d.kind.tag == NodeKind::Decl && (u32)d.kind.payload.Decl.value.kind.tag == tag)
         {
             Decl* dd = &d.kind.payload.Decl.value;
             Str dn = 0;
@@ -1023,7 +1121,7 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
     if (gcount > 0)
     {
         want = (Ty*)calloc((usize)gcount, @sizeof(Ty));
-        if (want == null) { cgError(cg, (u8*)"out of memory"); return Slice::from(null, 0); }
+        if (want == null) { cgError(cg, "out of memory"); return Slice::from(null, 0); }
         cg.mono.inferCallArgs(declId, args, argsLen, cg.subs, cg.subsLen, want);
     }
     u32 total = 0;
@@ -1066,7 +1164,7 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
     else {
         /* no argument+value match, and the fallback (a lone unkeyed
            instance) is unavailable — surface the mismatch */
-        cgError(cg, (u8*)"no unique mono instance for call");
+        cgError(cg, "no unique mono instance for call");
     }
     MonoInstance* p = cg.mono.instances + pick;
     *found = true;
@@ -1126,7 +1224,7 @@ u32 cgFileForModulePath(Codegen* cg, Str path)
     }
     bool hasCrl = s.len >= 4 && s.p[s.len - 4] == 46 && s.p[s.len - 3] == 99 &&
                   s.p[s.len - 2] == 114 && s.p[s.len - 1] == 108;
-    if (!hasCrl) stP(&s, (u8*)".crl");
+    if (!hasCrl) stP(&s, ".crl");
     if (s.len == 0) return 0;
     u32 f = 0;
     while (f < cg.sema.diag.fileCount)
@@ -1296,34 +1394,34 @@ Slice tyStrPut(Codegen* cg, Slice text, usize start)
 
 Slice tyStr(Codegen* cg, Ty t)
 {
-    if (t == 0) return Slice::from((u8*)"void*", 5);
+    if (t == 0) return Slice::fromStr("void*");
     TypeEntry* e = cg.ctx->types + t;
     TypeKind k = e.kind;
     usize start = cg.tybuf.len;
     switch (k.tag)
     {
-        TypeKind::Void => { return tyStrPut(cg, Slice::from((u8*)"void", 4), start); },
-        TypeKind::Bool => { return tyStrPut(cg, Slice::from((u8*)"_Bool", 5), start); },
+        TypeKind::Void => { return tyStrPut(cg, Slice::fromStr("void"), start); },
+        TypeKind::Bool => { return tyStrPut(cg, Slice::fromStr("_Bool"), start); },
         /* char = UTF-32 codepoint (u32 width), never C's 1-byte char */
-        TypeKind::Char => { return tyStrPut(cg, Slice::from((u8*)"uint32_t", 8), start); },
-        TypeKind::I8 => { return tyStrPut(cg, Slice::from((u8*)"int8_t", 6), start); },
-        TypeKind::U8 => { return tyStrPut(cg, Slice::from((u8*)"uint8_t", 7), start); },
-        TypeKind::I16 => { return tyStrPut(cg, Slice::from((u8*)"int16_t", 7), start); },
-        TypeKind::U16 => { return tyStrPut(cg, Slice::from((u8*)"uint16_t", 8), start); },
-        TypeKind::I32 => { return tyStrPut(cg, Slice::from((u8*)"int32_t", 7), start); },
-        TypeKind::U32 => { return tyStrPut(cg, Slice::from((u8*)"uint32_t", 8), start); },
-        TypeKind::I64 => { return tyStrPut(cg, Slice::from((u8*)"int64_t", 7), start); },
-        TypeKind::U64 => { return tyStrPut(cg, Slice::from((u8*)"uint64_t", 8), start); },
-        TypeKind::I128 => { return tyStrPut(cg, Slice::from((u8*)"__int128_t", 10), start); },
-        TypeKind::U128 => { return tyStrPut(cg, Slice::from((u8*)"__uint128_t", 11), start); },
-        TypeKind::F32 => { return tyStrPut(cg, Slice::from((u8*)"float", 5), start); },
-        TypeKind::F64 => { return tyStrPut(cg, Slice::from((u8*)"double", 6), start); },
-        TypeKind::Isize => { return tyStrPut(cg, Slice::from((u8*)"intptr_t", 8), start); },
-        TypeKind::Usize => { return tyStrPut(cg, Slice::from((u8*)"size_t", 6), start); },
-        TypeKind::Rawptr => { return tyStrPut(cg, Slice::from((u8*)"void*", 5), start); },
+        TypeKind::Char => { return tyStrPut(cg, Slice::fromStr("uint32_t"), start); },
+        TypeKind::I8 => { return tyStrPut(cg, Slice::fromStr("int8_t"), start); },
+        TypeKind::U8 => { return tyStrPut(cg, Slice::fromStr("uint8_t"), start); },
+        TypeKind::I16 => { return tyStrPut(cg, Slice::fromStr("int16_t"), start); },
+        TypeKind::U16 => { return tyStrPut(cg, Slice::fromStr("uint16_t"), start); },
+        TypeKind::I32 => { return tyStrPut(cg, Slice::fromStr("int32_t"), start); },
+        TypeKind::U32 => { return tyStrPut(cg, Slice::fromStr("uint32_t"), start); },
+        TypeKind::I64 => { return tyStrPut(cg, Slice::fromStr("int64_t"), start); },
+        TypeKind::U64 => { return tyStrPut(cg, Slice::fromStr("uint64_t"), start); },
+        TypeKind::I128 => { return tyStrPut(cg, Slice::fromStr("__int128_t"), start); },
+        TypeKind::U128 => { return tyStrPut(cg, Slice::fromStr("__uint128_t"), start); },
+        TypeKind::F32 => { return tyStrPut(cg, Slice::fromStr("float"), start); },
+        TypeKind::F64 => { return tyStrPut(cg, Slice::fromStr("double"), start); },
+        TypeKind::Isize => { return tyStrPut(cg, Slice::fromStr("intptr_t"), start); },
+        TypeKind::Usize => { return tyStrPut(cg, Slice::fromStr("size_t"), start); },
+        TypeKind::Rawptr => { return tyStrPut(cg, Slice::fromStr("void*"), start); },
         /* str = immutable slice view { ptr, len } (preamble typedef) */
-        TypeKind::Str => { return tyStrPut(cg, Slice::from((u8*)"_coral_str", 10), start); },
-        TypeKind::Error => { return tyStrPut(cg, Slice::from((u8*)"void", 4), start); },
+        TypeKind::Str => { return tyStrPut(cg, Slice::fromStr("_coral_str"), start); },
+        TypeKind::Error => { return tyStrPut(cg, Slice::fromStr("void"), start); },
         TypeKind::Named => {
             /* inside an instance: resolve a bare generic parameter name */
             Ty sub = cgSubstTy(cg, t);
@@ -1333,8 +1431,8 @@ Slice tyStr(Codegen* cg, Ty t)
              * char signedness matches cchar's flag(i8/u8) arms, and libc
              * prototypes take `char`). coral `char` itself is utf32 and
              * emits uint32_t — never C's char. */
-            if (slEqU8(cgIntern(cg, name), (u8*)"cchar", 5))
-                return tyStrPut(cg, Slice::from((u8*)"char", 4), start);
+            if (slEqU8(cgIntern(cg, name), "cchar"))
+                return tyStrPut(cg, Slice::fromStr("char"), start);
             if (k.payload.Named.genericArgsLen > 0) {
                 return cgInstanceName(cg, name, k.payload.Named.genericArgs, k.payload.Named.genericArgsLen);
             }
@@ -1385,8 +1483,8 @@ Slice tyStr(Codegen* cg, Ty t)
         TypeKind::TypeParam => {
             Ty sub = cgSubstTy(cg, t);
             if (sub != t) return tyStr(cg, sub);
-            cgError(cg, (u8*)"unresolved type param in codegen");
-            return tyStrPut(cg, Slice::from((u8*)"void*", 5), start);
+            cgError(cg, "unresolved type param in codegen");
+            return tyStrPut(cg, Slice::fromStr("void*"), start);
         },
         TypeKind::Slice => { return cgRegName(cg, t); },
         TypeKind::FnPtr => { return cgRegName(cg, t); },
@@ -1398,7 +1496,7 @@ Slice tyStr(Codegen* cg, Ty t)
             stCh(&cg.tybuf, ']');
             return stTail(&cg.tybuf, start);
         },
-        else => { return tyStrPut(cg, Slice::from((u8*)"void*", 5), start); },
+        else => { return tyStrPut(cg, Slice::fromStr("void*"), start); },
     }
     return stTail(&cg.tybuf, start);
 }
@@ -1561,9 +1659,9 @@ Node* cgNode(Codegen* cg, NodeId id)
 /* C type text for a value expression node (0-safe). */
 Slice cgValExprTy(Codegen* cg, NodeId id)
 {
-    if (id.index == 0) return Slice::from((u8*)"void*", 5);
+    if (id.index == 0) return Slice::fromStr("void*");
     Node* n = cgNode(cg, id);
-    if (n.kind.tag != NodeKind::Expr) return Slice::from((u8*)"void*", 5);
+    if (n.kind.tag != NodeKind::Expr) return Slice::fromStr("void*");
     return cgResultTy(cg, id, &n.kind.payload.Expr.value);
 }
 
@@ -1607,11 +1705,11 @@ bool cgIntToPtrInit(Codegen* cg, NodeId value, Ty targetTy)
 Slice cgWrapPtrCast(Codegen* cg, Slice tyText, Slice inner)
 {
     usize rs = cg.ebuf.len;
-    stP(&cg.ebuf, (u8*)"((");
+    stP(&cg.ebuf, "((");
     stPS(&cg.ebuf, tyText);
-    stP(&cg.ebuf, (u8*)")(");
+    stP(&cg.ebuf, ")(");
     stPS(&cg.ebuf, inner);
-    stP(&cg.ebuf, (u8*)"))");
+    stP(&cg.ebuf, "))");
     return stTail(&cg.ebuf, rs);
 }
 
@@ -1620,11 +1718,11 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
     if (e.resolvedType != 0) return tyStr(cg, cgSubstTy(cg, e.resolvedType));
     switch (e.kind.tag)
     {
-        ExprKind::Not => { return Slice::from((u8*)"_Bool", 5); },
+        ExprKind::Not => { return Slice::fromStr("_Bool"); },
         ExprKind::AddressOf => {
             NodeId c = e.kind.payload.AddressOf.expr;
             Node* cn = cgNode(cg, c);
-            Slice base = Slice::from((u8*)"void*", 5);
+            Slice base = Slice::fromStr("void*");
             usize s = cg.tybuf.len;
             if (cn.kind.tag == NodeKind::Expr)
                 base = cgResultTy(cg, c, &cn.kind.payload.Expr.value);
@@ -1646,17 +1744,17 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
         ExprKind::AssignShr => { return cgValExprTy(cg, e.kind.payload.AssignShr.value); },
         else => {},
     }
-    return Slice::from((u8*)"void*", 5);
+    return Slice::fromStr("void*");
 }
 
-void cgEmitStmt(Codegen* cg, u8* text)
+void cgEmitStmt(Codegen* cg, str text)
 {
     stNL(&cg.body, cg.ind);
-    stPS(&cg.body, Slice::from(text, strlen(text)));
+    stPS(&cg.body, Slice::fromStr(text));
     stCh(&cg.body, ';');
 }
 
-void cgEmitLine(Codegen* cg, Slice a, u8* mid, Slice b)
+void cgEmitLine(Codegen* cg, Slice a, str mid, Slice b)
 {
     stNL(&cg.body, cg.ind);
     stPS(&cg.body, a);
@@ -1668,25 +1766,25 @@ void cgEmitLine(Codegen* cg, Slice a, u8* mid, Slice b)
 void cgEmitLabel(Codegen* cg, u32 lab)
 {
     stNL(&cg.body, cg.ind);
-    stP(&cg.body, (u8*)"__L");
+    stP(&cg.body, "__L");
     stU64(&cg.body, (u64)lab);
-    stP(&cg.body, (u8*)": ;");
+    stP(&cg.body, ": ;");
 }
 
 void cgEmitGoto(Codegen* cg, u32 lab)
 {
     stNL(&cg.body, cg.ind);
-    stP(&cg.body, (u8*)"goto __L");
+    stP(&cg.body, "goto __L");
     stU64(&cg.body, (u64)lab);
     stCh(&cg.body, ';');
 }
 
-bool slEqU8(Slice a, u8* b, usize bl)
+bool slEqU8(Slice a, str b)
 {
-    if (a.len != bl) return false;
+    if (a.len != b.len) return false;
     usize i = 0;
-    while (i < bl) {
-        if (a.ptr[i] != b[i]) return false;
+    while (i < b.len) {
+        if (a.ptr[i] != b.ptr[i]) return false;
         i = i + 1;
     }
     return true;
@@ -1697,45 +1795,45 @@ bool slEqU8(Slice a, u8* b, usize bl)
 Slice cgIdent(Codegen* cg, Str name)
 {
     Slice t = cgIntern(cg, name);
-    if (slEqU8(t, (u8*)"auto", 4) ||
-        slEqU8(t, (u8*)"break", 5) ||
-        slEqU8(t, (u8*)"case", 4) ||
-        slEqU8(t, (u8*)"char", 4) ||
-        slEqU8(t, (u8*)"const", 5) ||
-        slEqU8(t, (u8*)"continue", 8) ||
-        slEqU8(t, (u8*)"default", 7) ||
-        slEqU8(t, (u8*)"do", 2) ||
-        slEqU8(t, (u8*)"double", 6) ||
-        slEqU8(t, (u8*)"else", 4) ||
-        slEqU8(t, (u8*)"enum", 4) ||
-        slEqU8(t, (u8*)"extern", 6) ||
-        slEqU8(t, (u8*)"float", 5) ||
-        slEqU8(t, (u8*)"for", 3) ||
-        slEqU8(t, (u8*)"goto", 4) ||
-        slEqU8(t, (u8*)"if", 2) ||
-        slEqU8(t, (u8*)"inline", 6) ||
-        slEqU8(t, (u8*)"int", 3) ||
-        slEqU8(t, (u8*)"long", 4) ||
-        slEqU8(t, (u8*)"register", 8) ||
-        slEqU8(t, (u8*)"restrict", 8) ||
-        slEqU8(t, (u8*)"return", 6) ||
-        slEqU8(t, (u8*)"short", 5) ||
-        slEqU8(t, (u8*)"signed", 6) ||
-        slEqU8(t, (u8*)"sizeof", 6) ||
-        slEqU8(t, (u8*)"static", 6) ||
-        slEqU8(t, (u8*)"struct", 6) ||
-        slEqU8(t, (u8*)"switch", 6) ||
-        slEqU8(t, (u8*)"typedef", 7) ||
-        slEqU8(t, (u8*)"union", 5) ||
-        slEqU8(t, (u8*)"unsigned", 8) ||
-        slEqU8(t, (u8*)"void", 4) ||
-        slEqU8(t, (u8*)"volatile", 8) ||
-        slEqU8(t, (u8*)"while", 5) ||
-        slEqU8(t, (u8*)"bool", 4) ||
-        slEqU8(t, (u8*)"true", 4) ||
-        slEqU8(t, (u8*)"false", 5) ||
-        slEqU8(t, (u8*)"size_t", 6) ||
-        slEqU8(t, (u8*)"NULL", 4))
+    if (slEqU8(t, "auto") ||
+        slEqU8(t, "break") ||
+        slEqU8(t, "case") ||
+        slEqU8(t, "char") ||
+        slEqU8(t, "const") ||
+        slEqU8(t, "continue") ||
+        slEqU8(t, "default") ||
+        slEqU8(t, "do") ||
+        slEqU8(t, "double") ||
+        slEqU8(t, "else") ||
+        slEqU8(t, "enum") ||
+        slEqU8(t, "extern") ||
+        slEqU8(t, "float") ||
+        slEqU8(t, "for") ||
+        slEqU8(t, "goto") ||
+        slEqU8(t, "if") ||
+        slEqU8(t, "inline") ||
+        slEqU8(t, "int") ||
+        slEqU8(t, "long") ||
+        slEqU8(t, "register") ||
+        slEqU8(t, "restrict") ||
+        slEqU8(t, "return") ||
+        slEqU8(t, "short") ||
+        slEqU8(t, "signed") ||
+        slEqU8(t, "sizeof") ||
+        slEqU8(t, "static") ||
+        slEqU8(t, "struct") ||
+        slEqU8(t, "switch") ||
+        slEqU8(t, "typedef") ||
+        slEqU8(t, "union") ||
+        slEqU8(t, "unsigned") ||
+        slEqU8(t, "void") ||
+        slEqU8(t, "volatile") ||
+        slEqU8(t, "while") ||
+        slEqU8(t, "bool") ||
+        slEqU8(t, "true") ||
+        slEqU8(t, "false") ||
+        slEqU8(t, "size_t") ||
+        slEqU8(t, "NULL"))
     {
         usize ns = cg.tybuf.len;
         stPS(&cg.tybuf, t);
@@ -1749,46 +1847,46 @@ bool cgIsCrtFn(Str name, Slice text)
 {
     /* provided by the preamble headers — compared inline (no local arrays:
        bootstrap C emission can't spell array locals) */
-    return slEqU8(text, (u8*)"printf", 6) ||
-           slEqU8(text, (u8*)"write", 5) ||
-           slEqU8(text, (u8*)"read", 4) ||
-           slEqU8(text, (u8*)"malloc", 6) ||
-           slEqU8(text, (u8*)"calloc", 6) ||
-           slEqU8(text, (u8*)"realloc", 7) ||
-           slEqU8(text, (u8*)"free", 4) ||
-           slEqU8(text, (u8*)"memcpy", 6) ||
-           slEqU8(text, (u8*)"memset", 6) ||
-           slEqU8(text, (u8*)"strlen", 6) ||
-           slEqU8(text, (u8*)"strcmp", 6) ||
-           slEqU8(text, (u8*)"exit", 4) ||
-           slEqU8(text, (u8*)"abort", 5) ||
-           slEqU8(text, (u8*)"puts", 4) ||
-           slEqU8(text, (u8*)"memcmp", 6) ||
-           slEqU8(text, (u8*)"strchr", 6) ||
-           slEqU8(text, (u8*)"strncpy", 7) ||
-           slEqU8(text, (u8*)"abs", 3) ||
-           slEqU8(text, (u8*)"fflush", 6) ||
-           slEqU8(text, (u8*)"strcpy", 6) ||
-           slEqU8(text, (u8*)"memmove", 7) ||
-           slEqU8(text, (u8*)"snprintf", 8) ||
-           slEqU8(text, (u8*)"chdir", 5) ||
-           slEqU8(text, (u8*)"rmdir", 5) ||
-           slEqU8(text, (u8*)"unlink", 6) ||
-           slEqU8(text, (u8*)"rename", 6) ||
-           slEqU8(text, (u8*)"access", 6) ||
-           slEqU8(text, (u8*)"fopen", 5) ||
-           slEqU8(text, (u8*)"fclose", 6) ||
-           slEqU8(text, (u8*)"fread", 5) ||
-           slEqU8(text, (u8*)"fwrite", 6) ||
-           slEqU8(text, (u8*)"feof", 4) ||
-           slEqU8(text, (u8*)"ferror", 6) ||
-           slEqU8(text, (u8*)"mkstemp", 7) ||
-           slEqU8(text, (u8*)"mkdtemp", 7) ||
-           slEqU8(text, (u8*)"execvp", 6) ||
-           slEqU8(text, (u8*)"getenv", 6) ||
-           slEqU8(text, (u8*)"setenv", 6) ||
-           slEqU8(text, (u8*)"unsetenv", 8) ||
-           slEqU8(text, (u8*)"readlink", 8);
+    return slEqU8(text, "printf") ||
+           slEqU8(text, "write") ||
+           slEqU8(text, "read") ||
+           slEqU8(text, "malloc") ||
+           slEqU8(text, "calloc") ||
+           slEqU8(text, "realloc") ||
+           slEqU8(text, "free") ||
+           slEqU8(text, "memcpy") ||
+           slEqU8(text, "memset") ||
+           slEqU8(text, "strlen") ||
+           slEqU8(text, "strcmp") ||
+           slEqU8(text, "exit") ||
+           slEqU8(text, "abort") ||
+           slEqU8(text, "puts") ||
+           slEqU8(text, "memcmp") ||
+           slEqU8(text, "strchr") ||
+           slEqU8(text, "strncpy") ||
+           slEqU8(text, "abs") ||
+           slEqU8(text, "fflush") ||
+           slEqU8(text, "strcpy") ||
+           slEqU8(text, "memmove") ||
+           slEqU8(text, "snprintf") ||
+           slEqU8(text, "chdir") ||
+           slEqU8(text, "rmdir") ||
+           slEqU8(text, "unlink") ||
+           slEqU8(text, "rename") ||
+           slEqU8(text, "access") ||
+           slEqU8(text, "fopen") ||
+           slEqU8(text, "fclose") ||
+           slEqU8(text, "fread") ||
+           slEqU8(text, "fwrite") ||
+           slEqU8(text, "feof") ||
+           slEqU8(text, "ferror") ||
+           slEqU8(text, "mkstemp") ||
+           slEqU8(text, "mkdtemp") ||
+           slEqU8(text, "execvp") ||
+           slEqU8(text, "getenv") ||
+           slEqU8(text, "setenv") ||
+           slEqU8(text, "unsetenv") ||
+           slEqU8(text, "readlink");
 }
 
 /* owner name for a method receiver type: strip one pointer level */
@@ -1948,7 +2046,7 @@ extern("C") Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext);
 Slice cgExpr(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
-        stP(&cg.ebuf, (u8*)"0");
+        stP(&cg.ebuf, "0");
         return stTail(&cg.ebuf, cg.ebuf.len - 1);
     }
     Node* n = cgNode(cg, id);
@@ -2261,31 +2359,39 @@ Slice cgExpr(Codegen* cg, NodeId id)
         ExprKind::BitAnd, ExprKind::BitOr, ExprKind::BitXor, ExprKind::Shl, ExprKind::Shr => {
             NodeId left;
             NodeId right;
-            u8* op = (u8*)"+";
+            str op = "+";
             switch (e.kind.tag)
             {
-                ExprKind::Add => { op = (u8*)" + "; },
-                ExprKind::Sub => { op = (u8*)" - "; },
-                ExprKind::Mul => { op = (u8*)" * "; },
-                ExprKind::Div => { op = (u8*)" / "; },
-                ExprKind::Mod => { op = (u8*)" % "; },
-                ExprKind::Eq => { op = (u8*)" == "; },
-                ExprKind::Ne => { op = (u8*)" != "; },
-                ExprKind::Lt => { op = (u8*)" < "; },
-                ExprKind::Le => { op = (u8*)" <= "; },
-                ExprKind::Gt => { op = (u8*)" > "; },
-                ExprKind::Ge => { op = (u8*)" >= "; },
-                ExprKind::BitAnd => { op = (u8*)" & "; },
-                ExprKind::BitOr => { op = (u8*)" | "; },
-                ExprKind::BitXor => { op = (u8*)" ^ "; },
-                ExprKind::Shl => { op = (u8*)" << "; },
-                ExprKind::Shr => { op = (u8*)" >> "; },
+                ExprKind::Add => { op = " + "; },
+                ExprKind::Sub => { op = " - "; },
+                ExprKind::Mul => { op = " * "; },
+                ExprKind::Div => { op = " / "; },
+                ExprKind::Mod => { op = " % "; },
+                ExprKind::Eq => { op = " == "; },
+                ExprKind::Ne => { op = " != "; },
+                ExprKind::Lt => { op = " < "; },
+                ExprKind::Le => { op = " <= "; },
+                ExprKind::Gt => { op = " > "; },
+                ExprKind::Ge => { op = " >= "; },
+                ExprKind::BitAnd => { op = " & "; },
+                ExprKind::BitOr => { op = " | "; },
+                ExprKind::BitXor => { op = " ^ "; },
+                ExprKind::Shl => { op = " << "; },
+                ExprKind::Shr => { op = " >> "; },
                 else => {},
             }
             left = e.kind.payload.Add.left;
             right = e.kind.payload.Add.right;
-            Slice l = cgExpr(cg, left);
-            Slice r = cgExpr(cg, right);
+            Slice l;
+            Slice r;
+            {
+                u64 cidx = 0;
+                bool cmp = e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne;
+                if (cmp && cgVariantCaseIdx(cg, left, &cidx)) l = cgU64Text(cg, cidx);
+                else l = cgExpr(cg, left);
+                if (cmp && cgVariantCaseIdx(cg, right, &cidx)) r = cgU64Text(cg, cidx);
+                else r = cgExpr(cg, right);
+            }
             /* str is a slice view: compare by content, not by struct bits */
             if (cgIsStrTy(cg, left) &&
                 (e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne))
@@ -2307,7 +2413,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Node* ln = cgNode(cg, left);
                 Slice lty = ln.kind.tag == NodeKind::Expr
                     ? cgResultTy(cg, left, &ln.kind.payload.Expr.value)
-                    : Slice::from((u8*)"void*", 5);
+                    : Slice::fromStr("void*");
                 usize cs = cg.ebuf.len;
                 stP(&cg.ebuf, "((memcmp(&(");
                 stPS(&cg.ebuf, l);
@@ -2556,7 +2662,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                     i = i + 1;
                 }
-                if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen > 16) cgError(cg, "too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             usize ccs = cg.ebuf.len;
@@ -2580,9 +2686,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (recvTy != 0 && (cg.ctx->types + recvTy)->kind.tag == TypeKind::Pointer)
                     recvTy = cgTyUnwrap(cg, (cg.ctx->types + recvTy)->kind.payload.Pointer.base);
                 if (recvTy != 0) owner = cgOwnerName(cg, recvTy);
-                else owner = Slice::from((u8*)"Unknown", 7);
+                else owner = Slice::fromStr("Unknown");
             } else {
-                owner = Slice::from((u8*)"Unknown", 7);
+                owner = Slice::fromStr("Unknown");
             }
             Slice recvText = cgExpr(cg, recv);
             bool recvIsPtr = false;
@@ -2653,7 +2759,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen + (passRecv ? 1 : 0) > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen + (u32)(passRecv ? 1 : 0) > 16) cgError(cg, "too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             Slice methResTy = cgResultTy(cg, id, e);
@@ -2705,7 +2811,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     n = n + 1;
                     i = i + 1;
                 }
-                if (argsLen > 16) cgError(cg, (u8*)"too many arguments (cap 16)");
+                if (argsLen > 16) cgError(cg, "too many arguments (cap 16)");
                 argTexts = stTail(&abuf, 0);
             }
             Slice statResTy = cgResultTy(cg, id, e);
@@ -2726,6 +2832,30 @@ Slice cgExpr(Codegen* cg, NodeId id)
             } else {
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
+            }
+            /* `x.payload.Case` — lower to the union member slot of the
+             * case's ordinal: `x.u.v<idx>` (only when the base is a variant
+             * and the case exists; a plain `payload` struct field is not) */
+            if (cgIsPayloadAccess(cg, obj))
+            {
+                NodeId base = cgFieldAccessObj(cg, obj);
+                Node* bn = cgNode(cg, base);
+                Ty bty = 0;
+                if (bn.kind.tag == NodeKind::Expr) bty = bn.kind.payload.Expr.value.resolvedType;
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, bty, field, &vidx);
+                if (vd.index != 0)
+                {
+                    bool basePtr = cgTyIsPtr(cg, bty);
+                    Slice o = basePtr ? cgExpr(cg, base) : cgLvalue(cg, base);
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, o);
+                    if (basePtr) stP(&cg.ebuf, "->");
+                    else stCh(&cg.ebuf, '.');
+                    stP(&cg.ebuf, "u.v");
+                    stU64(&cg.ebuf, (u64)vidx);
+                    return stTail(&cg.ebuf, cs);
+                }
             }
             Slice o = cgExpr(cg, obj);
             Node* on = cgNode(cg, obj);
@@ -2784,7 +2914,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i = i + 1;
             }
-            if (fvLen > 16) cgError(cg, (u8*)"too many struct fields (cap 16)");
+            if (fvLen > 16) cgError(cg, "too many struct fields (cap 16)");
             Slice lty = tyStr(cg, e.kind.payload.StructLiteral.typeNode);
             usize lcs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -2796,7 +2926,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 /* variant construction: tag + payload union member */
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, e.kind.payload.StructLiteral.typeNode, vname, &vidx);
-                if (vd.index == 0) cgError(cg, (u8*)"variant case not found");
+                if (vd.index == 0) cgError(cg, "variant case not found");
                 stP(&cg.ebuf, " .tag = ");
                 stU64(&cg.ebuf, (u64)vidx);
                 if (fvLen > 0)
@@ -2827,7 +2957,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.ArrayLiteral.elems[i]));
                 i = i + 1;
             }
-            if (alen > 16) cgError(cg, (u8*)"too many array elements (cap 16)");
+            if (alen > 16) cgError(cg, "too many array elements (cap 16)");
             Slice aty = cgResultTy(cg, id, e);
             usize acs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -2849,7 +2979,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.TupleExpr.elems[i]));
                 i = i + 1;
             }
-            if (elen > 16) cgError(cg, (u8*)"too many tuple elements (cap 16)");
+            if (elen > 16) cgError(cg, "too many tuple elements (cap 16)");
             Slice tty = cgResultTy(cg, id, e);
             usize tcs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -2921,11 +3051,11 @@ Slice cgExpr(Codegen* cg, NodeId id)
 
         ExprKind::PostInc, ExprKind::PostDec, ExprKind::PreInc, ExprKind::PreDec => {
             NodeId target;
-            u8* op = (u8*)"++";
-            if (e.kind.tag == ExprKind::PostInc) { target = e.kind.payload.PostInc.expr; op = (u8*)"++"; }
-            if (e.kind.tag == ExprKind::PostDec) { target = e.kind.payload.PostDec.expr; op = (u8*)"--"; }
-            if (e.kind.tag == ExprKind::PreInc) { target = e.kind.payload.PreInc.expr; op = (u8*)"++"; }
-            if (e.kind.tag == ExprKind::PreDec) { target = e.kind.payload.PreDec.expr; op = (u8*)"--"; }
+            str op = "++";
+            if (e.kind.tag == ExprKind::PostInc) { target = e.kind.payload.PostInc.expr; op = "++"; }
+            if (e.kind.tag == ExprKind::PostDec) { target = e.kind.payload.PostDec.expr; op = "--"; }
+            if (e.kind.tag == ExprKind::PreInc) { target = e.kind.payload.PreInc.expr; op = "++"; }
+            if (e.kind.tag == ExprKind::PreDec) { target = e.kind.payload.PreDec.expr; op = "--"; }
             Slice lv = cgLvalue(cg, target);
             usize ics = cg.ebuf.len;
             if (e.kind.tag == ExprKind::PostInc || e.kind.tag == ExprKind::PostDec) {
@@ -2949,20 +3079,20 @@ Slice cgExpr(Codegen* cg, NodeId id)
         ExprKind::AssignShl, ExprKind::AssignShr => {
             NodeId target;
             NodeId value;
-            u8* op = (u8*)"=";
+            str op = "=";
             if (e.kind.tag == ExprKind::Assign) { target = e.kind.payload.Assign.target; value = e.kind.payload.Assign.value; }
-            else if (e.kind.tag == ExprKind::AssignAdd) { target = e.kind.payload.AssignAdd.target; value = e.kind.payload.AssignAdd.value; op = (u8*)"+="; }
-            else if (e.kind.tag == ExprKind::AssignSub) { target = e.kind.payload.AssignSub.target; value = e.kind.payload.AssignSub.value; op = (u8*)"-="; }
-            else if (e.kind.tag == ExprKind::AssignMul) { target = e.kind.payload.AssignMul.target; value = e.kind.payload.AssignMul.value; op = (u8*)"*="; }
-            else if (e.kind.tag == ExprKind::AssignDiv) { target = e.kind.payload.AssignDiv.target; value = e.kind.payload.AssignDiv.value; op = (u8*)"/="; }
-            else if (e.kind.tag == ExprKind::AssignMod) { target = e.kind.payload.AssignMod.target; value = e.kind.payload.AssignMod.value; op = (u8*)"%="; }
-            else if (e.kind.tag == ExprKind::AssignBitAnd) { target = e.kind.payload.AssignBitAnd.target; value = e.kind.payload.AssignBitAnd.value; op = (u8*)"&="; }
-            else if (e.kind.tag == ExprKind::AssignBitOr) { target = e.kind.payload.AssignBitOr.target; value = e.kind.payload.AssignBitOr.value; op = (u8*)"|="; }
-            else if (e.kind.tag == ExprKind::AssignBitXor) { target = e.kind.payload.AssignBitXor.target; value = e.kind.payload.AssignBitXor.value; op = (u8*)"^="; }
-            else if (e.kind.tag == ExprKind::AssignShl) { target = e.kind.payload.AssignShl.target; value = e.kind.payload.AssignShl.value; op = (u8*)"<<="; }
-            else { target = e.kind.payload.AssignShr.target; value = e.kind.payload.AssignShr.value; op = (u8*)">>="; }
+            else if (e.kind.tag == ExprKind::AssignAdd) { target = e.kind.payload.AssignAdd.target; value = e.kind.payload.AssignAdd.value; op = "+="; }
+            else if (e.kind.tag == ExprKind::AssignSub) { target = e.kind.payload.AssignSub.target; value = e.kind.payload.AssignSub.value; op = "-="; }
+            else if (e.kind.tag == ExprKind::AssignMul) { target = e.kind.payload.AssignMul.target; value = e.kind.payload.AssignMul.value; op = "*="; }
+            else if (e.kind.tag == ExprKind::AssignDiv) { target = e.kind.payload.AssignDiv.target; value = e.kind.payload.AssignDiv.value; op = "/="; }
+            else if (e.kind.tag == ExprKind::AssignMod) { target = e.kind.payload.AssignMod.target; value = e.kind.payload.AssignMod.value; op = "%="; }
+            else if (e.kind.tag == ExprKind::AssignBitAnd) { target = e.kind.payload.AssignBitAnd.target; value = e.kind.payload.AssignBitAnd.value; op = "&="; }
+            else if (e.kind.tag == ExprKind::AssignBitOr) { target = e.kind.payload.AssignBitOr.target; value = e.kind.payload.AssignBitOr.value; op = "|="; }
+            else if (e.kind.tag == ExprKind::AssignBitXor) { target = e.kind.payload.AssignBitXor.target; value = e.kind.payload.AssignBitXor.value; op = "^="; }
+            else if (e.kind.tag == ExprKind::AssignShl) { target = e.kind.payload.AssignShl.target; value = e.kind.payload.AssignShl.value; op = "<<="; }
+            else { target = e.kind.payload.AssignShr.target; value = e.kind.payload.AssignShr.value; op = ">>="; }
             Slice lv = cgLvalue(cg, target);
-            Slice rv = cgExpr(cg, value);
+            Slice rv = cgAssignValue(cg, target, value);
             if (e.kind.tag == ExprKind::Assign)
             {
                 Node* tn = cgNode(cg, target);
@@ -2987,8 +3117,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
             if (name.len == 6) {
                 isAssert = true;
                 usize i = 0;
-                u8* want = (u8*)"assert";
-                while (i < 6) { if (name.ptr[i] != want[i]) { isAssert = false; break; } i = i + 1; }
+                str want = "assert";
+                while (i < 6) { if (name.ptr[i] != want.ptr[i]) { isAssert = false; break; } i = i + 1; }
             }
             if (isAssert && e.kind.payload.BuiltinCall.argsLen == 1) {
                 Slice a = cgExpr(cg, e.kind.payload.BuiltinCall.args[0]);
@@ -3006,8 +3136,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
             if (name.len == 9) {
                 isAssertOut = true;
                 usize iAo = 0;
-                u8* wantAo = (u8*)"assertOut";
-                while (iAo < 9) { if (name.ptr[iAo] != wantAo[iAo]) { isAssertOut = false; break; } iAo = iAo + 1; }
+                str wantAo = "assertOut";
+                while (iAo < 9) { if (name.ptr[iAo] != wantAo.ptr[iAo]) { isAssertOut = false; break; } iAo = iAo + 1; }
             }
             if (isAssertOut && e.kind.payload.BuiltinCall.argsLen >= 1) {
                 Slice a = cgExpr(cg, e.kind.payload.BuiltinCall.args[0]);
@@ -3040,9 +3170,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
             bool isIsFormatLiteral = false;
             if (name.len == 15) {
                 isIsFormatLiteral = true;
-                u8* wantIfl = (u8*)"isFormatLiteral";
+                str wantIfl = "isFormatLiteral";
                 usize iI = 0;
-                while (iI < 15) { if (name.ptr[iI] != wantIfl[iI]) { isIsFormatLiteral = false; break; } iI = iI + 1; }
+                while (iI < 15) { if (name.ptr[iI] != wantIfl.ptr[iI]) { isIsFormatLiteral = false; break; } iI = iI + 1; }
             }
             if (isIsFormatLiteral)
             {
@@ -3058,7 +3188,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stP(&cg.ebuf, hasStrLit ? "1" : "0");
                 return stTail(&cg.ebuf, rs);
             }
-            cgError(cg, (u8*)"unsupported builtin call");
+            cgError(cg, "unsupported builtin call");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -3077,7 +3207,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
         },
 
         ExprKind::TypeRef => {
-            cgError(cg, (u8*)"unresolved TypeRef");
+            cgError(cg, "unresolved TypeRef");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -3087,13 +3217,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return cgExpr(cg, e.kind.payload.Spread.expr);
         },
         ExprKind::Typeof => {
-            cgError(cg, (u8*)"typeof not supported");
+            cgError(cg, "typeof not supported");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
 
         else => {
-            cgError(cg, (u8*)"unsupported expression kind");
+            cgError(cg, "unsupported expression kind");
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -3109,7 +3239,7 @@ Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext)
     Node* on = cgNode(cg, oid);
     bool lv = false;
     if (on.kind.tag == NodeKind::Expr) {
-        u32 ok = on.kind.payload.Expr.value.kind.tag;
+        u32 ok = (u32)on.kind.payload.Expr.value.kind.tag;
         lv = ok == ExprKind::Ident || ok == ExprKind::Field || ok == ExprKind::DerefField ||
              ok == ExprKind::Deref || ok == ExprKind::Index || ok == ExprKind::TupleField;
     }
@@ -3122,33 +3252,33 @@ Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext)
         } else if (on.kind.tag == NodeKind::Expr) {
             oty = cgResultTy(cg, oid, &on.kind.payload.Expr.value);
         } else {
-            oty = Slice::from((u8*)"void*", 5);
+            oty = Slice::fromStr("void*");
         }
         u32 t = cgNewTemp(cg, oty, 0);
         Slice tn = cgTempName(cg, t);
         stNL(&cg.body, cg.ind);
         stPS(&cg.body, tn);
-        stP(&cg.body, (u8*)" = ");
+        stP(&cg.body, " = ");
         stPS(&cg.body, c);
         stCh(&cg.body, ';');
         c = tn;
     }
     usize rs = cg.ebuf.len;
-    stP(&cg.ebuf, (u8*)"(&(");
+    stP(&cg.ebuf, "(&(");
     stPS(&cg.ebuf, c);
-    stP(&cg.ebuf, (u8*)"))");
+    stP(&cg.ebuf, "))");
     return stTail(&cg.ebuf, rs);
 }
 
 Slice cgLvalue(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
-        stP(&cg.ebuf, (u8*)"0");
+        stP(&cg.ebuf, "0");
         return stTail(&cg.ebuf, cg.ebuf.len - 1);
     }
     Node* n = cgNode(cg, id);
     if (n.kind.tag != NodeKind::Expr) {
-        cgError(cg, (u8*)"expected expression node");
+        cgError(cg, "expected expression node");
         stP(&cg.ebuf, "0");
         return stTail(&cg.ebuf, cg.ebuf.len - 1);
     }
@@ -3160,7 +3290,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             Str iname = e.kind.payload.Ident.name;
             /* self is a pointer parameter — an lvalue assignment to it
              * writes through the pointer */
-            if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern((u8*)"self", 4)) {
+            if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern("self".ptr, 4)) {
                 stP(&cg.ebuf, "*(");
                 stPS(&cg.ebuf, cgIdent(cg, iname));
                 stCh(&cg.ebuf, ')');
@@ -3208,6 +3338,30 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             } else {
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
+            }
+            /* `x.payload.Case` — lower to the union member slot of the
+             * case's ordinal: `x.u.v<idx>` (only when the base is a variant
+             * and the case exists; a plain `payload` struct field is not) */
+            if (cgIsPayloadAccess(cg, obj))
+            {
+                NodeId base = cgFieldAccessObj(cg, obj);
+                Node* bn = cgNode(cg, base);
+                Ty bty = 0;
+                if (bn.kind.tag == NodeKind::Expr) bty = bn.kind.payload.Expr.value.resolvedType;
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, bty, field, &vidx);
+                if (vd.index != 0)
+                {
+                    bool basePtr = cgTyIsPtr(cg, bty);
+                    Slice o = basePtr ? cgExpr(cg, base) : cgLvalue(cg, base);
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, o);
+                    if (basePtr) stP(&cg.ebuf, "->");
+                    else stCh(&cg.ebuf, '.');
+                    stP(&cg.ebuf, "u.v");
+                    stU64(&cg.ebuf, (u64)vidx);
+                    return stTail(&cg.ebuf, cs);
+                }
             }
             Node* on = cgNode(cg, obj);
             bool isPtr = false;
@@ -3259,12 +3413,12 @@ Slice cgLvalue(Codegen* cg, NodeId id)
 
 Slice cgValBody(Codegen* cg, NodeId id)
 {
-    if (id.index == 0) return Slice::from((u8*)"0", 1);
+    if (id.index == 0) return Slice::fromStr("0");
     Node* n = cgNode(cg, id);
     if (n.kind.tag == NodeKind::Expr) return cgExpr(cg, id);
     if (n.kind.tag != NodeKind::Stmt) {
-        cgError(cg, (u8*)"expected lvalue node");
-        return Slice::from((u8*)"0", 1);
+        cgError(cg, "expected lvalue node");
+        return Slice::fromStr("0");
     }
     Stmt* s = &n.kind.payload.Stmt.value;
     if (s.kind.tag == StmtKind::ExprStmt) return cgExpr(cg, s.kind.payload.ExprStmt.expr);
@@ -3277,16 +3431,16 @@ Slice cgValBody(Codegen* cg, NodeId id)
             cgStmt(cg, s.kind.payload.Block.stmts[i]);
             i = i + 1;
         }
-        if (cnt == 0) return Slice::from((u8*)"0", 1);
+        if (cnt == 0) return Slice::fromStr("0");
         NodeId last = s.kind.payload.Block.stmts[cnt - 1];
         Node* ln = cgNode(cg, last);
         if (ln.kind.tag == NodeKind::Stmt && ln.kind.payload.Stmt.value.kind.tag == StmtKind::ExprStmt)
             return cgExpr(cg, ln.kind.payload.Stmt.value.kind.payload.ExprStmt.expr);
         cgStmt(cg, last);
-        return Slice::from((u8*)"0", 1);
+        return Slice::fromStr("0");
     }
-    cgError(cg, (u8*)"expected statement node");
-    return Slice::from((u8*)"0", 1);
+    cgError(cg, "expected statement node");
+    return Slice::fromStr("0");
 }
 
 /* ── switch lowering: compare chains + labels ────────────────── */
@@ -3365,16 +3519,45 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 }
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, scrutTy, p.kind.payload.Variant.variantName, &vidx);
+                bool tagField = vd.index != 0;
+                if (vd.index == 0 && p.kind.payload.Variant.typeName != 0)
+                {
+                    /* `switch (x.kind.tag)` — the scrutinee is already the
+                     * ordinal; resolve the variant behind the pattern head */
+                    vd = cgFindDecl(cg, p.kind.payload.Variant.typeName, (u32)DeclKind::Variant);
+                    if (vd.index != 0)
+                    {
+                        Node* dn = cgNode(cg, vd);
+                        Decl* dd = &dn.kind.payload.Decl.value;
+                        u32 v = 0;
+                        bool found = false;
+                        while (v < dd.kind.payload.Variant.variantsLen)
+                        {
+                            if (dd.kind.payload.Variant.variants[v].name == p.kind.payload.Variant.variantName)
+                            {
+                                vidx = v;
+                                found = true;
+                                break;
+                            }
+                            v = v + 1;
+                        }
+                        if (!found) vd.index = 0;
+                    }
+                }
                 if (vd.index == 0) {
-                    cgError(cg, (u8*)"pattern lowering failed");
+                    cgError(cg, "pattern lowering failed");
                     *isWildcard = true;
                     return Slice::from(null, 0);
                 }
                 usize s = cg.ebuf.len;
                 stCh(&cg.ebuf, '(');
                 stPS(&cg.ebuf, scrut);
-                if (cgTyIsPtr(cg, scrutTy)) stP(&cg.ebuf, "->tag == ");
-                else stP(&cg.ebuf, ".tag == ");
+                if (tagField)
+                {
+                    if (cgTyIsPtr(cg, scrutTy)) stP(&cg.ebuf, "->tag == ");
+                    else stP(&cg.ebuf, ".tag == ");
+                }
+                else stP(&cg.ebuf, " == ");
                 stU64(&cg.ebuf, (u64)vidx);
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, s);
@@ -3433,7 +3616,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 return stTail(&cg.ebuf, s);
             },
             else => {
-                cgError(cg, (u8*)"pattern lowering failed");
+                cgError(cg, "pattern lowering failed");
                 *isWildcard = true;
                 return Slice::from(null, 0);
             },
@@ -3451,7 +3634,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
         stCh(&cg.ebuf, ')');
         return stTail(&cg.ebuf, s);
     }
-    cgError(cg, (u8*)"pattern lowering failed");
+    cgError(cg, "pattern lowering failed");
     *isWildcard = true;
     return Slice::from(null, 0);
 }
@@ -3567,9 +3750,9 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
         if (d < casesLen)
         {
             stNL(&cg.body, cg.ind);
-            if (first) stP(&cg.body, (u8*)"{");
-            else stP(&cg.body, (u8*)"else");
-            if (!first) { stNL(&cg.body, cg.ind); stP(&cg.body, (u8*)"{"); }
+            if (first) stP(&cg.body, "{");
+            else stP(&cg.body, "else");
+            if (!first) { stNL(&cg.body, cg.ind); stP(&cg.body, "{"); }
             cg.ind = cg.ind + 1;
             cgSwitchBinds(cg, scrut, scrutTy, cases + d);
             cgSwitchBody(cg, cases + d, resultTemp);
@@ -3589,8 +3772,8 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
         {
             bool w = false;
             Slice t = cgPatTest(cg, c.patterns[p], scrut, scrutTy, &w);
-            if (p > 0) stP(&pbuf, (u8*)" || ");
-            if (w) { stP(&pbuf, (u8*)"1"); break; }
+            if (p > 0) stP(&pbuf, " || ");
+            if (w) { stP(&pbuf, "1"); break; }
             stPS(&pbuf, t);
             p = p + 1;
         }
@@ -3598,8 +3781,8 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
     }
 
     stNL(&cg.body, cg.ind);
-    if (first) stP(&cg.body, (u8*)"if (");
-    else stP(&cg.body, (u8*)"else if (");
+    if (first) stP(&cg.body, "if (");
+    else stP(&cg.body, "else if (");
     stPS(&cg.body, testText);
     stCh(&cg.body, ')');
     stNL(&cg.body, cg.ind);
@@ -3611,7 +3794,7 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
     {
         Slice g = cgExpr(cg, c.guard);
         stNL(&cg.body, cg.ind);
-        stP(&cg.body, (u8*)"if (");
+        stP(&cg.body, "if (");
         stPS(&cg.body, g);
         stCh(&cg.body, ')');
         stNL(&cg.body, cg.ind);
@@ -3623,7 +3806,7 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
         stCh(&cg.body, '}');
         /* guard failed: try the remaining cases */
         stNL(&cg.body, cg.ind);
-        stP(&cg.body, (u8*)"else");
+        stP(&cg.body, "else");
         stNL(&cg.body, cg.ind);
         stCh(&cg.body, '{');
         cg.ind = cg.ind + 1;
@@ -3648,7 +3831,7 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
 void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 casesLen, Slice resultTemp)
 {
     if (casesLen > 64) {
-        cgError(cg, (u8*)"too many switch cases (cap 64)");
+        cgError(cg, "too many switch cases (cap 64)");
         return;
     }
 
@@ -3728,7 +3911,7 @@ void cgStmtBraced(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
         stNL(&cg.body, cg.ind);
-        stP(&cg.body, (u8*)"{}");
+        stP(&cg.body, "{}");
         return;
     }
     Node* n = cgNode(cg, id);
@@ -3758,7 +3941,7 @@ void cgStmt(Codegen* cg, NodeId id)
             stCh(&cg.body, ';');
             return;
         }
-        cgError(cg, (u8*)"expected statement node");
+        cgError(cg, "expected statement node");
         return;
     }
     Stmt* s = &n.kind.payload.Stmt.value;
@@ -3801,8 +3984,8 @@ void cgStmt(Codegen* cg, NodeId id)
                 Node* inn = cgNode(cg, init);
                 if (inn.kind.tag == NodeKind::Expr)
                     tyText = cgResultTy(cg, init, &inn.kind.payload.Expr.value);
-                else tyText = Slice::from((u8*)"void*", 5);
-            } else tyText = Slice::from((u8*)"void*", 5);
+                else tyText = Slice::fromStr("void*");
+            } else tyText = Slice::fromStr("void*");
 
             /* array-typed local: declarator form, braced initializer */
             bool isArray = false;
@@ -3842,7 +4025,7 @@ void cgStmt(Codegen* cg, NodeId id)
                     }
                     stCh(&cg.body, '}');
                 } else if (init.index != 0) {
-                    if (!initIsArrayLit) cgError(cg, (u8*)"array local needs array-literal init");
+                    if (!initIsArrayLit) cgError(cg, "array local needs array-literal init");
                     stP(&cg.body, " = {0}");
                 } else {
                     stP(&cg.body, " = {0}");
@@ -3868,7 +4051,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Assign => {
             Slice lv = cgLvalue(cg, s.kind.payload.Assign.target);
-            Slice rv = cgExpr(cg, s.kind.payload.Assign.value);
+            Slice rv = cgAssignValue(cg, s.kind.payload.Assign.target, s.kind.payload.Assign.value);
             Slice op = cgIntern(cg, s.kind.payload.Assign.op);
             /* plain `=` of an integer into a pointer (only reachable with
              * --allow-int-ptr) — gcc needs the cast; `+=` is pointer
@@ -3905,14 +4088,14 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Break => {
-            if (cg.loopDepth == 0) { cgError(cg, (u8*)"break outside of loop"); return; }
+            if (cg.loopDepth == 0) { cgError(cg, "break outside of loop"); return; }
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "break;");
             return;
         },
 
         StmtKind::Continue => {
-            if (cg.loopDepth == 0) { cgError(cg, (u8*)"continue outside of loop"); return; }
+            if (cg.loopDepth == 0) { cgError(cg, "continue outside of loop"); return; }
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "continue;");
             return;
@@ -4061,7 +4244,7 @@ void cgStmt(Codegen* cg, NodeId id)
             TypeEntry* te = null;
             if (iterTy != 0) te = cg.ctx->types + iterTy;
             if (te == null || (te.kind.tag != TypeKind::Slice && te.kind.tag != TypeKind::Array)) {
-                cgError(cg, (u8*)"for-in over non-slice/array");
+                cgError(cg, "for-in over non-slice/array");
                 return;
             }
             Slice elemTy = tyStr(cg, te.kind.payload.Slice.base);
@@ -4136,7 +4319,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Defer => {
-            cgError(cg, (u8*)"defer is not supported");
+            cgError(cg, "defer is not supported");
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "/* unsupported: defer */");
             return;
@@ -4158,7 +4341,7 @@ void cgStmt(Codegen* cg, NodeId id)
             if (s.kind.payload.Asm.flags & 1) stP(&cg.body, "__asm__ volatile (");
             else stP(&cg.body, "__asm__ (");
             /* template: string literal pieces only */
-            u8* built = (u8*)"";
+            u8* built = "".ptr;
             usize blen = 0;
             u32 i = 0;
             while (i < s.kind.payload.Asm.templateLen)
@@ -4175,7 +4358,7 @@ void cgStmt(Codegen* cg, NodeId id)
                         blen = blen + piece.len;
                     }
                 } else {
-                    cgError(cg, (u8*)"asm template pieces must be string literals");
+                    cgError(cg, "asm template pieces must be string literals");
                 }
                 i = i + 1;
             }
@@ -4200,7 +4383,7 @@ void cgStmt(Codegen* cg, NodeId id)
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
                         }
-                        else cgError(cg, (u8*)"asm operand constraint must be a string literal");
+                        else cgError(cg, "asm operand constraint must be a string literal");
                         if (oi + 1 < s.kind.payload.Asm.outputsLen)
                         {
                             stCh(&cg.body, '(');
@@ -4226,7 +4409,7 @@ void cgStmt(Codegen* cg, NodeId id)
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
                         }
-                        else cgError(cg, (u8*)"asm operand constraint must be a string literal");
+                        else cgError(cg, "asm operand constraint must be a string literal");
                         if (ii + 1 < s.kind.payload.Asm.inputsLen)
                         {
                             stCh(&cg.body, '(');
@@ -4252,7 +4435,7 @@ void cgStmt(Codegen* cg, NodeId id)
                             stPut(&cg.body, cs.ptr, cs.len);
                             stCh(&cg.body, '"');
                         }
-                        else cgError(cg, (u8*)"asm clobber must be a string literal");
+                        else cgError(cg, "asm clobber must be a string literal");
                         ci = ci + 1;
                     }
                 }
@@ -4262,7 +4445,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         else => {
-            cgError(cg, (u8*)"unsupported statement kind");
+            cgError(cg, "unsupported statement kind");
             return;
         },
     }
@@ -4380,7 +4563,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner, M
             if ((p.flags & 1) != 0)
             {
                 if (owner.len == 0) {
-                    cgError(cg, (u8*)"explicit self with unknown owner");
+                    cgError(cg, "explicit self with unknown owner");
                     stP(s, "rawptr* self");
                 } else {
                     stPS(s, owner);
@@ -4411,7 +4594,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner, M
         }
         i = i + 1;
     }
-    if (!hadOne) stP(s, (u8*)"void");
+    if (!hadOne) stP(s, "void");
 }
 
 void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys, MonoSubstitution* subs, u32 subsLen, Slice owner, MonoInstance* inst)
@@ -4429,7 +4612,7 @@ void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys
     stPS(&cg.protos, cname);
     stCh(&cg.protos, '(');
     cgEmitParams(cg, &cg.protos, dd, paramTys, owner, inst);
-    stP(&cg.protos, (u8*)");");
+    stP(&cg.protos, ");");
 
     cg.subs = oldSubs;
     cg.subsLen = oldSubsLen;
@@ -4490,7 +4673,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     /* bound names: fresh set per function — params and `self` are
      * locals (Ident refs to them stay raw) */
     cg.localNamesLen = 0;
-    if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern((u8*)"self", 4));
+    if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern("self".ptr, 4));
     {
         u32 pi = 0;
         while (pi < dd.kind.payload.Func.paramsLen)
@@ -4542,12 +4725,12 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     stPS(&cg.bodies, cname);
     stCh(&cg.bodies, '(');
     cgEmitParams(cg, &cg.bodies, dd, paramTys, owner, inst);
-    stP(&cg.bodies, (u8*)") {");
+    stP(&cg.bodies, ") {");
     /* temporaries declared at function top */
     u32 t = 0;
     while (t < cg.tempsLen)
     {
-        stP(&cg.bodies, (u8*)"\n    ");
+        stP(&cg.bodies, "\n    ");
         Slice tty = cg.tempTys[t];
         /* an array type spells as `T[N]` — in a declaration the suffix
          * must follow the name: split at the first '[' */
@@ -4561,14 +4744,14 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
             stPS(&cg.bodies, cgTempName(cg, t));
             j = bi;
             while (j < tty.len) { stCh(&cg.bodies, tty.ptr[j]); j = j + 1; }
-            stP(&cg.bodies, (u8*)";");
+            stP(&cg.bodies, ";");
         }
         else
         {
             stPS(&cg.bodies, tty);
             stCh(&cg.bodies, ' ');
             stPS(&cg.bodies, cgTempName(cg, t));
-            stP(&cg.bodies, (u8*)";");
+            stP(&cg.bodies, ";");
         }
         t = t + 1;
     }
@@ -4631,11 +4814,11 @@ void cgEmitFwd(Codegen* cg)
             if (inst.kind == MonoInstanceKind::TypeInstance)
             {
                 Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
-                stP(&cg.fwd, (u8*)"typedef struct ");
+                stP(&cg.fwd, "typedef struct ");
                 stPS(&cg.fwd, m);
                 stCh(&cg.fwd, ' ');
                 stPS(&cg.fwd, m);
-                stP(&cg.fwd, (u8*)";\n");
+                stP(&cg.fwd, ";\n");
             }
             i = i + 1;
         }
@@ -4701,7 +4884,7 @@ void cgEmitAliasBridges(Codegen* cg)
 
 void cgEmitEnumDef(Codegen* cg, NodeId declId, Decl* dd)
 {
-    stP(&cg.defs, (u8*)"typedef enum {\n");
+    stP(&cg.defs, "typedef enum {\n");
     u32 v = 0;
     i64 nextVal = 0;
     while (v < dd.kind.payload.Enum.variantsLen)
@@ -4750,7 +4933,7 @@ void cgEmitEnumDef(Codegen* cg, NodeId declId, Decl* dd)
                 }
                 else
                 {
-                    cgError(cg, (u8*)"enum variant is not a literal");
+                    cgError(cg, "enum variant is not a literal");
                 }
             }
             else
@@ -4764,9 +4947,9 @@ void cgEmitEnumDef(Codegen* cg, NodeId declId, Decl* dd)
         }
         v = v + 1;
     }
-    stP(&cg.defs, (u8*)"} ");
+    stP(&cg.defs, "} ");
     stPS(&cg.defs, cgMangle(cg, declId, dd.kind.payload.Enum.name, 0));
-    stP(&cg.defs, (u8*)";\n");
+    stP(&cg.defs, ";\n");
 }
 
 /* `T name` / `T name[len]` at file scope (C puts array bounds after the name) */
@@ -4888,14 +5071,14 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
         }
         f = f + 1;
     }
-    if (!hadOne) stP(&cg.defs, (u8*)"\n    char _empty;");
+    if (!hadOne) stP(&cg.defs, "\n    char _empty;");
 }
 
 void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
 {
-    stP(&cg.defs, (u8*)"struct ");
+    stP(&cg.defs, "struct ");
     stPS(&cg.defs, name);
-    stP(&cg.defs, (u8*)" {\n    int32_t tag;");
+    stP(&cg.defs, " {\n    int32_t tag;");
     if (dd.kind.payload.Variant.variantsLen > 0)
     {
         stP(&cg.defs, "\n    union {");
@@ -4922,7 +5105,7 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
         }
         stP(&cg.defs, "\n    } u;");
     }
-    stP(&cg.defs, (u8*)"\n};\n");
+    stP(&cg.defs, "\n};\n");
 }
 
 /* file-scope constant values must lower to C constant expressions:
@@ -4933,7 +5116,7 @@ bool cgConstAtom(Codegen* cg, NodeId id)
     Node* n = cgNode(cg, id);
     if (n.kind.tag != NodeKind::Expr) return false;
     Expr* e = &n.kind.payload.Expr.value;
-    u32 k = e->kind.tag;
+    u32 k = (u32)e->kind.tag;
     if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
         k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit) return true;
     if (k == ExprKind::Neg) return cgConstAtom(cg, e->kind.payload.Neg.expr);
@@ -4972,7 +5155,7 @@ void cgConstExpr(Codegen* cg, NodeId id)
     Node* n = cgNode(cg, id);
     if (n.kind.tag != NodeKind::Expr) { stPS(&cg.defs, cgExpr(cg, id)); return; }
     Expr* e = &n.kind.payload.Expr.value;
-    u32 k = e->kind.tag;
+    u32 k = (u32)e->kind.tag;
     if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
         k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit ||
         k == ExprKind::Ident || k == ExprKind::Path)
@@ -5004,7 +5187,7 @@ void cgConstExpr(Codegen* cg, NodeId id)
         stP(&cg.defs, ")");
         return;
     }
-    u8* op = (u8*)"+";
+    str op = "+";
     switch (k)
     {
         ExprKind::Add, ExprKind::Sub, ExprKind::Mul, ExprKind::Div, ExprKind::Mod,
@@ -5013,24 +5196,24 @@ void cgConstExpr(Codegen* cg, NodeId id)
         ExprKind::BitAnd, ExprKind::BitOr, ExprKind::BitXor, ExprKind::Shl, ExprKind::Shr => {
             switch (k)
             {
-                ExprKind::Add => { op = (u8*)"+"; },
-                ExprKind::Sub => { op = (u8*)"-"; },
-                ExprKind::Mul => { op = (u8*)"*"; },
-                ExprKind::Div => { op = (u8*)"/"; },
-                ExprKind::Mod => { op = (u8*)"%"; },
-                ExprKind::Eq => { op = (u8*)"=="; },
-                ExprKind::Ne => { op = (u8*)"!="; },
-                ExprKind::Lt => { op = (u8*)"<"; },
-                ExprKind::Le => { op = (u8*)"<="; },
-                ExprKind::Gt => { op = (u8*)">"; },
-                ExprKind::Ge => { op = (u8*)">="; },
-                ExprKind::And => { op = (u8*)"&&"; },
-                ExprKind::Or => { op = (u8*)"||"; },
-                ExprKind::BitAnd => { op = (u8*)"&"; },
-                ExprKind::BitOr => { op = (u8*)"|"; },
-                ExprKind::BitXor => { op = (u8*)"^"; },
-                ExprKind::Shl => { op = (u8*)"<<"; },
-                ExprKind::Shr => { op = (u8*)">>"; },
+                ExprKind::Add => { op = "+"; },
+                ExprKind::Sub => { op = "-"; },
+                ExprKind::Mul => { op = "*"; },
+                ExprKind::Div => { op = "/"; },
+                ExprKind::Mod => { op = "%"; },
+                ExprKind::Eq => { op = "=="; },
+                ExprKind::Ne => { op = "!="; },
+                ExprKind::Lt => { op = "<"; },
+                ExprKind::Le => { op = "<="; },
+                ExprKind::Gt => { op = ">"; },
+                ExprKind::Ge => { op = ">="; },
+                ExprKind::And => { op = "&&"; },
+                ExprKind::Or => { op = "||"; },
+                ExprKind::BitAnd => { op = "&"; },
+                ExprKind::BitOr => { op = "|"; },
+                ExprKind::BitXor => { op = "^"; },
+                ExprKind::Shl => { op = "<<"; },
+                ExprKind::Shr => { op = ">>"; },
                 else => {},
             }
             stCh(&cg.defs, '(');
@@ -5082,7 +5265,7 @@ void cgEmitGlobals(Codegen* cg)
                         bool isArrLit = inn.kind.tag == NodeKind::Expr &&
                             inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
                         if (isArray && !isArrLit)
-                            cgError(cg, (u8*)"array constant needs an array-literal initializer");
+                            cgError(cg, "array constant needs an array-literal initializer");
                         stP(&cg.defs, " = ");
                         cgEmitInitValue(cg, cval);
                     }
@@ -5617,18 +5800,18 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
      * errors (const placement, int32_t vs int, ...). assert.h stays:
      * it defines the assert() macro and declares no libc function
      * prototypes that coral also declares. */
-    stP(&cg.out, (u8*)"#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
-    stP(&cg.out, (u8*)"#include <assert.h>\n\n");
+    stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
+    stP(&cg.out, "#include <assert.h>\n\n");
     /* memcmp for str/struct equality — a bare prototype, not a header
        (generated C must not include system headers) */
-    stP(&cg.out, (u8*)"extern int memcmp(const void*, const void*, size_t);\n\n");
+    stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n\n");
     /* limits.crl defines the same names — drop the stdint macros so the
        emitted constants win */
-    stP(&cg.out, (u8*)"#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
-    stP(&cg.out, (u8*)"#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");
-    stP(&cg.out, (u8*)"typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n");
-    stP(&cg.out, (u8*)"static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
-    stP(&cg.out, (u8*)"static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n");
+    stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
+    stP(&cg.out, "#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");
+    stP(&cg.out, "typedef struct _coral_str { const uint8_t* ptr; size_t len; } _coral_str;\n");
+    stP(&cg.out, "static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
+    stP(&cg.out, "static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n");
     stPS(&cg.out, Slice::from(cg.fwd.p, cg.fwd.len));
     stPS(&cg.out, Slice::from(cg.tdecl.p, cg.tdecl.len));
     stPS(&cg.out, Slice::from(cg.defs.p, cg.defs.len));

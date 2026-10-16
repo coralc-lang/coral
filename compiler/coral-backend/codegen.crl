@@ -713,6 +713,104 @@ bool cgSliceEq(Slice a, Slice b)
     return true;
 }
 
+bool cgStrFieldIs(Codegen* cg, Str s, u8* lit, usize n)
+{
+    Slice t = cgIntern(cg, s);
+    if (t.len != n) return false;
+    usize i = 0;
+    while (i < n)
+    {
+        if (t.ptr[i] != lit[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+/* `x.payload` access node inside a field chain */
+bool cgIsPayloadAccess(Codegen* cg, NodeId id)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag == ExprKind::Field)
+        return cgStrFieldIs(cg, e->kind.payload.Field.field, (u8*)"payload", 7);
+    if (e->kind.tag == ExprKind::DerefField)
+        return cgStrFieldIs(cg, e->kind.payload.DerefField.field, (u8*)"payload", 7);
+    return false;
+}
+
+NodeId cgFieldAccessObj(Codegen* cg, NodeId id)
+{
+    Node* n = cgNode(cg, id);
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag == ExprKind::Field) return e->kind.payload.Field.obj;
+    return e->kind.payload.DerefField.obj;
+}
+
+/* `V::Case` as a bare value: the C form is the ordinal of the case;
+ * false when the path is not a variant case */
+bool cgVariantCaseIdx(Codegen* cg, NodeId id, u64* outIdx)
+{
+    if (id.index == 0) return false;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag != ExprKind::Path) return false;
+    if (e->kind.payload.Path.segmentsLen != 2) return false;
+    Node* s0n = cgNode(cg, e->kind.payload.Path.segments[0]);
+    Node* s1n = cgNode(cg, e->kind.payload.Path.segments[1]);
+    if (s0n.kind.tag != NodeKind::Expr || s1n.kind.tag != NodeKind::Expr) return false;
+    if (s0n.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return false;
+    if (s1n.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return false;
+    Str root = s0n.kind.payload.Expr.value.kind.payload.Ident.name;
+    Str member = s1n.kind.payload.Expr.value.kind.payload.Ident.name;
+    NodeId vd = cgFindDecl(cg, root, (u32)DeclKind::Variant);
+    if (vd.index == 0) return false;
+    Node* dn = cgNode(cg, vd);
+    Decl* dd = &dn.kind.payload.Decl.value;
+    u32 v = 0;
+    while (v < dd.kind.payload.Variant.variantsLen)
+    {
+        if (dd.kind.payload.Variant.variants[v].name == member)
+        {
+            *outIdx = (u64)v;
+            return true;
+        }
+        v = v + 1;
+    }
+    return false;
+}
+
+Slice cgU64Text(Codegen* cg, u64 v)
+{
+    usize s = cg.ebuf.len;
+    stU64(&cg.ebuf, v);
+    return stTail(&cg.ebuf, s);
+}
+
+/* assignment RHS: `x.tag = V::Case` writes the ordinal; other variant-case
+ * uses keep the struct form */
+Slice cgAssignValue(Codegen* cg, NodeId target, NodeId value)
+{
+    Node* tn = cgNode(cg, target);
+    if (tn.kind.tag == NodeKind::Expr)
+    {
+        Expr* te = &tn.kind.payload.Expr.value;
+        bool tagTarget = false;
+        if (te->kind.tag == ExprKind::Field &&
+            cgStrFieldIs(cg, te->kind.payload.Field.field, (u8*)"tag", 3)) tagTarget = true;
+        if (te->kind.tag == ExprKind::DerefField &&
+            cgStrFieldIs(cg, te->kind.payload.DerefField.field, (u8*)"tag", 3)) tagTarget = true;
+        if (tagTarget)
+        {
+            u64 cidx = 0;
+            if (cgVariantCaseIdx(cg, value, &cidx)) return cgU64Text(cg, cidx);
+        }
+    }
+    return cgExpr(cg, value);
+}
+
 NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
 {
     NodeId none;
@@ -2291,8 +2389,16 @@ Slice cgExpr(Codegen* cg, NodeId id)
             }
             left = e.kind.payload.Add.left;
             right = e.kind.payload.Add.right;
-            Slice l = cgExpr(cg, left);
-            Slice r = cgExpr(cg, right);
+            Slice l;
+            Slice r;
+            {
+                u64 cidx = 0;
+                bool cmp = e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne;
+                if (cmp && cgVariantCaseIdx(cg, left, &cidx)) l = cgU64Text(cg, cidx);
+                else l = cgExpr(cg, left);
+                if (cmp && cgVariantCaseIdx(cg, right, &cidx)) r = cgU64Text(cg, cidx);
+                else r = cgExpr(cg, right);
+            }
             /* str is a slice view: compare by content, not by struct bits */
             if (cgIsStrTy(cg, left) &&
                 (e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne))
@@ -2734,6 +2840,30 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
             }
+            /* `x.payload.Case` — lower to the union member slot of the
+             * case's ordinal: `x.u.v<idx>` (only when the base is a variant
+             * and the case exists; a plain `payload` struct field is not) */
+            if (cgIsPayloadAccess(cg, obj))
+            {
+                NodeId base = cgFieldAccessObj(cg, obj);
+                Node* bn = cgNode(cg, base);
+                Ty bty = 0;
+                if (bn.kind.tag == NodeKind::Expr) bty = bn.kind.payload.Expr.value.resolvedType;
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, bty, field, &vidx);
+                if (vd.index != 0)
+                {
+                    bool basePtr = cgTyIsPtr(cg, bty);
+                    Slice o = basePtr ? cgExpr(cg, base) : cgLvalue(cg, base);
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, o);
+                    if (basePtr) stP(&cg.ebuf, "->");
+                    else stCh(&cg.ebuf, '.');
+                    stP(&cg.ebuf, "u.v");
+                    stU64(&cg.ebuf, (u64)vidx);
+                    return stTail(&cg.ebuf, cs);
+                }
+            }
             Slice o = cgExpr(cg, obj);
             Node* on = cgNode(cg, obj);
             bool isPtr = false;
@@ -2969,7 +3099,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             else if (e.kind.tag == ExprKind::AssignShl) { target = e.kind.payload.AssignShl.target; value = e.kind.payload.AssignShl.value; op = (u8*)"<<="; }
             else { target = e.kind.payload.AssignShr.target; value = e.kind.payload.AssignShr.value; op = (u8*)">>="; }
             Slice lv = cgLvalue(cg, target);
-            Slice rv = cgExpr(cg, value);
+            Slice rv = cgAssignValue(cg, target, value);
             if (e.kind.tag == ExprKind::Assign)
             {
                 Node* tn = cgNode(cg, target);
@@ -3216,6 +3346,30 @@ Slice cgLvalue(Codegen* cg, NodeId id)
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
             }
+            /* `x.payload.Case` — lower to the union member slot of the
+             * case's ordinal: `x.u.v<idx>` (only when the base is a variant
+             * and the case exists; a plain `payload` struct field is not) */
+            if (cgIsPayloadAccess(cg, obj))
+            {
+                NodeId base = cgFieldAccessObj(cg, obj);
+                Node* bn = cgNode(cg, base);
+                Ty bty = 0;
+                if (bn.kind.tag == NodeKind::Expr) bty = bn.kind.payload.Expr.value.resolvedType;
+                u32 vidx = 0;
+                NodeId vd = cgFindVariantOfTy(cg, bty, field, &vidx);
+                if (vd.index != 0)
+                {
+                    bool basePtr = cgTyIsPtr(cg, bty);
+                    Slice o = basePtr ? cgExpr(cg, base) : cgLvalue(cg, base);
+                    usize cs = cg.ebuf.len;
+                    stPS(&cg.ebuf, o);
+                    if (basePtr) stP(&cg.ebuf, "->");
+                    else stCh(&cg.ebuf, '.');
+                    stP(&cg.ebuf, "u.v");
+                    stU64(&cg.ebuf, (u64)vidx);
+                    return stTail(&cg.ebuf, cs);
+                }
+            }
             Node* on = cgNode(cg, obj);
             bool isPtr = false;
             if (on.kind.tag == NodeKind::Expr) {
@@ -3372,6 +3526,31 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 }
                 u32 vidx = 0;
                 NodeId vd = cgFindVariantOfTy(cg, scrutTy, p.kind.payload.Variant.variantName, &vidx);
+                bool tagField = vd.index != 0;
+                if (vd.index == 0 && p.kind.payload.Variant.typeName != 0)
+                {
+                    /* `switch (x.kind.tag)` — the scrutinee is already the
+                     * ordinal; resolve the variant behind the pattern head */
+                    vd = cgFindDecl(cg, p.kind.payload.Variant.typeName, (u32)DeclKind::Variant);
+                    if (vd.index != 0)
+                    {
+                        Node* dn = cgNode(cg, vd);
+                        Decl* dd = &dn.kind.payload.Decl.value;
+                        u32 v = 0;
+                        bool found = false;
+                        while (v < dd.kind.payload.Variant.variantsLen)
+                        {
+                            if (dd.kind.payload.Variant.variants[v].name == p.kind.payload.Variant.variantName)
+                            {
+                                vidx = v;
+                                found = true;
+                                break;
+                            }
+                            v = v + 1;
+                        }
+                        if (!found) vd.index = 0;
+                    }
+                }
                 if (vd.index == 0) {
                     cgError(cg, (u8*)"pattern lowering failed");
                     *isWildcard = true;
@@ -3380,8 +3559,12 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 usize s = cg.ebuf.len;
                 stCh(&cg.ebuf, '(');
                 stPS(&cg.ebuf, scrut);
-                if (cgTyIsPtr(cg, scrutTy)) stP(&cg.ebuf, "->tag == ");
-                else stP(&cg.ebuf, ".tag == ");
+                if (tagField)
+                {
+                    if (cgTyIsPtr(cg, scrutTy)) stP(&cg.ebuf, "->tag == ");
+                    else stP(&cg.ebuf, ".tag == ");
+                }
+                else stP(&cg.ebuf, " == ");
                 stU64(&cg.ebuf, (u64)vidx);
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, s);
@@ -3875,7 +4058,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Assign => {
             Slice lv = cgLvalue(cg, s.kind.payload.Assign.target);
-            Slice rv = cgExpr(cg, s.kind.payload.Assign.value);
+            Slice rv = cgAssignValue(cg, s.kind.payload.Assign.target, s.kind.payload.Assign.value);
             Slice op = cgIntern(cg, s.kind.payload.Assign.op);
             /* plain `=` of an integer into a pointer (only reachable with
              * --allow-int-ptr) — gcc needs the cast; `+=` is pointer

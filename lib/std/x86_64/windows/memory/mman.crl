@@ -1,6 +1,5 @@
 import(lib) std::allocator { Allocator, mimalloc::{ MiAlloc }, tlsf::{ Tlsf } };
 import(lib) std::intrinsics { mmap, munmap, memmove, memcpy, memcmp };
-import(lib) std::result { Result };
 import(lib) platform::libc;
 
 // Reported by user-facing inits whose initial backing allocation genuinely
@@ -498,25 +497,19 @@ pub struct ArenaAllocator
     usize cap;
     usize used;
 
-    // Err(AllocFailed) — the initial buffer allocation from the backing
-    // allocator failed (errno-backed when that is libc/mmap). The arena is
-    // left empty (cap 0), which still grows lazily from the backing allocator
-    // on first use, so ignoring the Err degrades to null-returning push
-    // instead of writing through a null base.
-    Result<bool, AllocError> init(Allocator* backing, usize initialCap)
+    // A failed initial buffer allocation leaves the arena empty (cap 0),
+    // which still grows lazily from the backing allocator on first use, so
+    // push degrades to null-returning instead of writing through a null base.
+    void init(Allocator* backing, usize initialCap)
     {
         self.backing = backing;
         self.base = null;
         self.cap = 0;
         self.used = 0;
-        if (initialCap == 0) return Result<bool, AllocError>::Ok { .value = true };
+        if (initialCap == 0) return;
         self.base = (u8*)backing->alloc(backing->ctx, initialCap);
-        if (self.base == null)
-            return Result<bool, AllocError>::Err {
-                .error = AllocError::AllocFailed { .msg = "ArenaAllocator initial buffer allocation failed" }
-            };
+        if (self.base == null) return;
         self.cap = initialCap;
-        return Result<bool, AllocError>::Ok { .value = true };
     }
 
     void deinit()

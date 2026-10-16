@@ -1,13 +1,13 @@
 /* frontend/io.crl — file and cmdline readers shared by coralc. */
 
 import common::slice { Slice };
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc, realloc };
 
-extern("C") i32 open(u8* path, i32 flags, i32 mode);
+extern("C") i32 open(const cchar* path, i32 flags, i32 mode);
 extern("C") i32 read(i32 fd, u8* buf, usize len);
 extern("C") i32 close(i32 fd);
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
-extern("C") void free(rawptr ptr);
+extern("C") i32 write(i32 fd, const cchar* buf, usize len);
 
 usize readAll(i32 fd, u8* buf, usize cap)
 {
@@ -23,10 +23,10 @@ usize readAll(i32 fd, u8* buf, usize cap)
 
 pub Slice readCmdline()
 {
-    u8* buf = (u8*)malloc(8192);
+    u8* buf = alloc<u8>(8192);
     if (buf == null) return Slice::from(null, 0);
-    i32 fd = open((u8*)"/proc/self/cmdline", 0, 0);
-    if (fd < 0) return Slice::from(null, 0);
+    i32 fd = open(C"/proc/self/cmdline", 0, 0);
+    if (fd < 0) { dealloc<u8>(buf); return Slice::from(null, 0); }
     usize len = readAll(fd, buf, 8192);
     close(fd);
     return Slice::from(buf, len);
@@ -35,10 +35,10 @@ pub Slice readCmdline()
 pub Slice readFile(u8* cpath, usize* outLen)
 {
     *outLen = 0;
-    i32 fd = open(cpath, 0, 0);
+    i32 fd = open((const cchar*)cpath, 0, 0);
     if (fd < 0) return Slice::from(null, 0);
     usize cap = 65536;
-    u8* buf = (u8*)malloc(cap);
+    u8* buf = alloc<u8>(cap);
     if (buf == null) {
         close(fd);
         return Slice::from(null, 0);
@@ -49,10 +49,10 @@ pub Slice readFile(u8* cpath, usize* outLen)
         if (len + 1 >= cap)
         {
             usize newCap = cap * 2;
-            u8* grown = (u8*)realloc((rawptr)buf, newCap);
+            u8* grown = realloc<u8>(buf, newCap);
             if (grown == null) {
                 close(fd);
-                free((rawptr)buf);
+                dealloc<u8>(buf);
                 return Slice::from(null, 0);
             }
             buf = grown;
@@ -70,7 +70,7 @@ pub Slice readFile(u8* cpath, usize* outLen)
 
 pub u8* sliceCStr(Slice s)
 {
-    u8* p = (u8*)malloc(s.len + 1);
+    u8* p = alloc<u8>(s.len + 1);
     if (p == null) return null;
     usize i = 0;
     while (i < s.len) {
@@ -81,17 +81,15 @@ pub u8* sliceCStr(Slice s)
     return p;
 }
 
-extern("C") i32 write(i32 fd, u8* buf, usize len);
-
 pub bool writeFile(u8* cpath, Slice data)
 {
     /* O_WRONLY|O_CREAT|O_TRUNC, mode 0644 */
-    i32 fd = open(cpath, 577, 420);
+    i32 fd = open((const cchar*)cpath, 577, 420);
     if (fd < 0) return false;
     usize off = 0;
     while (off < data.len)
     {
-        i32 n = write(fd, data.ptr + off, data.len - off);
+        i32 n = write(fd, (const cchar*)(data.ptr + off), data.len - off);
         if (n <= 0) { close(fd); return false; }
         off = off + (usize)n;
     }
