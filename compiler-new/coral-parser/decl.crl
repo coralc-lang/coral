@@ -1,4 +1,7 @@
 /* parser/decl.crl — declaration parsing */
+import(lib) std::mman { realloc };
+import(lib) std::text::string { String };
+
 import parser;
 import common::token { Token, TokenKind };
 import diag::code { ErrorCode };
@@ -10,8 +13,6 @@ import ast {
     node { Node, NodeKind },
     types { Ty, TypeEntry, TypeKind }
 };
-// extern("C") rawptr malloc(usize size);
-// extern("C") rawptr realloc(rawptr ptr, usize size);
 
 struct ImportSymList
 {
@@ -215,7 +216,7 @@ pub extend Parser
                 while (i < entry->kind.payload.Named.genericArgsLen)
                 {
                     self.rebindTypeParams(entry->kind.payload.Named.genericArgs[i], genericValues, genericCount);
-                    i = i + 1;
+                    i++;
                 }
                 return;
             },
@@ -224,38 +225,44 @@ pub extend Parser
                 self.rebindTypeParams(entry->kind.payload.Pointer.base, genericValues, genericCount);
                 return;
             },
+            
             TypeKind::Const => {
                 self.rebindTypeParams(entry->kind.payload.Const.base, genericValues, genericCount);
                 return;
             },
+            
             TypeKind::Comptime => {
                 self.rebindTypeParams(entry->kind.payload.Comptime.base, genericValues, genericCount);
                 return;
             },
+            
             TypeKind::Slice => {
                 self.rebindTypeParams(entry->kind.payload.Slice.base, genericValues, genericCount);
                 return;
             },
+            
             TypeKind::Array => {
                 self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
                 return;
             }
+            
             TypeKind::FnPtr => {
                 self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);
                 u32 p = 0;
                 while (p < entry->kind.payload.FnPtr.paramsLen)
                 {
                     self.rebindTypeParams(entry->kind.payload.FnPtr.params[p], genericValues, genericCount);
-                    p = p + 1;
+                    p++;
                 }
                 return;
             },
+            
             TypeKind::Tuple => {
                 u32 e = 0;
                 while (e < entry->kind.payload.Tuple.elemsLen)
                 {
                     self.rebindTypeParams(entry->kind.payload.Tuple.elems[e], genericValues, genericCount);
-                    e = e + 1;
+                    e++;
                 }
                 return;
             }
@@ -269,7 +276,7 @@ pub extend Parser
          * routed to parseConstDecl before we ever get here */
         if (self.match(TokenKind::Const)) isConst = true;
         Token nameTok = self.expectName();
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         NodeListBuilder genericParams;
         self.ctx.nodeListInit(&genericParams);
         
@@ -351,7 +358,7 @@ pub extend Parser
         param.flags = 0;
         if (self.match(TokenKind::Comptime)) param.flags = param.flags | 1;
         Token nameTok = self.expectName();
-        param.name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        param.name = self.ctx.intern(nameTok.data.asStr());
         return self.storeNode(NodeKind::GenericParam{ .value = param });
     }
 
@@ -389,7 +396,7 @@ pub extend Parser
         if (self.current.kind == TokenKind::Self)
         {
             self.advance();
-            param.name = self.ctx.intern((u8*)"self", 4);
+            param.name = self.ctx.intern("self");
             param.typeNode = 0;
             param.flags = 1;
             return self.storeParam(param);
@@ -404,7 +411,7 @@ pub extend Parser
             if (self.current.kind == TokenKind::Ident)
             {
                 Token varTok = self.advance();
-                param.name = self.ctx.intern(varTok.data.ptr, varTok.data.len);
+                param.name = self.ctx.intern(varTok.data.asStr());
             }
             return self.storeParam(param);
         }
@@ -422,9 +429,9 @@ pub extend Parser
                 typeEntry = self.ctx.types + resolved;
             }
             if (typeEntry != null && typeEntry->kind.tag == TypeKind::Named &&
-                typeEntry->kind.payload.Named.name == self.ctx.intern((u8*)"self", 4))
+                typeEntry->kind.payload.Named.name == self.ctx.intern("self"))
             {
-                param.name = self.ctx.intern((u8*)"self", 4);
+                param.name = self.ctx.intern("self");
                 param.flags = 1;
                 return self.storeParam(param);
             }
@@ -454,7 +461,7 @@ pub extend Parser
             return self.storeParam(param);
         }
         Token name = self.expectName();
-        param.name = self.ctx.intern(name.data.ptr, name.data.len);
+        param.name = self.ctx.intern(name.data.asStr());
         /* `T name[]` / `T name[N]` — C-style declarator array suffix */
         if (param.typeNode != 0) param.typeNode = self.parseDeclaratorArray(param.typeNode);
         return self.storeParam(param);
@@ -464,7 +471,7 @@ pub extend Parser
     {
         self.expect(TokenKind::Struct);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         NodeListBuilder genericParams;
         self.ctx.nodeListInit(&genericParams);
         if (self.current.kind == TokenKind::Less)
@@ -522,7 +529,7 @@ pub extend Parser
                 Token fieldNameTok = self.expect(TokenKind::Ident);
                 Ty declType = self.parseDeclaratorArray(fieldType);
                 Field field;
-                field.name = self.ctx.intern(fieldNameTok.data.ptr, fieldNameTok.data.len);
+                field.name = self.ctx.intern(fieldNameTok.data.asStr());
                 field.typeNode = declType;
                 field.defaultValue = self.noneNode();
                 field.loc.data = 0;
@@ -547,14 +554,19 @@ pub extend Parser
         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
         u8 flags = 0;
         if (isPub) flags = 1;
-        return self.storeDecl(DeclKind::Struct{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .fields = fieldValues, .fieldsLen = fieldCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+        return self.storeDecl(DeclKind::Struct{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .fields = fieldValues,
+            .fieldsLen = fieldCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        });
     }
 
     NodeId parseEnumDecl(bool isPub)
     {
         self.expect(TokenKind::Enum);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         Ty backingType = 0;
         u8 flags = 0;
         if (self.match(TokenKind::Colon))
@@ -572,7 +584,7 @@ pub extend Parser
             {
                 EnumVariant enumValue;
                 Token variantTok = self.expect(TokenKind::Ident);
-                enumValue.name = self.ctx.intern(variantTok.data.ptr, variantTok.data.len);
+                enumValue.name = self.ctx.intern(variantTok.data.asStr());
                 enumValue.value = self.noneNode();
                 enumValue.loc.data = 0;
                 enumValue.flags = 0;
@@ -597,7 +609,7 @@ pub extend Parser
     {
         self.expect(TokenKind::Variant);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         NodeListBuilder genericParams;
         self.ctx.nodeListInit(&genericParams);
         if (self.current.kind == TokenKind::Less)
@@ -622,7 +634,7 @@ pub extend Parser
             }
             Token variantTok = self.expect(TokenKind::Ident);
             VariantVariant variantValue;
-            variantValue.name = self.ctx.intern(variantTok.data.ptr, variantTok.data.len);
+            variantValue.name = self.ctx.intern(variantTok.data.asStr());
             variantValue.fieldNames = null;
             variantValue.fieldTypes = null;
             variantValue.fieldsLen = 0;
@@ -638,7 +650,7 @@ pub extend Parser
                 {
                     Ty fieldType = self.parseType();
                     Token fieldTok = self.expect(TokenKind::Ident);
-                    Str fieldName = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
+                    Str fieldName = self.ctx.intern(fieldTok.data.asStr());
                     if (!self.ctx.tyListAppend(&fieldTypes, fieldType)) self.reportAllocFailed();
                     if (!self.ctx.strListAppend(&fieldNames, fieldName)) self.reportAllocFailed();
                     if (!self.match(TokenKind::Comma) && !self.match(TokenKind::Semicolon)) break;
@@ -660,14 +672,19 @@ pub extend Parser
         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
         u8 flags = 0;
         if (isPub) flags = 1;
-        return self.storeDecl(DeclKind::Variant{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .variants = variantValues, .variantsLen = variantCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+        return self.storeDecl(DeclKind::Variant{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .variants = variantValues,
+            .variantsLen = variantCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        });
     }
 
     NodeId parseUnionDecl(bool isPub)
     {
         self.expect(TokenKind::Union);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         NodeListBuilder genericParams;
         self.ctx.nodeListInit(&genericParams);
         if (self.current.kind == TokenKind::Less)
@@ -720,7 +737,7 @@ pub extend Parser
             {
                 Token fieldTok = self.expect(TokenKind::Ident);
                 Field field;
-                field.name = self.ctx.intern(fieldTok.data.ptr, fieldTok.data.len);
+                field.name = self.ctx.intern(fieldTok.data.asStr());
                 field.typeNode = fieldType;
                 field.defaultValue = self.noneNode();
                 field.loc.data = 0;
@@ -740,14 +757,19 @@ pub extend Parser
         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
         u8 flags = 0;
         if (isPub) flags = 1;
-        return self.storeDecl(DeclKind::Union{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .fields = fieldValues, .fieldsLen = fieldCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+        return self.storeDecl(DeclKind::Union{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount, .fields = fieldValues,
+            .fieldsLen = fieldCount, .methods = methodValues,
+            .methodsLen = methodCount, .flags = flags
+        });
     }
 
     NodeId parseTraitDecl(bool isPub)
     {
         self.expect(TokenKind::Trait);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         NodeListBuilder genericParams;
         self.ctx.nodeListInit(&genericParams);
         if (self.current.kind == TokenKind::Less)
@@ -774,8 +796,7 @@ pub extend Parser
                 bool mIsStatic = self.match(TokenKind::Static);
                 method = self.parseFuncOrVarDecl(false, mIsExtern, mIsStatic, false);
             }
-            else
-            {
+            else {
                 method = self.parseFuncDecl();
             }
             if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
@@ -784,10 +805,17 @@ pub extend Parser
         self.outerGenerics = null;
         self.outerGenericsLen = 0;
         u32 methodCount = methods.len;
+        
         NodeId* methodValues = self.ctx.nodeListFinish(&methods);
         u8 flags = 0;
         if (isPub) flags = 1;
-        return self.storeDecl(DeclKind::Trait{ .name = name, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount, .flags = flags });
+        
+        return self.storeDecl(DeclKind::Trait{
+            .name = name, .genericParams = genericValues,
+            .genericParamsLen = genericCount,
+            .methods = methodValues, .methodsLen = methodCount,
+            .flags = flags
+        });
     }
 
     NodeId parseExtendDecl(bool isPub)
@@ -812,19 +840,14 @@ pub extend Parser
             Token traitTok = self.expect(TokenKind::Ident);
             if (atMark)
             {
-                u8* buf = (u8*)malloc(traitTok.data.len + 1);
-                if (buf != null)
-                {
-                    buf[0] = '@';
-                    u32 i = 0;
-                    while (i < (usize)traitTok.data.len) { buf[i + 1] = traitTok.data.ptr[i]; i = i + 1; }
-                    /* intern keeps the pointer — the buffer lives as long as the context */
-                    if (!self.ctx.track((rawptr)buf)) self.reportAllocFailed();
-                    traitName = self.ctx.intern(buf, traitTok.data.len + 1);
-                }
+                String atName = String::withCap(traitTok.data.len + 1);
+                atName.pushByte('@');
+                atName.pushView(traitTok.data.asStr());
+                traitName = self.ctx.intern(atName.asView());
+                atName.free();
             }
             else {
-                traitName = self.ctx.intern(traitTok.data.ptr, traitTok.data.len);
+                traitName = self.ctx.intern(traitTok.data.asStr());
             }
         }
         NodeListBuilder methods;
@@ -882,7 +905,7 @@ pub extend Parser
         {
             Token name = self.expectName();
             if (typeNode != 0) typeNode = self.parseDeclaratorArray(typeNode);
-            nameId = self.ctx.intern(name.data.ptr, name.data.len);
+            nameId = self.ctx.intern(name.data.asStr());
         }
         if (nameId == 0) self.reportCurrentError(ErrorCode::ParseExpectedToken, "expected a constant name");
         self.expect(TokenKind::Equal);
@@ -916,7 +939,7 @@ pub extend Parser
             else self.restore(m);
         }
         Token nameTok = self.expectName();
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         if (typed) ty = self.parseDeclaratorArray(ty);
         NodeId value = self.noneNode();
         if (self.match(TokenKind::Equal)) value = self.parseInitExpr();
@@ -930,7 +953,7 @@ pub extend Parser
     {
         self.expect(TokenKind::Typedef);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         self.expect(TokenKind::Equal);
         Ty target = self.parseType();
         self.expect(TokenKind::Semicolon);
@@ -941,7 +964,7 @@ pub extend Parser
     {
         self.expect(TokenKind::Distinct);
         Token nameTok = self.expect(TokenKind::Ident);
-        Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+        Str name = self.ctx.intern(nameTok.data.asStr());
         self.expect(TokenKind::Equal);
         Ty base = 0;
         if (self.current.kind == TokenKind::Flag) base = self.parseFlagType();
@@ -959,7 +982,7 @@ pub extend Parser
         self.advance(); /* flag */
         self.expect(TokenKind::LParen);
         Token nameTokStmt = self.expect(TokenKind::Ident);
-        Str nameStrFor = self.ctx.intern(nameTokStmt.data.ptr, nameTokStmt.data.len);
+        Str nameStrFor = self.ctx.intern(nameTokStmt.data.asStr());
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::LBrace);
 
@@ -982,14 +1005,14 @@ pub extend Parser
                 bool isMatch = false;
                 if (self.ctx != null)
                 {
-                    Str keyStr = self.ctx.intern(keyTok.data.ptr, keyTok.data.len);
+                    Str keyStr = self.ctx.intern(keyTok.data.asStr());
                     Str anm = nameStrFor; /* filled in at top of parseFlagType */
                     u32 f1 = 0;
                     while (f1 < self.ctx->flagsLen)
                     {
                         if (self.ctx->flagNames[f1] == anm &&
                             self.ctx->flagValues[f1] == keyStr) isMatch = true;
-                        f1 = f1 + 1;
+                        f1++;
                     }
                 }
                 if (isMatch) isHost = true;
@@ -1039,45 +1062,17 @@ pub extend Parser
         Str* values = self.ctx.strListFinish(parts);
         if (count == 0 || values == null) return 0;
         if (count == 1) return values[0];
-        usize total = 0;
+        String text = String::new();
         u32 i = 0;
         while (i < count)
         {
+            if (i > 0) text.pushView("::");
             InternEntry* entry = self.ctx.interns + values[i];
-            total = total + entry->len;
-            if (i + 1 < count) total = total + 2;
-            i = i + 1;
+            text.pushView(str::fromParts(entry->ptr, entry->len));
+            i++;
         }
-        u8* text = (u8*)malloc(total);
-        if (text == null)
-        {
-            self.reportAllocFailed();
-            return 0;
-        }
-        usize offset = 0;
-        i = 0;
-        while (i < count)
-        {
-            InternEntry* entry = self.ctx.interns + values[i];
-            usize len = entry->len;
-            u8* source = entry->ptr;
-            usize j = 0;
-            while (j < len)
-            {
-                text[offset + j] = source[j];
-                j = j + 1;
-            }
-            offset = offset + len;
-            if (i + 1 < count)
-            {
-                text[offset] = ':';
-                text[offset + 1] = ':';
-                offset = offset + 2;
-            }
-            i = i + 1;
-        }
-        Str result = self.ctx.intern(text, total);
-        if (!self.ctx.track((rawptr)text)) self.reportAllocFailed();
+        Str result = self.ctx.intern(text.asView());
+        text.free();
         return result;
     }
 
@@ -1088,7 +1083,7 @@ pub extend Parser
         while (true)
         {
             Token tok = self.expectName();
-            Str part = self.ctx.intern(tok.data.ptr, tok.data.len);
+            Str part = self.ctx.intern(tok.data.asStr());
             if (!self.ctx.strListAppend(&parts, part))
             {
                 self.reportAllocFailed();
@@ -1122,22 +1117,22 @@ pub extend Parser
                 {
                     u32 newCap = list->cap * 2;
                     if (newCap == 0) newCap = 4;
-                    rawptr raw = realloc((rawptr)list->items, (usize)newCap * @sizeof(ImportSymbol));
+                    ImportSymbol* raw = realloc<ImportSymbol>(list->items, (usize)newCap);
                     if (raw == null)
                     {
                         self.reportAllocFailed();
                         return false;
                     }
-                    list->items = (ImportSymbol*)raw;
+                    list->items = raw;
                     list->cap = newCap;
                 }
                 list->items[list->len] = value;
-                list->len = list->len + 1;
+                list->len++;
             }
             else
             {
                 Token nameTok = self.expectName();
-                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                Str name = self.ctx.intern(nameTok.data.asStr());
                 if (prefix != 0)
                 {
                     StrListBuilder parts;
@@ -1167,7 +1162,7 @@ pub extend Parser
                         while (self.current.kind == TokenKind::Ident)
                         {
                             Token partTok = self.current;
-                            Str part = self.ctx.intern(partTok.data.ptr, partTok.data.len);
+                            Str part = self.ctx.intern(partTok.data.asStr());
                             self.ctx.strListAppend(&pathParts, part);
                             self.advance();
                             if (self.current.kind != TokenKind::ColonColon) break;
@@ -1193,24 +1188,24 @@ pub extend Parser
                     if (self.match(TokenKind::As))
                     {
                         Token aliasTok = self.expectName();
-                        value.alias = self.ctx.intern(aliasTok.data.ptr, aliasTok.data.len);
+                        value.alias = self.ctx.intern(aliasTok.data.asStr());
                         value.flags = value.flags | 1;
                     }
                     if (list->len >= list->cap)
                     {
                         u32 newCap = list->cap * 2;
                         if (newCap == 0) newCap = 4;
-                        rawptr raw = realloc((rawptr)list->items, (usize)newCap * @sizeof(ImportSymbol));
+                        ImportSymbol* raw = realloc<ImportSymbol>(list->items, (usize)newCap);
                         if (raw == null)
                         {
                             self.reportAllocFailed();
                             return false;
                         }
-                        list->items = (ImportSymbol*)raw;
+                        list->items = raw;
                         list->cap = newCap;
                     }
                     list->items[list->len] = value;
-                    list->len = list->len + 1;
+                    list->len++;
                 }
             }
             if (!self.match(TokenKind::Comma)) break;
@@ -1269,7 +1264,7 @@ pub extend Parser
     {
         self.expect(TokenKind::Mod);
         Token aliasToken = self.expectName();
-        Str alias = self.ctx.intern(aliasToken.data.ptr, aliasToken.data.len);
+        Str alias = self.ctx.intern(aliasToken.data.asStr());
         self.expect(TokenKind::Equal);
         self.expect(TokenKind::Import);
         u8 flags = 0;

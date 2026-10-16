@@ -4,18 +4,22 @@
  * binary operators, parameterized by minimum precedence.
  */
 
+import parser;
 import diag::code { ErrorCode };
 import base { Parser, ParserMark };
-import parser;
 import context::context { AstContext, NodeListBuilder, StrListBuilder, SwitchListBuilder };
 import common::token { Token, TokenKind };
-import ast::id { NodeId, Str };
-import ast::types { Ty, TypeEntry };
-import ast::expr { Expr, ExprKind };
-import ast::stmt { SwitchCase };
-import ast::node { Node, NodeKind };
-import lexer::escape { EscapeResult };
-import lexer::ident { decodeUtf8 };
+import lexer {
+    escape { EscapeResult },
+    ident { decodeUtf8 },
+};
+import ast {
+    id { NodeId, Str },
+    types { Ty, TypeEntry },
+    expr { Expr, ExprKind },
+    stmt { SwitchCase },
+    node { Node, NodeKind }
+};
 
 pub extend Parser
 {
@@ -75,12 +79,13 @@ pub extend Parser
 
     NodeId storeExpr(ExprKind kind)
     {
-        Expr e = Expr {
-            .kind = kind,
-            .loc = self.tokenLoc(self.previous),
-            .resolvedType = 0
-        };
-        return self.storeNode(NodeKind::Expr{ .value = e });
+        return self.storeNode(NodeKind::Expr{
+            .value = Expr {
+                .kind = kind,
+                .loc = self.tokenLoc(self.previous),
+                .resolvedType = 0 
+            }
+        });
     }
 
     void parseCallArgs(NodeListBuilder* args)
@@ -311,9 +316,10 @@ pub extend Parser
                     Token index = self.advance();
                     u32 field = (u32)index.number;
                     expr = self.storeExpr(ExprKind::TupleField{ .obj = expr, .index = field });
-                } else {
+                }
+                else {
                     Token field = self.expectName();
-                    Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                    Str fieldName = self.ctx.intern(field.data.asStr());
                     if (self.current.kind == TokenKind::LParen) {
                         self.advance();
                         NodeListBuilder args;
@@ -330,7 +336,7 @@ pub extend Parser
             } else if (self.current.kind == TokenKind::ColonColon) {
                 self.advance();
                 Token part = self.expectName();
-                Str partName = self.ctx.intern(part.data.ptr, part.data.len);
+                Str partName = self.ctx.intern(part.data.asStr());
                 NodeId segment = self.storeExpr(ExprKind::Ident{ .name = partName });
                 NodeListBuilder segments;
                 self.ctx.nodeListInit(&segments);
@@ -339,6 +345,7 @@ pub extend Parser
                 u32 count = segments.len;
                 NodeId* values = self.ctx.nodeListFinish(&segments);
                 expr = self.storeExpr(ExprKind::Path{ .segments = values, .segmentsLen = count });
+                
                 if (self.current.kind == TokenKind::LBrace) {
                     Ty litTy = self.pathHeadType(expr);
                     expr = self.parseLiteralFields(litTy, partName);
@@ -367,7 +374,7 @@ pub extend Parser
         self.advance(); /* flag */
         self.expect(TokenKind::LParen);
         Token tknn = self.expect(TokenKind::Ident);
-        Str nameStr = self.ctx.intern(tknn.data.ptr, tknn.data.len);
+        Str nameStr = self.ctx.intern(tknn.data.asStr());
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::LBrace);
 
@@ -382,7 +389,7 @@ pub extend Parser
             else
             {
                 Token ky = self.expect(TokenKind::Ident);
-                keyStr = self.ctx.intern(ky.data.ptr, ky.data.len);
+                keyStr = self.ctx.intern(ky.data.asStr());
             }
             self.expect(TokenKind::FatArrow);
             NodeId bodyNodeId = self.noneNode();
@@ -404,7 +411,7 @@ pub extend Parser
                 while (ii < self.ctx->flagsLen)
                 {
                     if (self.ctx->flagNames[ii] == nameStr) { flagValStr = self.ctx->flagValues[ii]; break; }
-                    ii = ii + 1;
+                    ii++;
                 }
                 if (flagValStr != 0 && flagValStr == keyStr) chosenNodeId = bodyNodeId;
             }
@@ -444,22 +451,22 @@ pub extend Parser
 
             TokenKind::Float => {
                 Token tok = self.advance();
-                return self.storeExpr(ExprKind::FloatLit{ .value = self.ctx.intern(tok.data.ptr, tok.data.len), .flags = tok.numFlags });
+                return self.storeExpr(ExprKind::FloatLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = tok.numFlags });
             },
 
             TokenKind::String => {
                 Token tok = self.advance();
-                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.ptr, tok.data.len), .flags = 0 });
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 0 });
             },
 
             TokenKind::CString => {
                 Token tok = self.advance();
-                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.ptr, tok.data.len), .flags = 1 });
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 1 });
             },
 
             TokenKind::RawString => {
                 Token tok = self.advance();
-                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.ptr, tok.data.len), .flags = 0 });
+                return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 0 });
             },
 
             TokenKind::CharLit => {
@@ -476,7 +483,7 @@ pub extend Parser
                     {
                         EscapeResult esc = EscapeResult::decodeEscapeSequence(p, end);
                         if (esc.isValid && esc.bytesConsumed > 0) value = esc.codepoint;
-                        else value = p[(u32)1];
+                        else value = (u32)p[(u32)1];
                     }
                     else
                     {
@@ -506,7 +513,7 @@ pub extend Parser
             
             TokenKind::Ident => {
                 Token nameTok = self.advance();
-                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                Str name = self.ctx.intern(nameTok.data.asStr());
                 Ty* genericArgs = null;
                 u32 genericArgsLen = 0;
                 bool hasGenericArgs = self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
@@ -522,7 +529,7 @@ pub extend Parser
 
             TokenKind::Str => {
                 Token nameTok = self.advance();
-                Str name = self.ctx.intern(nameTok.data.ptr, nameTok.data.len);
+                Str name = self.ctx.intern(nameTok.data.asStr());
                 if (self.current.kind == TokenKind::LBrace)
                 {
                     /* a pure Str tuple value: `str { .ptr = p, .len = n }` */
@@ -544,7 +551,7 @@ pub extend Parser
 
             TokenKind::Self => {
                 self.advance();
-                return self.storeExpr(ExprKind::Ident{ .name = self.ctx.intern((u8*)"self", 4) });
+                return self.storeExpr(ExprKind::Ident{ .name = self.ctx.intern("self") });
             },
             
             TokenKind::LParen => {
@@ -716,7 +723,7 @@ pub extend Parser
                 self.expect(TokenKind::RParen);
                 u32 bargCount = bargs.len;
                 NodeId* bargValues = self.ctx.nodeListFinish(&bargs);
-                return self.storeExpr(ExprKind::BuiltinCall{ .name = self.ctx.intern((u8*)"assert", 6), .args = bargValues, .argsLen = bargCount });
+                return self.storeExpr(ExprKind::BuiltinCall{ .name = self.ctx.intern("assert"), .args = bargValues, .argsLen = bargCount });
             },
             
             TokenKind::Flag => { return self.parseFlagExpr(); },
@@ -736,10 +743,10 @@ pub extend Parser
                     self.current.kind == TokenKind::BuiltinAssertOut ||
                     self.current.kind == TokenKind::BuiltinTypeof) {
                     Token bt = self.advance();
-                    bname = self.ctx.intern(bt.data.ptr, bt.data.len);
+                    bname = self.ctx.intern(bt.data.asStr());
                 } else {
                     Token bt = self.expect(TokenKind::Ident);
-                    bname = self.ctx.intern(bt.data.ptr, bt.data.len);
+                    bname = self.ctx.intern(bt.data.asStr());
                 }
                 self.expect(TokenKind::LParen);
                 NodeListBuilder bargs;
@@ -805,7 +812,7 @@ pub extend Parser
             {
                 self.match(TokenKind::Dot);
                 Token field = self.expectName();
-                Str fieldName = self.ctx.intern(field.data.ptr, field.data.len);
+                Str fieldName = self.ctx.intern(field.data.asStr());
                 self.expect(TokenKind::Equal);
                 NodeId value = self.parseExpr();
                 if (!self.ctx.strListAppend(&fields, fieldName)) self.reportAllocFailed();
