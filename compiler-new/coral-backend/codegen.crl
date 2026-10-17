@@ -170,6 +170,18 @@ pub struct Codegen
     Stream ebuf;
     Stream tybuf;
     Stream tdecl;
+    /* alias/distinct/enum typedefs — emitted before tdecl so fn-pointer
+     * typedefs can name them */
+    Stream typedefs;
+    /* C-symbol registries for mono instances: alias-equal coral args
+     * (`u32`, `Str`, `Ty`) spell one C type, so several instances can
+     * compose the same symbol — emit it once per phase */
+    Slice* protoFnNames;
+    u32 protoFnLen;
+    u32 protoFnCap;
+    Slice* bodyFnNames;
+    u32 bodyFnLen;
+    u32 bodyFnCap;
     MonoSubstitution* subs;
     u32 subsLen;
     u32 errors;
@@ -453,6 +465,25 @@ bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
             Decl* dd = &n.kind.payload.Decl.value;
             if (dd.kind.tag == DeclKind::Func && (dd.kind.payload.Func.flags & 2) != 0) return true;
             if (dd.kind.tag == DeclKind::Constant && (dd.kind.payload.Constant.flags & 2) != 0) return true;
+            /* a definition whose file also declares an extern("C") proto
+             * of the same name is C-visible: calls bind the proto (which
+             * is exempt), so the definition must spell bare as well */
+            if (dd.kind.tag == DeclKind::Func && cg.file != null)
+            {
+                u32 fi = 0;
+                while (fi < cg.file.declsLen)
+                {
+                    Node* fn = cg.ctx->nodes + cg.file.decls[fi].index;
+                    if (fn.kind.tag == NodeKind::Decl)
+                    {
+                        Decl* fd = &fn.kind.payload.Decl.value;
+                        if (fd.kind.tag == DeclKind::Func && (fd.kind.payload.Func.flags & 2) != 0 &&
+                            cgSliceEq(name, cgIntern(cg, fd.kind.payload.Func.name)))
+                            return true;
+                    }
+                    fi++;
+                }
+            }
         }
     }
     return false;
@@ -612,6 +643,28 @@ NodeId cgFindTypeDecl(Codegen* cg, Str name, u32 refFile)
     NodeId none;
     none.index = 0;
     if (cg.file == null || name == 0) return none;
+    /* resolve the way sema did: the binding visible from the spelling
+     * site — `File` spelled in parser/file.crl binds to ast's struct,
+     * not to the first same-named decl in the merged unit (lib's fs
+     * distinct File) */
+    if (cg.sema != null && refFile != 0)
+    {
+        ScopeStack* tyScopes = cg.sema.scopes;
+        Symbol* sym = null;
+        if (tyScopes != null) sym = tyScopes.lookupFrom(name, refFile);
+        if (sym != null && sym->declaration.index != 0)
+        {
+            Node* sn = cgNode(cg, sym->declaration);
+            if (sn.kind.tag == NodeKind::Decl)
+            {
+                u32 stag = sn.kind.payload.Decl.value.kind.tag;
+                if (stag == DeclKind::Struct || stag == DeclKind::Enum ||
+                    stag == DeclKind::Variant || stag == DeclKind::Union ||
+                    stag == DeclKind::TypeAlias || stag == DeclKind::Distinct)
+                    return sym->declaration;
+            }
+        }
+    }
     NodeId first;
     first.index = 0;
     u32 i = 0;
@@ -1564,6 +1617,44 @@ void cgRegAdd(Codegen* cg, Slice name)
     cg.regLen++;
 }
 
+/* has the C symbol already been emitted in this phase (protos / bodies)?
+ * `proto` picks the registry so the body pass still runs after the
+ * proto pass has seen the same name */
+bool cgFnSeen(Codegen* cg, Slice name, bool proto)
+{
+    Slice* names = cg.bodyFnNames;
+    u32 len = cg.bodyFnLen;
+    if (proto) { names = cg.protoFnNames; len = cg.protoFnLen; }
+    if (names == null) return false;
+    u32 i = 0;
+    while (i < len)
+    {
+        if (cgSliceEq(names[i], name)) return true;
+        i++;
+    }
+    return false;
+}
+
+void cgFnSee(Codegen* cg, Slice name, bool proto)
+{
+    if (proto)
+    {
+        if (cg.protoFnNames != null && cg.protoFnLen < cg.protoFnCap)
+        {
+            cg.protoFnNames[cg.protoFnLen] = name;
+            cg.protoFnLen++;
+        }
+    }
+    else
+    {
+        if (cg.bodyFnNames != null && cg.bodyFnLen < cg.bodyFnCap)
+        {
+            cg.bodyFnNames[cg.bodyFnLen] = name;
+            cg.bodyFnLen++;
+        }
+    }
+}
+
 extern("C") Slice cgRegName(Codegen* cg, Ty t);
 
 Slice cgRegName(Codegen* cg, Ty t)
@@ -2041,8 +2132,28 @@ u8 cgMethodRecvKind(Codegen* cg, Ty recvTy, Str method, bool* found)
                     methods = dd.kind.payload.Variant.methods;
                     mlen = dd.kind.payload.Variant.methodsLen;
                 },
-                DeclKind::Extend => { methods = dd.kind.payload.Extend.methods; mlen = dd.kind.payload.Extend.methodsLen; },
-                DeclKind::ExtendTrait => { methods = dd.kind.payload.ExtendTrait.methods; mlen = dd.kind.payload.ExtendTrait.methodsLen; },
+                /* an extend's methods belong to its self type — without
+                 * this filter a fn-pointer field call (`p->alloc(...)`,
+                 * where some OTHER type has an `alloc` method) matches
+                 * this unrelated extend and composes a bogus method call */
+                DeclKind::Extend => {
+                    Ty st = cgTyUnwrap(cg, dd.kind.payload.Extend.selfType);
+                    if (st != 0 && (cg.ctx->types + st)->kind.tag == TypeKind::Pointer)
+                        st = cgTyUnwrap(cg, (cg.ctx->types + st)->kind.payload.Pointer.base);
+                    if (st == 0 || (cg.ctx->types + st)->kind.tag != TypeKind::Named ||
+                        (cg.ctx->types + st)->kind.payload.Named.name != typeName) break;
+                    methods = dd.kind.payload.Extend.methods;
+                    mlen = dd.kind.payload.Extend.methodsLen;
+                },
+                DeclKind::ExtendTrait => {
+                    Ty st = cgTyUnwrap(cg, dd.kind.payload.ExtendTrait.selfType);
+                    if (st != 0 && (cg.ctx->types + st)->kind.tag == TypeKind::Pointer)
+                        st = cgTyUnwrap(cg, (cg.ctx->types + st)->kind.payload.Pointer.base);
+                    if (st == 0 || (cg.ctx->types + st)->kind.tag != TypeKind::Named ||
+                        (cg.ctx->types + st)->kind.payload.Named.name != typeName) break;
+                    methods = dd.kind.payload.ExtendTrait.methods;
+                    mlen = dd.kind.payload.ExtendTrait.methodsLen;
+                },
                 else => {},
             }
             if (methods != null)
@@ -2193,6 +2304,13 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::NullLit => {
+            /* `null` in a str position is the empty slice, not C NULL */
+            Ty nt = cgSubstTy(cg, e.resolvedType);
+            if (nt != 0 && (cg.ctx->types + nt)->kind.tag == TypeKind::Str)
+            {
+                stP(&cg.ebuf, "(_coral_str){0}");
+                return stTail(&cg.ebuf, es);
+            }
             stP(&cg.ebuf, "0");
             return stTail(&cg.ebuf, es);
         },
@@ -2389,6 +2507,29 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stCh(&cg.ebuf, 34);
                 stP(&cg.ebuf, "))");
                 return stTail(&cg.ebuf, rs2);
+            }
+            /* `(u32)V::Case` is the case's ordinal, not its struct form */
+            {
+                u64 vcase = 0;
+                if (cgVariantCaseIdx(cg, cin, &vcase))
+                {
+                    usize rv = cg.ebuf.len;
+                    stP(&cg.ebuf, "((");
+                    stPS(&cg.ebuf, tyStr(cg, e.kind.payload.Cast.targetType));
+                    stP(&cg.ebuf, ")");
+                    stU64(&cg.ebuf, vcase);
+                    stP(&cg.ebuf, ")");
+                    return stTail(&cg.ebuf, rv);
+                }
+            }
+            /* casting a void call (`(usize)f()`) drops the value; C has
+             * no cast-from-void */
+            {
+                Ty cit = 0;
+                if (cn != null && cn->kind.tag == NodeKind::Expr)
+                    cit = cgSubstTy(cg, cn->kind.payload.Expr.value.resolvedType);
+                if (cit != 0 && (cg.ctx->types + cit)->kind.tag == TypeKind::Void)
+                    return cgExpr(cg, cin);
             }
             Slice c = cgExpr(cg, e.kind.payload.Cast.expr);
             usize rs = cg.ebuf.len;
@@ -2753,6 +2894,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
              * fn-pointer field: lower to `(p->alloc)(ctx, size)` */
             bool fieldCall = !mFound && cgHasField(cg, rawRecvTy, methName);
             Slice callee;
+            NodeId mdef;
+            mdef.index = 0;
             if (fieldCall)
             {
                 usize cfs = cg.ebuf.len;
@@ -2773,8 +2916,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Slice rawCallee = stTail(&cg.ebuf, cs);
                 /* resolve the method's own decl for file-correct mangling
                    (def side: cgEmitMethodSet composes the same base) */
-                NodeId mdecl = cgFindMethodDecl(cg, rawRecvTy, methName);
-                if (mdecl.index != 0) callee = cgMangleS(cg, mdecl, rawCallee, 0);
+                mdef = cgFindMethodDecl(cg, rawRecvTy, methName);
+                if (mdef.index != 0) callee = cgMangleS(cg, mdef, rawCallee, 0);
                 else callee = rawCallee;
             }
 
@@ -2804,7 +2947,33 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 while (i < argsLen && n < 16) {
                     if (first) first = false;
                     else stP(&abuf, ", ");
-                    stPS(&abuf, cgExpr(cg, args[i]));
+                    /* `null` in a str parameter position is the empty slice */
+                    bool nullStr = false;
+                    if (mdef.index != 0)
+                    {
+                        Node* mdn = cgNode(cg, mdef);
+                        Node* an2 = cgNode(cg, args[i]);
+                        if (mdn.kind.tag == NodeKind::Decl && an2.kind.tag == NodeKind::Expr &&
+                            an2.kind.payload.Expr.value.kind.tag == ExprKind::NullLit &&
+                            i < mdn.kind.payload.Decl.value.kind.payload.Func.paramsLen)
+                        {
+                            Node* mpn = cgNode(cg, mdn.kind.payload.Decl.value.kind.payload.Func.params[i]);
+                            if (mpn.kind.tag == NodeKind::Param)
+                            {
+                                Ty pt = mpn.kind.payload.Param.value.typeNode;
+                                while (pt != 0 && ((cg.ctx->types + pt)->kind.tag == TypeKind::Const ||
+                                                   (cg.ctx->types + pt)->kind.tag == TypeKind::Comptime))
+                                {
+                                    if ((cg.ctx->types + pt)->kind.tag == TypeKind::Const)
+                                        pt = (cg.ctx->types + pt)->kind.payload.Const.base;
+                                    else pt = (cg.ctx->types + pt)->kind.payload.Comptime.base;
+                                }
+                                if (pt != 0 && (cg.ctx->types + pt)->kind.tag == TypeKind::Str) nullStr = true;
+                            }
+                        }
+                    }
+                    if (nullStr) stP(&abuf, "(_coral_str){0}");
+                    else stPS(&abuf, cgExpr(cg, args[i]));
                     n++;
                     i++;
                 }
@@ -2963,7 +3132,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stPS(&vs, cgExpr(cg, e.kind.payload.StructLiteral.fieldValues[i]));
                 i++;
             }
-            if (fvLen > 16) cgError(cg, "too many struct fields (cap 16)");
+            if (fvLen > 256) cgError(cg, "too many struct fields (cap 256)");
             Slice lty = tyStr(cg, e.kind.payload.StructLiteral.typeNode);
             usize lcs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -3879,14 +4048,14 @@ void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, 
  * (resultTemp names the variable each branch assigns). */
 void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 casesLen, Slice resultTemp)
 {
-    if (casesLen > 64) {
-        cgError(cg, "too many switch cases (cap 64)");
+    if (casesLen > 256) {
+        cgError(cg, "too many switch cases (cap 256)");
         return;
     }
 
     // pattern bindings: declared up front, assigned on case entry
     {
-        Str* bindNames = (Str*)cg.arena.alloc(64 * 4, 4);
+        Str* bindNames = (Str*)cg.arena.alloc(256 * 4, 4);
         u32 bindCount = 0;
         if (bindNames != null)
         {
@@ -3901,7 +4070,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
                     if (pn.kind.tag == NodeKind::Pat)
                     {
                         Pat* pv = &pn.kind.payload.Pat.value;
-                        if (pv.kind.tag == PatKind::Variant && pv.kind.payload.Variant.fieldNamesLen > 0 && bindCount < 64)
+                        if (pv.kind.tag == PatKind::Variant && pv.kind.payload.Variant.fieldNamesLen > 0 && bindCount < 256)
                         {
                             u32 vidx0 = 0;
                             NodeId vd0 = cgFindVariantOfTy(cg, scrutTy, pv.kind.payload.Variant.variantName, &vidx0);
@@ -3911,7 +4080,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
                                 Decl* vdd = &vdn.kind.payload.Decl.value;
                                 VariantVariant* vv0 = vdd.kind.payload.Variant.variants + vidx0;
                                 u32 ff = 0;
-                                while (ff < pv.kind.payload.Variant.fieldNamesLen && bindCount < 64)
+                                while (ff < pv.kind.payload.Variant.fieldNamesLen && bindCount < 256)
                                 {
                                     Str fname = pv.kind.payload.Variant.fieldNames[ff];
                                     u32 kk = 0;
@@ -5335,6 +5504,12 @@ void cgEmitGlobals(Codegen* cg)
 void cgEmitTypeDefs(Codegen* cg)
 {
     u32 i = 0;
+    /* sweeps 1+2 target cg.typedefs (emitted before the registry
+     * typedefs — FnP typedefs name aliases like `File` by value, so the
+     * aliases must be complete before them). Re-bind the stream; growth
+     * reallocates, so copy the grown stream back. */
+    Stream defsSaved = cg.defs;
+    cg.defs = cg.typedefs;
     // sweep 1: aliases
     while (i < cg.file.declsLen)
     {
@@ -5372,6 +5547,56 @@ void cgEmitTypeDefs(Codegen* cg)
             if (dd.kind.tag == DeclKind::Enum) cgEmitEnumDef(cg, cg.file.decls[i], dd);
         }
         i++;
+    }
+    cg.typedefs = cg.defs;
+    cg.defs = defsSaved;
+    /* sweep 2b: monomorphised struct/union instances — file structs hold
+     * them by value (`Vec_String entries`), while a Vec-style instance
+     * only reaches its element type through a pointer, so instances go
+     * first. Variant instances stay after the file structs: a payload
+     * (`Result<String, IoError>`) holds one by value. */
+    if (cg.mono != null)
+    {
+        i = 0;
+        while (i < cg.mono.instancesLen)
+        {
+            MonoInstance* inst = cg.mono.instances + i;
+            if (inst.kind == MonoInstanceKind::TypeInstance)
+            {
+                Node* d = cgNode(cg, inst.declaration);
+                if (d.kind.tag == NodeKind::Decl)
+                {
+                    Decl* dd = &d.kind.payload.Decl.value;
+                    if (dd.kind.tag == DeclKind::Struct || dd.kind.tag == DeclKind::Union)
+                    {
+                        Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                        MonoSubstitution* oldSubs = cg.subs;
+                        u32 oldSubsLen = cg.subsLen;
+                        cg.subs = inst.substitutions;
+                        cg.subsLen = inst.substitutionsLen;
+                        if (dd.kind.tag == DeclKind::Struct)
+                        {
+                            stP(&cg.defs, "struct ");
+                            stPS(&cg.defs, m);
+                            stP(&cg.defs, " {");
+                            cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
+                            stP(&cg.defs, "\n};\n");
+                        }
+                        else
+                        {
+                            stP(&cg.defs, "union ");
+                            stPS(&cg.defs, m);
+                            stP(&cg.defs, " {");
+                            cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
+                            stP(&cg.defs, "\n};\n");
+                        }
+                        cg.subs = oldSubs;
+                        cg.subsLen = oldSubsLen;
+                    }
+                }
+            }
+            i++;
+        }
     }
     // sweep 3: structs / unions / variants
     i = 0;
@@ -5412,7 +5637,8 @@ void cgEmitTypeDefs(Codegen* cg)
     /* sweep 4 (file-scope constants) moved to cgEmitGlobals: it runs
      * after the prototypes so fn-pointer initializers see a prior
      * declaration of the function */
-    // sweep 5: monomorphised type instances
+    /* sweep 5: monomorphised variant instances (struct/union instances
+     * went out in sweep 2b) */
     if (cg.mono != null)
     {
         i = 0;
@@ -5425,32 +5651,17 @@ void cgEmitTypeDefs(Codegen* cg)
                 if (d.kind.tag == NodeKind::Decl)
                 {
                     Decl* dd = &d.kind.payload.Decl.value;
-                    Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
-                    MonoSubstitution* oldSubs = cg.subs;
-                    u32 oldSubsLen = cg.subsLen;
-                    cg.subs = inst.substitutions;
-                    cg.subsLen = inst.substitutionsLen;
-                    switch (dd.kind.tag)
+                    if (dd.kind.tag == DeclKind::Variant)
                     {
-                        DeclKind::Struct => {
-                            stP(&cg.defs, "struct ");
-                            stPS(&cg.defs, m);
-                            stP(&cg.defs, " {");
-                            cgEmitStructFields(cg, dd.kind.payload.Struct.fields, dd.kind.payload.Struct.fieldsLen, 4);
-                            stP(&cg.defs, "\n};\n");
-                        },
-                        DeclKind::Union => {
-                            stP(&cg.defs, "union ");
-                            stPS(&cg.defs, m);
-                            stP(&cg.defs, " {");
-                            cgEmitStructFields(cg, dd.kind.payload.Union.fields, dd.kind.payload.Union.fieldsLen, 4);
-                            stP(&cg.defs, "\n};\n");
-                        },
-                        DeclKind::Variant => { cgEmitVariantDef(cg, dd, m); },
-                        else => {},
+                        Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+                        MonoSubstitution* oldSubs = cg.subs;
+                        u32 oldSubsLen = cg.subsLen;
+                        cg.subs = inst.substitutions;
+                        cg.subsLen = inst.substitutionsLen;
+                        cgEmitVariantDef(cg, dd, m);
+                        cg.subs = oldSubs;
+                        cg.subsLen = oldSubsLen;
                     }
-                    cg.subs = oldSubs;
-                    cg.subsLen = oldSubsLen;
                 }
             }
             i++;
@@ -5606,6 +5817,17 @@ void cgEmitInstMethodList(Codegen* cg, NodeId* methods, u32 mlen, Slice m, MonoI
 void cgEmitInstanceMethods(Codegen* cg, Decl* dd, MonoInstance* inst, bool withBodies)
 {
     Slice m = cgInstanceName(cg, inst.name, inst.arguments, inst.argumentsLen);
+    /* same alias-equal-args symbol collapse as FunctionInstance protos */
+    if (withBodies)
+    {
+        if (cgFnSeen(cg, m, false)) return;
+        cgFnSee(cg, m, false);
+    }
+    else
+    {
+        if (cgFnSeen(cg, m, true)) return;
+        cgFnSee(cg, m, true);
+    }
     NodeId* methods = null;
     u32 mlen = 0;
     switch (dd.kind.tag)
@@ -5699,8 +5921,14 @@ void cgEmitProtos(Codegen* cg)
             {
                 Slice m = cgMangleS(cg, inst.declaration,
                                     cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
-                cgEmitProto(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
-                            inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), inst);
+                /* alias-equal args (`u32` / `Str` / `Ty` all spell `uint32_t`)
+                 * compose one C symbol from several instances — emit once */
+                if (!cgFnSeen(cg, m, true))
+                {
+                    cgFnSee(cg, m, true);
+                    cgEmitProto(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
+                                inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), inst);
+                }
             }
             else if (inst.kind == MonoInstanceKind::TypeInstance)
             {
@@ -5761,8 +5989,12 @@ void cgEmitBodies(Codegen* cg)
                 {
                     Slice m = cgMangleS(cg, inst.declaration,
                                         cgInstanceNameV(cg, inst.name, inst.arguments, inst.argumentsLen, inst.valueKey), 0);
-                    cgEmitFuncCommon(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
-                                     inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0, inst);
+                    if (!cgFnSeen(cg, m, false))
+                    {
+                        cgFnSee(cg, m, false);
+                        cgEmitFuncCommon(cg, inst.declaration, m, inst.returnType, inst.paramTypes,
+                                         inst.substitutions, inst.substitutionsLen, Slice::from(null, 0), 0, inst);
+                    }
                 }
             }
             else if (inst.kind == MonoInstanceKind::TypeInstance)
@@ -5801,6 +6033,13 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.ebuf = stNew(arena, 8192);
     cg.tybuf = stNew(arena, 16384);
     cg.tdecl = stNew(arena, 16384);
+    cg.typedefs = stNew(arena, 8192);
+    cg.protoFnCap = 16384;
+    cg.protoFnLen = 0;
+    cg.protoFnNames = (Slice*)arena.alloc(16384 * @sizeof(Slice), 8);
+    cg.bodyFnCap = 16384;
+    cg.bodyFnLen = 0;
+    cg.bodyFnNames = (Slice*)arena.alloc(16384 * @sizeof(Slice), 8);
     cg.subs = null;
     cg.subsLen = 0;
     cg.errors = 0;
@@ -5851,7 +6090,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     }
     cgEmitBodies(&cg);
 
-    // assemble: preamble | fwd typedefs | registry typedefs | defs | protos | bodies
+    // assemble: preamble | fwd typedefs | alias/enum typedefs | registry typedefs | defs | protos | bodies
     /* Type/macro headers ONLY; no function-declaring headers (stdio,
      * stdlib, string, unistd). The generated C carries coral's own extern
      * prototypes (libc.crl / `extern` decls) and links against libc; a
@@ -5872,6 +6111,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     stP(&cg.out, "static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
     stP(&cg.out, "static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n");
     stPS(&cg.out, Slice::from(cg.fwd.p, cg.fwd.len));
+    stPS(&cg.out, Slice::from(cg.typedefs.p, cg.typedefs.len));
     stPS(&cg.out, Slice::from(cg.tdecl.p, cg.tdecl.len));
     stPS(&cg.out, Slice::from(cg.defs.p, cg.defs.len));
     stPS(&cg.out, Slice::from(cg.protos.p, cg.protos.len));
