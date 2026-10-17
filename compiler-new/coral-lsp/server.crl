@@ -1,0 +1,766 @@
+/* coral-lsp/server.crl: the coralc language server (`coralc --serve`).
+ *
+ * JSON-RPC over stdin/stdout, Content-Length framed. One analyzed
+ * CompileUnit per open document; diagnostics come from the engine's
+ * structured DiagList collector, hover resolves the expression type at a
+ * position (Expr.resolvedType) or a top-level symbol's declared type.
+ *
+ * stdout hazard: the builder/compiler print to stdout. fd 1 is diverted
+ * to /dev/null at startup and protocol frames go to a private dup of the
+ * real stdout, so stray printf can never corrupt the LSP stream.
+ */
+
+import common::slice { Slice };
+import build {
+    arena { Arena },
+    parser { CrlbParser },
+    ast { CrlbNode, CrlbNodeKind },
+    builder { Builder, builderRunEx }
+};
+import sem::analyze { CompileUnit, analyzeForCompile, freeUnit };
+import sem { scope { Symbol }, sema { Sema } };
+import diag::engine { DiagList, DiagRecord };
+import ast::id { SourceLoc, locFile, locLine, locCol };
+import ast::types { Ty };
+import ast::node { Node, NodeKind };
+import ast::expr { Expr, ExprKind };
+
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) std::result { Result };
+import(lib) std::text::string { String };
+import(lib) std::parser::json {
+    JsonValue, JsonType, JsonPair, ParseError, parseJson, serialize
+};
+import(lib) platform::libc { open, close, read, write, dup2, fflush };
+
+pub struct LspDoc
+{
+    String uri;
+    String path;
+    String text;
+    CompileUnit unit;
+    bool analyzed;
+}
+
+/* stdout plumbing */
+
+/* divert fd 1 to /dev/null; returns a private fd holding the real
+ * stdout for protocol writes (1 if /dev/null cannot be opened) */
+i32 lspSilenceStdout()
+{
+    i32 nul = open(C"/dev/null", 1, 0);
+    if (nul < 0) return 1;
+    i32 save = open(C"/dev/null", 1, 0);
+    if (save < 0) { close(nul); return 1; }
+    dup2(1, save);      // save becomes a dup of the real stdout
+    dup2(nul, 1);       // everything printed now goes to /dev/null
+    close(nul);
+    fflush(null);       // drop anything buffered from before the switch
+    return save;
+}
+
+void lspWriteAll(i32 fd, const u8* data, usize len)
+{
+    usize off = 0;
+    while (off < len)
+    {
+        i64 w = write(fd, (const cchar*)data + off, len - off);
+        if (w <= 0) return;
+        off = off + (usize)w;
+    }
+}
+
+/* one JSON-RPC frame: Content-Length header + compact body */
+void lspSend(i32 fd, JsonValue* msg)
+{
+    String body = serialize(msg);
+    String hdr = String::new();
+    hdr.pushView("Content-Length: ");
+    u8 digits[13];
+    usize dn = 0;
+    usize v = body.len;
+    if (v == 0) { digits[0] = 48; dn = 1; }
+    while (v > 0)
+    {
+        digits[dn] = (u8)(48 + (v % 10));
+        dn++;
+        v = v / 10;
+    }
+    while (dn > 0)
+    {
+        dn--;
+        hdr.pushByte(digits[dn]);
+    }
+    hdr.pushView("\r\n\r\n");
+    lspWriteAll(fd, hdr.asU8(), hdr.len);
+    lspWriteAll(fd, body.asU8(), body.len);
+}
+
+/* ── transport  */
+
+bool lspReadExact(i32 fd, u8* buf, usize n)
+{
+    usize off = 0;
+    while (off < n)
+    {
+        i64 r = read(fd, buf + off, n - off);
+        if (r <= 0) return false;
+        off = off + (usize)r;
+    }
+    return true;
+}
+
+/* read header bytes up to the blank line, return Content-Length
+ * (-1 = EOF, -2 = malformed header) */
+i32 lspReadContentLength(i32 fd)
+{
+    u8 hdr[1056];
+    usize n = 0;
+    while (n < 1056)
+    {
+        if (!lspReadExact(fd, hdr + n, 1)) return -1;
+        n++;
+        if (n >= 4 && hdr[n - 4] == 13 && hdr[n - 3] == 10 && hdr[n - 2] == 13 && hdr[n - 1] == 10) break;
+    }
+    // find "Content-Length:" (clients send the canonical spelling)
+    usize i = 0;
+    while (i + 15 <= n)
+    {
+        bool hit = hdr[i] == 67 && hdr[i + 1] == 111 && hdr[i + 2] == 110 && hdr[i + 3] == 116 &&
+                   hdr[i + 4] == 101 && hdr[i + 5] == 110 && hdr[i + 6] == 116 && hdr[i + 7] == 45 &&
+                   hdr[i + 8] == 76 && hdr[i + 9] == 101 && hdr[i + 10] == 110 && hdr[i + 11] == 103 &&
+                   hdr[i + 12] == 116 && hdr[i + 13] == 104 && hdr[i + 14] == 58;
+        if (hit)
+        {
+            usize j = i + 15;
+            while (j < n && hdr[j] == 32) j++;
+            i32 v = 0;
+            u32 digits = 0;
+            while (j < n && hdr[j] >= 48 && hdr[j] <= 57)
+            {
+                v = v * 10 + (i32)(hdr[j] - 48);
+                digits++;
+                j++;
+            }
+            if (digits == 0) return -2;
+            return v;
+        }
+        i++;
+    }
+    return -2;
+}
+
+/* ── tiny JSON helpers ─────────────────────────────────────────────── */
+
+JsonValue* jGet(JsonValue* o, str key)
+{
+    if (o == null || o->type != JsonType::Object) return null;
+    usize i = 0;
+    while (i < o->objVal.count())
+    {
+        JsonPair* p = o->objVal.atPtr(i);
+        if (p->key.asView().equals(key)) return &p->value;
+        i++;
+    }
+    return null;
+}
+
+i64 jInt(JsonValue* v, i64 dflt)
+{
+    if (v == null) return dflt;
+    if (v->type == JsonType::I64) return v->i64Val;
+    if (v->type == JsonType::F64) return (i64)v->f64Val;
+    return dflt;
+}
+
+str jStr(JsonValue* v)
+{
+    if (v != null && v->type == JsonType::String) return v->strVal.asView();
+    return str::empty();
+}
+
+JsonValue lspObj()
+{
+    return JsonValue::objectVal();
+}
+
+void lspPut(JsonValue* o, str key, JsonValue v)
+{
+    o->objVal.push(JsonPair { .key = String::from(key), .value = v });
+}
+
+JsonValue lspIdCopy(JsonValue* id)
+{
+    if (id != null && id->type == JsonType::I64) return JsonValue::i64Val(id->i64Val);
+    if (id != null && id->type == JsonType::String) return JsonValue::stringVal(id->strVal.clone());
+    return JsonValue::nullVal();
+}
+
+JsonValue lspResp(JsonValue* id, JsonValue result)
+{
+    JsonValue o = lspObj();
+    lspPut(&o, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
+    lspPut(&o, "id", lspIdCopy(id));
+    lspPut(&o, "result", result);
+    return o;
+}
+
+JsonValue lspErrResp(JsonValue* id, i64 code, str message)
+{
+    JsonValue err = lspObj();
+    lspPut(&err, "code", JsonValue::i64Val(code));
+    lspPut(&err, "message", JsonValue::stringVal(String::from(message)));
+    JsonValue o = lspObj();
+    lspPut(&o, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
+    lspPut(&o, "id", lspIdCopy(id));
+    lspPut(&o, "error", err);
+    return o;
+}
+
+/* ── URIs ──────────────────────────────────────────────────────────── */
+
+u8 lspHex(u8 c)
+{
+    if (c >= 48 && c <= 57) return c - 48;
+    if (c >= 97 && c <= 102) return c - 97 + 10;
+    if (c >= 65 && c <= 70) return c - 65 + 10;
+    return 255;
+}
+
+/* file:///a%20b.crl → /a b.crl */
+String lspUriToPath(str uri)
+{
+    String out = String::new();
+    usize i = 0;
+    if (uri.len >= 7 && uri.ptr[0] == 102 && uri.ptr[1] == 105 && uri.ptr[2] == 108 && uri.ptr[3] == 101 &&
+        uri.ptr[4] == 58 && uri.ptr[5] == 47 && uri.ptr[6] == 47)
+    {
+        i = 7;
+    }
+    while (i < uri.len)
+    {
+        u8 c = uri.ptr[i];
+        if (c == 37 && i + 2 < uri.len)
+        {
+            u8 h1 = lspHex(uri.ptr[i + 1]);
+            u8 h2 = lspHex(uri.ptr[i + 2]);
+            if (h1 != 255 && h2 != 255)
+            {
+                out.pushByte((u8)(h1 * 16 + h2));
+                i = i + 3;
+                continue;
+            }
+        }
+        out.pushByte(c);
+        i++;
+    }
+    return out;
+}
+
+JsonValue lspFileUri(str path)
+{
+    String u = String::new();
+    u.pushView("file://");
+    u.pushView(path);
+    return JsonValue::stringVal(u);
+}
+
+/* ── diagnostics ───────────────────────────────────────────────────── */
+
+i64 lspSeverity(str level)
+{
+    if (level.equals("warning")) return 2;
+    if (level.equals("note")) return 3;
+    return 1;
+}
+
+JsonValue lspDiagRange(DiagRecord* r)
+{
+    i64 line = r->line > 0 ? (i64)r->line - 1 : 0;
+    i64 col = r->col > 0 ? (i64)r->col - 1 : 0;
+    i64 endCol = r->endCol > 0 ? (i64)r->endCol - 1 : col;
+    JsonValue range = lspObj();
+    JsonValue start = lspObj();
+    lspPut(&start, "line", JsonValue::i64Val(line));
+    lspPut(&start, "character", JsonValue::i64Val(col));
+    JsonValue end = lspObj();
+    lspPut(&end, "line", JsonValue::i64Val(line));
+    lspPut(&end, "character", JsonValue::i64Val(endCol));
+    lspPut(&range, "start", start);
+    lspPut(&range, "end", end);
+    return range;
+}
+
+JsonValue lspDiagItem(DiagRecord* r)
+{
+    JsonValue d = lspObj();
+    lspPut(&d, "range", lspDiagRange(r));
+    lspPut(&d, "severity", JsonValue::i64Val(lspSeverity(r->level.asView())));
+    lspPut(&d, "code", JsonValue::stringVal(r->code.clone()));
+    lspPut(&d, "source", JsonValue::stringVal(String::from("coral")));
+    lspPut(&d, "message", JsonValue::stringVal(r->message.clone()));
+    return d;
+}
+
+/* publish one notification per file that appears in the records; the
+ * document's own file keeps the client's exact URI */
+void lspPublish(i32 outFd, LspDoc* doc, DiagList* diags)
+{
+    u32 i = 0;
+    while (i < diags->len)
+    {
+        DiagRecord* r = diags->items + i;
+        str file = r->file.asView();
+        bool isDoc = file.equals(doc->path.asView());
+        // skip files already published in this batch (earlier index)
+        bool dup = false;
+        u32 j = 0;
+        while (j < i)
+        {
+            if ((diags->items + j)->file.asView().equals(file)) { dup = true; break; }
+            j++;
+        }
+        if (dup) { i++; continue; }
+
+        JsonValue params = lspObj();
+        if (isDoc) lspPut(&params, "uri", JsonValue::stringVal(doc->uri.clone()));
+        else lspPut(&params, "uri", lspFileUri(file));
+        JsonValue arr = JsonValue::arrayVal();
+        u32 k = i;
+        while (k < diags->len)
+        {
+            DiagRecord* rk = diags->items + k;
+            if (rk->file.asView().equals(file))
+            {
+                arr.arrVal.push(lspDiagItem(rk));
+            }
+            k++;
+        }
+        lspPut(&params, "diagnostics", arr);
+
+        JsonValue msg = lspObj();
+        lspPut(&msg, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
+        lspPut(&msg, "method", JsonValue::stringVal(String::from("textDocument/publishDiagnostics")));
+        lspPut(&msg, "params", params);
+        lspSend(outFd, &msg);
+
+        i++;
+    }
+}
+
+/* ── documents ─────────────────────────────────────────────────────── */
+
+LspDoc* lspDocNew(str uri)
+{
+    LspDoc* d = alloc<LspDoc>(1);
+    if (d == null) return null;
+    *d = LspDoc {
+        .uri = String::from(uri),
+        .path = lspUriToPath(uri),
+        .text = String::new(),
+        .unit = CompileUnit {
+            .ctx = null,
+            .file = null,
+            .sema = null,
+            .mono = null,
+            .bufs = null,
+            .bufsLen = 0,
+            .engineObj = null,
+            .parseErrors = 0,
+            .semanticErrors = 0,
+            .monoErrors = 0
+        },
+        .analyzed = false
+    };
+    return d;
+}
+
+void lspDocFree(LspDoc* d)
+{
+    if (d == null) return;
+    freeUnit(&d->unit);
+    d->uri.free();
+    d->path.free();
+    d->text.free();
+    dealloc<LspDoc>(d);
+}
+
+/* run analysis over the document body and publish the diagnostics */
+void lspAnalyze(i32 outFd, LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen)
+{
+    freeUnit(&d->unit);
+    DiagList diags;
+    diags.init();
+    d->unit = analyzeForCompile(d->text.asU8(), d->text.len, d->path.asU8(), null, null, 0,
+                                200, false, false, true,
+                                modKeys, modVals, modLen, &diags);
+    d->analyzed = true;
+    lspPublish(outFd, d, &diags);
+    diags.dispose();
+}
+
+/* ── hover ─────────────────────────────────────────────────────────── */
+
+bool lspWordByte(u8 c)
+{
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+i32 lspExprRank(ExprKind k)
+{
+    switch (k.tag)
+    {
+        ExprKind::Ident => { return 4; },
+        ExprKind::Field => { return 3; },
+        ExprKind::DerefField => { return 3; },
+        ExprKind::Call => { return 2; },
+        ExprKind::MethodCall => { return 2; },
+        ExprKind::StaticCall => { return 2; },
+        ExprKind::TypeRef => { return 2; },
+        else => { return 1; }
+    }
+}
+
+/* type of the expression at (line0, char0), 0 when nothing resolves */
+Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
+{
+    if (d->unit.ctx == null || d->unit.sema == null) return 0;
+    u8* base = d->text.asU8();
+    usize n = d->text.len;
+
+    // skip to the start of line0 (0-based)
+    usize pos = 0;
+    i64 ln = 0;
+    while (pos < n && ln < line0)
+    {
+        if (base[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line0) return 0;
+    usize lineStart = pos;
+    i64 c = 0;
+    while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
+    {
+        pos++;
+        c++;
+    }
+
+    usize s = pos;
+    while (s > lineStart && lspWordByte(base[s - 1])) s--;
+    usize e = pos;
+    while (e < n && lspWordByte(base[e])) e++;
+    if (s == e) return 0;   // not on an identifier
+
+    u32 line1 = (u32)line0 + 1;
+    u32 col1 = (u32)(s - lineStart) + 1;
+
+    Ty best = 0;
+    i32 bestRank = 0;
+    u32 fId = 0;
+    bool haveF = false;
+    u32 i = 1;
+    while (i < d->unit.ctx.nodesLen)
+    {
+        Node* nd = d->unit.ctx.nodes + i;
+        i++;
+        if (nd->kind.tag != NodeKind::Expr) continue;
+        Expr ex = nd->kind.payload.Expr.value;
+        if (locLine(ex.loc) != line1 || locCol(ex.loc) != col1) continue;
+        if (!haveF) { fId = locFile(ex.loc); haveF = true; }
+        if (ex.resolvedType == 0) continue;
+        i32 r = lspExprRank(ex.kind);
+        if (r > bestRank)
+        {
+            bestRank = r;
+            best = ex.resolvedType;
+        }
+    }
+
+    if (best == 0)
+    {
+        // declaration name / no expression node: top-level symbol lookup
+        u32 sid = d->unit.ctx.intern(str { .ptr = base + s, .len = e - s });
+        if (sid != 0)
+        {
+            Symbol* sym = d->unit.sema.scopes.lookupFrom(sid, fId);
+            if (sym != null && sym->typeNode != 0) best = sym->typeNode;
+        }
+    }
+    return best;
+}
+
+JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0)
+{
+    Ty ty = lspHoverType(d, line0, char0);
+    if (ty == 0) return JsonValue::nullVal();
+
+    u8* buf = alloc<u8>(512);
+    if (buf == null) return JsonValue::nullVal();
+    u8* sp = d->unit.sema.tySpelling(ty, buf, 512);
+    usize sl = 0;
+    while (sp[sl] != 0) sl++;
+
+    String val = String::new();
+    val.pushView("```coral\n");
+    val.pushView(str { .ptr = sp, .len = sl });
+    val.pushView("\n```");
+
+    JsonValue contents = lspObj();
+    lspPut(&contents, "kind", JsonValue::stringVal(String::from("markdown")));
+    lspPut(&contents, "value", JsonValue::stringVal(val));
+    JsonValue res = lspObj();
+    lspPut(&res, "contents", contents);
+    dealloc<u8>(buf);
+    return res;
+}
+
+/* ── server ────────────────────────────────────────────────────────── */
+
+JsonValue lspInitializeResult()
+{
+    JsonValue caps = lspObj();
+    // 1 = full sync: every didChange carries the whole buffer
+    lspPut(&caps, "textDocumentSync", JsonValue::i64Val(1));
+    lspPut(&caps, "hoverProvider", JsonValue::boolVal(true));
+    JsonValue info = lspObj();
+    lspPut(&info, "name", JsonValue::stringVal(String::from("coralc")));
+    lspPut(&info, "version", JsonValue::stringVal(String::from("0.1.0")));
+    JsonValue res = lspObj();
+    lspPut(&res, "capabilities", caps);
+    lspPut(&res, "serverInfo", info);
+    return res;
+}
+
+Slice lspReadFileSlice(str path, usize* outLen)
+{
+    String pz = String::from(path);
+    i32 fd = open((const cchar*)pz.asU8(), 0, 0);
+    if (fd < 0) return Slice::from(null, 0);
+    usize cap = 65536;
+    usize len = 0;
+    u8* buf = alloc<u8>(cap);
+    if (buf == null) { close(fd); return Slice::from(null, 0); }
+    while (true)
+    {
+        if (len == cap)
+        {
+            cap = cap * 2;
+            buf = realloc<u8>(buf, cap);
+            if (buf == null) { close(fd); return Slice::from(null, 0); }
+        }
+        i64 r = read(fd, buf + len, cap - len);
+        if (r <= 0) break;
+        len = len + (usize)r;
+    }
+    close(fd);
+    *outLen = len;
+    return Slice::from(buf, len);
+}
+
+pub i32 runServer(Slice buildFile, bool buildFileSet)
+{
+    i32 outFd = lspSilenceStdout();
+
+    /* best-effort module table from the build file: this is what makes
+     * imports resolve across files (diagnostics then cover the whole
+     * project, not just the open buffer) */
+    Arena arena;
+    arena.init(4194304);
+    Slice* modKeys = null;
+    Slice* modVals = null;
+    u32 modLen = 0;
+    {
+        Slice bf = buildFileSet ? buildFile : Slice::fromStr("coral.crlb");
+        usize blen = 0;
+        Slice bsrc = lspReadFileSlice(bf.asStr(), &blen);
+        if (bsrc.ptr != null)
+        {
+            CrlbParser p;
+            p.init(&arena, bsrc);
+            CrlbNode* root = p.parseFile();
+            if (root != null && p.errors == 0)
+            {
+                Builder b;
+                i32 errs = builderRunEx(root, &arena, false, true, true, &b);
+                if (errs == 0 && b.modKeys != null)
+                {
+                    modKeys = b.modKeys;
+                    modVals = b.modVals;
+                    modLen = b.modLen;
+                }
+            }
+        }
+    }
+
+    LspDoc* docs[16];
+    usize di = 0;
+    while (di < 16)
+    {
+        docs[di] = null;
+        di++;
+    }
+
+    while (true)
+    {
+        i32 len = lspReadContentLength(0);
+        if (len < 0) return 0;
+        if (len > 16777216) return 0;
+        u8* body = alloc<u8>((usize)len + 1);
+        if (body == null) return 3;
+        if (!lspReadExact(0, body, (usize)len))
+        {
+            dealloc<u8>(body);
+            return 0;
+        }
+        body[len] = 0;
+
+        Result<JsonValue, ParseError> pr = parseJson(str { .ptr = body, .len = (usize)len });
+        if (pr.isErr())
+        {
+            dealloc<u8>(body);
+            continue;
+        }
+        JsonValue msg = pr.unwrap();
+
+        str method = jStr(jGet(&msg, "method"));
+        JsonValue* id = jGet(&msg, "id");
+        JsonValue* params = jGet(&msg, "params");
+
+        if (method.equals("initialize"))
+        {
+            JsonValue resp = lspResp(id, lspInitializeResult());
+            lspSend(outFd, &resp);
+        }
+        else if (method.equals("initialized"))
+        {
+        }
+        else if (method.equals("shutdown"))
+        {
+            JsonValue resp = lspResp(id, JsonValue::nullVal());
+            lspSend(outFd, &resp);
+        }
+        else if (method.equals("exit"))
+        {
+            dealloc<u8>(body);
+            return 0;
+        }
+        else if (method.equals("textDocument/didOpen"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            str text = jStr(jGet(td, "text"));
+            if (uri.len > 0)
+            {
+                usize slot = 16;
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    {
+                        slot = fi;
+                        break;
+                    }
+                    fi++;
+                }
+                if (slot == 16)
+                {
+                    usize empty = 16;
+                    fi = 0;
+                    while (fi < 16)
+                    {
+                        if (docs[fi] == null) { empty = fi; break; }
+                        fi++;
+                    }
+                    if (empty < 16)
+                    {
+                        docs[empty] = lspDocNew(uri);
+                        slot = empty;
+                    }
+                }
+                if (slot < 16 && docs[slot] != null)
+                {
+                    LspDoc* d = docs[slot];
+                    freeUnit(&d->unit);
+                    d->text.free();
+                    d->text = String::from(text);
+                    lspAnalyze(outFd, d, modKeys, modVals, modLen);
+                }
+            }
+        }
+        else if (method.equals("textDocument/didChange"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            JsonValue* changes = jGet(params, "contentChanges");
+            if (uri.len > 0 && changes != null && changes->type == JsonType::Array && changes->arrVal.count() > 0)
+            {
+                str text = jStr(jGet(changes->arrVal.atPtr(0), "text"));
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    {
+                        LspDoc* d = docs[fi];
+                        freeUnit(&d->unit);
+                        d->text.free();
+                        d->text = String::from(text);
+                        lspAnalyze(outFd, d, modKeys, modVals, modLen);
+                        break;
+                    }
+                    fi++;
+                }
+            }
+        }
+        else if (method.equals("textDocument/didClose"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            usize fi = 0;
+            while (fi < 16)
+            {
+                if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                {
+                    lspDocFree(docs[fi]);
+                    docs[fi] = null;
+                    break;
+                }
+                fi++;
+            }
+        }
+        else if (method.equals("textDocument/hover"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            JsonValue* posn = jGet(params, "position");
+            i64 line0 = jInt(jGet(posn, "line"), 0);
+            i64 char0 = jInt(jGet(posn, "character"), 0);
+            JsonValue res = JsonValue::nullVal();
+            if (uri.len > 0)
+            {
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    {
+                        res = lspHoverResult(docs[fi], line0, char0);
+                        break;
+                    }
+                    fi++;
+                }
+            }
+            JsonValue resp = lspResp(id, res);
+            lspSend(outFd, &resp);
+        }
+        else if (method.equals("$/cancelRequest"))
+        {
+        }
+        else if (id != null)
+        {
+            JsonValue resp = lspErrResp(id, -32601, "method not found");
+            lspSend(outFd, &resp);
+        }
+
+        dealloc<u8>(body);
+    }
+}
