@@ -1,7 +1,6 @@
 # Session State — 2026-10-17
 
-Repo: coralc @ commit `efc7996` ("commit") + uncommitted allocator/runtime-shim
-changes (below).
+Repo: coralc @ HEAD `5dc32ad` + uncommitted frontend/build changes (below).
 
 ## Milestone: self-hosting achieved
 
@@ -31,6 +30,19 @@ Latest lineage (after the global-lib fallback in `analyze.crl`):
 - fullbuild19 + selfbuild19: rc=0, `cmp` **IDENTICAL** (emits 2280236 B C,
   binary 834792 B) — this is the compiler installed to `~/.coral/bin`
 
+Later lineage (`coralc init` + `.gitignore` feature):
+
+- fullbuild20 + selfbuild20: rc=0, **IDENTICAL** (emits 2285935 B C) —
+  `coralc init` wired into the dispatch
+- fullbuild21: rc=0 (emits 2286138 B C) — `init [dir]` positional accepted
+- fullbuild22: FAILED (ternary `needsNl ? 1 : 0` mixed i32 with usize);
+  superseded, log kept
+- fullbuild23 + selfbuild23: rc=0, **IDENTICAL** (emits 2290087 B C, binary
+  839344 B) — `.gitignore` handling + `**/.coral/` pattern; matest rebuilt
+  with this binary → ALL PASS
+- `~/.coral` install (fullbuild19 lineage) **predates** `init`; per standing
+  instruction it is only refreshed when a milestone completes
+
 ## Last-commit contents (efc7996, source files)
 
 - `compiler-new/coral-backend/codegen.crl`, `compiler/coral-backend/codegen.crl`:
@@ -49,7 +61,17 @@ Latest lineage (after the global-lib fallback in `analyze.crl`):
 - `lib/std/x86_64/linux/memory/allocators/mimalloc.crl`: 5 allocator fixes
   (see below).
 
-## Uncommitted changes (this session, after efc7996)
+## Uncommitted changes (as of this update)
+
+- `compiler-new/coral-frontend/init.crl` (new, staged) — `coralc init`
+- `compiler-new/coral-frontend/args.crl` — `init [dir]` positional + usage line
+- `compiler-new/coral-frontend/coralc.crl` — wire `runInit` into dispatch
+- `compiler-new/build/{coralc,coralc.c}` — fullbuild23 artifacts
+- `print.crl` (repo root) — user's own edit, untouched by this session
+- `compiler-new/.coral/cache/` — untracked build cache (not ignored)
+
+Previously uncommitted allocator/runtime-shim + shim work is now in commits
+`a10a6fa` and `5dc32ad`; that set was:
 
 1. `lib/std/x86_64/windows/memory/allocators/mimalloc.crl` — mirrored the same
    5 fixes from the linux file:
@@ -75,6 +97,68 @@ Latest lineage (after the global-lib fallback in `analyze.crl`):
    paths. `compiler/` (stage0) intentionally unchanged.
 
 All edited files pass `python3 coral-docs/check_crl.py` (PASS ×7).
+
+## `coralc init` (new)
+
+`coralc init [dir]` (no dir = `.`) scaffolds and refuses to overwrite an
+existing `coral.crlb`:
+
+```
+<dir>/
+├── coral.crlb            build "…" { root="."; entry="src"; modules=["src"];
+│                         target="native-x86_64"; opt="debug"; output="build/<name>" }
+├── .gitignore            ensures `**/.coral/` (any depth)
+├── .coral/
+└── src/
+    └── lib.crl           hello main, so `coralc run` works immediately
+```
+
+`.gitignore` behavior: creates the file if absent; otherwise appends
+`**/.coral/` only when no `.coral` / `.coral/` / `**/.coral/` line exists
+(handles missing trailing newline).
+
+Deviations from `coral-docs/build_sys.md` §11 (doc example is internally
+inconsistent: `root="src/"` + `modules=["src"]` would look in `src/src/`):
+consistent form is `root="."` + `modules=["src"]`; `src/lib.crl` gets a minimal
+main (doc says empty — but that yields a non-runnable link target); the
+`.gitignore` step is not in the doc.
+
+Verified (fullbuild23 binary): fresh init → run rc=0; append to existing
+`.gitignore` (with and without trailing newline); no-op when `**/.coral/`
+already present; re-init refusal rc=1; `git init` + `git check-ignore -v`
+confirms root `.coral/` and nested `src/deep/.coral/` are ignored via
+`**/.coral/`.
+
+## Mu projects build-system findings (2026-10-17)
+
+Local fixes applied in `~/Documents/Mu` (uncommitted there):
+- `Mu_coral/src/mu-parser/base.crl`: missing closing `}` for the top-level
+  `pub extend Parser {` (line 44) — appended at EOF (brother files end `}\n}\n`)
+- `Mu_coral/src/mu-json/lsp.crl`: local `Lsp self;` renamed (…self is a
+  reserved keyword; only occurrence of a `self`-named local)
+- `Mu_coral/coral.crlb`: added aliases `buf`, `lsp` (→ mu-json) and
+  `frontend` (→ mu-frontend)
+
+Mu_coral now reaches typecheck (was parse/import errors). Current sample:
+`io.crl:8 str cmd = commandLine()` type mismatch, `fmtStr2` arg `u8*` vs `str`
+(decl.crl:767), `strEq` undeclared in mu-sema, `str.endsWith` method missing.
+
+Mu_engine (schema 2): parses fine, 18 modules mapped, 0 aliases; 3 sema
+errors (`sqrt` undeclared in math; `usize * u32` operand mismatches in scene).
+
+Build-system status in `compiler-new` (per field/feature):
+- **evaluated**: include, extends (field merge, child wins), root/entry/output/
+  module_map/cache_dir/target/opt/flags/modules/skip, aliases, fingerprint
+  cache/staleness, `coralc map`, `coralc build` (`--force/--map-only/--dry-run`),
+  `coralc run` (builds then execs the *output* path)
+- **parsed only, not evaluated**: task (`exec`/`after`/`output`), phase (`on`/
+  `run`/`output`/`after`), link (`libs`/`flags`/`script`/`strip`), deps, profile,
+  workspace, target/artifact blocks, features, env, log/metrics, hooks, test,
+  bench, lint/format/lsp/ci/remote, override
+- **not implemented**: `coralc clean`, `coralc graph`, `coralc doctor`
+
+Mu usage that needs the parsed-only features: `link.libs` + `phase "jolt"`
+(Mu_engine), task `run` (Mu_coral, Mu_engine), extends (Mu root).
 
 ## Global install (~/.coral)
 
@@ -158,8 +242,15 @@ can be regenerated by step 1–2; logs live in `build/*.log`.
 - Leak cleanup for long-running modes: `AstContext` arena, DiagnosticEngine
   source-buffer Vec, small per-decl allocations (see Diagnostics status)
 
+- Remaining build system (per `coral-docs/build_sys.md`; Mu-driven priority):
+  task `exec`/`after` evaluation (`coralc run` currently execs the output only),
+  `link { libs }` wiring into the gcc driver, `phase` (on/run/output/after),
+  `deps`; then `coralc clean/graph/doctor`, `profile`/`workspace`/hooks
 - `errors.txt` triage + priority object
-- build/cache system; `coralc init`/`exec`; `--serve` + JSON language server
+- build/cache system; `--serve` + JSON language server
+- Mu source/typecheck follow-ups: `commandLine()`/io wrapper, `strEq` import
+  surface, `str.endsWith`, `fmtStr2` u8*→str args, `sqrt`, mixed usize/u32
+  arithmetic — collect the real language/compiler gaps from both projects
 - Fix `std::result` for real (`result.crl:94` `Ok { error }` field bug;
   isErr/isOk resolve) and `Arr<T, N>` generic-size rejection
   (`coral-parser/type.crl:140`), then re-enable the preloads in `analyze.crl`

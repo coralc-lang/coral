@@ -2669,6 +2669,13 @@ void crl__loc__coral_frontend__map__mAppend(uint8_t* buf, size_t* len, _coral_st
 void crl__loc__coral_frontend__map__mAppendSpaces(uint8_t* buf, size_t* len, size_t n);
 _Bool crl__loc__coral_frontend__map__mSplice(crl__loc__coral_frontend__args__Options* opts, crl__loc__coral_build__arena__Arena* a, crl__loc__coral_common__slice__Slice raw, crl__loc__coral_frontend__map__MapArr* arr, crl__loc__coral_common__slice__Slice* adds, uint32_t addLen);
 int32_t crl__loc__coral_frontend__map__runMap(crl__loc__coral_frontend__args__Options* opts, crl__loc__coral_build__ast__CrlbNode* root, crl__loc__coral_build__arena__Arena* a, crl__loc__coral_common__slice__Slice raw);
+_coral_str crl__loc__coral_frontend__init__inJoin(_coral_str a, _coral_str b);
+crl__loc__coral_common__slice__Slice crl__loc__coral_frontend__init__inBaseName(crl__loc__coral_common__slice__Slice dir);
+void crl__loc__coral_frontend__init__inPut(uint8_t* buf, size_t cap, size_t* len, _coral_str s);
+void crl__loc__coral_frontend__init__inPutSlice(uint8_t* buf, size_t cap, size_t* len, crl__loc__coral_common__slice__Slice s);
+_Bool crl__loc__coral_frontend__init__inEqN(crl__loc__coral_common__slice__Slice s, size_t start, _coral_str lit);
+_Bool crl__loc__coral_frontend__init__inHasIgnore(crl__loc__coral_common__slice__Slice s);
+int32_t crl__loc__coral_frontend__init__runInit(crl__loc__coral_frontend__args__Options* opts);
 _coral_str crl__loc__coral_diagnostics__code__codeStr(crl__loc__coral_diagnostics__code__ErrorCode code);
 crl__loc__coral_ast__id__SourceLoc crl__loc__coral_ast__id__makeLoc(uint32_t file, uint32_t line, uint32_t col);
 uint32_t crl__loc__coral_ast__id__locFile(crl__loc__coral_ast__id__SourceLoc loc);
@@ -11680,7 +11687,7 @@ void crl__loc__coral_frontend__args__usage(void) {
     printf("commands:\n");
     printf("  build       build the project (default)\n");
     printf("  map         discover lib.crl folders, update the build file\n");
-    printf("  init        scaffold a new build file\n");
+    printf("  init [dir]  scaffold a new project\n");
     printf("  run         build, then run the output\n");
     printf("  <file.crl>  compile a single file\n");
     printf("options:\n");
@@ -11890,6 +11897,11 @@ _Bool crl__loc__coral_frontend__args__parseArgs(crl__loc__coral_frontend__args__
         }
         if (haveCmd)
         {
+            if (((((opts->cmd == crl__loc__coral_frontend__args__Command_Init))) && (((opts->input.len == 0)))))
+            {
+                ((opts->input = tok));
+                continue;
+            }
             printf("coralc: unexpected argument: %s\n", crl__loc__coral_frontend__io__sliceCStr(tok));
             return 0;
         }
@@ -12373,6 +12385,223 @@ int32_t crl__loc__coral_frontend__map__runMap(crl__loc__coral_frontend__args__Op
     {
         return 3;
     }
+    return 0;
+}
+_coral_str crl__loc__coral_frontend__init__inJoin(_coral_str a, _coral_str b) {
+    size_t n = ((a.len + b.len));
+    uint8_t* p = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((n + 1)));
+    if (((p == 0)))
+    {
+        return ((_coral_str){.ptr = 0, .len = 0});
+    }
+    size_t i = 0;
+    while (((i < a.len)))
+    {
+        ((p[i] = a.ptr[i]));
+        ((i)++);
+    }
+    size_t j = 0;
+    while (((j < b.len)))
+    {
+        ((p[((a.len + j))] = b.ptr[j]));
+        ((j)++);
+    }
+    ((p[n] = 0));
+    return ((_coral_str){.ptr = p, .len = n});
+}
+crl__loc__coral_common__slice__Slice crl__loc__coral_frontend__init__inBaseName(crl__loc__coral_common__slice__Slice dir) {
+    size_t end = dir.len;
+    while (((((end > 0))) && (((dir.ptr[((end - 1))] == 47)))))
+    {
+        ((end)--);
+    }
+    size_t start = 0;
+    size_t i = 0;
+    while (((i < end)))
+    {
+        if (((dir.ptr[i] == 47)))
+        {
+            ((start = ((i + 1))));
+        }
+        ((i)++);
+    }
+    return crl__loc__coral_common__slice__Slice_from(((dir.ptr + start)), ((end - start)));
+}
+void crl__loc__coral_frontend__init__inPut(uint8_t* buf, size_t cap, size_t* len, _coral_str s) {
+    size_t i = 0;
+    while (((((i < s.len))) && ((((*(len)) < cap)))))
+    {
+        ((buf[(*(len))] = s.ptr[i]));
+        (((*(len)) = (((*(len)) + 1))));
+        ((i)++);
+    }
+}
+void crl__loc__coral_frontend__init__inPutSlice(uint8_t* buf, size_t cap, size_t* len, crl__loc__coral_common__slice__Slice s) {
+    size_t i = 0;
+    while (((((i < s.len))) && ((((*(len)) < cap)))))
+    {
+        ((buf[(*(len))] = s.ptr[i]));
+        (((*(len)) = (((*(len)) + 1))));
+        ((i)++);
+    }
+}
+_Bool crl__loc__coral_frontend__init__inEqN(crl__loc__coral_common__slice__Slice s, size_t start, _coral_str lit) {
+    size_t i = 0;
+    while (((i < lit.len)))
+    {
+        if (((((start + i)) >= s.len)))
+        {
+            return 0;
+        }
+        if (((s.ptr[((start + i))] != lit.ptr[i])))
+        {
+            return 0;
+        }
+        ((i)++);
+    }
+    return 1;
+}
+_Bool crl__loc__coral_frontend__init__inHasIgnore(crl__loc__coral_common__slice__Slice s) {
+    size_t i = 0;
+    while (((i < s.len)))
+    {
+        size_t start = i;
+        while (((((i < s.len))) && (((s.ptr[i] != 10)))))
+        {
+            ((i)++);
+        }
+        size_t end = i;
+        if (((i < s.len)))
+        {
+            ((i)++);
+        }
+        while (((((end > start))) && (((((s.ptr[start] == 32))) || (((s.ptr[start] == 9)))))))
+        {
+            ((start)++);
+        }
+        while (((((end > start))) && (((((((s.ptr[((end - 1))] == 32))) || (((s.ptr[((end - 1))] == 9))))) || (((s.ptr[((end - 1))] == 13)))))))
+        {
+            ((end)--);
+        }
+        size_t n = ((end - start));
+        if (((((n > 3))) && (crl__loc__coral_frontend__init__inEqN(s, start, (_coral_str){ (const uint8_t*)"**/", 3 }))))
+        {
+            ((start = ((start + 3))));
+            ((n = ((n - 3))));
+        }
+        if (((((n == 6))) && (crl__loc__coral_frontend__init__inEqN(s, start, (_coral_str){ (const uint8_t*)".coral", 6 }))))
+        {
+            return 1;
+        }
+        if (((((n == 7))) && (crl__loc__coral_frontend__init__inEqN(s, start, (_coral_str){ (const uint8_t*)".coral/", 7 }))))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+int32_t crl__loc__coral_frontend__init__runInit(crl__loc__coral_frontend__args__Options* opts) {
+    crl__loc__coral_common__slice__Slice __t0;
+    __t0 = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)".", 1 });
+    _coral_str dir = ((((opts->input.len > 0))) ? (crl__loc__coral_common__slice__Slice_asStr((&(opts->input)))) : (crl__loc__coral_common__slice__Slice_asStr((&(__t0)))));
+    while (((((dir.len > 1))) && (((dir.ptr[((dir.len - 1))] == 47)))))
+    {
+        ((dir.len = ((dir.len - 1))));
+    }
+    crl__loc__coral_common__slice__Slice name = ((((opts->input.len > 0))) ? (crl__loc__coral_frontend__init__inBaseName(opts->input)) : (crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"app", 3 })));
+    if (((((name.len == 0))) || (((((name.len == 1))) && (((name.ptr[0] == 46)))))))
+    {
+        ((name = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"app", 3 })));
+    }
+    _coral_str crlbPath = crl__loc__coral_frontend__init__inJoin(dir, (_coral_str){ (const uint8_t*)"/coral.crlb", 11 });
+    _coral_str coralDir = crl__loc__coral_frontend__init__inJoin(dir, (_coral_str){ (const uint8_t*)"/.coral", 7 });
+    _coral_str srcDir = crl__loc__coral_frontend__init__inJoin(dir, (_coral_str){ (const uint8_t*)"/src", 4 });
+    _coral_str libPath = crl__loc__coral_frontend__init__inJoin(dir, (_coral_str){ (const uint8_t*)"/src/lib.crl", 12 });
+    if (((((crlbPath.ptr == 0))) || (((libPath.ptr == 0)))))
+    {
+        return 1;
+    }
+    if (crl__loc__coral_build__builder__bFileExists(crlbPath))
+    {
+        printf("coralc: %s already exists; refusing to overwrite\n", ((char*)(crlbPath.ptr)));
+        return 1;
+    }
+    crl__lib__std__x86_64__linux__io__fs__createDirRecursive(coralDir, 493);
+    crl__lib__std__x86_64__linux__io__fs__createDirRecursive(srcDir, 493);
+    uint8_t* buf = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(4096);
+    if (((buf == 0)))
+    {
+        return 1;
+    }
+    size_t len = 0;
+    crl__loc__coral_frontend__init__inPut(buf, 4096, (&(len)), (_coral_str){ (const uint8_t*)"build \"", 7 });
+    crl__loc__coral_frontend__init__inPutSlice(buf, 4096, (&(len)), name);
+    crl__loc__coral_frontend__init__inPut(buf, 4096, (&(len)), (_coral_str){ (const uint8_t*)"\" {\n    root    = \".\";\n    entry   = \"src\";\n    target  = \"native-x86_64\";\n    opt     = \"debug\";\n    output  = \"build/", 119 });
+    crl__loc__coral_frontend__init__inPutSlice(buf, 4096, (&(len)), name);
+    crl__loc__coral_frontend__init__inPut(buf, 4096, (&(len)), (_coral_str){ (const uint8_t*)"\";\n    modules = [\"src\"];\n}\n", 28 });
+    _Bool ok = crl__loc__coral_frontend__io__writeFile(crlbPath, crl__loc__coral_common__slice__Slice_from(buf, len));
+    if (ok)
+    {
+        ((ok = crl__loc__coral_frontend__io__writeFile(libPath, crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"// public surface of src\n\npub i32 main()\n{\n    return 0;\n}\n", 59 }))));
+    }
+    crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(buf);
+    if ((!(ok)))
+    {
+        printf("coralc: cannot write scaffold files under %s\n", ((char*)(dir.ptr)));
+        return 1;
+    }
+    _coral_str giPath = crl__loc__coral_frontend__init__inJoin(dir, (_coral_str){ (const uint8_t*)"/.gitignore", 11 });
+    if (crl__loc__coral_build__builder__bFileExists(giPath))
+    {
+        size_t giLen = 0;
+        crl__loc__coral_common__slice__Slice gi = crl__loc__coral_frontend__io__readFile(giPath, (&(giLen)));
+        if (((gi.ptr != 0)))
+        {
+            if ((!(crl__loc__coral_frontend__init__inHasIgnore(gi))))
+            {
+                _Bool needsNl = ((((gi.len > 0))) && (((gi.ptr[((gi.len - 1))] != 10))));
+                size_t extra = 0;
+                if (needsNl)
+                {
+                    ((extra = 1));
+                }
+                size_t need = ((((gi.len + extra)) + 11));
+                uint8_t* nb = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(need);
+                if (((nb != 0)))
+                {
+                    size_t k = 0;
+                    while (((k < gi.len)))
+                    {
+                        ((nb[k] = gi.ptr[k]));
+                        ((k)++);
+                    }
+                    if (needsNl)
+                    {
+                        ((nb[k] = 10));
+                        ((k)++);
+                    }
+                    crl__loc__coral_frontend__init__inPut(nb, need, (&(k)), (_coral_str){ (const uint8_t*)"**/.coral/\n", 11 });
+                    if (crl__loc__coral_frontend__io__writeFile(giPath, crl__loc__coral_common__slice__Slice_from(nb, k)))
+                    {
+                        printf("coralc: updated %s\n", ((char*)(giPath.ptr)));
+                    }
+                    crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(nb);
+                }
+            }
+            crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(gi.ptr);
+        }
+    }
+    else
+    {
+        if (crl__loc__coral_frontend__io__writeFile(giPath, crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"**/.coral/\n", 11 })))
+        {
+            printf("coralc: created %s\n", ((char*)(giPath.ptr)));
+        }
+    }
+    printf("coralc: created %s\n", ((char*)(crlbPath.ptr)));
+    printf("coralc: created %s\n", ((char*)(libPath.ptr)));
+    printf("coralc: created %s/\n", ((char*)(coralDir.ptr)));
+    printf("next: cd %s && coralc run\n", ((char*)(dir.ptr)));
     return 0;
 }
 _coral_str crl__loc__coral_diagnostics__code__codeStr(crl__loc__coral_diagnostics__code__ErrorCode code) {
@@ -43910,8 +44139,7 @@ int32_t main(void) {
     else if ((opts.cmd == crl__loc__coral_frontend__args__Command_Init))
     {
         {
-            printf("coralc: init is not implemented yet\n");
-            return 4;
+            return crl__loc__coral_frontend__init__runInit((&(opts)));
         }
     }
     else if ((opts.cmd == crl__loc__coral_frontend__args__Command_Run))
