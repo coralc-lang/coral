@@ -24,11 +24,10 @@ import mono {
 };
 import diag::engine { DiagnosticEngine };
 import(lib) std::mman { alloc, dealloc, realloc };
-
-// extern("C") u64 write(i32 fd, u8* buf, u64 n); write should not be declared here
+import(lib) platform::libc { write };
 
 // stderr boundary for loader diagnostics: str in, no raw ptr+len at call sites
-void errWrite(str s) { write(2, (u8*)s.ptr, s.len); }
+void errWrite(str s) { write(2, (const cchar*)s.ptr, s.len); }
 
 pub struct AnalyzeResult
 {
@@ -41,7 +40,7 @@ pub struct AnalyzeResult
 
 /* Like analyze(), but keeps the AST alive for a backend: the context is
  * heap-allocated and outlives this call. Free with freeUnit().
- * sema/mono are kept too — the backend reads monomorphisation instances. */
+ * sema/mono are kept too; the backend reads monomorphisation instances. */
 pub struct CompileUnit
 {
     AstContext* ctx;
@@ -92,7 +91,7 @@ pub void freeUnit(CompileUnit* unit)
  * Resolves `import(lib) a::b::c` against the lib/ roots:
  *   1. <root>/a/b/c.crl            direct module file
  *   2. <root>/a/b/c/lib.crl        directory manifest
- *   3. <root>/a/lib.crl entry `b`  package manifest — entries are
+ *   3. <root>/a/lib.crl entry `b`  package manifest: entries are
  *      `pub mod name = import <path>;` and their targets resolve
  *      relative to the manifest's directory (nesting recurses).
  * Roots: <dir(input)>/../../lib, then ./lib.  The resolved file is
@@ -231,7 +230,7 @@ u32 libSplit(u8* s, usize n, LibSeg* out, u32 max)
 
 File* libParse(LibLoader* L, u8* buf, usize len, u8* cpath, DiagnosticEngine* diag, u32 fileId)
 {
-    /* report into the caller's engine — it owns the file table entry for
+    /* report into the caller's engine; it owns the file table entry for
      * `buf` (registered via addFile before this call). A throwaway engine
      * here produced location-less diagnostics: empty file table made
      * renderAt fall back to the bare one-line form. */
@@ -275,7 +274,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
 
     if (n == 1)
     {
-        /* existence probe only — the file is re-read by the loader later,
+        /* existence probe only; the file is re-read by the loader later,
          * and nothing here interns into this buffer, so it can be freed */
         usize len = 0;
         u8* cand = libCandidate(dir, dirLen, segs[0].ptr, (usize)segs[0].len, ".crl");
@@ -360,7 +359,7 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         }
         dealloc<u8>(mpath);
     }
-    // no export entry (or its target failed) — descend as a directory
+    // no export entry (or its target failed); descend as a directory
     return libResolveSegs(L, segs++, n - 1, sub, subLen, depth++);
 }
 
@@ -368,7 +367,7 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
 {
     if (nsPtr == null || nsLen == 0) return null;
     /* map-first: the builder's table is authoritative for module paths.
-     * keys are byte-compared (no interning) — `common::token` hits the
+     * keys are byte-compared (no interning); `common::token` hits the
      * entry the builder registered for that import. Returns a malloc'd
      * copy because callers free() the result, same as libCandidate. */
     if (L->modKeys != null && L->modLen > 0)
@@ -448,12 +447,12 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
         }
     }
     /* `base` stays alive until the platform-root fallback below also
-     * probes it (it was freed here first — use-after-free) */
+     * probes it (it was freed here first, use-after-free) */
     if (result == null)
         result = libResolveSegs(L, segs, n, "lib".ptr, 3, 0);
     if (result == null && L->platformRootSegsLen > 0 && n > 1)
     {
-        /* platform-first: <module>/<platform_root>/<rest> — neutral paths
+        /* platform-first: <module>/<platform_root>/<rest>; neutral paths
          * resolve under the platform root before the base tree
          * (see coral-docs/builder_incomplete.md) */
         LibSeg* psegs = alloc<LibSeg>((usize)n + (usize)L->platformRootSegsLen);
@@ -528,7 +527,7 @@ bool libPushFile(LibLoader* L, File* f)
     return true;
 }
 
-/* resolve + load one import(lib)-style module — used for the builtin `str`
+/* resolve + load one import(lib)-style module; used for the builtin `str`
  * prelude that every unit merges */
 void libLoadModulePath(LibLoader* L, str ns)
 {
@@ -596,10 +595,10 @@ void libLoadModulePath(LibLoader* L, str ns)
      return false;
  }
 
- /* non-lib `import a { … }` — load the sibling file <dir-of-f>/a.crl and
+ /* non-lib `import a { … }`: load the sibling file <dir-of-f>/a.crl and
   * merge it flat, like import(lib) files. Nested imports recurse;
   * already-loaded paths are skipped (libHas dedupes). A missing file is
-  * not an error here — sema then falls back to module-symbol lookup. */
+  * not an error here; sema then falls back to module-symbol lookup. */
  void libLoadSiblingImports(LibLoader* L, File* f)
  {
      if (f == null || f->path == 0) return;
@@ -665,9 +664,9 @@ void libLoadModulePath(LibLoader* L, str ns)
                                 File* lf = libParse(L, buf, len, cand, dg, fid);
                                 if (lf == null)
                                 {
-                                    write(2, C"coralc: cannot parse sibling import ", 34);
-                                    write(2, cand, libLen(cand));
-                                    write(2, C"\n", 1);
+                                    errWrite("coralc: cannot parse sibling impor");
+                                    errWrite(str { .ptr = cand, .len = libLen(cand) });
+                                    errWrite("\n");
                                     L->errors++;
                                 }
                                 else
@@ -698,7 +697,7 @@ void libLoadImports(LibLoader* L, File* f)
             Decl* dd = &dn->kind.payload.Decl.value;
             if (dd->kind.tag == DeclKind::Import && dd->kind.payload.Import.path != 0)
             {
-                /* route: import(lib) always; plain `import a::b` too — a
+                /* route: import(lib) always; plain `import a::b` too: a
                  * namespace path is a module import, resolved via the
                  * module table / lib roots, not a sibling file. Bare
                  * `import name` stays with libLoadSiblingImports. */
@@ -758,13 +757,13 @@ void libLoadImports(LibLoader* L, File* f)
                     i++;
                     continue;
                 }
-                /* copy out before libResolve — parsing manifests grows the
+                /* copy out before libResolve; parsing manifests grows the
                  * intern table, invalidating InternEntry pointers */
                 InternEntry* ie = L->ctx->interns + dd->kind.payload.Import.path;
                 u8* nsPtr = ie->ptr;
                 usize nsLen = ie->len;
                 /* targets: the import path itself, plus `path::mod` for
-                 * every nested item group `mod::{ … }` — the submodule file
+                 * every nested item group `mod::{ … }`; the submodule file
                  * must be merged too, not just the directory manifest */
                 u32 symCount = dd->kind.payload.Import.symbolsLen;
                 usize compsSize = 0;
@@ -939,15 +938,15 @@ void libLoadImports(LibLoader* L, File* f)
                         if (tHard[k] != 0)
                         {
                             if ((dd->kind.payload.Import.flags & 1) != 0)
-                                 write(2, C"coralc: cannot resolve import(lib) ", 34);
+                                errWrite("coralc: cannot resolve import(lib)");
                             else
-                                 write(2, C"coralc: cannot resolve import ", 28);
-                            write(2, target, targetLen);
-                            write(2, C"\n", 1);
+                                errWrite("coralc: cannot resolve impor");
+                            errWrite(str { .ptr = target, .len = targetLen });
+                            errWrite("\n");
                             /* with a module table present, name the
                              * likely cause: an unlisted module */
                             if (L->modKeys != null && L->modLen > 0)
-                                write(2, C"  note: not in the module table; check modules/aliases in the build file\n", 73);
+                                errWrite("  note: not in the module table; check modules/aliases in the build file\n");
                             L->errors++;
                         }
                     }
@@ -955,9 +954,9 @@ void libLoadImports(LibLoader* L, File* f)
                     {
                         if (getenv(C"CORAL_TRACE_LOAD") != null)
                         {
-                            write(2, C"coralc: load ", 12);
-                            write(2, resolved, libLen(resolved));
-                            write(2, C"\n", 1);
+                            errWrite("coralc: load");
+                            errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+                            errWrite("\n");
                         }
                         if (libHas(L, resolved))
                         {
@@ -990,10 +989,10 @@ void libLoadImports(LibLoader* L, File* f)
                             }
                             if (lf == null)
                             {
-                                 write(2, C"coralc: cannot read import(lib) file ", 36);
-                                 write(2, resolved, libLen(resolved));
-                                 write(2, C"\n", 1);
-                                 L->errors++;
+                                errWrite("coralc: cannot read import(lib) file");
+                                errWrite(str { .ptr = resolved, .len = libLen(resolved) });
+                                errWrite("\n");
+                                L->errors++;
                             }
                             else
                             {
@@ -1222,7 +1221,7 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
     u32 k = 0;
     if (slashes == 0)
     {
-        /* bare OS name — prefix the arch. x86_64 is the only tree that
+        /* bare OS name: prefix the arch. x86_64 is the only tree that
          * exists in lib/std today; once the builder does manifest
          * selection the full triple comes from the selected manifest's
          * platform_root and this shim goes away. An explicit arch flag
@@ -1399,7 +1398,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         loader.idents = &idents;
         loader.inputPath = path;
         loader.diag = engine;
-        /* platform root — neutral lib paths resolve under
+        /* platform root; neutral lib paths resolve under
          * <platform_root>/ first, then the base tree (see
          * coral-docs/builder_incomplete.md). Target flags select the
          * root first (--flag platform=windows[,arch=...]); then
@@ -1473,7 +1472,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
         else
         {
-            /* builtin prelude — merged first so every unit sees the
+            /* builtin prelude: merged first so every unit sees the
              * common surface without importing it: core::str for
              * `pub extend str` (fromCstr, fromParts, …) used by
              * findMethod, plus the everyday std modules (io, string,
@@ -1499,7 +1498,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
             libLoadSiblingImports(&loader, file);
             if (loader.errors == 0 && !libMerge(&loader, file))
             {
-                write(2, C"coralc: failed to merge import(lib) decls\n", 41);
+                errWrite("coralc: failed to merge import(lib) decls");
                 loader.errors++;
             }
         }
@@ -1538,7 +1537,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         }
     }
 
-    /* lib file buffers must stay alive until codegen finishes — interned
+    /* lib file buffers must stay alive until codegen finishes; interned
      * strings point into them (see freeUnit) */
     unit.bufs = loader.bufs;
     unit.bufsLen = loader.bufsLen;
