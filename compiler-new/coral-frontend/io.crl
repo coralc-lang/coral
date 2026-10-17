@@ -1,46 +1,18 @@
-/* frontend/io.crl — file and cmdline readers shared by coralc. */
+/* frontend/io.crl — file readers/writers shared by coralc. */
 
 import common::slice { Slice };
-import(lib) core::cchar { cchar };
 import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) std::io::fios { FileHandle, fileOpen, fileClose, fileRead, fileWrite };
 
-extern("C") i32 open(const cchar* path, i32 flags, i32 mode);
-extern("C") i32 read(i32 fd, u8* buf, usize len);
-extern("C") i32 close(i32 fd);
-extern("C") i32 write(i32 fd, const cchar* buf, usize len);
-
-usize readAll(i32 fd, u8* buf, usize cap)
-{
-    usize len = 0;
-    while (len + 1 < cap)
-    {
-        i32 got = read(fd, buf + len, cap - 1 - len);
-        if (got <= 0) break;
-        len = len + (usize)got;
-    }
-    return len;
-}
-
-pub Slice readCmdline()
-{
-    u8* buf = alloc<u8>(8192);
-    if (buf == null) return Slice::from(null, 0);
-    i32 fd = open(C"/proc/self/cmdline", 0, 0);
-    if (fd < 0) { dealloc<u8>(buf); return Slice::from(null, 0); }
-    usize len = readAll(fd, buf, 8192);
-    close(fd);
-    return Slice::from(buf, len);
-}
-
-pub Slice readFile(u8* cpath, usize* outLen)
+pub Slice readFile(str path, usize* outLen)
 {
     *outLen = 0;
-    i32 fd = open((const cchar*)cpath, 0, 0);
-    if (fd < 0) return Slice::from(null, 0);
+    FileHandle fh = fileOpen(path, "rb").unwrapOr((FileHandle)0);
+    if (fh == (FileHandle)0) return Slice::from(null, 0);
     usize cap = 65536;
     u8* buf = alloc<u8>(cap);
     if (buf == null) {
-        close(fd);
+        fileClose(fh);
         return Slice::from(null, 0);
     }
     usize len = 0;
@@ -51,18 +23,18 @@ pub Slice readFile(u8* cpath, usize* outLen)
             usize newCap = cap * 2;
             u8* grown = realloc<u8>(buf, newCap);
             if (grown == null) {
-                close(fd);
+                fileClose(fh);
                 dealloc<u8>(buf);
                 return Slice::from(null, 0);
             }
             buf = grown;
             cap = newCap;
         }
-        i32 got = read(fd, buf + len, cap - 1 - len);
-        if (got <= 0) break;
-        len = len + (usize)got;
+        usize got = fileRead(fh, buf + len, cap - 1 - len).unwrapOr(0);
+        if (got == 0) break;
+        len = len + got;
     }
-    close(fd);
+    fileClose(fh);
     buf[len] = 0;
     *outLen = len;
     return Slice::from(buf, len);
@@ -75,24 +47,17 @@ pub u8* sliceCStr(Slice s)
     usize i = 0;
     while (i < s.len) {
         p[i] = s.ptr[i];
-        i = i + 1;
+        i++;
     }
     p[s.len] = 0;
     return p;
 }
 
-pub bool writeFile(u8* cpath, Slice data)
+pub bool writeFile(str path, Slice data)
 {
-    /* O_WRONLY|O_CREAT|O_TRUNC, mode 0644 */
-    i32 fd = open((const cchar*)cpath, 577, 420);
-    if (fd < 0) return false;
-    usize off = 0;
-    while (off < data.len)
-    {
-        i32 n = write(fd, (const cchar*)(data.ptr + off), data.len - off);
-        if (n <= 0) { close(fd); return false; }
-        off = off + (usize)n;
-    }
-    close(fd);
-    return true;
+    FileHandle fh = fileOpen(path, "wb").unwrapOr((FileHandle)0);
+    if (fh == (FileHandle)0) return false;
+    bool ok = fileWrite(fh, str::fromParts(data.ptr, data.len)).isOk();
+    fileClose(fh);
+    return ok;
 }

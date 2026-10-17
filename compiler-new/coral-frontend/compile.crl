@@ -10,10 +10,10 @@ import hir::hir { build, printHir, HirModule };
 import build::parser { CrlbParser };
 import build::ast { CrlbNode, CrlbNodeKind, Value, ValueArray };
 import(lib) core::cchar { cchar };
-import(lib) std::mman { alloc };
+import(lib) std::mman { alloc, dealloc };
 
-extern("C") i32 printf(const cchar* fmt, ...);
-extern("C") i32 system(const cchar* cmd);
+// extern("C") i32 printf(const cchar* fmt, ...);
+// extern("C") i32 system(const cchar* cmd);
 
 bool endsWithCrl(Slice s)
 {
@@ -36,7 +36,7 @@ usize appendStr(u8* buf, usize cap, usize len, str s)
     while (i < s.len && len + 1 < cap) {
         buf[len] = s.ptr[i];
         len = len + 1;
-        i = i + 1;
+        i++;
     }
     buf[len] = 0;
     return len;
@@ -62,7 +62,7 @@ bool codeHasMain(Slice code)
             j = j + 1;
         }
         if (m) return true;
-        i = i + 1;
+        i++;
     }
     return false;
 }
@@ -72,7 +72,7 @@ bool codeHasMain(Slice code)
 pub i32 compileUnitTo(u8* inC, u8* outC, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen)
 {
     usize len = 0;
-    Slice src = readFile(inC, &len);
+    Slice src = readFile(str::fromCstr((const cchar*)inC), &len);
     if (src.ptr == null) {
         printf(C"coral: cannot read %s\n", inC);
         return 1;
@@ -100,13 +100,15 @@ pub i32 compileUnitTo(u8* inC, u8* outC, Slice* flagsN, Slice* flagsV, u32 nFlag
     if (cg.errors > 0 || cg.cCode.ptr == null) {
         printf(C"coral: codegen failed, errors=%d\n", (i32)cg.errors);
         a.freeAll();
+        dealloc<u8>(cPath);
         freeUnit(&unit);
         return 3;
     }
 
-    if (!writeFile(cPath, cg.cCode)) {
+    if (!writeFile(str::fromParts(cPath, outLen + 2), cg.cCode)) {
         printf(C"coral: cannot write %s\n", cPath);
         a.freeAll();
+        dealloc<u8>(cPath);
         freeUnit(&unit);
         return 3;
     }
@@ -142,9 +144,11 @@ pub i32 compileUnitTo(u8* inC, u8* outC, Slice* flagsN, Slice* flagsV, u32 nFlag
                 printf(C"coral: compiled %s -> %s\n", inC, outC);
             }
         }
+        dealloc<u8>(cmd);
     }
 
     a.freeAll();
+    dealloc<u8>(cPath);
     freeUnit(&unit);
     return rc;
 }
@@ -159,7 +163,7 @@ pub i32 compileFile(Options* opts)
     if (opts->buildFileSet)
     {
         usize fbuflen = 0;
-        Slice fsrc = readFile(sliceCStr(opts->buildFile), &fbuflen);
+        Slice fsrc = readFile(opts->buildFile.asStr(), &fbuflen);
         if (fsrc.ptr != null && fbuflen > 0)
         {
             Arena fa;
@@ -226,13 +230,13 @@ pub i32 compileFile(Options* opts)
     Slice out = opts.output;
     if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
     u8* outC = sliceCStr(out);
-    if (outC == null) return 1;
+    if (outC == null) { dealloc<u8>(inC); return 1; }
 
     i32 rc = compileUnitTo(inC, outC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, opts->quiet, opts->dryRun, null, null, 0);
     if (rc == 0 && opts.emitHir) {
         /* HIR dump needs a second analysis pass; cheap enough for a debug flag */
         usize hlen = 0;
-        Slice hsrc = readFile(inC, &hlen);
+        Slice hsrc = readFile(str::fromCstr((const cchar*)inC), &hlen);
         if (hsrc.ptr != null) {
             CompileUnit hunit = analyzeForCompile(hsrc.ptr, hlen, inC, opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, true, null, null, 0);
             if (hunit.ctx != null) {
@@ -242,5 +246,7 @@ pub i32 compileFile(Options* opts)
             }
         }
     }
+    dealloc<u8>(outC);
+    dealloc<u8>(inC);
     return rc;
 }

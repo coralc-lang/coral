@@ -51,18 +51,16 @@ pub i32 main()
         else => { return 2; },
     }
 
-    u8* fileC = sliceCStr(opts.buildFile);
-    if (fileC == null) return 1;
+    Slice buildPath = opts.buildFile;
     usize len = 0;
-    Slice src = readFile(fileC, &len);
-    
+    Slice src = readFile(buildPath.asStr(), &len);
+
     if (src.ptr == null && !opts.buildFileSet) {
-        Slice alt = Slice::fromStr("build.crlb");
-        fileC = sliceCStr(alt);
-        src = readFile(fileC, &len);
+        buildPath = Slice::fromStr("build.crlb");
+        src = readFile(buildPath.asStr(), &len);
     }
     if (src.ptr == null) {
-        printf(C"coral: cannot read %s\n", fileC);
+        printf(C"coralc: cannot read %s\n", sliceCStr(buildPath));
         return 1;
     }
 
@@ -72,7 +70,7 @@ pub i32 main()
     p.init(&a, src);
     CrlbNode* root = p.parseFile();
     if (root == null || p.errors > 0) {
-        printf(C"coral: parse failed, errors=%d\n", (i32)p.errors);
+        printf(C"coralc: parse failed, errors=%d\n", (i32)p.errors);
         return 2;
     }
 
@@ -86,44 +84,43 @@ pub i32 main()
             while (i < root.children.len)
             {
                 CrlbNode* c = root.children.data + i;
-                if (c.kind != CrlbNodeKind::Include || !c.hasPayload) { i = i + 1; continue; }
+                if (c.kind != CrlbNodeKind::Include || !c.hasPayload) { i++; continue; }
                 anyInc = true;
-                u8* base = fileC;
                 usize sep = 0;
                 usize k = 0;
-                while (fileC[k] != 0)
+                while (k < buildPath.len)
                 {
-                    if (fileC[k] == '/') sep = k + 1;
-                    k = k + 1;
+                    if (buildPath.ptr[k] == '/') sep = k + 1;
+                    k++;
                 }
                 usize blen = sep > 0 ? sep : 0;
                 usize plen = c.payload.len;
                 u8* joined = alloc<u8>(blen + plen + 1);
                 k = 0;
-                while (k < blen) { joined[k] = base[k]; k = k + 1; }
+                while (k < blen) { joined[k] = buildPath.ptr[k]; k++; }
                 usize j = 0;
                 while (j < plen) { joined[blen + j] = c.payload.ptr[j]; j = j + 1; }
                 joined[blen + plen] = 0;
                 usize ilen = 0;
-                Slice isrc = readFile(joined, &ilen);
+                Slice isrc = readFile(str::fromParts(joined, blen + plen), &ilen);
                 if (isrc.ptr == null)
                 {
-                    printf(C"coral: cannot read include \"%s\"\n", joined);
+                    printf(C"coralc: cannot read include \"%s\"\n", joined);
                     return 2;
                 }
                 CrlbParser ip;
                 ip.init(&a, isrc);
                 CrlbNode* iroot = ip.parseFile();
                 dealloc<u8>(joined);
-                if (iroot == null || ip.errors > 0) { printf(C"coral: include parse failed\n"); return 2; }
+                if (iroot == null || ip.errors > 0) { printf(C"coralc: include parse failed\n"); return 2; }
                 usize nl = root.children.len - i - 1;
                 CrlbNode* grown = (CrlbNode*)a.alloc((root.children.len + iroot.children.len) * @sizeof(CrlbNode), 8);
                 k = 0;
-                while (k < i) { grown[k] = root.children.data[k]; k = k + 1; }
+                while (k < i) { grown[k] = root.children.data[k]; k++; }
                 k = 0;
-                while (k < iroot.children.len) { grown[i + k] = iroot.children.data[k]; k = k + 1; }
+                while (k < iroot.children.len) { grown[i + k] = iroot.children.data[k]; k++; }
                 k = 0;
-                while (k < nl) { grown[i + iroot.children.len + k] = root.children.data[i + 1 + k]; k = k + 1; }
+                while (k < nl) { grown[i + iroot.children.len + k] = root.children.data[i + 1 + k]; k++; }
                 root.children.data = grown;
                 root.children.cap = root.children.len + iroot.children.len;
                 root.children.len = root.children.len + iroot.children.len - 1;
@@ -145,30 +142,36 @@ pub i32 main()
             while (i < root.children.len)
             {
                 CrlbNode* c = root.children.data + i;
-                i = i + 1;
+                i++;
                 if (!c.hasExtends) continue;
                 anyExt = true;
                 Slice target = c.extendsTarget;
                 usize k = 0;
                 usize nl = 0;
-                while (target.ptr[k] != 0 && k < target.len) { nl = nl + 1; k = k + 1; }
+                
+                while (target.ptr[k] != 0 && k < target.len) { nl = nl + 1; k++; }
                 usize sep = 0;
                 k = 0;
-                while (fileC[k] != 0) { if (fileC[k] == '/') sep = k + 1; k = k + 1; }
+                
+                while (k < buildPath.len) { if (buildPath.ptr[k] == '/') sep = k + 1; k++; }
                 u8* joined = alloc<u8>(sep + nl + 1);
                 k = 0;
-                while (k < sep) { joined[k] = fileC[k]; k = k + 1; }
+                
+                while (k < sep) { joined[k] = buildPath.ptr[k]; k++; }
                 usize j = 0;
                 while (j < nl) { joined[sep + j] = target.ptr[j]; j = j + 1; }
                 joined[sep + nl] = 0;
                 usize elen = 0;
-                Slice esrc = readFile(joined, &elen);
+                Slice esrc = readFile(str::fromParts(joined, sep + nl), &elen);
+                
                 dealloc<u8>(joined);
-                if (esrc.ptr == null) { printf(C"coral: cannot read extends target\n"); return 2; }
+                
+                if (esrc.ptr == null) { printf(C"coralc: cannot read extends target\n"); return 2; }
                 CrlbParser ep;
                 ep.init(&a, esrc);
+                
                 CrlbNode* eroot = ep.parseFile();
-                if (eroot == null || ep.errors > 0) { printf(C"coral: extends target parse failed\n"); return 2; }
+                if (eroot == null || ep.errors > 0) { printf(C"coralc: extends target parse failed\n"); return 2; }
                 CrlbNode* ebuild = null;
                 usize q = 0;
                 while (q < eroot.children.len)
@@ -180,7 +183,7 @@ pub i32 main()
                 usize newcap = c.fields.len + ebuild.fields.len;
                 CrlbField* merged = (CrlbField*)a.alloc(newcap * @sizeof(CrlbField), 8);
                 k = 0;
-                while (k < c.fields.len) { merged[k] = c.fields.data[k]; k = k + 1; }
+                while (k < c.fields.len) { merged[k] = c.fields.data[k]; k++; }
                 usize w = c.fields.len;
                 usize m = 0;
                 while (m < ebuild.fields.len)
@@ -243,7 +246,7 @@ pub i32 main()
     u8* outC = sliceCStr(b.output);
     if (outC == null || b.output.len == 0)
     {
-        printf(C"coral: build block needs output = \"path\" (the linked binary)\n");
+        printf(C"coralc: build block needs output = \"path\" (the linked binary)\n");
         return 3;
     }
     if (!opts.force && !b.anyStale && !opts.dryRun && bFileExists(outC))
@@ -263,13 +266,13 @@ pub i32 main()
      * table first, then falls back to lib-root probing. */
     if (!bMkdirParent(outC))
     {
-        printf(C"coral: cannot create output directory for %s\n", outC);
+        printf(C"coralc: cannot create output directory for %s\n", outC);
         return 3;
     }
     u8* entryC = sliceCStr(b.entryPath);
     if (entryC == null)
     {
-        printf(C"coral: entry module not resolved\n");
+        printf(C"coralc: entry module not resolved\n");
         return 3;
     }
     i32 rc = compileUnitTo(entryC, outC, opts.flagNames, opts.flagValues, opts.flagsCount,
