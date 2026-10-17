@@ -11,7 +11,11 @@ import build::parser { CrlbParser };
 import build::ast { CrlbNode, CrlbNodeKind, Value, ValueArray };
 import(lib) core::cchar { cchar };
 import(lib) std::mman { alloc, dealloc };
-import(lib) platform::libc { printf, system };
+import(lib) std::vec { Vec };
+import(lib) std::result { Result };
+import(lib) std::io::fs { IoError };
+import(lib) std::io::process { spawn, writeStdin, waitFor, pollfd, Process, ProcessResult };
+import(lib) platform::libc { printf, close, read, write, poll };
 
 bool endsWithCrl(Slice s)
 {
@@ -27,22 +31,93 @@ Slice defaultOutput(Slice input)
     return input;
 }
 
-// append a NUL-terminated string to a byte buffer
-usize appendStr(u8* buf, usize cap, usize len, str s)
+/* feed the generated C to gcc through a pipe: no .c file ever touches the
+ * disk. gcc's diagnostics are dropped unless showGcc. Returns gcc's exit
+ * status (127 = could not start / wait for gcc). */
+i32 runGcc(str outPath, str opt, Slice cCode, bool hasMain, bool showGcc)
 {
-    usize i = 0;
-    while (i < s.len && len + 1 < cap) {
-        buf[len] = s.ptr[i];
-        len++;
-        i++;
+    Vec<str> args = Vec<str>::new();
+    args.push("-std=gnu11");
+    args.push("-x");
+    args.push("c");
+    args.push("-");
+    if (opt.len == 7 && opt.ptr[0] == 114 && opt.ptr[1] == 101 && opt.ptr[2] == 108 && opt.ptr[3] == 101 && opt.ptr[4] == 97 && opt.ptr[5] == 115 && opt.ptr[6] == 101)
+    {
+        args.push("-O2");
     }
-    buf[len] = 0;
-    return len;
-}
+    else if (opt.len == 4 && opt.ptr[0] == 115 && opt.ptr[1] == 105 && opt.ptr[2] == 122 && opt.ptr[3] == 101)
+    {
+        args.push("-Os");
+    }
+    else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 51)
+    {
+        args.push("-O3");
+    }
+    else
+    {
+        args.push("-O0");
+        args.push("-g");
+    }
+    if (!hasMain) args.push("-c");
+    else args.push("-s");
+    args.push("-o");
+    args.push(outPath);
+    args.push("-lm");
 
-usize appendSlice(u8* buf, usize cap, usize len, Slice s)
-{
-    return appendStr(buf, cap, len, s.asStr());
+    Result<Process, IoError> sr = spawn("gcc", &args);
+    if (sr.isErr()) return 127;
+    Process p = sr.unwrap();
+
+    usize off = 0;
+    while (off < cCode.len)
+    {
+        Result<isize, IoError> wr = writeStdin(&p, (const cchar*)(cCode.ptr + off), cCode.len - off);
+        if (wr.isErr()) break;
+        isize n = wr.unwrap();
+        if (n <= 0) break;
+        off = off + (usize)n;
+    }
+    /* EOF for gcc, then drain both output pipes so gcc can never block
+     * writing diagnostics while we wait for it */
+    close(p.stdinFd);
+    p.stdinFd = -1;
+
+    u8* buf = alloc<u8>(4096);
+    if (buf != null)
+    {
+        while (true)
+        {
+            pollfd fds[2];
+            usize nfds = 0;
+            if (p.stdoutFd >= 0) { fds[nfds].fd = p.stdoutFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+            if (p.stderrFd >= 0) { fds[nfds].fd = p.stderrFd; fds[nfds].events = 1; fds[nfds].revents = 0; nfds++; }
+            if (nfds == 0) break;
+            i32 prc = poll((rawptr)fds, nfds, -1);
+            if (prc <= 0) break;
+            usize i = 0;
+            while (i < nfds)
+            {
+                if ((fds[i].revents & 17) == 0) { i++; continue; }
+                isize n = read(fds[i].fd, buf, 4096);
+                if (n <= 0)
+                {
+                    if (fds[i].fd == p.stdoutFd) { close(fds[i].fd); p.stdoutFd = -1; }
+                    else { close(fds[i].fd); p.stderrFd = -1; }
+                }
+                else if (showGcc)
+                {
+                    if (fds[i].fd == p.stdoutFd) write(1, (const cchar*)buf, (usize)n);
+                    else write(2, (const cchar*)buf, (usize)n);
+                }
+                i++;
+            }
+        }
+        dealloc<u8>(buf);
+    }
+
+    Result<ProcessResult, IoError> gw = waitFor(&p);
+    if (gw.isErr()) return 127;
+    return gw.unwrap().exitCode;
 }
 
 bool codeHasSlice(Slice code, str pat)
@@ -72,7 +147,7 @@ bool codeHasMain(Slice code)
 
 /* one compilation unit → one binary/object. The build path calls this with
  * the builder's in-memory module table; single-file mode passes nulls. */
-pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen, str opt)
+pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude, bool quiet, bool dryRun, Slice* modKeys, Slice* modVals, u32 modLen, str opt, bool emitC, bool showGcc)
 {
     usize len = 0;
     Slice src = readFile(inPath, &len);
@@ -84,9 +159,8 @@ pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32
     }
     CompileUnit unit = analyzeForCompile(src.ptr, len, inZ, flagsN, flagsV, nFlags, errorLimit, allowIntPtr, noPrelude, quiet, modKeys, modVals, modLen);
     if (unit.ctx == null) {
-        printf(C"coral: compile failed, errors=%d (parse=%d sema=%d mono=%d)\n",
-               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors),
-               (i32)unit.parseErrors, (i32)unit.semanticErrors, (i32)unit.monoErrors);
+        printf(C"coral: compile failed, errors=%d\n",
+               (i32)(unit.parseErrors + unit.semanticErrors + unit.monoErrors));
         dealloc<u8>(inZ);
         return 2;
     }
@@ -111,15 +185,18 @@ pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32
         return 3;
     }
 
-    if (!writeFile(str { .ptr = cPath, .len = outLen + 2 }, cg.cCode)) {
-        printf(C"coral: cannot write %s\n", cPath);
-        a.freeAll();
-        dealloc<u8>(cPath);
-        dealloc<u8>(inZ);
-        freeUnit(&unit);
-        return 3;
+    if (emitC)
+    {
+        if (!writeFile(str { .ptr = cPath, .len = outLen + 2 }, cg.cCode)) {
+            printf(C"coral: cannot write %s\n", cPath);
+            a.freeAll();
+            dealloc<u8>(cPath);
+            dealloc<u8>(inZ);
+            freeUnit(&unit);
+            return 3;
+        }
+        printf(C"coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
     }
-    printf(C"coral: wrote %s (%d bytes)\n", cPath, (i32)cg.cCode.len);
 
     i32 rc = 0;
     if (dryRun) {
@@ -130,48 +207,15 @@ pub i32 compileUnitTo(str inPath, str outPath, Slice* flagsN, Slice* flagsV, u32
         /* helper/library files emit no main: compile to an object instead
          * of linking an executable (which would fail with undefined main) */
         bool hasMain = codeHasMain(cg.cCode);
-        u8* cmd = alloc<u8>(outLen + 4096);
-        if (cmd == null) { rc = 3; }
-        else {
-            usize cl = 0;
-            cl = appendStr(cmd, outLen + 4096, cl, "gcc -std=gnu11 ");
-            if (opt.len == 7 && opt.ptr[0] == 114 && opt.ptr[1] == 101 && opt.ptr[2] == 108 && opt.ptr[3] == 101 && opt.ptr[4] == 97 && opt.ptr[5] == 115 && opt.ptr[6] == 101)
-            {
-                cl = appendStr(cmd, outLen + 4096, cl, "-O2 ");
-            }
-            else if (opt.len == 4 && opt.ptr[0] == 115 && opt.ptr[1] == 105 && opt.ptr[2] == 122 && opt.ptr[3] == 101)
-            {
-                cl = appendStr(cmd, outLen + 4096, cl, "-Os ");
-            }
-            else if (opt.len == 2 && opt.ptr[0] == 79 && opt.ptr[1] == 51)
-            {
-                cl = appendStr(cmd, outLen + 4096, cl, "-O3 ");
-            }
-            else
-            {
-                cl = appendStr(cmd, outLen + 4096, cl, "-O0 -g ");
-            }
-            cl = appendSlice(cmd, outLen + 4096, cl, Slice::from(cPath, outLen + 2));
-            if (hasMain) {
-                cl = appendStr(cmd, outLen + 4096, cl, " -o ");
-                cl = appendSlice(cmd, outLen + 4096, cl, Slice::fromStr(outPath));
-            } else {
-                cl = appendStr(cmd, outLen + 4096, cl, " -c -o ");
-                cl = appendSlice(cmd, outLen + 4096, cl, Slice::fromStr(outPath));
-            }
-            cl = appendStr(cmd, outLen + 4096, cl, " -lm");
-            cl = appendStr(cmd, outLen + 4096, cl, " 2>&1");
-            i32 st = system((const cchar*)cmd);
-            if (st != 0) {
-                printf(C"coral: gcc failed (status %d)\n", (i32)st);
-                rc = 3;
-            } else {
-                u8* outZ = sliceCStr(Slice::fromStr(outPath));
-                printf(C"coral: compiled %s -> %s\n", inZ, outZ);
-                dealloc<u8>(outZ);
-            }
+        i32 st = runGcc(outPath, opt, cg.cCode, hasMain, showGcc);
+        if (st != 0) {
+            printf(C"coral: gcc failed (status %d); rerun with --show-gcc for output\n", (i32)st);
+            rc = 3;
+        } else {
+            u8* outZ = sliceCStr(Slice::fromStr(outPath));
+            printf(C"coral: compiled %s -> %s\n", inZ, outZ);
+            dealloc<u8>(outZ);
         }
-        dealloc<u8>(cmd);
     }
 
     a.freeAll();
@@ -255,7 +299,7 @@ pub i32 compileFile(Options* opts)
     Slice out = opts.output;
     if (out.ptr == null || out.len == 0) out = defaultOutput(opts.input);
 
-    i32 rc = compileUnitTo(opts.input.asStr(), out.asStr(), opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, opts->quiet, opts->dryRun, null, null, 0, opts->opt.asStr());
+    i32 rc = compileUnitTo(opts.input.asStr(), out.asStr(), opts->flagNames, opts->flagValues, opts->flagsCount, opts->errorLimit, opts->allowIntPtr, opts->noPrelude, opts->quiet, opts->dryRun, null, null, 0, opts->opt.asStr(), opts->emitC, opts->showGcc);
     if (rc == 0 && opts.emitHir) {
         // HIR dump needs a second analysis pass; cheap enough for a debug flag
         usize hlen = 0;
