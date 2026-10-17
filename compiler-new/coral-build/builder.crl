@@ -2,18 +2,12 @@ import arena { Arena };
 import ast { CrlbNode, CrlbNodeKind, Value, ValueArray, nodeKindName };
 import common::slice { Slice };
 import(lib) core::cchar { cchar };
-import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) std::mman { alloc, dealloc, realloc, copy };
 import(lib) std::result { Result };
-import(lib) std::io::fios { FileHandle, fileOpen, fileRead, fileClose };
-import(lib) std::io::fs { IoError };
+import(lib) std::io::fios { FileHandle, fileOpen, fileRead, fileWrite, fileClose };
+import(lib) std::io::fs { IoError, fileExists, openDir, readDirEntry, closeDir, createDirRecursive, Dirent, Dir };
 
 extern("C") i32 printf(const cchar* fmt, ...);
-extern("C") i32 open(const cchar* path, i32 flags, i32 mode);
-extern("C") i32 write(i32 fd, const cchar* buf, usize len);
-extern("C") i32 close(i32 fd);
-extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
-extern("C") usize strlen(const cchar* s);
-extern("C") i64 syscall(i64 num, ...);
 extern("C") cchar* getenv(const cchar* name);
 
 // small helpers
@@ -40,7 +34,7 @@ pub u8* bCStr(Arena* a, Slice s)
 {
     u8* p = (u8*)a.alloc(s.len + 1, 1);
     if (p == null) return null;
-    memcpy(p, s.ptr, s.len);
+    copy<u8>(p, s.ptr, s.len);
     p[s.len] = 0;
     return p;
 }
@@ -50,9 +44,9 @@ u8* bConcat3(Arena* a, Slice x, str mid, Slice y)
     usize total = x.len + mid.len + y.len;
     u8* p = (u8*)a.alloc(total + 1, 1);
     if (p == null) return null;
-    memcpy(p, x.ptr, x.len);
-    memcpy(p + x.len, mid.ptr, mid.len);
-    memcpy(p + x.len + mid.len, y.ptr, y.len);
+    copy<u8>(p, x.ptr, x.len);
+    copy<u8>(p + x.len, mid.ptr, mid.len);
+    copy<u8>(p + x.len + mid.len, y.ptr, y.len);
     p[total] = 0;
     return p;
 }
@@ -83,6 +77,16 @@ pub usize bJoin(u8* out, usize cap, Slice dir, Slice name)
     return n;
 }
 
+// arena-owned `<dir>/<name>` join (mirrors bJoin's slash handling)
+pub str bJoinStr(Arena* a, Slice dir, Slice name)
+{
+    usize cap = dir.len + name.len + 2;
+    u8* p = (u8*)a.alloc(cap, 1);
+    if (p == null) return str { .ptr = null, .len = 0 };
+    usize n = bJoin(p, cap, dir, name);
+    return str { .ptr = p, .len = n };
+}
+
 u64 bFnv(u64 h, u8* data, usize len)
 {
     usize i = 0;
@@ -107,12 +111,9 @@ usize bApp(u8* buf, usize cap, usize* len, str src)
     return *len;
 }
 
-pub bool bFileExists(u8* cpath)
+pub bool bFileExists(str path)
 {
-    i32 fd = open(cpath, 0, 0);
-    if (fd < 0) return false;
-    close(fd);
-    return true;
+    return fileExists(path);
 }
 
 Slice bReadFile(Arena* a, str path, usize* outLen)
@@ -146,17 +147,17 @@ Slice bReadFile(Arena* a, str path, usize* outLen)
         len = len + got;
     }
     fileClose(fh);
-    u8* copy = (u8*)a.alloc(len + 1, 1);
-    if (copy == null)
+    u8* cp = (u8*)a.alloc(len + 1, 1);
+    if (cp == null)
     {
         dealloc<u8>(buf);
         return Slice::from(null, 0);
     }
-    memcpy(copy, buf, len);
-    copy[len] = 0;
+    copy<u8>(cp, buf, len);
+    cp[len] = 0;
     dealloc<u8>(buf);
     *outLen = len;
-    return Slice::from(copy, len);
+    return Slice::from(cp, len);
 }
 
 pub struct DirEnt
@@ -165,63 +166,48 @@ pub struct DirEnt
     u8 dtype;
 }
 
-pub DirEnt* bListDir(Arena* a, u8* cpath, u32* outLen)
+pub DirEnt* bListDir(Arena* a, str path, u32* outLen)
 {
     *outLen = 0;
-    i32 fd = open(cpath, 0, 0);
-    if (fd < 0) return null;
-    u8* buf = alloc<u8>(65536);
-    if (buf == null)
-    {
-        close(fd);
-        return null;
-    }
+    Result<Dir, IoError> od = openDir(path);
+    if (od.isErr()) return null;
+    Dir dir = od.unwrap();
     DirEnt* arr = (DirEnt*)a.alloc(64 * @sizeof(DirEnt), 8);
     u32 cap = 64;
     if (arr == null)
     {
-        dealloc<u8>(buf);
-        close(fd);
+        closeDir(dir);
         return null;
     }
     u32 len = 0;
-    while (true)
+    Dirent de;
+    while (readDirEntry(dir, &de))
     {
-        i64 n = syscall(217, fd, buf, 65536);
-        if (n <= 0) break;
-        i64 off = 0;
-        while (off < n)
+        u8 dtype = de.d_type;
+        usize nameLen = 0;
+        while (nameLen < 255 && de.d_name[nameLen] != 0) nameLen = nameLen + 1;
+        if (len >= cap)
         {
-            u16 reclen = (u16)(((u32)buf[off + 16]) | ((u32)buf[off + 17] << 8));
-            if (reclen == 0) break;
-            u8 dtype = buf[off + 18];
-            usize nameLen = 0;
-            while (nameLen < 255 && buf[off + 19 + nameLen] != 0) nameLen = nameLen + 1; //why the cast of a lteral? the fuck!
-            if (len >= cap)
+            u32 newCap = cap * 2;
+            DirEnt* fresh = (DirEnt*)a.alloc((usize)newCap * @sizeof(DirEnt), 8);
+            if (fresh == null) break;
+            u32 i = 0;
+            while (i < len)
             {
-                u32 newCap = cap * 2;
-                DirEnt* fresh = (DirEnt*)a.alloc((usize)newCap * @sizeof(DirEnt), 8);
-                if (fresh == null) break;
-                u32 i = 0;
-                while (i < len)
-                {
-                    fresh[i] = arr[i];
-                    i = i + 1;
-                }
-                arr = fresh;
-                cap = cap * 2;
+                fresh[i] = arr[i];
+                i = i + 1;
             }
-            u8* name = (u8*)a.alloc(nameLen + 1, 1);
-            memcpy(name, buf + off + 19, nameLen);
-            name[nameLen] = 0;
-            arr[len].name = name;
-            arr[len].dtype = dtype;
-            len = len + 1;
-            off = off + (i64)reclen;
+            arr = fresh;
+            cap = cap * 2;
         }
+        u8* name = (u8*)a.alloc(nameLen + 1, 1);
+        copy<u8>(name, &de.d_name[0], nameLen);
+        name[nameLen] = 0;
+        arr[len].name = name;
+        arr[len].dtype = dtype;
+        len = len + 1;
     }
-    dealloc<u8>(buf);
-    close(fd);
+    closeDir(dir);
     *outLen = len;
     return arr;
 }
@@ -237,33 +223,31 @@ bool bIsSkipped(Slice name, Slice* skips, u32 skipLen)
     return false;
 }
 
-u32 bCollectCrl(Arena* a, u8* dirC, Slice dirS, Slice* skips, u32 skipLen, Slice* out, u32 cap, u32* outLen)
+u32 bCollectCrl(Arena* a, Slice dirS, Slice* skips, u32 skipLen, Slice* out, u32 cap, u32* outLen)
 {
     DirEnt* ents = null;
     u32 n = 0;
-    ents = bListDir(a, dirC, &n);
+    ents = bListDir(a, dirS.asStr(), &n);
     u32 i = 0;
     while (i < n)
     {
-        Slice nm = Slice::from(ents[i].name, strlen(ents[i].name));
+        usize nameLen = 0;
+        while (ents[i].name[nameLen] != 0) nameLen = nameLen + 1;
+        Slice nm = Slice::from(ents[i].name, nameLen);
         if (!bEq(nm, ".") && !bEq(nm, ".."))
         {
             if (ents[i].dtype == 4)
             {
                 if (!bIsSkipped(nm, skips, skipLen))
                 {
-                    u8* subC = (u8*)a.alloc(dirS.len + nm.len + 2, 1);
-                    usize subLen = bJoin(subC, dirS.len + nm.len + 2, dirS, nm);
-                    bCollectCrl(a, subC, Slice::from(subC, subLen), skips, skipLen, out, cap, outLen);
+                    bCollectCrl(a, Slice::fromStr(bJoinStr(a, dirS, nm)), skips, skipLen, out, cap, outLen);
                 }
             }
             else if (bEndsWith(nm, ".crl"))
             {
                 if (*outLen < cap)
                 {
-                    u8* fullC = (u8*)a.alloc(dirS.len + nm.len + 2, 1);
-                    usize fullLen = bJoin(fullC, dirS.len + nm.len + 2, dirS, nm);
-                    out[*outLen] = Slice::from(fullC, fullLen);
+                    out[*outLen] = Slice::fromStr(bJoinStr(a, dirS, nm));
                     *outLen = *outLen + 1;
                 }
             }
@@ -487,7 +471,7 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
     b.skips = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
     b.skipsLen = bFieldList(b.build, Slice::fromStr("skip"), a, b.skips, 512);
 
-    /* build-file flags: k=v pairs (flag table) plus recognized options */
+    // build-file flags: k=v pairs (flag table) plus recognized options
     b.crlbFlagNames = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
     b.crlbFlagValues = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
     Slice* rawFlags = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
@@ -508,7 +492,7 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
             }
             else
             {
-                /* k=v pair — split at the first '=' */
+                // k=v pair — split at the first '='
                 usize eq = 0;
                 while (eq < e.len && e.ptr[eq] != 61) eq = eq + 1;
                 if (eq > 0 && eq < e.len && b.crlbFlagPairs < 64)
@@ -625,25 +609,16 @@ i32 bModuleIdx(Builder* b, Slice folder)
 // runs the full Coral parser on user sources.
 bool bScanLib(Builder* b, Slice folder)
 {
-    u8* pathBuf = alloc<u8>(4096);
-    if (pathBuf == null) return false;
-    usize plen = bJoin(pathBuf, 4096, b.rootDir, folder);
-    str libSuf = "/lib.crl";
-    usize withLen = 0;
-    while (plen + withLen + 1 < 4096 && withLen < libSuf.len)
+    str libDir = bJoinStr(b.arena, b.rootDir, folder);
+    if (libDir.ptr == null) return false;
+    str libPath = bJoinStr(b.arena, Slice::from(libDir.ptr, libDir.len), Slice::fromStr("lib.crl"));
+    if (libPath.ptr == null) return false;
+    if (!bFileExists(libPath))
     {
-        pathBuf[plen + withLen] = libSuf.ptr[withLen];
-        withLen = withLen + 1;
-    }
-    pathBuf[plen + withLen] = 0;
-    if (!bFileExists(pathBuf))
-    {
-        bError(b, "E1001", "missing lib.crl", "module", folder.asStr(), "path", Slice::from(pathBuf, plen + withLen).asStr(),
+        bError(b, "E1001", "missing lib.crl", "module", folder.asStr(), "path", libPath,
                "run `coralc init <module>` or add a lib.crl");
-        dealloc<u8>(pathBuf);
         return false;
     }
-    dealloc<u8>(pathBuf);
     return true;
 }
 
@@ -664,13 +639,14 @@ bool bValidateAliases(Builder* b)
     return true;
 }
 
-pub bool bWriteFile(u8* cpath, u8* data, usize len)
+pub bool bWriteFile(str path, const u8* data, usize len)
 {
-    i32 fd = open(cpath, 577, 420);
-    if (fd < 0) return false;
-    i32 w = write(fd, data, len);
-    close(fd);
-    return w >= 0;
+    Result<FileHandle, IoError> fo = fileOpen(path, "w");
+    if (fo.isErr()) return false;
+    FileHandle fh = fo.unwrap();
+    Result<usize, IoError> wr = fileWrite(fh, str { .ptr = (u8*)data, .len = len });
+    fileClose(fh);
+    return wr.isOk();
 }
 
 /* platform root for platform-first re-export resolution inside the
@@ -709,7 +685,7 @@ Slice bPlatformRoot(Builder* b)
         p[k] = 0;
         return Slice::from(p, k);
     }
-    /* full 'arch/os' value: use as-is */
+    // full 'arch/os' value: use as-is
     {
         usize sc = 0;
         usize q = 0;
@@ -724,7 +700,7 @@ Slice bPlatformRoot(Builder* b)
             return Slice::from(p, platLen);
         }
     }
-    /* bare OS name — prefix the arch (same shim as segsFromPlatformFlag) */
+    // bare OS name — prefix the arch (same shim as segsFromPlatformFlag)
     if (arch == null) { str dfltArch = "x86_64"; arch = dfltArch.ptr; archLen = dfltArch.len; }
     u8* p = (u8*)b.arena.alloc(archLen + 1 + platLen + 1, 1);
     if (p == null) return Slice::from(null, 0);
@@ -737,7 +713,7 @@ Slice bPlatformRoot(Builder* b)
     return Slice::from(p, k);
 }
 
-/* append key→value to the in-memory module table (arena-owned copies) */
+// append key→value to the in-memory module table (arena-owned copies)
 bool bModTableAdd(Builder* b, Slice key, Slice val)
 {
     if (b.modCap == 0)
@@ -747,7 +723,7 @@ bool bModTableAdd(Builder* b, Slice key, Slice val)
         b.modVals = (Slice*)b.arena.alloc((usize)b.modCap * @sizeof(Slice), 8);
         if (b.modKeys == null || b.modVals == null) { b.modCap = 0; return false; }
     }
-    if (b.modLen >= b.modCap) return true; /* table full — probing still works */
+    if (b.modLen >= b.modCap) return true; // table full — probing still works
     u8* k = bCStr(b.arena, key);
     u8* v = bCStr(b.arena, val);
     if (k == null || v == null) return false;
@@ -772,7 +748,7 @@ bool bModTableHas(Builder* b, Slice key)
  * module folder plus the raw folder name */
 void bRegisterExport(Builder* b, Slice folder, Slice name, Slice val)
 {
-    /* raw: folder::name */
+    // raw: folder::name
     u8* k1 = (u8*)b.arena.alloc(folder.len + 2 + name.len + 1, 1);
     if (k1 != null)
     {
@@ -793,7 +769,7 @@ void bRegisterExport(Builder* b, Slice folder, Slice name, Slice val)
             b.errors = b.errors + 1;
         }
     }
-    /* alias: aliasname::name for each alias whose folder matches */
+    // alias: aliasname::name for each alias whose folder matches
     u32 ai = 0;
     while (ai < b.aliasesLen)
     {
@@ -826,30 +802,29 @@ bool bIsIdentChar(u8 c)
 }
 
 /* try <base>/<path>.crl then <base>/<path>/lib.crl; returns a heap-allocated
- * path (release with dealloc<u8>) or null. baseC is NUL-terminated. */
-u8* bProbePath(u8* baseC, Slice path)
+ * path (release with dealloc<u8>) or null. base is a str. */
+u8* bProbePath(str base, Slice path)
 {
-    usize bl = 0;
-    while (baseC[bl] != 0) bl = bl + 1;
-    /* room for BOTH candidates: base + '/' + path + "/lib.crl" + NUL */
+    usize bl = base.len;
+    // room for BOTH candidates: base + '/' + path + "/lib.crl" + NUL
     usize cand = bl + 1 + path.len + 9 + 1;
     u8* p = alloc<u8>(cand);
     if (p == null) return null;
     usize n = 0;
     usize i = 0;
-    while (i < bl) { p[n] = baseC[i]; n = n + 1; i = i + 1; }
+    while (i < bl) { p[n] = base.ptr[i]; n = n + 1; i = i + 1; }
     p[n] = 47; n = n + 1;
     i = 0;
     while (i < path.len) { p[n] = path.ptr[i]; n = n + 1; i = i + 1; }
     p[n] = 46; p[n + 1] = 99; p[n + 2] = 114; p[n + 3] = 108; p[n + 4] = 0;
-    if (bFileExists(p)) return p;
-    /* <base>/<path>/lib.crl */
+    if (bFileExists(str { .ptr = p, .len = n + 4 })) return p;
+    // <base>/<path>/lib.crl
     p[n] = 47; n = n + 1;
     str suf = "/lib.crl";
     i = 0;
     while (i < suf.len) { p[n] = suf.ptr[i]; n = n + 1; i = i + 1; }
     p[n] = 0;
-    if (bFileExists(p)) return p;
+    if (bFileExists(str { .ptr = p, .len = n })) return p;
     dealloc<u8>(p);
     return null;
 }
@@ -861,17 +836,17 @@ bool bScanReexports(Builder* b, Slice folder, str libPathC, Slice platRoot)
 {
     usize len = 0;
     Slice content = bReadFile(b.arena, libPathC, &len);
-    if (content.ptr == null) return true; /* E1001 already covered existence */
+    if (content.ptr == null) return true; // E1001 already covered existence
     u8* modDir = alloc<u8>(4096);
     if (modDir == null) return false;
-    bJoin(modDir, 4096, b.rootDir, folder);
+    usize modDirLen = bJoin(modDir, 4096, b.rootDir, folder);
     usize i = 0;
     while (i < len)
     {
-        /* skip whitespace */
+        // skip whitespace
         while (i < len && (content.ptr[i] == 32 || content.ptr[i] == 9 || content.ptr[i] == 10 || content.ptr[i] == 13)) i = i + 1;
         if (i >= len) break;
-        /* only `pub mod NAME = import ... ;` lines are re-exports */
+        // only `pub mod NAME = import ... ;` lines are re-exports
         if (i + 7 <= len && content.ptr[i] == 112 && content.ptr[i + 1] == 117 && content.ptr[i + 2] == 98 &&
             (i + 3 >= len || !bIsIdentChar(content.ptr[i + 3])))
         {
@@ -896,7 +871,7 @@ bool bScanReexports(Builder* b, Slice folder, str libPathC, Slice platRoot)
                     {
                         i = i + 6;
                         while (i < len && (content.ptr[i] == 32 || content.ptr[i] == 9)) i = i + 1;
-                        /* optional (lib) marker */
+                        // optional (lib) marker
                         if (i < len && content.ptr[i] == 40)
                         {
                             while (i < len && content.ptr[i] != 41) i = i + 1;
@@ -930,7 +905,7 @@ bool bScanReexports(Builder* b, Slice folder, str libPathC, Slice platRoot)
                                     else break;
                                 }
                             }
-                            /* skip to statement end */
+                            // skip to statement end
                             while (i < len && content.ptr[i] != 59 && content.ptr[i] != 10) i = i + 1;
                             if (i < len && content.ptr[i] == 59) i = i + 1;
                             if (nameLen > 0 && pathLen > 0)
@@ -950,11 +925,11 @@ bool bScanReexports(Builder* b, Slice folder, str libPathC, Slice platRoot)
                                         q = 0;
                                         while (q < platRoot.len && pn < 4094) { platBase[pn] = platRoot.ptr[q]; pn = pn + 1; q = q + 1; }
                                         platBase[pn] = 0;
-                                        resolved = bProbePath(platBase, Slice::from(pathBuf, pathLen));
+                                        resolved = bProbePath(str { .ptr = platBase, .len = pn }, Slice::from(pathBuf, pathLen));
                                         dealloc<u8>(platBase);
                                     }
                                 }
-                                if (resolved == null) resolved = bProbePath(modDir, Slice::from(pathBuf, pathLen));
+                                if (resolved == null) resolved = bProbePath(str { .ptr = modDir, .len = modDirLen }, Slice::from(pathBuf, pathLen));
                                 if (resolved != null)
                                 {
                                     usize rl = 0;
@@ -985,7 +960,7 @@ bool bScanReexports(Builder* b, Slice folder, str libPathC, Slice platRoot)
                 }
             }
         }
-        /* not a re-export line — skip to end of line */
+        // not a re-export line — skip to end of line
         while (i < len && content.ptr[i] != 10) i = i + 1;
     }
     dealloc<u8>(modDir);
@@ -1007,9 +982,9 @@ bool bBuildModuleTable(Builder* b)
         usize k = 0;
         while (k < suf.len && n < 4095) { libP[n] = suf.ptr[k]; n = n + 1; k = k + 1; }
         libP[n] = 0;
-        if (bFileExists(libP))
+        if (bFileExists(str { .ptr = libP, .len = n }))
         {
-            /* module surface: `module` → lib.crl; alias → lib.crl */
+            // module surface: `module` → lib.crl; alias → lib.crl
             if (!bModTableHas(b, b.modules[m])) bModTableAdd(b, b.modules[m], Slice::from(libP, n));
             u32 ai = 0;
             while (ai < b.aliasesLen)
@@ -1035,7 +1010,7 @@ bool bBuildModuleTable(Builder* b)
         usize k = 0;
         while (k < suf.len && n < 4095) { libP[n] = suf.ptr[k]; n = n + 1; k = k + 1; }
         libP[n] = 0;
-        if (bFileExists(libP)) bScanReexports(b, b.modules[m], Slice::from(libP, n).asStr(), platRoot);
+        if (bFileExists(str { .ptr = libP, .len = n })) bScanReexports(b, b.modules[m], str { .ptr = libP, .len = n }, platRoot);
         dealloc<u8>(libP);
         m = m + 1;
     }
@@ -1064,7 +1039,7 @@ bool bResolveEntry(Builder* b)
     usize n = bJoin(cand, 4096, b.rootDir, b.entry);
     if (hasCrl)
     {
-        if (bFileExists(cand))
+        if (bFileExists(str { .ptr = cand, .len = n }))
         {
             b.entryPath = Slice::from(bCStr(b.arena, Slice::from(cand, n)), n);
             dealloc<u8>(cand);
@@ -1074,7 +1049,7 @@ bool bResolveEntry(Builder* b)
     if (n + 4 < 4095)
     {
         cand[n] = 46; cand[n + 1] = 99; cand[n + 2] = 114; cand[n + 3] = 108; cand[n + 4] = 0;
-        if (bFileExists(cand))
+        if (bFileExists(str { .ptr = cand, .len = n + 4 }))
         {
             b.entryPath = Slice::from(bCStr(b.arena, Slice::from(cand, n + 4)), n + 4);
             dealloc<u8>(cand);
@@ -1086,7 +1061,7 @@ bool bResolveEntry(Builder* b)
     usize k = 0;
     while (k < mid.len && n < 4095) { cand[n] = mid.ptr[k]; n = n + 1; k = k + 1; }
     cand[n] = 0;
-    if (bFileExists(cand))
+    if (bFileExists(str { .ptr = cand, .len = n }))
     {
         b.entryPath = Slice::from(bCStr(b.arena, Slice::from(cand, n)), n);
         dealloc<u8>(cand);
@@ -1097,7 +1072,7 @@ bool bResolveEntry(Builder* b)
     k = 0;
     while (k < libSuf.len && n < 4095) { cand[n] = libSuf.ptr[k]; n = n + 1; k = k + 1; }
     cand[n] = 0;
-    if (bFileExists(cand))
+    if (bFileExists(str { .ptr = cand, .len = n }))
     {
         b.entryPath = Slice::from(bCStr(b.arena, Slice::from(cand, n)), n);
         dealloc<u8>(cand);
@@ -1128,34 +1103,19 @@ pub bool bWriteAllFps(Builder* b)
 
 /* create the parent directory of a file path (for output=build/foo).
  * an existing directory is success (mkdir EEXIST). */
-pub bool bMkdirParent(u8* path)
+pub bool bMkdirParent(str path)
 {
-    usize len = 0;
-    while (path[len] != 0) len = len + 1;
     i32 last = -1;
     usize i = 0;
-    while (i < len) { if (path[i] == 47) last = (i32)i; i = i + 1; }
+    while (i < path.len) { if (path.ptr[i] == 47) last = (i32)i; i = i + 1; }
     if (last <= 0) return true;
-    u8* dir = alloc<u8>((usize)last + 1);
-    if (dir == null) return false;
-    i = 0;
-    while (i < (usize)last) { dir[i] = path[i]; i = i + 1; }
-    dir[last] = 0;
-    i32 r = (i32)syscall(83, dir, 493);
-    bool ok = r == 0;
-    if (!ok)
-    {
-        /* mkdir failed — fine if the directory is already there */
-        i32 fd = open(dir, 0, 0);
-        if (fd >= 0) { close(fd); ok = true; }
-    }
-    dealloc<u8>(dir);
-    return ok;
+    Result<bool, IoError> r = createDirRecursive(str { .ptr = path.ptr, .len = (usize)last }, 493);
+    return r.isOk();
 }
 
 bool bWriteMap(Builder* b)
 {
-    syscall(83, C".coral", 493);
+    createDirRecursive(".coral", 493);
 
     usize cap = 262144;
     u8* buf = alloc<u8>(cap);
@@ -1179,15 +1139,12 @@ bool bWriteMap(Builder* b)
             pad = pad + 1;
         }
         bApp(buf, cap, &len, " →  ");
-        u8* dirP = alloc<u8>(4096);
-        usize dl = bJoin(dirP, 4096, b.rootDir, b.modules[t]);
-        bApp(buf, cap, &len, str::fromParts(dirP, dl));
+        bApp(buf, cap, &len, bJoinStr(b.arena, b.rootDir, b.modules[t]));
         if (len + 1 < cap)
         {
             buf[len] = '\n';
             len = len + 1;
         }
-        dealloc<u8>(dirP);
         t = t + 1;
     }
 
@@ -1233,7 +1190,7 @@ bool bWriteMap(Builder* b)
     usize mi = 0;
     while (mi < b.mapPath.len && mi < 4095) { mapC[mi] = b.mapPath.ptr[mi]; mi = mi + 1; }
     mapC[mi] = 0;
-    /* resolved table: key → path (what the loader actually consumes) */
+    // resolved table: key → path (what the loader actually consumes)
     if (b.modLen > 0)
     {
         if (len + 1 < cap)
@@ -1262,7 +1219,7 @@ bool bWriteMap(Builder* b)
             e = e + 1;
         }
     }
-    bool ok = bWriteFile(mapC, buf, len);
+    bool ok = bWriteFile(b.mapPath.asStr(), buf, len);
     if (!ok)
     {
         printf(C"E1000  cannot write %s\n", mapC);
@@ -1280,14 +1237,13 @@ bool bFingerprint(Builder* b)
     u32 m = 0;
     while (m < b.modulesLen)
     {
-        u8* dirBuf = alloc<u8>(4096);
-        if (dirBuf == null) return false;
-        usize dl = bJoin(dirBuf, 4096, b.rootDir, b.modules[m]);
+        Slice dirS = Slice::fromStr(bJoinStr(b.arena, b.rootDir, b.modules[m]));
+        if (dirS.ptr == null) return false;
 
         Slice* files = (Slice*)b.arena.alloc(512 * @sizeof(Slice), 8);
-        if (files == null) { dealloc<u8>(dirBuf); return false; }
+        if (files == null) return false;
         u32 filesLen = 0;
-        bCollectCrl(b.arena, dirBuf, Slice::from(dirBuf, dl), b.skips, b.skipsLen, files, 512, &filesLen);
+        bCollectCrl(b.arena, dirS, b.skips, b.skipsLen, files, 512, &filesLen);
         bSortFiles(files, filesLen);
         b.mods[m].files = files;
         b.mods[m].filesLen = filesLen;
@@ -1313,7 +1269,6 @@ bool bFingerprint(Builder* b)
             b.mods[m].fingerprint = bFnv(b.mods[m].fingerprint, b.crlbFlagValues[fl].ptr, b.crlbFlagValues[fl].len);
             fl = fl + 1;
         }
-        dealloc<u8>(dirBuf);
         m = m + 1;
     }
     return true;
@@ -1453,7 +1408,7 @@ bool bLoadGraph(Builder* b)
 
 pub bool bWriteGraph(Builder* b)
 {
-    syscall(83, C".coral", 493);
+    createDirRecursive(".coral", 493);
     usize cap = 65536;
     u8* buf = alloc<u8>(cap);
     if (buf == null) return false;
@@ -1477,7 +1432,7 @@ pub bool bWriteGraph(Builder* b)
         m = m + 1;
     }
     bApp(buf, cap, &len, "}\n");
-    bool ok = bWriteFile(bCStr(b->arena, Slice::fromStr(".coral/graph.dot")), buf, len);
+    bool ok = bWriteFile(".coral/graph.dot", buf, len);
     dealloc<u8>(buf);
     if (!ok)
     {
@@ -1506,7 +1461,7 @@ pub bool bWriteGraph(Builder* b)
         }
         m2 = m2 + 1;
     }
-    bool ok2 = bWriteFile(bCStr(b->arena, Slice::fromStr(".coral/graph")), buf2, len2);
+    bool ok2 = bWriteFile(".coral/graph", buf2, len2);
     dealloc<u8>(buf2);
     if (!ok2)
     {
@@ -1518,8 +1473,8 @@ pub bool bWriteGraph(Builder* b)
 
 pub bool bWriteFp(Builder* b, u32 modIdx)
 {
-    syscall(83, C".coral", 493);
-    syscall(83, C".coral/cache", 493);
+    createDirRecursive(".coral", 493);
+    createDirRecursive(".coral/cache", 493);
     u8* pathC = alloc<u8>(512);
     if (pathC == null) return false;
     usize n = 0;
@@ -1541,7 +1496,7 @@ pub bool bWriteFp(Builder* b, u32 modIdx)
         s = s + 1;
     }
     hex[16] = 0;
-    bool ok = bWriteFile(pathC, hex, 16);
+    bool ok = bWriteFile(str { .ptr = pathC, .len = n + 3 }, hex, 16);
     dealloc<u8>(pathC);
     dealloc<u8>(hex);
     return ok;
@@ -1560,7 +1515,7 @@ bool bCheckFp(Builder* b, u32 modIdx)
     str fp = ".fp";
     pathC[n] = fp.ptr[0]; pathC[n + 1] = fp.ptr[1]; pathC[n + 2] = fp.ptr[2]; pathC[n + 3] = 0;
     usize len = 0;
-    Slice got = bReadFile(b.arena, Slice::from(pathC, n + 3).asStr(), &len);
+    Slice got = bReadFile(b.arena, str { .ptr = pathC, .len = n + 3 }, &len);
     if (got.ptr == null || len < 16) { dealloc<u8>(pathC); return true; }
     u8* hex = alloc<u8>(17);
     if (hex == null) { dealloc<u8>(pathC); return true; }
@@ -1607,7 +1562,7 @@ pub i32 builderRunEx(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnly
      * compiler's loader consumes this directly at compile time. */
     if (!bBuildModuleTable(&b)) return (i32)b.errors;
     if (!bResolveEntry(&b)) return (i32)b.errors;
-    /* a dry run writes nothing: no modules.map, no graph, no cache */
+    // a dry run writes nothing: no modules.map, no graph, no cache
     if (!dryRunIn && !bWriteMap(&b)) return (i32)b.errors;
     if (emitMapOnlyIn)
     {

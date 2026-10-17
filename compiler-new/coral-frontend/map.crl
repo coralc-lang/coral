@@ -7,17 +7,14 @@ import common::slice { Slice };
 import build::arena { Arena };
 import build::ast { CrlbNode, CrlbNodeKind };
 import build::builder {
-    bEq, bJoin, bCStr, bFileExists, bFieldStr, bFieldList, bListDir, bWriteFile,
+    bEq, bCStr, bFileExists, bFieldStr, bFieldList, bListDir, bJoinStr, bWriteFile,
     DirEnt, builderRun, Builder
 };
 import args { Options };
-import io { sliceCStr };
 import(lib) core::cchar { cchar };
-import(lib) std::mman { alloc, dealloc };
+import(lib) std::mman { alloc, dealloc, copy };
 
 extern("C") i32 printf(const cchar* fmt, ...);
-extern("C") usize strlen(const cchar* s);
-extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
 
 struct MapArr
 {
@@ -192,53 +189,34 @@ bool mListed(Slice raw, usize from, usize to, Slice name)
 
 void mWalk(Arena* a, Slice root, Slice rel, Slice* found, u32* foundLen, u32 cap, Slice* skips, u32 skipLen)
 {
-    u8* dirC = (u8*)a.alloc(root.len + rel.len + 4, 1);
-    if (dirC == null) return;
-    usize dirLen = bJoin(dirC, root.len + rel.len + 4, root, rel);
+    str dir = bJoinStr(a, root, rel);
+    if (dir.ptr == null) return;
     u32 n = 0;
-    DirEnt* ents = bListDir(a, dirC, &n);
+    DirEnt* ents = bListDir(a, dir, &n);
     if (ents == null) return;
     u32 i = 0;
     while (i < n)
     {
-        Slice nm = Slice::from(ents[i].name, strlen((const cchar*)ents[i].name));
+        usize nameLen = 0;
+        while (ents[i].name[nameLen] != 0) nameLen = nameLen + 1;
+        Slice nm = Slice::from(ents[i].name, nameLen);
         bool hidden = nm.len > 0 && nm.ptr[0] == 46;
         if (!hidden && !mInList(nm, skips, skipLen))
         {
             if (ents[i].dtype == 4)
             {
-                u8* childRel = (u8*)a.alloc(rel.len + nm.len + 4, 1);
-                if (childRel == null) return;
-                usize clen = 0;
-                if (rel.len > 0)
-                {
-                    memcpy(childRel, rel.ptr, rel.len);
-                    childRel[rel.len] = 47;
-                    clen = rel.len + 1;
-                }
-                memcpy(childRel + clen, nm.ptr, nm.len);
-                clen = clen + nm.len;
-                childRel[clen] = 0;
+                str child = bJoinStr(a, rel, nm);
+                if (child.ptr == null) return;
+                Slice childRel = Slice::fromStr(child);
 
-                u8* libP = (u8*)a.alloc(dirLen + nm.len + 12, 1);
-                if (libP != null)
+                str libDir = bJoinStr(a, Slice::from(dir.ptr, dir.len), nm);
+                str libP = bJoinStr(a, Slice::from(libDir.ptr, libDir.len), Slice::fromStr("lib.crl"));
+                if (libDir.ptr != null && libP.ptr != null && bFileExists(libP) && *foundLen < cap)
                 {
-                    usize lp = bJoin(libP, dirLen + nm.len + 12, Slice::from(dirC, dirLen), nm);
-                    str suf = "/lib.crl";
-                    usize s = 0;
-                    while (s < suf.len && lp + s + 1 < dirLen + nm.len + 12)
-                    {
-                        libP[lp + s] = suf[s];
-                        s++;
-                    }
-                    libP[lp + s] = 0;
-                    if (bFileExists(libP) && *foundLen < cap)
-                    {
-                        found[*foundLen] = Slice::from(childRel, clen);
-                        *foundLen = *foundLen + 1;
-                    }
+                    found[*foundLen] = childRel;
+                    *foundLen = *foundLen + 1;
                 }
-                mWalk(a, root, Slice::from(childRel, clen), found, foundLen, cap, skips, skipLen);
+                mWalk(a, root, childRel, found, foundLen, cap, skips, skipLen);
             }
         }
         i++;
@@ -329,18 +307,11 @@ bool mSplice(Options* opts, Arena* a, Slice raw, MapArr* arr, Slice* adds, u32 a
         dealloc<u8>(insert);
         return false;
     }
-    memcpy(buf, raw.ptr, arr->insPos);
-    memcpy(buf + arr->insPos, insert, ilen);
-    memcpy(buf + arr->insPos + ilen, raw.ptr + arr->insPos, raw.len - arr->insPos);
+    copy<u8>(buf, raw.ptr, arr->insPos);
+    copy<u8>(buf + arr->insPos, insert, ilen);
+    copy<u8>(buf + arr->insPos + ilen, raw.ptr + arr->insPos, raw.len - arr->insPos);
     dealloc<u8>(insert);
-    u8* pathC = sliceCStr(opts->buildFile);
-    if (pathC == null)
-    {
-        dealloc<u8>(buf);
-        return false;
-    }
-    bool ok = bWriteFile(pathC, buf, total);
-    dealloc<u8>(pathC);
+    bool ok = bWriteFile(opts->buildFile.asStr(), buf, total);
     dealloc<u8>(buf);
     return ok;
 }
