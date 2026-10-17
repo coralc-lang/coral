@@ -6,6 +6,7 @@ mod context = import "../coral-context/context";
 mod scope = import "scope";
 mod sema = import "sema";
 mod diagnostics = import "../coral-diagnostics/code";
+mod slice_mod = import "../coral-common/slice";
 
 import id { Str, NodeId };
 import types { Ty, TypeEntry, TypeKind };
@@ -15,6 +16,7 @@ import context { InternEntry };
 import scope { Symbol, ScopeStack };
 import sema { Sema };
 import diagnostics { ErrorCode };
+import slice_mod { Slice };
 
 pub extend Sema
 {
@@ -123,9 +125,20 @@ pub extend Sema
                     }
                 }
             }
-            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags, self.fileOf(id)) &&
-                self.scopes.lastDeclFail == 1 && !protoPair)
-                self.dupDeclDiag(name, id);
+            if (!self.scopes.declare(name, kind, typeNode, id, symbolFlags, self.fileOf(id)))
+            {
+                if (protoPair && self.scopes.lastDeclFail == 1)
+                {
+                    /* prototype + later definition is one function, not a
+                     * duplicate — the failed declare already counted an
+                     * error, so take it back (nothing is reported) */
+                    if (self.scopes.errors > 0) self.scopes.errors = self.scopes.errors - 1;
+                }
+                else if (self.scopes.lastDeclFail == 1)
+                {
+                    self.dupDeclDiag(name, id);
+                }
+            }
         }
         if (!bodies)
         {
@@ -332,6 +345,55 @@ pub extend Sema
         return true;
     }
 
+    /* exact module-table lookup: module path → the file path the builder
+     * resolved it to (Slice::from(null, 0) when absent) */
+    Slice moduleFileForPath(Str modulePath)
+    {
+        if (self.modKeys == null || modulePath == 0) return Slice::from(null, 0);
+        InternEntry* me = self.ctx.interns + modulePath;
+        u32 i = 0;
+        while (i < self.modLen)
+        {
+            Slice k = self.modKeys[i];
+            if (k.ptr != null && k.len == me->len)
+            {
+                bool same = true;
+                usize j = 0;
+                while (j < me->len)
+                {
+                    if (k.ptr[j] != me->ptr[j]) { same = false; break; }
+                    j = j + 1;
+                }
+                if (same) return self.modVals[i];
+            }
+            i = i + 1;
+        }
+        return Slice::from(null, 0);
+    }
+
+    /* does the diag path of `fileId` end at `suffix` on component
+     * boundaries (also true for full equality)? */
+    bool filePathEndsWith(u32 fileId, Slice suffix)
+    {
+        if (suffix.ptr == null || suffix.len == 0) return false;
+        if (self.diag == null) return false;
+        if (fileId >= self.diag.fileCount) return false;
+        u8* fp = self.diag.filePaths[fileId];
+        usize fl = self.diag.filePathLens[fileId];
+        if (fp == null || fl < suffix.len) return false;
+        usize off = fl - suffix.len;
+        usize i = 0;
+        while (i < suffix.len)
+        {
+            if (fp[off + i] != suffix.ptr[i]) return false;
+            i = i + 1;
+        }
+        if (off > 0 && fp[off - 1] != 47) return false;
+        usize end = off + suffix.len;
+        if (end < fl && fp[end] != 47 && fp[end] != 46) return false;
+        return true;
+    }
+
     bool bindImportSymbols(NodeId id, Decl* decl, u8* notFoundMsg)
     {
         u32 fileId = self.fileOf(id);
@@ -367,8 +429,15 @@ pub extend Sema
                     if (cands != null)
                     {
                         u32 n = self.scopes.lookupAll(lookupName, cands, 16);
+                        Slice want = self.moduleFileForPath(modulePath);
                         u32 m = 0;
                         while (m < n)
+                        {
+                            if (self.filePathEndsWith(cands[m]->fileId, want)) { real = cands[m]; break; }
+                            m = m + 1;
+                        }
+                        m = 0;
+                        while (real == null && m < n)
                         {
                             if (self.importPathInFile(modulePath, cands[m]->fileId)) { real = cands[m]; break; }
                             m = m + 1;
