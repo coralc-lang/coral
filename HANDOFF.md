@@ -2,6 +2,8 @@
 
 ## Owner directives
 - **2026-10-17 — parser static free functions get stripped.** The owner will remove the use of static free functions from the parser; they should not be allowed again. Do not add new ones.
+- **2026-10-17 — errors.txt (project root) must be matched to what we support**, with a priority object; many of the listed errors need to be implemented in the compiler. Includes: enforce module privacy (items not marked `pub` must not be callable/usable), OOB index of fixed arrays must be impossible, switch exhaustiveness rules (all variants no else, or else, fallthrough warned), slice type proposal (`slice T name;` or `T name[..]`), error codes E0103/E0104/E0105/E0201-E0205/E0304.
+- **2026-10-17 — after compiler-new compiles and runs:** add a build and cache system (much is still incomplete); implement `coralc init`, `exec` in the build fields, and the other unimplemented parts; add `coralc --serve` + JSON serialization so the compiler acts as a language server (type info, multi-file tracking, lib referencing).
 
 ## Repo / build commands
 - Workspace: `/home/cerie/Documents/coralc`
