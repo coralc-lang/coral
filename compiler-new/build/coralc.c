@@ -4241,10 +4241,20 @@ void memcpy(void* dst, const void* src, size_t n) {
     uint8_t* d = ((uint8_t*)(dst));
     uint8_t* s = ((uint8_t* const)(src));
     size_t i = 0;
-    while (((((i + 8)) <= n)))
+    while (((((i < n))) && (((((((size_t)(((d + i)))) & 7)) != 0)))))
+    {
+        ((d[i] = s[i]));
+        ((i)++);
+    }
+    while (((((((i + 8)) <= n))) && (((((((size_t)(((s + i)))) & 7)) == 0)))))
     {
         (((*(((size_t*)(((d + i)))))) = (*(((size_t* const)(((s + i))))))));
         ((i += 8));
+    }
+    while (((((((i + 4)) <= n))) && (((((((size_t)(((s + i)))) & 3)) == 0)))))
+    {
+        (((*(((uint32_t*)(((d + i)))))) = (*(((uint32_t* const)(((s + i))))))));
+        ((i += 4));
     }
     while (((i < n)))
     {
@@ -5747,8 +5757,7 @@ void crl__lib__std__x86_64__linux__memory__mman__initDefaultAllocator(void) {
     {
         return;
     }
-    crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiAlloc_init((&(crl__lib__std__x86_64__linux__memory__mman___miAllocInstance)), ((((64 * 1024)) * 1024)));
-    ((crl__lib__std__x86_64__linux__memory__mman__defaultAllocator = (&(crl__lib__std__x86_64__linux__memory__mman__miAllocator))));
+    ((crl__lib__std__x86_64__linux__memory__mman__defaultAllocator = (&(crl__lib__std__x86_64__linux__memory__mman__libcAllocator))));
 }
 void* crl__lib__std__x86_64__linux__memory__mman___tlsfAlloc(void* ctx, size_t size) {
     return crl__lib__std__x86_64__linux__memory__allocators__tlsf__Tlsf_alloc(((crl__lib__std__x86_64__linux__memory__allocators__tlsf__Tlsf*)(ctx)), size);
