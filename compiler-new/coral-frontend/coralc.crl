@@ -9,12 +9,13 @@ import build {
     arena { Arena },
     parser { CrlbParser },
     ast { CrlbNode, CrlbNodeKind, CrlbField },
-    builder { builderRunEx, Builder, bFileExists, bWriteAllFps, bMkdirParent }
+    builder { builderRunEx, Builder, bFileExists, bWriteAllFps, bMkdirParent, bTaskIndex }
 };
 import args { Options, Command, parseArgs, usage, addFlagPair };
 import io { readFile, sliceCStr };
 import map { runMap };
 import init { runInit };
+import tasks { runTask };
 import compile { compileFile, compileUnitTo };
 import diag::explain { explain };
 
@@ -47,6 +48,7 @@ pub i32 main()
         Command::Compile => { return compileFile(&opts); },
         Command::Init => { return runInit(&opts); },
         Command::Run => {}, // stub
+        Command::Task => {}, // stub
         Command::Build => {}, // stub
         Command::Map => {}, // stub
         else => { return 2; },
@@ -243,6 +245,27 @@ pub i32 main()
         if (b.crlbQuiet) opts.quiet = true;
     }
 
+    /* task commands: `coralc run` executes task "run" if the build file
+     * defines one (else the output binary); `coralc <name>` runs that task.
+     * Every task path builds first. */
+    bool wantTask = opts.cmd == Command::Run || opts.cmd == Command::Task;
+    bool haveTask = false;
+    str taskName = Slice::fromStr("run").asStr();
+    if (opts.cmd == Command::Task)
+    {
+        taskName = opts.input.asStr();
+        if (bTaskIndex(&b, taskName) < 0)
+        {
+            printf(C"coralc: no task \"%.*s\" in the build file\n", (i32)opts.input.len, opts.input.ptr);
+            return 2;
+        }
+        haveTask = true;
+    }
+    else if (opts.cmd == Command::Run)
+    {
+        haveTask = bTaskIndex(&b, "run") >= 0;
+    }
+
     // up to date: nothing stale, the output binary exists, no --force
     u8* outZ = sliceCStr(b.output);
     if (outZ == null || b.output.len == 0)
@@ -254,10 +277,18 @@ pub i32 main()
     {
         printf(C"coralc: up to date (%s)\n", outZ);
         b.compilePhaseReached = true;
-        if (opts.cmd == Command::Run)
+        if (wantTask)
         {
-            i32 st = system((const cchar*)outZ);
-            if (st != 0) return 3;
+            if (haveTask)
+            {
+                i32 st = runTask(&b, taskName, 0);
+                if (st != 0) return st;
+            }
+            else
+            {
+                i32 st = system((const cchar*)outZ);
+                if (st != 0) return 3;
+            }
         }
         return 0;
     }
@@ -277,15 +308,23 @@ pub i32 main()
     }
     i32 rc = compileUnitTo(b.entryPath.asStr(), b.output.asStr(), opts.flagNames, opts.flagValues, opts.flagsCount,
                            opts.errorLimit, opts.allowIntPtr, opts.noPrelude, opts.quiet, opts.dryRun,
-                           b.modKeys, b.modVals, b.modLen);
+                           b.modKeys, b.modVals, b.modLen, b.opt.asStr());
     if (rc == 0)
     {
         b.compilePhaseReached = true;
         if (!opts.dryRun) bWriteAllFps(&b);
-        if (opts.cmd == Command::Run)
+        if (wantTask)
         {
-            i32 st = system((const cchar*)outZ);
-            if (st != 0) return 3;
+            if (haveTask)
+            {
+                i32 st = runTask(&b, taskName, 0);
+                if (st != 0) return st;
+            }
+            else
+            {
+                i32 st = system((const cchar*)outZ);
+                if (st != 0) return 3;
+            }
         }
         return 0;
     }

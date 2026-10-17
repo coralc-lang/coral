@@ -359,6 +359,7 @@ pub struct Builder
     Slice mapPath;
     Slice cacheDir;
     Slice target;
+    Slice opt;
     Slice* modules;
     u32 modulesLen;
     Slice* skips;
@@ -387,6 +388,14 @@ pub struct Builder
     u32 crlbFlagPairs;
     bool crlbAllowIntPtr;
     bool crlbQuiet;
+    /* task decls: name → exec/output plus `after` deps ("build" is the
+     * pseudo-task of the compile+link pipeline itself) */
+    Slice* taskNames;
+    Slice* taskExecs;
+    Slice* taskOutputs;
+    Slice** taskAfters;
+    u32* taskAfterLens;
+    u32 tasksLen;
     Slice entryPath;
     bool anyStale;
     /* false until the compile phase actually compiles modules. coralc.crl
@@ -419,6 +428,7 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
     b.mapPath = Slice::fromStr(".coral/modules.map");
     b.cacheDir = Slice::fromStr(".coral/cache");
     b.target = Slice::from(null, 0);
+    b.opt = Slice::fromStr("debug");
     b.modules = null;
     b.modulesLen = 0;
     b.skips = null;
@@ -437,6 +447,12 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
     b.crlbFlagPairs = 0;
     b.crlbAllowIntPtr = false;
     b.crlbQuiet = false;
+    b.taskNames = null;
+    b.taskExecs = null;
+    b.taskOutputs = null;
+    b.taskAfters = null;
+    b.taskAfterLens = null;
+    b.tasksLen = 0;
     b.entryPath = Slice::from(null, 0);
     b.anyStale = false;
 
@@ -464,6 +480,13 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
     bFieldStr(b.build, Slice::fromStr("module_map"), &b.mapPath);
     bFieldStr(b.build, Slice::fromStr("cache_dir"), &b.cacheDir);
     bFieldStr(b.build, Slice::fromStr("target"), &b.target);
+    bFieldStr(b.build, Slice::fromStr("opt"), &b.opt);
+    if (!(bEq(b.opt, "debug") || bEq(b.opt, "release") || bEq(b.opt, "size") || bEq(b.opt, "O3")))
+    {
+        printf(C"E1000  unknown opt \"%s\" (expected debug, release, size, or O3)\n", bCStr(b.arena, b.opt));
+        b.errors++;
+        return false;
+    }
     b.modules = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
     b.modulesLen = bFieldList(b.build, Slice::fromStr("modules"), a, b.modules, 512);
     b.skips = (Slice*)a.alloc(512 * @sizeof(Slice), 8);
@@ -562,6 +585,38 @@ bool bInit(Builder* b, Arena* a, CrlbNode* root, bool forceIn, bool emitMapOnlyI
         }
         i++;
     }
+
+    /* task decls (name, exec, output, after) */
+    b.taskNames = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
+    b.taskExecs = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
+    b.taskOutputs = (Slice*)a.alloc(64 * @sizeof(Slice), 8);
+    b.taskAfters = (Slice**)a.alloc(64 * @sizeof(Slice*), 8);
+    b.taskAfterLens = (u32*)a.alloc(64 * @sizeof(u32), 8);
+    if (b.taskNames == null || b.taskExecs == null || b.taskOutputs == null ||
+        b.taskAfters == null || b.taskAfterLens == null) return false;
+    i = 0;
+    while (i < (u32)root.children.len)
+    {
+        CrlbNode* c = root.children.data + i;
+        if (c.kind == CrlbNodeKind::Task && c.hasLabel && b.tasksLen < 64)
+        {
+            u32 t = b.tasksLen;
+            b.taskNames[t] = c.label;
+            b.taskExecs[t] = Slice::from(null, 0);
+            b.taskOutputs[t] = Slice::from(null, 0);
+            bFieldStr(c, Slice::fromStr("exec"), &b.taskExecs[t]);
+            bFieldStr(c, Slice::fromStr("output"), &b.taskOutputs[t]);
+            Slice* aft = (Slice*)a.alloc(16 * @sizeof(Slice), 8);
+            b.taskAfters[t] = aft;
+            b.taskAfterLens[t] = 0;
+            if (aft != null)
+            {
+                b.taskAfterLens[t] = bFieldList(c, Slice::fromStr("after"), a, aft, 16);
+            }
+            b.tasksLen++;
+        }
+        i++;
+    }
     return b.errors == 0;
 }
 
@@ -597,6 +652,18 @@ i32 bModuleIdx(Builder* b, Slice folder)
     while (i < b.modulesLen)
     {
         if (bEq(b.modules[i], folder.asStr())) return (i32)i;
+        i++;
+    }
+    return -1;
+}
+
+pub i32 bTaskIndex(Builder* b, str name)
+{
+    if (b.taskNames == null) return -1;
+    u32 i = 0;
+    while (i < b.tasksLen)
+    {
+        if (bEq(b.taskNames[i], name)) return (i32)i;
         i++;
     }
     return -1;
