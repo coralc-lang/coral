@@ -138,6 +138,7 @@ const u32 MI_PAGE_SIZES[MI_SIZE_CLASS_COUNT] = {
 // Size class lookup table for O(1) size class determination (sizes <= 1024)
 // Index = (size - 1) >> 3 for sizes up to 128, then use MI_BLOCK_SIZES for larger
 static const u8 MI_SIZE_CLASS_SMALL[129] = {
+    0,                // size 0 (unused)
     0,0,0,0,0,0,0,0,  // 1-8: sc 0 (8)
     1,1,1,1,1,1,1,1,  // 9-16: sc 1 (16)
     2,2,2,2,2,2,2,2,  // 17-24: sc 2 (24)
@@ -157,10 +158,8 @@ u32 _miSizeClass(usize size)
     if (size == 0) return 0;
     // Fast path for small sizes (<= 128) using lookup table
     if (size <= 128) return (u32)MI_SIZE_CLASS_SMALL[size];
-    // Fast path for medium sizes (129-1024) using division
-    if (size <= 1024) return 8 + (u32)((size - 129) / 16);
-    // Slow path for large sizes
-    for (u32 i = 0; i < MI_SIZE_CLASS_COUNT; i++)
+    // Larger sizes: first class whose block size fits
+    for (u32 i = 12; i < MI_SIZE_CLASS_COUNT; i++)
     {
         if (size <= (usize)MI_BLOCK_SIZES[i]) return i;
     }
@@ -929,8 +928,8 @@ pub struct MiAlloc
 
         u32 sc = _miSizeClass(size);
 
-        // Handle huge allocations directly
-        if (size >= MI_HUGE_THRESHOLD)
+        // Handle allocations above the largest size class directly
+        if (size > (usize)MI_BLOCK_SIZES[MI_SIZE_CLASS_COUNT - 1])
         {
             usize allocSize = (size + 255) & ~(usize)255; // align to 256 bytes
             u8* mem = (u8*)mmap(null, allocSize, 3, 0x22, -1, 0);
@@ -1091,8 +1090,8 @@ pub struct MiAlloc
         MiPage* page = _miPageFind(&self.heap, ptr);
         if (page == null) return;
 
-        // Handle huge page deallocation
-        if (page->capacity == 1 && page->blockSize >= MI_HUGE_THRESHOLD)
+        // Handle huge page deallocation (single mmap-backed page)
+        if (page->segment == null)
         {
             // Unlink from hugePages
             MiPage** pp = &self.heap.hugePages;
@@ -1127,8 +1126,8 @@ pub struct MiAlloc
         u32 oldSc = page->sizeClass;
         u32 newSc = _miSizeClass(newSize);
 
-        // Same size class - no-op
-        if (oldSc == newSc) return ptr;
+        // Same size class - no-op when the existing block still fits
+        if (oldSc == newSc && newSize <= (usize)page->blockSize) return ptr;
 
         // Allocate new, copy, free old
         rawptr newPtr = self.alloc(newSize);

@@ -1763,6 +1763,9 @@ struct crl__loc__coral_semantics__sema__Sema {
     uint32_t aliasLen;
     uint32_t aliasCap;
     uint32_t comptimeDepth;
+    crl__loc__coral_common__slice__Slice* modKeys;
+    crl__loc__coral_common__slice__Slice* modVals;
+    uint32_t modLen;
 };
 struct crl__loc__coral_mono__mono__MonoDecl {
     crl__loc__coral_mono__mono__MonoDeclKind kind;
@@ -1950,6 +1953,13 @@ struct crl__loc__coral_backend__codegen__Codegen {
     crl__loc__coral_backend__codegen__Stream ebuf;
     crl__loc__coral_backend__codegen__Stream tybuf;
     crl__loc__coral_backend__codegen__Stream tdecl;
+    crl__loc__coral_backend__codegen__Stream typedefs;
+    crl__loc__coral_common__slice__Slice* protoFnNames;
+    uint32_t protoFnLen;
+    uint32_t protoFnCap;
+    crl__loc__coral_common__slice__Slice* bodyFnNames;
+    uint32_t bodyFnLen;
+    uint32_t bodyFnCap;
     crl__loc__coral_mono__mono__MonoSubstitution* subs;
     uint32_t subsLen;
     uint32_t errors;
@@ -1961,6 +1971,10 @@ struct crl__loc__coral_backend__codegen__Codegen {
     uint32_t tempsLen;
     uint32_t loopDepth;
     uint32_t loopCap;
+    uint32_t* breakKinds;
+    uint32_t* breakLabels;
+    uint32_t breakDepth;
+    uint32_t switchSeq;
     uint32_t* declCacheNames;
     uint32_t* declCacheIds;
     uint32_t* declCacheTags;
@@ -3100,6 +3114,8 @@ _Bool crl__loc__coral_semantics__decl__Sema_moduleExportsContain(crl__loc__coral
 _Bool crl__loc__coral_semantics__decl__Sema_isRootSegment(crl__loc__coral_semantics__sema__Sema* self, uint8_t* ptr, uint32_t len);
 uint32_t crl__loc__coral_semantics__decl__Sema_importSymbolModulePath(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__decl__Decl* decl, uint32_t symbolName);
 _Bool crl__loc__coral_semantics__decl__Sema_importPathInFile(crl__loc__coral_semantics__sema__Sema* self, uint32_t path, uint32_t fileId);
+crl__loc__coral_common__slice__Slice crl__loc__coral_semantics__decl__Sema_moduleFileForPath(crl__loc__coral_semantics__sema__Sema* self, uint32_t modulePath);
+_Bool crl__loc__coral_semantics__decl__Sema_filePathEndsWith(crl__loc__coral_semantics__sema__Sema* self, uint32_t fileId, crl__loc__coral_common__slice__Slice suffix);
 _Bool crl__loc__coral_semantics__decl__Sema_bindImportSymbols(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__decl__Decl* decl, _coral_str notFoundMsg);
 _Bool crl__loc__coral_semantics__decl__Sema_checkImportDecl(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__decl__Decl* decl);
 _Bool crl__loc__coral_semantics__decl__Sema_checkFile(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__decl__File* file);
@@ -3178,6 +3194,9 @@ uint32_t crl__loc__coral_backend__codegen__cgLabel(crl__loc__coral_backend__code
 uint32_t crl__loc__coral_backend__codegen__cgNewTemp(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice ty, uint32_t arrLen);
 crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgTempName(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
 void crl__loc__coral_backend__codegen__cgPopLoop(crl__loc__coral_backend__codegen__Codegen* cg);
+void crl__loc__coral_backend__codegen__cgPushLoop(crl__loc__coral_backend__codegen__Codegen* cg);
+void crl__loc__coral_backend__codegen__cgPushSwitch(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t label);
+void crl__loc__coral_backend__codegen__cgPopSwitch(crl__loc__coral_backend__codegen__Codegen* cg);
 crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgIntern(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t s);
 crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgTail(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_backend__codegen__Stream* s, size_t start);
 uint32_t crl__loc__coral_backend__codegen__cgSubstTy(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
@@ -3221,6 +3240,8 @@ crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__tyStrPut(
 crl__loc__coral_common__slice__Slice tyStr(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
 _Bool crl__loc__coral_backend__codegen__cgRegHas(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name);
 void crl__loc__coral_backend__codegen__cgRegAdd(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name);
+_Bool crl__loc__coral_backend__codegen__cgFnSeen(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name, _Bool proto);
+void crl__loc__coral_backend__codegen__cgFnSee(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name, _Bool proto);
 crl__loc__coral_common__slice__Slice cgRegName(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
 crl__loc__coral_common__slice__Slice cgRegName(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
 void crl__loc__coral_backend__codegen__cgRegEnsure(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t);
@@ -3293,6 +3314,7 @@ _Bool crl__loc__coral_frontend__compile__endsWithCrl(crl__loc__coral_common__sli
 crl__loc__coral_common__slice__Slice crl__loc__coral_frontend__compile__defaultOutput(crl__loc__coral_common__slice__Slice input);
 size_t crl__loc__coral_frontend__compile__appendStr(uint8_t* buf, size_t cap, size_t len, _coral_str s);
 size_t crl__loc__coral_frontend__compile__appendSlice(uint8_t* buf, size_t cap, size_t len, crl__loc__coral_common__slice__Slice s);
+_Bool crl__loc__coral_frontend__compile__codeHasSlice(crl__loc__coral_common__slice__Slice code, _coral_str pat);
 _Bool crl__loc__coral_frontend__compile__codeHasMain(crl__loc__coral_common__slice__Slice code);
 int32_t crl__loc__coral_frontend__compile__compileUnitTo(_coral_str inPath, _coral_str outPath, crl__loc__coral_common__slice__Slice* flagsN, crl__loc__coral_common__slice__Slice* flagsV, uint32_t nFlags, size_t errorLimit, _Bool allowIntPtr, _Bool noPrelude, _Bool quiet, _Bool dryRun, crl__loc__coral_common__slice__Slice* modKeys, crl__loc__coral_common__slice__Slice* modVals, uint32_t modLen);
 int32_t crl__loc__coral_frontend__compile__compileFile(crl__loc__coral_frontend__args__Options* opts);
@@ -3620,7 +3642,7 @@ uint32_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SEGMENT_
 uint32_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_COUNT = 44;
 uint32_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_BLOCK_SIZES[44] = {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384, 20480, 24576, 28672, 32768};
 uint32_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_PAGE_SIZES[44] = {4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 8192, 8192, 8192, 8192, 16384, 16384, 16384, 16384, 32768, 32768, 32768, 32768, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536, 65536};
-uint8_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_SMALL[129] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11};
+uint8_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_SMALL[129] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11};
 static crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiSegmentMap crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miGlobalPages;
 static uint64_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miMapLockWord = 0;
 uint32_t crl__lib__std__x86_64__linux__memory__allocators__tlsf__FLI_COUNT = 32;
@@ -4277,12 +4299,8 @@ uint32_t crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miSizeClas
     {
         return ((uint32_t)(crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_SMALL[size]));
     }
-    if (((size <= 1024)))
-    {
-        return ((8 + ((uint32_t)(((((size - 129)) / 16))))));
-    }
     for (
-    uint32_t i = 0;((i < crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_COUNT));((i)++))
+    uint32_t i = 12;((i < crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_COUNT));((i)++))
     {
         if (((size <= ((size_t)(crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_BLOCK_SIZES[i])))))
         {
@@ -5008,7 +5026,7 @@ void* crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiAlloc_alloc(
         crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miProcessDelayedFree((&(self->heap)));
     }
     uint32_t sc = crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miSizeClass(size);
-    if (((size >= crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_HUGE_THRESHOLD)))
+    if (((size > ((size_t)(crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_BLOCK_SIZES[((crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_SIZE_CLASS_COUNT - 1))])))))
     {
         size_t allocSize = ((((size + 255)) & (~(((size_t)(255))))));
         uint8_t* mem = ((uint8_t*)(mmap(0, allocSize, 3, 34, (-(1)), 0)));
@@ -5159,7 +5177,7 @@ void crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiAlloc_free(cr
     {
         return;
     }
-    if (((((page->capacity == 1))) && (((page->blockSize >= crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MI_HUGE_THRESHOLD)))))
+    if (((page->segment == 0)))
     {
         crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiPage** pp = (&(self->heap.hugePages));
         while ((((*(pp)) != 0)))
@@ -5197,7 +5215,7 @@ void* crl__lib__std__x86_64__linux__memory__allocators__mimalloc__MiAlloc_reallo
     }
     uint32_t oldSc = page->sizeClass;
     uint32_t newSc = crl__lib__std__x86_64__linux__memory__allocators__mimalloc___miSizeClass(newSize);
-    if (((oldSc == newSc)))
+    if (((((oldSc == newSc))) && (((newSize <= ((size_t)(page->blockSize)))))))
     {
         return ptr;
     }
@@ -7662,6 +7680,7 @@ crl__loc__coral_build__token__CrlbToken crl__loc__coral_build__lexer__CrlbLexer_
                         ((decoded = esc));
                     }
                 }
+                __Lsw0:;
                 ((self->src.ptr[writePos] = decoded));
                 ((writePos)++);
                 continue;
@@ -7902,6 +7921,7 @@ _coral_str crl__loc__coral_build__ast__nodeKindName(crl__loc__coral_build__ast__
             return (_coral_str){ (const uint8_t*)"node", 4 };
         }
     }
+    __Lsw1:;
 }
 void crl__loc__coral_build__ast__CrlbNode_init(crl__loc__coral_build__ast__CrlbNode* self, crl__loc__coral_build__ast__CrlbNodeKind k, crl__loc__coral_build__arena__Arena* a) {
     ((self->kind = k));
@@ -8118,6 +8138,7 @@ crl__loc__coral_build__ast__Value crl__loc__coral_build__parser__CrlbParser_pars
             return v;
         }
     }
+    __Lsw2:;
 }
 _Bool crl__loc__coral_build__parser__CrlbParser_childKind(crl__loc__coral_build__parser__CrlbParser* self, crl__loc__coral_common__slice__Slice name, crl__loc__coral_build__ast__CrlbNodeKind* out) {
     if (crl__loc__coral_common__slice__Slice_eq((&(name)), crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"override", 8 })))
@@ -10873,21 +10894,6 @@ int32_t crl__loc__coral_build__builder__builderRunEx(crl__loc__coral_build__ast_
                 printf("%c", b.mods[idx].name.ptr[n]);
                 ((n)++);
             }
-            if (b.force)
-            {
-                printf("  forced-stale\n");
-            }
-            else
-            {
-                if (b.mods[idx].stale)
-                {
-                    printf("  stale\n");
-                }
-                else
-                {
-                    printf("  fresh\n");
-                }
-            }
             ((i)++);
         }
     }
@@ -11656,6 +11662,7 @@ crl__loc__coral_frontend__args__Flag crl__loc__coral_frontend__args__classifyFla
             return crl__loc__coral_frontend__args__Flag_Other;
         }
     }
+    __Lsw3:;
     return crl__loc__coral_frontend__args__Flag_Other;
 }
 void crl__loc__coral_frontend__args__usage(void) {
@@ -11865,6 +11872,7 @@ _Bool crl__loc__coral_frontend__args__parseArgs(crl__loc__coral_frontend__args__
                 return 0;
             }
         }
+        __Lsw4:;
         if (((tok.ptr[0] == 45)))
         {
             printf("coralc: unknown flag: %s\n", crl__loc__coral_frontend__io__sliceCStr(tok));
@@ -11917,6 +11925,7 @@ _Bool crl__loc__coral_frontend__args__parseArgs(crl__loc__coral_frontend__args__
             {
             }
         }
+        __Lsw5:;
         if ((!(known)))
         {
             size_t i = tok.len;
@@ -12555,6 +12564,7 @@ _coral_str crl__loc__coral_diagnostics__code__codeStr(crl__loc__coral_diagnostic
             return (_coral_str){ (const uint8_t*)"404-0000", 8 };
         }
     }
+    __Lsw6:;
 }
 crl__loc__coral_ast__id__SourceLoc crl__loc__coral_ast__id__makeLoc(uint32_t file, uint32_t line, uint32_t col) {
     crl__loc__coral_ast__id__SourceLoc loc;
@@ -13803,6 +13813,7 @@ crl__loc__coral_lexer__escape__EscapeResult crl__loc__coral_lexer__escape__Escap
             ((esc.codepoint = ((uint32_t)(next))));
         }
     }
+    __Lsw7:;
     return esc;
 }
 void crl__loc__coral_lexer__skip_ws__Lexer_skipWsCmts(crl__loc__coral_lexer__base__Lexer* self) {
@@ -13881,6 +13892,7 @@ void crl__loc__coral_lexer__skip_ws__Lexer_skipWsCmts(crl__loc__coral_lexer__bas
                 return;
             }
         }
+        __Lsw8:;
     }
 }
 uint64_t crl__loc__coral_lexer__number__Lexer_parseInteger(crl__loc__coral_lexer__base__Lexer* self, crl__loc__coral_common__slice__Slice data, uint32_t base) {
@@ -14049,6 +14061,7 @@ crl__loc__coral_common__token__Token crl__loc__coral_lexer__number__Lexer_makePr
             ((base = 8));
         }
     }
+    __Lsw9:;
     if (((base != 0)))
     {
         ((token.number = crl__loc__coral_lexer__number__Lexer_parseInteger(self, token.data, base)));
@@ -14613,6 +14626,7 @@ crl__loc__coral_common__token__Token crl__loc__coral_lexer__operator__Lexer_lexP
             return crl__loc__coral_lexer__base__Lexer_makeToken(self, crl__loc__coral_common__token__TokenKind_Unknown, start);
         }
     }
+    __Lsw10:;
 }
 crl__loc__coral_common__token__Token crl__loc__coral_lexer__lexer__Lexer_nextToken(crl__loc__coral_lexer__base__Lexer* self) {
     if (crl__loc__coral_lexer__base__Lexer_isAtEnd(self))
@@ -15602,6 +15616,7 @@ _Bool crl__loc__coral_parser__parser__Parser_consumeGreater(crl__loc__coral_pars
             return 0;
         }
     }
+    __Lsw11:;
 }
 uint32_t crl__loc__coral_parser__recovery__Parser_errorCount(crl__loc__coral_parser__base__Parser* self) {
     return ((self->panicMode & 1073741823));
@@ -15751,6 +15766,7 @@ _coral_str crl__loc__coral_parser__recovery__Parser_expectedTokenText(crl__loc__
             return (_coral_str){ (const uint8_t*)"expected token", 14 };
         }
     }
+    __Lsw12:;
 }
 void crl__loc__coral_parser__recovery__Parser_reportExpected(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_common__token__TokenKind kind) {
     if (((self->current.kind == crl__loc__coral_common__token__TokenKind_Eof)))
@@ -16117,6 +16133,7 @@ _Bool crl__loc__coral_parser__pattern__Parser_isDeclarationStart(crl__loc__coral
             return 0;
         }
     }
+    __Lsw13:;
 }
 crl__loc__coral_ast__decl__File* crl__loc__coral_parser__file__Parser_parseFile(crl__loc__coral_parser__base__Parser* self, uint32_t path) {
     crl__loc__coral_parser__type__Parser_prescanConstInts(self);
@@ -16355,6 +16372,7 @@ int32_t crl__loc__coral_parser__expr__Parser_prec(crl__loc__coral_parser__base__
             return 0;
         }
     }
+    __Lsw14:;
 }
 _Bool crl__loc__coral_parser__expr__Parser_isAssignOp(crl__loc__coral_parser__base__Parser* self, crl__loc__coral_common__token__TokenKind kind) {
     return ((((((((((((((((((((((((kind == crl__loc__coral_common__token__TokenKind_Equal))) || (((kind == crl__loc__coral_common__token__TokenKind_PlusEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_MinusEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_StarEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_SlashEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_PercentEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_AmpEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_PipeEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_CaretEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_ShlEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_ShrEqual))))) || (((kind == crl__loc__coral_common__token__TokenKind_NegEqual))));
@@ -16691,6 +16709,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__expr__Parser_makeBinOp(c
             return crl__loc__coral_parser__parser__Parser_allocNode(self);
         }
     }
+    __Lsw15:;
 }
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__expr__Parser_parseUnaryExpr(crl__loc__coral_parser__base__Parser* self) {
     if (((self->current.kind == crl__loc__coral_common__token__TokenKind_Not)))
@@ -17176,6 +17195,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__expr__Parser_parsePrimar
                     {
                     }
                 }
+                __Lsw17:;
                 if (isStatement)
                 {
                     ((result = crl__loc__coral_parser__stmt__Parser_parseStmt(self)));
@@ -17371,6 +17391,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__expr__Parser_parsePrimar
             return crl__loc__coral_parser__parser__Parser_noneNode(self);
         }
     }
+    __Lsw16:;
 }
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__expr__Parser_parseLiteralFields(crl__loc__coral_parser__base__Parser* self, uint32_t typeNode, uint32_t variantName) {
     crl__loc__coral_parser__parser__Parser_expect(self, crl__loc__coral_common__token__TokenKind_LBrace);
@@ -18439,6 +18460,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__decl__Parser_parseDecl(c
         {
         }
     }
+    __Lsw18:;
     if (((((isExtern) || (isStatic))) || (crl__loc__coral_parser__decl__Parser_isTypeStart(self))))
     {
         return crl__loc__coral_parser__decl__Parser_parseFuncOrVarDecl(self, isPub, isExtern, isStatic, isConst);
@@ -18608,6 +18630,7 @@ _Bool crl__loc__coral_parser__decl__Parser_isTypeStart(crl__loc__coral_parser__b
             return 0;
         }
     }
+    __Lsw19:;
 }
 void crl__loc__coral_parser__decl__Parser_rebindTypeParams(crl__loc__coral_parser__base__Parser* self, uint32_t ty, crl__loc__coral_ast__id__NodeId* genericValues, uint32_t genericCount) {
     if (((((ty == 0))) || (((genericCount == 0)))))
@@ -18702,6 +18725,7 @@ void crl__loc__coral_parser__decl__Parser_rebindTypeParams(crl__loc__coral_parse
             return;
         }
     }
+    __Lsw20:;
 }
 crl__loc__coral_ast__id__NodeId crl__loc__coral_parser__decl__Parser_parseFuncOrVarDecl(crl__loc__coral_parser__base__Parser* self, _Bool isPub, _Bool isExtern, _Bool isStatic, _Bool isConst) {
     uint32_t retType = crl__loc__coral_parser__type__Parser_parseType(self);
@@ -20778,6 +20802,9 @@ void crl__loc__coral_semantics__sema__Sema_init(crl__loc__coral_semantics__sema_
     ((self->aliasLen = 0));
     ((self->aliasCap = 0));
     ((self->comptimeDepth = 0));
+    ((self->modKeys = 0));
+    ((self->modVals = 0));
+    ((self->modLen = 0));
 }
 void crl__loc__coral_semantics__sema__Sema_deinit(crl__loc__coral_semantics__sema__Sema* self) {
     if (((self->scopes != 0)))
@@ -21316,6 +21343,7 @@ uint8_t* crl__loc__coral_semantics__sema__Sema_tySpelling(crl__loc__coral_semant
             crl__loc__coral_semantics__sema__Sema_tyAppend(self, buf, cap, (&(len)), (_coral_str){ (const uint8_t*)"?", 1 });
         }
     }
+    __Lsw21:;
     crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(sub);
     crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(digits);
     return buf;
@@ -21922,6 +21950,7 @@ _Bool crl__loc__coral_semantics__typecheck__Sema_sameType(crl__loc__coral_semant
             return 1;
         }
     }
+    __Lsw22:;
 }
 uint32_t crl__loc__coral_semantics__typecheck__Sema_resolveScalarAlias(crl__loc__coral_semantics__sema__Sema* self, uint32_t t) {
     uint32_t guard = 0;
@@ -22031,6 +22060,7 @@ uint32_t crl__loc__coral_semantics__typecheck__Sema_intWidth(crl__loc__coral_sem
             return 0;
         }
     }
+    __Lsw23:;
 }
 _Bool crl__loc__coral_semantics__typecheck__Sema_intSigned(crl__loc__coral_semantics__sema__Sema* self, uint32_t t) {
     if (((t == 0)))
@@ -22051,6 +22081,7 @@ _Bool crl__loc__coral_semantics__typecheck__Sema_intSigned(crl__loc__coral_seman
             return 0;
         }
     }
+    __Lsw24:;
 }
 _Bool crl__loc__coral_semantics__typecheck__Sema_integerType(crl__loc__coral_semantics__sema__Sema* self, uint32_t typeNode) {
     if (((typeNode == 0)))
@@ -22137,6 +22168,7 @@ uint32_t crl__loc__coral_semantics__typecheck__Sema_genericCount(crl__loc__coral
             return 0;
         }
     }
+    __Lsw25:;
 }
 _Bool crl__loc__coral_semantics__typecheck__Sema_checkType(crl__loc__coral_semantics__sema__Sema* self, uint32_t typeNode) {
     if (((typeNode == 0)))
@@ -22263,6 +22295,7 @@ _Bool crl__loc__coral_semantics__typecheck__Sema_checkType(crl__loc__coral_seman
             return 1;
         }
     }
+    __Lsw26:;
 }
 _Bool crl__loc__coral_semantics__typecheck__Sema_dependentType(crl__loc__coral_semantics__sema__Sema* self, uint32_t typeNode) {
     if (((typeNode == 0)))
@@ -22595,6 +22628,7 @@ _Bool crl__loc__coral_semantics__typecheck__Sema_sameTypePattern(crl__loc__coral
             return 1;
         }
     }
+    __Lsw27:;
     return 1;
 }
 uint32_t crl__loc__coral_semantics__typecheck__Sema_substituteFieldTy(crl__loc__coral_semantics__sema__Sema* self, uint32_t fieldType, uint32_t objectType) {
@@ -22776,6 +22810,7 @@ uint32_t crl__loc__coral_semantics__typecheck__Sema_substituteFieldTy(crl__loc__
             return fieldType;
         }
     }
+    __Lsw28:;
 }
 uint32_t crl__loc__coral_semantics__typecheck__Sema_unqualTy(crl__loc__coral_semantics__sema__Sema* self, uint32_t t) {
     uint32_t guard = 0;
@@ -23204,6 +23239,7 @@ uint32_t crl__loc__coral_mono__mono__MonoContext_substituteType(crl__loc__coral_
             return typeNode;
         }
     }
+    __Lsw29:;
 }
 _Bool crl__loc__coral_mono__mono__MonoContext_reserveDeclarations(crl__loc__coral_mono__mono__MonoContext* self) {
     if (((self->declarationsLen < self->declarationsCap)))
@@ -23479,6 +23515,7 @@ uint64_t crl__loc__coral_mono__mono__MonoContext_typeDigest(crl__loc__coral_mono
             return ((uint64_t)(t));
         }
     }
+    __Lsw30:;
 }
 uint64_t crl__loc__coral_mono__mono__MonoContext_callValueKeyTyped(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId* args, uint32_t argsLen, crl__loc__coral_mono__mono__MonoSubstitution* subs, uint32_t subsLen) {
     uint64_t h = crl__loc__coral_mono__mono__MonoContext_callValueKey(self, args, argsLen);
@@ -23654,6 +23691,7 @@ uint8_t crl__loc__coral_mono__mono__MonoContext_declarationKind(crl__loc__coral_
             return 0;
         }
     }
+    __Lsw31:;
 }
 uint32_t crl__loc__coral_mono__mono__MonoContext_declarationName(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
     crl__loc__coral_ast__decl__Decl* decl = crl__loc__coral_mono__mono__MonoContext_declAt(self, id);
@@ -23703,6 +23741,7 @@ uint32_t crl__loc__coral_mono__mono__MonoContext_declarationName(crl__loc__coral
             return 0;
         }
     }
+    __Lsw32:;
 }
 uint32_t crl__loc__coral_mono__mono__MonoContext_parameterName(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
     crl__loc__coral_ast__node__Node* node = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, id);
@@ -23800,6 +23839,7 @@ uint32_t crl__loc__coral_mono__mono__MonoContext_explicitGenericCount(crl__loc__
             return 0;
         }
     }
+    __Lsw33:;
 }
 _Bool crl__loc__coral_mono__mono__MonoContext_nameInGenericParams(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id, uint32_t name) {
     crl__loc__coral_ast__decl__Decl* decl = crl__loc__coral_mono__mono__MonoContext_declAt(self, id);
@@ -23850,6 +23890,7 @@ _Bool crl__loc__coral_mono__mono__MonoContext_nameInGenericParams(crl__loc__cora
             return 0;
         }
     }
+    __Lsw34:;
     uint32_t i = 0;
     while (((i < len)))
     {
@@ -24614,6 +24655,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectExpr(crl__loc__coral_mon
             return 1;
         }
     }
+    __Lsw35:;
 }
 _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
     crl__loc__coral_ast__node__Node* node = crl__loc__coral_mono__mono__MonoContext_nodeAt(self, id);
@@ -24689,6 +24731,7 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectStmt(crl__loc__coral_mon
             return 1;
         }
     }
+    __Lsw36:;
 }
 _Bool crl__loc__coral_mono__collect__MonoContext_collectDecl(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__id__NodeId id) {
     crl__loc__coral_ast__decl__Decl* decl = crl__loc__coral_mono__mono__MonoContext_declAt(self, id);
@@ -24779,12 +24822,43 @@ _Bool crl__loc__coral_mono__collect__MonoContext_collectDecl(crl__loc__coral_mon
             return crl__loc__coral_mono__collect__MonoContext_collectType(self, decl->kind.u.v12.baseType);
         }
     }
+    else if ((decl->kind.tag == 7))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < decl->kind.u.v7.methodsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectDecl(self, decl->kind.u.v7.methods[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
+    else if ((decl->kind.tag == 8))
+    {
+        {
+            uint32_t i = 0;
+            while (((i < decl->kind.u.v8.methodsLen)))
+            {
+                if ((!(crl__loc__coral_mono__collect__MonoContext_collectDecl(self, decl->kind.u.v8.methods[i]))))
+                {
+                    return 0;
+                }
+                ((i)++);
+            }
+            return 1;
+        }
+    }
     else
     {
         {
             return 1;
         }
     }
+    __Lsw37:;
 }
 _Bool crl__loc__coral_mono__collect__MonoContext_collectFile(crl__loc__coral_mono__mono__MonoContext* self, crl__loc__coral_ast__decl__File* file) {
     ((self->file = file));
@@ -25168,6 +25242,7 @@ crl__loc__coral_semantics__member__MemberInfo crl__loc__coral_semantics__member_
             {
             }
         }
+        __Lsw38:;
         uint32_t i = 0;
         while (((i < methodCount)))
         {
@@ -26039,6 +26114,7 @@ _Bool crl__loc__coral_mono__comptime__CtEval_matchPat(crl__loc__coral_mono__comp
             return 0;
         }
     }
+    __Lsw39:;
 }
 _Bool crl__loc__coral_mono__comptime__CtEval_matchLitPat(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId patId, uint64_t val) {
     crl__loc__coral_ast__node__Node* pn = crl__loc__coral_mono__comptime__CtEval_nodeAt(self, patId);
@@ -27018,6 +27094,7 @@ crl__loc__coral_mono__comptime__CtVal crl__loc__coral_mono__comptime__CtEval_eva
             return crl__loc__coral_mono__comptime__CtEval_makeRt(self, id, rt);
         }
     }
+    __Lsw40:;
 }
 crl__loc__coral_mono__comptime__CtVal crl__loc__coral_mono__comptime__CtEval_evalIntBin(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId lid, crl__loc__coral_ast__id__NodeId rid, uint32_t op, uint8_t cmp) {
     crl__loc__coral_mono__comptime__CtVal l = crl__loc__coral_mono__comptime__CtEval_evalExpr(self, lid);
@@ -27307,6 +27384,7 @@ void crl__loc__coral_mono__comptime__CtEval_evalStmt(crl__loc__coral_mono__compt
             return;
         }
     }
+    __Lsw41:;
 }
 void crl__loc__coral_mono__comptime__CtEval_evalVarDecl(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__stmt__Stmt* s) {
     uint32_t name = s->kind.u.v1.name;
@@ -27367,6 +27445,7 @@ _Bool crl__loc__coral_mono__comptime__CtEval_assignExprTag(crl__loc__coral_mono_
             return 0;
         }
     }
+    __Lsw42:;
 }
 _Bool crl__loc__coral_mono__comptime__CtEval_tryFoldAssign(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__expr__Expr* e) {
     crl__loc__coral_ast__id__NodeId t;
@@ -27454,6 +27533,7 @@ _Bool crl__loc__coral_mono__comptime__CtEval_tryFoldAssign(crl__loc__coral_mono_
             return 0;
         }
     }
+    __Lsw43:;
     crl__loc__coral_ast__node__Node* tn = crl__loc__coral_mono__comptime__CtEval_nodeAt(self, t);
     if (((((tn == 0))) || (((tn->kind.tag != 1)))))
     {
@@ -27639,6 +27719,7 @@ _Bool crl__loc__coral_mono__comptime__CtEval_tryFoldInc(crl__loc__coral_mono__co
             return 0;
         }
     }
+    __Lsw44:;
     crl__loc__coral_ast__node__Node* tn = crl__loc__coral_mono__comptime__CtEval_nodeAt(self, t);
     if (((((tn == 0))) || (((tn->kind.tag != 1)))))
     {
@@ -27899,6 +27980,7 @@ void crl__loc__coral_mono__comptime__CtEval_collectLoopAssigns(crl__loc__coral_m
                         return;
                     }
                 }
+                __Lsw46:;
                 crl__loc__coral_mono__comptime__CtEval_collectAssignTarget(self, t, names, len, cap);
             }
             return;
@@ -27985,6 +28067,7 @@ void crl__loc__coral_mono__comptime__CtEval_collectLoopAssigns(crl__loc__coral_m
             return;
         }
     }
+    __Lsw45:;
 }
 void crl__loc__coral_mono__comptime__CtEval_collectAssignTarget(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId t, uint32_t* names, uint32_t* len, uint32_t cap) {
     crl__loc__coral_ast__node__Node* tn = crl__loc__coral_mono__comptime__CtEval_nodeAt(self, t);
@@ -28215,6 +28298,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_mono__comptime__CtEval_rwStmt(cr
             return stmtId;
         }
     }
+    __Lsw47:;
 }
 void crl__loc__coral_mono__comptime__CtEval_evalIf(crl__loc__coral_mono__comptime__CtEval* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__stmt__Stmt* s) {
     crl__loc__coral_mono__comptime__CtVal c = crl__loc__coral_mono__comptime__CtEval_evalExpr(self, s->kind.u.v7.cond);
@@ -28645,6 +28729,7 @@ crl__loc__coral_mono__mono__MonoSubstitution* crl__loc__coral_mono__instantiate_
         {
         }
     }
+    __Lsw48:;
     uint32_t i = 0;
     while (((((i < paramCount))) && (((next < argumentsLen)))))
     {
@@ -29364,6 +29449,7 @@ _Bool crl__loc__coral_semantics__decl__Sema_checkDecl(crl__loc__coral_semantics_
         {
         }
     }
+    __Lsw49:;
     if (((((name != 0))) && ((!(bodies)))))
     {
         _Bool protoPair = 0;
@@ -29383,9 +29469,22 @@ _Bool crl__loc__coral_semantics__decl__Sema_checkDecl(crl__loc__coral_semantics_
                 }
             }
         }
-        if ((((((!(crl__loc__coral_semantics__scope__ScopeStack_declare(self->scopes, name, kind, typeNode, id, symbolFlags, crl__loc__coral_semantics__sema__Sema_fileOf(self, id))))) && (((self->scopes->lastDeclFail == 1))))) && ((!(protoPair)))))
+        if ((!(crl__loc__coral_semantics__scope__ScopeStack_declare(self->scopes, name, kind, typeNode, id, symbolFlags, crl__loc__coral_semantics__sema__Sema_fileOf(self, id)))))
         {
-            crl__loc__coral_semantics__sema__Sema_dupDeclDiag(self, name, id);
+            if (((protoPair) && (((self->scopes->lastDeclFail == 1)))))
+            {
+                if (((self->scopes->errors > 0)))
+                {
+                    ((self->scopes->errors = ((self->scopes->errors - 1))));
+                }
+            }
+            else
+            {
+                if (((self->scopes->lastDeclFail == 1)))
+                {
+                    crl__loc__coral_semantics__sema__Sema_dupDeclDiag(self, name, id);
+                }
+            }
         }
     }
     if ((!(bodies)))
@@ -29539,9 +29638,9 @@ uint32_t crl__loc__coral_semantics__decl__Sema_importSymbolModulePath(crl__loc__
     crl__loc__coral_context__context__InternEntry* se = ((self->ctx->interns + symbolName));
     size_t last = 0;
     size_t q = 0;
-    while (((((q)++) < se->len)))
+    while (((((q + 1)) < se->len)))
     {
-        if (((((se->ptr[q] == 58))) && (((se->ptr[((q)++)] == 58)))))
+        if (((((se->ptr[q] == 58))) && (((se->ptr[((q + 1))] == 58)))))
         {
             ((last = q));
         }
@@ -29552,7 +29651,7 @@ uint32_t crl__loc__coral_semantics__decl__Sema_importSymbolModulePath(crl__loc__
         return base;
     }
     crl__loc__coral_context__context__InternEntry* pe = ((self->ctx->interns + base));
-    if (((last > ((pe->len)++))))
+    if (((last > ((pe->len + 1)))))
     {
         _Bool absolute = 1;
         size_t chk = 0;
@@ -29565,7 +29664,7 @@ uint32_t crl__loc__coral_semantics__decl__Sema_importSymbolModulePath(crl__loc__
             }
             ((chk)++);
         }
-        if (((absolute) && (((((se->ptr[pe->len] != 58))) || (((se->ptr[((pe->len)++)] != 58)))))))
+        if (((absolute) && (((((se->ptr[pe->len] != 58))) || (((se->ptr[((pe->len + 1))] != 58)))))))
         {
             ((absolute = 0));
         }
@@ -29587,7 +29686,7 @@ uint32_t crl__loc__coral_semantics__decl__Sema_importSymbolModulePath(crl__loc__
         ((k)++);
     }
     ((buf[k] = 58));
-    ((buf[((k)++)] = 58));
+    ((buf[((k + 1))] = 58));
     size_t m = 0;
     while (((m < last)))
     {
@@ -29621,9 +29720,9 @@ _Bool crl__loc__coral_semantics__decl__Sema_importPathInFile(crl__loc__coral_sem
     {
         size_t segLen = ((pe->len - pi));
         size_t q = pi;
-        while (((((q)++) < pe->len)))
+        while (((((q + 1)) < pe->len)))
         {
-            if (((((pe->ptr[q] == 58))) && (((pe->ptr[((q)++)] == 58)))))
+            if (((((pe->ptr[q] == 58))) && (((pe->ptr[((q + 1))] == 58)))))
             {
                 ((segLen = ((q - pi))));
                 break;
@@ -29666,6 +29765,77 @@ _Bool crl__loc__coral_semantics__decl__Sema_importPathInFile(crl__loc__coral_sem
     }
     return 1;
 }
+crl__loc__coral_common__slice__Slice crl__loc__coral_semantics__decl__Sema_moduleFileForPath(crl__loc__coral_semantics__sema__Sema* self, uint32_t modulePath) {
+    if (((((self->modKeys == 0))) || (((modulePath == 0)))))
+    {
+        return crl__loc__coral_common__slice__Slice_from(0, 0);
+    }
+    crl__loc__coral_context__context__InternEntry* me = ((self->ctx->interns + modulePath));
+    uint32_t i = 0;
+    while (((i < self->modLen)))
+    {
+        crl__loc__coral_common__slice__Slice k = self->modKeys[i];
+        if (((((k.ptr != 0))) && (((k.len == me->len)))))
+        {
+            _Bool same = 1;
+            size_t j = 0;
+            while (((j < me->len)))
+            {
+                if (((k.ptr[j] != me->ptr[j])))
+                {
+                    ((same = 0));
+                    break;
+                }
+                ((j)++);
+            }
+            if (same)
+            {
+                return self->modVals[i];
+            }
+        }
+        ((i)++);
+    }
+    return crl__loc__coral_common__slice__Slice_from(0, 0);
+}
+_Bool crl__loc__coral_semantics__decl__Sema_filePathEndsWith(crl__loc__coral_semantics__sema__Sema* self, uint32_t fileId, crl__loc__coral_common__slice__Slice suffix) {
+    if (((((suffix.ptr == 0))) || (((suffix.len == 0)))))
+    {
+        return 0;
+    }
+    if (((self->diag == 0)))
+    {
+        return 0;
+    }
+    if (((((size_t)(fileId)) >= self->diag->filePaths.len)))
+    {
+        return 0;
+    }
+    _coral_str fp = crl__lib__std__x86_64__linux__collections__vec__Vec__coral_str_at((&(self->diag->filePaths)), ((size_t)(fileId)));
+    if (((((fp.ptr == 0))) || (((fp.len < suffix.len)))))
+    {
+        return 0;
+    }
+    size_t off = ((fp.len - suffix.len));
+    size_t i = 0;
+    while (((i < suffix.len)))
+    {
+        if (((fp.ptr[((off + i))] != suffix.ptr[i])))
+        {
+            return 0;
+        }
+        ((i)++);
+    }
+    if (((((off > 0))) && (((fp.ptr[((off - 1))] != 47)))))
+    {
+        return 0;
+    }
+    size_t end = ((off + suffix.len));
+    if (((((((end < fp.len))) && (((fp.ptr[end] != 47))))) && (((fp.ptr[end] != 46)))))
+    {
+        return 0;
+    }
+    return 1;
+}
 _Bool crl__loc__coral_semantics__decl__Sema_bindImportSymbols(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId id, crl__loc__coral_ast__decl__Decl* decl, _coral_str notFoundMsg) {
     uint32_t fileId = crl__loc__coral_semantics__sema__Sema_fileOf(self, id);
     uint32_t i = 0;
@@ -29680,9 +29850,9 @@ _Bool crl__loc__coral_semantics__decl__Sema_bindImportSymbols(crl__loc__coral_se
             size_t sl = se->len;
             size_t lastCol = 0;
             size_t q = 0;
-            while (((((q)++) < sl)))
+            while (((((q + 1)) < sl)))
             {
-                if (((((sp[q] == 58))) && (((sp[((q)++)] == 58)))))
+                if (((((sp[q] == 58))) && (((sp[((q + 1))] == 58)))))
                 {
                     ((lastCol = q));
                 }
@@ -29700,8 +29870,19 @@ _Bool crl__loc__coral_semantics__decl__Sema_bindImportSymbols(crl__loc__coral_se
                 if (((cands != 0)))
                 {
                     uint32_t n = crl__loc__coral_semantics__scope__ScopeStack_lookupAll(self->scopes, lookupName, cands, 16);
+                    crl__loc__coral_common__slice__Slice want = crl__loc__coral_semantics__decl__Sema_moduleFileForPath(self, modulePath);
                     uint32_t m = 0;
                     while (((m < n)))
+                    {
+                        if (crl__loc__coral_semantics__decl__Sema_filePathEndsWith(self, cands[m]->fileId, want))
+                        {
+                            ((real = cands[m]));
+                            break;
+                        }
+                        ((m)++);
+                    }
+                    ((m = 0));
+                    while (((((real == 0))) && (((m < n)))))
                     {
                         if (crl__loc__coral_semantics__decl__Sema_importPathInFile(self, modulePath, cands[m]->fileId))
                         {
@@ -29762,9 +29943,9 @@ _Bool crl__loc__coral_semantics__decl__Sema_checkImportDecl(crl__loc__coral_sema
         crl__loc__coral_context__context__InternEntry* pe = ((self->ctx->interns + path));
         size_t lastCol = 0;
         size_t q = 0;
-        while (((((q)++) < pe->len)))
+        while (((((q + 1)) < pe->len)))
         {
-            if (((((pe->ptr[q] == 58))) && (((pe->ptr[((q)++)] == 58)))))
+            if (((((pe->ptr[q] == 58))) && (((pe->ptr[((q + 1))] == 58)))))
             {
                 ((lastCol = q));
             }
@@ -30520,6 +30701,7 @@ _Bool crl__loc__coral_semantics__expr__Sema_assignCompatible(crl__loc__coral_sem
                             return 1;
                         }
                     }
+                    __Lsw50:;
                 }
             }
             if (((ev->kind.tag == 3)))
@@ -32912,6 +33094,7 @@ _Bool crl__loc__coral_semantics__expr__Sema_checkExpr(crl__loc__coral_semantics_
             return 0;
         }
     }
+    __Lsw51:;
 }
 _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__id__NodeId id) {
     if (((id.index == 0)))
@@ -33270,6 +33453,7 @@ _Bool crl__loc__coral_semantics__stmt__Sema_checkStmt(crl__loc__coral_semantics_
             return 0;
         }
     }
+    __Lsw52:;
 }
 uint32_t crl__loc__coral_semantics__stmt__Sema_resolveSelfTy(crl__loc__coral_semantics__sema__Sema* self, uint32_t t, uint32_t selfType) {
     if (((t == 0)))
@@ -33315,6 +33499,7 @@ uint32_t crl__loc__coral_semantics__stmt__Sema_resolveSelfTy(crl__loc__coral_sem
             return t;
         }
     }
+    __Lsw53:;
 }
 _Bool crl__loc__coral_semantics__stmt__Sema_checkFunction(crl__loc__coral_semantics__sema__Sema* self, crl__loc__coral_ast__decl__Decl* decl, uint32_t selfType) {
     crl__loc__coral_semantics__scope__ScopeStack_enter(self->scopes);
@@ -33645,7 +33830,7 @@ _Bool crl__loc__coral_semantics__analyze__libBytesEq(uint8_t* a, size_t al, uint
     return 1;
 }
 uint8_t* crl__loc__coral_semantics__analyze__libCandidate(uint8_t* dir, size_t dirLen, uint8_t* seg, size_t segLen, _coral_str suffix) {
-    uint8_t* p = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((((((dirLen + 1)) + segLen)) + ((suffix.len)++))));
+    uint8_t* p = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((((((((dirLen + 1)) + segLen)) + suffix.len)) + 1)));
     if (((p == 0)))
     {
         return 0;
@@ -33689,7 +33874,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libDir(uint8_t* path) {
             {
                 return 0;
             }
-            uint8_t* d = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((i)++));
+            uint8_t* d = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((i + 1)));
             if (((d == 0)))
             {
                 return 0;
@@ -33727,7 +33912,7 @@ uint32_t crl__loc__coral_semantics__analyze__libSplit(uint8_t* s, size_t n, crl_
     {
         _Bool atEnd = ((i == n));
         _Bool atSep = 0;
-        if ((((((((!(atEnd))) && (((((i)++) < n))))) && (((s[i] == 58))))) && (((s[((i)++)] == 58)))))
+        if ((((((((!(atEnd))) && (((((i + 1)) < n))))) && (((s[i] == 58))))) && (((s[((i + 1))] == 58)))))
         {
             ((atSep = 1));
         }
@@ -33850,7 +34035,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolveSegs(crl__loc__coral_sema
                                         ((got)++);
                                         ((j)++);
                                     }
-                                    uint8_t* r = crl__loc__coral_semantics__analyze__libResolveSegs(L, next, got, sub, subLen, ((depth)++));
+                                    uint8_t* r = crl__loc__coral_semantics__analyze__libResolveSegs(L, next, got, sub, subLen, ((depth + 1)));
                                     crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_semantics__analyze__LibSeg(next);
                                     if (((r != 0)))
                                     {
@@ -33867,7 +34052,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolveSegs(crl__loc__coral_sema
         }
         crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(mpath);
     }
-    return crl__loc__coral_semantics__analyze__libResolveSegs(L, ((segs)++), ((n - 1)), sub, subLen, ((depth)++));
+    return crl__loc__coral_semantics__analyze__libResolveSegs(L, ((segs + 1)), ((n - 1)), sub, subLen, ((depth + 1)));
 }
 uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantics__analyze__LibLoader* L, uint8_t* nsPtr, size_t nsLen) {
     if (((((nsPtr == 0))) || (((nsLen == 0)))))
@@ -33882,7 +34067,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
             if (crl__loc__coral_semantics__analyze__libBytesEq(L->modKeys[mi].ptr, L->modKeys[mi].len, nsPtr, nsLen))
             {
                 size_t vl = L->modVals[mi].len;
-                uint8_t* copy = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((vl)++));
+                uint8_t* copy = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((vl + 1)));
                 if (((copy == 0)))
                 {
                     return 0;
@@ -33902,7 +34087,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
         size_t bq = 0;
         while (((((bq + 1)) < nsLen)))
         {
-            if (((((nsPtr[bq] == 58))) && (((nsPtr[((bq)++)] == 58)))))
+            if (((((nsPtr[bq] == 58))) && (((nsPtr[((bq + 1))] == 58)))))
             {
                 ((bareName = 0));
                 break;
@@ -33918,7 +34103,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
                 if (((((((((key.len > ((nsLen + 2))))) && (((key.ptr[((((key.len - nsLen)) - 2))] == 58))))) && (((key.ptr[((((key.len - nsLen)) - 1))] == 58))))) && (crl__loc__coral_semantics__analyze__libBytesEq(((key.ptr + ((key.len - nsLen)))), nsLen, nsPtr, nsLen))))
                 {
                     crl__loc__coral_common__slice__Slice mv = L->modVals[mi];
-                    uint8_t* copy = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((mv.len)++));
+                    uint8_t* copy = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((mv.len + 1)));
                     if (((copy == 0)))
                     {
                         return 0;
@@ -33940,7 +34125,7 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
     size_t i = 0;
     while (((((i + 1)) < nsLen)))
     {
-        if (((((nsPtr[i] == 58))) && (((nsPtr[((i)++)] == 58)))))
+        if (((((nsPtr[i] == 58))) && (((nsPtr[((i + 1))] == 58)))))
         {
             ((maxSegs)++);
         }
@@ -34293,7 +34478,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                             size_t gq = 0;
                             while (((((gq + 1)) < ge->len)))
                             {
-                                if (((((ge->ptr[gq] == 58))) && (((ge->ptr[((gq)++)] == 58)))))
+                                if (((((ge->ptr[gq] == 58))) && (((ge->ptr[((gq + 1))] == 58)))))
                                 {
                                     ((hasGroups = 1));
                                     break;
@@ -34360,7 +34545,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                         size_t q = 0;
                         while (((((q + 1)) < se->len)))
                         {
-                            if (((((se->ptr[q] == 58))) && (((se->ptr[((q)++)] == 58)))))
+                            if (((((se->ptr[q] == 58))) && (((se->ptr[((q + 1))] == 58)))))
                             {
                                 ((lastCol = q));
                             }
@@ -34416,7 +34601,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                 size_t q = 0;
                                 while (((((q + 1)) < se->len)))
                                 {
-                                    if (((((se->ptr[q] == 58))) && (((se->ptr[((q)++)] == 58)))))
+                                    if (((((se->ptr[q] == 58))) && (((se->ptr[((q + 1))] == 58)))))
                                     {
                                         ((lastCol = q));
                                     }
@@ -34437,7 +34622,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                             }
                                             ((c)++);
                                         }
-                                        if (((absolute) && (((((se->ptr[nsLen] != 58))) || (((se->ptr[((nsLen)++)] != 58)))))))
+                                        if (((absolute) && (((((se->ptr[nsLen] != 58))) || (((se->ptr[((nsLen + 1))] != 58)))))))
                                         {
                                             ((absolute = 0));
                                         }
@@ -34464,7 +34649,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                             ((d)++);
                                         }
                                         ((dst[nsLen] = 58));
-                                        ((dst[((nsLen)++)] = 58));
+                                        ((dst[((nsLen + 1))] = 58));
                                         ((d = 0));
                                         while (((d < lastCol)))
                                         {
@@ -34664,7 +34849,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                     {
                                         ((L->errors)++);
                                     }
-                                    uint32_t* rxAliases = crl__lib__std__x86_64__linux__memory__mman__alloc_uint32_t(((size_t)(((lf->declsLen)++))));
+                                    uint32_t* rxAliases = crl__lib__std__x86_64__linux__memory__mman__alloc_uint32_t(((((size_t)(lf->declsLen)) + 1)));
                                     uint8_t* rxWant = 0;
                                     uint32_t rxCount = 0;
                                     if (((rxAliases != 0)))
@@ -34716,7 +34901,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                                                 size_t q2 = 0;
                                                                 while (((((q2 + 1)) < nl2)))
                                                                 {
-                                                                    if (((((np2[q2] == 58))) && (((np2[((q2)++)] == 58)))))
+                                                                    if (((((np2[q2] == 58))) && (((np2[((q2 + 1))] == 58)))))
                                                                     {
                                                                         ((lc = q2));
                                                                     }
@@ -34793,7 +34978,7 @@ void crl__loc__coral_semantics__analyze__libLoadImports(crl__loc__coral_semantic
                                                                 ((w)++);
                                                             }
                                                             ((nt[targetLen] = 58));
-                                                            ((nt[((targetLen)++)] = 58));
+                                                            ((nt[((targetLen + 1))] = 58));
                                                             ((w = 0));
                                                             while (((w < ae->len)))
                                                             {
@@ -34886,7 +35071,7 @@ _Bool crl__loc__coral_semantics__analyze__libMerge(crl__loc__coral_semantics__an
         {
             ((merged[k] = L->files[i]->decls[j]));
             ((k)++);
-            j;
+            ((j)++);
         }
         ((i)++);
     }
@@ -35176,9 +35361,7 @@ crl__loc__coral_semantics__analyze__CompileUnit crl__loc__coral_semantics__analy
                 crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::io::ios", 12 });
                 crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::text::string", 17 });
                 crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::option", 11 });
-                crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::Ressult", 12 });
                 crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::vec", 8 });
-                crl__loc__coral_semantics__analyze__libLoadModulePath((&(loader)), (_coral_str){ (const uint8_t*)"std::arr", 8 });
             }
             crl__loc__coral_semantics__analyze__libLoadImports((&(loader)), file);
             crl__loc__coral_semantics__analyze__libLoadSiblingImports((&(loader)), file);
@@ -35222,6 +35405,9 @@ crl__loc__coral_semantics__analyze__CompileUnit crl__loc__coral_semantics__analy
         {
             crl__loc__coral_semantics__sema__Sema_init(sema, ctx, engine);
             ((sema->allowIntPtr = allowIntPtr));
+            ((sema->modKeys = modKeys));
+            ((sema->modVals = modVals));
+            ((sema->modLen = modLen));
             crl__loc__coral_semantics__scope__ScopeStack_enter(sema->scopes);
             crl__loc__coral_semantics__decl__Sema_declareAll(sema, file);
             crl__loc__coral_semantics__decl__Sema_checkBodies(sema, file);
@@ -35433,6 +35619,33 @@ void crl__loc__coral_backend__codegen__cgPopLoop(crl__loc__coral_backend__codege
     if (((cg->loopDepth > 0)))
     {
         ((cg->loopDepth)--);
+    }
+    if (((cg->breakDepth > 0)))
+    {
+        ((cg->breakDepth)--);
+    }
+}
+void crl__loc__coral_backend__codegen__cgPushLoop(crl__loc__coral_backend__codegen__Codegen* cg) {
+    ((cg->loopDepth)++);
+    if (((cg->breakDepth < 64)))
+    {
+        ((cg->breakKinds[cg->breakDepth] = 0));
+        ((cg->breakLabels[cg->breakDepth] = 0));
+        ((cg->breakDepth)++);
+    }
+}
+void crl__loc__coral_backend__codegen__cgPushSwitch(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t label) {
+    if (((cg->breakDepth < 64)))
+    {
+        ((cg->breakKinds[cg->breakDepth] = 1));
+        ((cg->breakLabels[cg->breakDepth] = label));
+        ((cg->breakDepth)++);
+    }
+}
+void crl__loc__coral_backend__codegen__cgPopSwitch(crl__loc__coral_backend__codegen__Codegen* cg) {
+    if (((cg->breakDepth > 0)))
+    {
+        ((cg->breakDepth)--);
     }
 }
 crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgIntern(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t s) {
@@ -35652,6 +35865,7 @@ uint32_t crl__loc__coral_backend__codegen__cgDeclOwnName(crl__loc__coral_ast__de
         {
         }
     }
+    __Lsw54:;
     return dn;
 }
 _Bool crl__loc__coral_backend__codegen__cgMangleExempt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId declId, crl__loc__coral_common__slice__Slice name) {
@@ -35680,6 +35894,23 @@ _Bool crl__loc__coral_backend__codegen__cgMangleExempt(crl__loc__coral_backend__
             if (((((dd->kind.tag == 10))) && (((((dd->kind.u.v10.flags & 2)) != 0)))))
             {
                 return 1;
+            }
+            if (((((dd->kind.tag == 9))) && (((cg->file != 0)))))
+            {
+                uint32_t fi = 0;
+                while (((fi < cg->file->declsLen)))
+                {
+                    crl__loc__coral_ast__node__Node* fn = ((cg->ctx->nodes + cg->file->decls[fi].index));
+                    if (((fn->kind.tag == 3)))
+                    {
+                        crl__loc__coral_ast__decl__Decl* fd = (&(fn->kind.u.v3.value));
+                        if (((((((fd->kind.tag == 9))) && (((((fd->kind.u.v9.flags & 2)) != 0))))) && (crl__loc__coral_backend__codegen__cgSliceEq(name, crl__loc__coral_backend__codegen__cgIntern(cg, fd->kind.u.v9.name)))))
+                        {
+                            return 1;
+                        }
+                    }
+                    ((fi)++);
+                }
             }
         }
     }
@@ -35857,6 +36088,27 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_backend__codegen__cgFindTypeDecl
     if (((((cg->file == 0))) || (((name == 0)))))
     {
         return none;
+    }
+    if (((((cg->sema != 0))) && (((refFile != 0)))))
+    {
+        crl__loc__coral_semantics__scope__ScopeStack* tyScopes = cg->sema->scopes;
+        crl__loc__coral_semantics__scope__Symbol* sym = 0;
+        if (((tyScopes != 0)))
+        {
+            ((sym = crl__loc__coral_semantics__scope__ScopeStack_lookupFrom(tyScopes, name, refFile)));
+        }
+        if (((((sym != 0))) && (((sym->declaration.index != 0)))))
+        {
+            crl__loc__coral_ast__node__Node* sn = crl__loc__coral_backend__codegen__cgNode(cg, sym->declaration);
+            if (((sn->kind.tag == 3)))
+            {
+                uint32_t stag = ((uint32_t)(sn->kind.u.v3.value.kind.tag));
+                if (((((((((((((stag == 2))) || (((stag == 3))))) || (((stag == 4))))) || (((stag == 5))))) || (((stag == 11))))) || (((stag == 12)))))
+                {
+                    return sym->declaration;
+                }
+            }
+        }
     }
     crl__loc__coral_ast__id__NodeId first;
     ((first.index = 0));
@@ -36236,6 +36488,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_backend__codegen__cgFindMethodDe
                         {
                         }
                     }
+                    __Lsw55:;
                     crl__loc__coral_ast__id__NodeId hit = crl__loc__coral_backend__codegen__cgMethodsContain(cg, methods, mlen, methName);
                     if (((hit.index != 0)))
                     {
@@ -36286,6 +36539,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_backend__codegen__cgFindMethodDe
                         {
                         }
                     }
+                    __Lsw56:;
                     crl__loc__coral_ast__id__NodeId hit = crl__loc__coral_backend__codegen__cgMethodsContain(cg, methods, mlen, methName);
                     if (((hit.index != 0)))
                     {
@@ -36481,6 +36735,7 @@ crl__loc__coral_ast__id__NodeId crl__loc__coral_backend__codegen__cgFindDecl(crl
                 {
                 }
             }
+            __Lsw57:;
             if (((dn == name)))
             {
                 crl__loc__coral_ast__id__NodeId found = cg->file->decls[i];
@@ -37218,6 +37473,7 @@ crl__loc__coral_common__slice__Slice tyStr(crl__loc__coral_backend__codegen__Cod
             return crl__loc__coral_backend__codegen__tyStrPut(cg, crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"void*", 5 }), start);
         }
     }
+    __Lsw58:;
     return crl__loc__coral_backend__codegen__stTail((&(cg->tybuf)), start);
 }
 _Bool crl__loc__coral_backend__codegen__cgRegHas(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name) {
@@ -37254,6 +37510,47 @@ void crl__loc__coral_backend__codegen__cgRegAdd(crl__loc__coral_backend__codegen
     }
     ((cg->regNames[cg->regLen] = name));
     ((cg->regLen)++);
+}
+_Bool crl__loc__coral_backend__codegen__cgFnSeen(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name, _Bool proto) {
+    crl__loc__coral_common__slice__Slice* names = cg->bodyFnNames;
+    uint32_t len = cg->bodyFnLen;
+    if (proto)
+    {
+        ((names = cg->protoFnNames));
+        ((len = cg->protoFnLen));
+    }
+    if (((names == 0)))
+    {
+        return 0;
+    }
+    uint32_t i = 0;
+    while (((i < len)))
+    {
+        if (crl__loc__coral_backend__codegen__cgSliceEq(names[i], name))
+        {
+            return 1;
+        }
+        ((i)++);
+    }
+    return 0;
+}
+void crl__loc__coral_backend__codegen__cgFnSee(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice name, _Bool proto) {
+    if (proto)
+    {
+        if (((((cg->protoFnNames != 0))) && (((cg->protoFnLen < cg->protoFnCap)))))
+        {
+            ((cg->protoFnNames[cg->protoFnLen] = name));
+            ((cg->protoFnLen)++);
+        }
+    }
+    else
+    {
+        if (((((cg->bodyFnNames != 0))) && (((cg->bodyFnLen < cg->bodyFnCap)))))
+        {
+            ((cg->bodyFnNames[cg->bodyFnLen] = name));
+            ((cg->bodyFnLen)++);
+        }
+    }
 }
 crl__loc__coral_common__slice__Slice cgRegName(crl__loc__coral_backend__codegen__Codegen* cg, uint32_t t) {
     crl__loc__coral_ast__types__TypeEntry* e = ((cg->ctx->types + t));
@@ -37588,6 +37885,7 @@ crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgResultT
         {
         }
     }
+    __Lsw59:;
     return crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"void*", 5 });
 }
 void crl__loc__coral_backend__codegen__cgEmitStmt(crl__loc__coral_backend__codegen__Codegen* cg, _coral_str text) {
@@ -37779,7 +38077,7 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
                 {
                     if (((dd->kind.u.v2.name != typeName)))
                     {
-                        break;
+                        goto __Lsw60;
                     }
                     ((methods = dd->kind.u.v2.methods));
                     ((mlen = dd->kind.u.v2.methodsLen));
@@ -37790,7 +38088,7 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
                 {
                     if (((dd->kind.u.v5.name != typeName)))
                     {
-                        break;
+                        goto __Lsw60;
                     }
                     ((methods = dd->kind.u.v5.methods));
                     ((mlen = dd->kind.u.v5.methodsLen));
@@ -37801,7 +38099,7 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
                 {
                     if (((dd->kind.u.v4.name != typeName)))
                     {
-                        break;
+                        goto __Lsw60;
                     }
                     ((methods = dd->kind.u.v4.methods));
                     ((mlen = dd->kind.u.v4.methodsLen));
@@ -37810,6 +38108,15 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
             else if ((dd->kind.tag == 7))
             {
                 {
+                    uint32_t st = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, dd->kind.u.v7.selfType);
+                    if (((((st != 0))) && (((((cg->ctx->types + st))->kind.tag == 20)))))
+                    {
+                        ((st = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, ((cg->ctx->types + st))->kind.u.v20.base)));
+                    }
+                    if (((((((st == 0))) || (((((cg->ctx->types + st))->kind.tag != 24))))) || (((((cg->ctx->types + st))->kind.u.v24.name != typeName)))))
+                    {
+                        goto __Lsw60;
+                    }
                     ((methods = dd->kind.u.v7.methods));
                     ((mlen = dd->kind.u.v7.methodsLen));
                 }
@@ -37817,6 +38124,15 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
             else if ((dd->kind.tag == 8))
             {
                 {
+                    uint32_t st = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, dd->kind.u.v8.selfType);
+                    if (((((st != 0))) && (((((cg->ctx->types + st))->kind.tag == 20)))))
+                    {
+                        ((st = crl__loc__coral_backend__codegen__cgTyUnwrap(cg, ((cg->ctx->types + st))->kind.u.v20.base)));
+                    }
+                    if (((((((st == 0))) || (((((cg->ctx->types + st))->kind.tag != 24))))) || (((((cg->ctx->types + st))->kind.u.v24.name != typeName)))))
+                    {
+                        goto __Lsw60;
+                    }
                     ((methods = dd->kind.u.v8.methods));
                     ((mlen = dd->kind.u.v8.methodsLen));
                 }
@@ -37826,6 +38142,7 @@ uint8_t crl__loc__coral_backend__codegen__cgMethodRecvKind(crl__loc__coral_backe
                 {
                 }
             }
+            __Lsw60:;
             if (((methods != 0)))
             {
                 uint32_t m = 0;
@@ -38055,6 +38372,12 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
     else if ((e->kind.tag == 5))
     {
         {
+            uint32_t nt = crl__loc__coral_backend__codegen__cgSubstTy(cg, e->resolvedType);
+            if (((((nt != 0))) && (((((cg->ctx->types + nt))->kind.tag == 19)))))
+            {
+                crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"(_coral_str){0}", 15 });
+                return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), es);
+            }
             crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"0", 1 });
             return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), es);
         }
@@ -38336,6 +38659,30 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                 crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"))", 2 });
                 return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), rs2);
             }
+            {
+                uint64_t vcase = 0;
+                if (crl__loc__coral_backend__codegen__cgVariantCaseIdx(cg, cin, (&(vcase))))
+                {
+                    size_t rv = cg->ebuf.len;
+                    crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"((", 2 });
+                    crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), tyStr(cg, e->kind.u.v15.targetType));
+                    crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)")", 1 });
+                    crl__loc__coral_backend__codegen__stU64((&(cg->ebuf)), vcase);
+                    crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)")", 1 });
+                    return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), rv);
+                }
+            }
+            {
+                uint32_t cit = 0;
+                if (((((cn != 0))) && (((cn->kind.tag == 1)))))
+                {
+                    ((cit = crl__loc__coral_backend__codegen__cgSubstTy(cg, cn->kind.u.v1.value.resolvedType)));
+                }
+                if (((((cit != 0))) && (((((cg->ctx->types + cit))->kind.tag == 1)))))
+                {
+                    return cgExpr(cg, cin);
+                }
+            }
             crl__loc__coral_common__slice__Slice c = cgExpr(cg, e->kind.u.v15.expr);
             size_t rs = cg->ebuf.len;
             crl__loc__coral_backend__codegen__stP((&(cg->ebuf)), (_coral_str){ (const uint8_t*)"((", 2 });
@@ -38453,6 +38800,7 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                 {
                 }
             }
+            __Lsw62:;
             ((left = e->kind.u.v24.left));
             ((right = e->kind.u.v24.right));
             crl__loc__coral_common__slice__Slice l;
@@ -38855,6 +39203,8 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
             uint8_t recvKind = crl__loc__coral_backend__codegen__cgMethodRecvKind(cg, rawRecvTy, methName, (&(mFound)));
             _Bool fieldCall = (((!(mFound))) && (crl__loc__coral_backend__codegen__cgHasField(cg, rawRecvTy, methName)));
             crl__loc__coral_common__slice__Slice callee;
+            crl__loc__coral_ast__id__NodeId mdef;
+            ((mdef.index = 0));
             if (fieldCall)
             {
                 size_t cfs = cg->ebuf.len;
@@ -38879,10 +39229,10 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                 crl__loc__coral_backend__codegen__stCh((&(cg->ebuf)), '_');
                 crl__loc__coral_backend__codegen__stPS((&(cg->ebuf)), crl__loc__coral_backend__codegen__cgIntern(cg, methName));
                 crl__loc__coral_common__slice__Slice rawCallee = crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), cs);
-                crl__loc__coral_ast__id__NodeId mdecl = crl__loc__coral_backend__codegen__cgFindMethodDecl(cg, rawRecvTy, methName);
-                if (((mdecl.index != 0)))
+                ((mdef = crl__loc__coral_backend__codegen__cgFindMethodDecl(cg, rawRecvTy, methName)));
+                if (((mdef.index != 0)))
                 {
-                    ((callee = crl__loc__coral_backend__codegen__cgMangleS(cg, mdecl, rawCallee, 0)));
+                    ((callee = crl__loc__coral_backend__codegen__cgMangleS(cg, mdef, rawCallee, 0)));
                 }
                 else
                 {
@@ -38922,7 +39272,43 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                     {
                         crl__loc__coral_backend__codegen__stP((&(abuf)), (_coral_str){ (const uint8_t*)", ", 2 });
                     }
-                    crl__loc__coral_backend__codegen__stPS((&(abuf)), cgExpr(cg, args[i]));
+                    _Bool nullStr = 0;
+                    if (((mdef.index != 0)))
+                    {
+                        crl__loc__coral_ast__node__Node* mdn = crl__loc__coral_backend__codegen__cgNode(cg, mdef);
+                        crl__loc__coral_ast__node__Node* an2 = crl__loc__coral_backend__codegen__cgNode(cg, args[i]);
+                        if (((((((((mdn->kind.tag == 3))) && (((an2->kind.tag == 1))))) && (((an2->kind.u.v1.value.kind.tag == 5))))) && (((i < mdn->kind.u.v3.value.kind.u.v9.paramsLen)))))
+                        {
+                            crl__loc__coral_ast__node__Node* mpn = crl__loc__coral_backend__codegen__cgNode(cg, mdn->kind.u.v3.value.kind.u.v9.params[i]);
+                            if (((mpn->kind.tag == 6)))
+                            {
+                                uint32_t pt = mpn->kind.u.v6.value.typeNode;
+                                while (((((pt != 0))) && (((((((cg->ctx->types + pt))->kind.tag == 21))) || (((((cg->ctx->types + pt))->kind.tag == 22)))))))
+                                {
+                                    if (((((cg->ctx->types + pt))->kind.tag == 21)))
+                                    {
+                                        ((pt = ((cg->ctx->types + pt))->kind.u.v21.base));
+                                    }
+                                    else
+                                    {
+                                        ((pt = ((cg->ctx->types + pt))->kind.u.v22.base));
+                                    }
+                                }
+                                if (((((pt != 0))) && (((((cg->ctx->types + pt))->kind.tag == 19)))))
+                                {
+                                    ((nullStr = 1));
+                                }
+                            }
+                        }
+                    }
+                    if (nullStr)
+                    {
+                        crl__loc__coral_backend__codegen__stP((&(abuf)), (_coral_str){ (const uint8_t*)"(_coral_str){0}", 15 });
+                    }
+                    else
+                    {
+                        crl__loc__coral_backend__codegen__stPS((&(abuf)), cgExpr(cg, args[i]));
+                    }
                     ((n)++);
                     ((i)++);
                 }
@@ -39137,9 +39523,9 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
                 crl__loc__coral_backend__codegen__stPS((&(vs)), cgExpr(cg, e->kind.u.v54.fieldValues[i]));
                 ((i)++);
             }
-            if (((fvLen > 16)))
+            if (((fvLen > 256)))
             {
-                crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"too many struct fields (cap 16)", 31 });
+                crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"too many struct fields (cap 256)", 32 });
             }
             crl__loc__coral_common__slice__Slice lty = tyStr(cg, e->kind.u.v54.typeNode);
             size_t lcs = cg->ebuf.len;
@@ -39647,6 +40033,7 @@ crl__loc__coral_common__slice__Slice cgExpr(crl__loc__coral_backend__codegen__Co
             return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), es);
         }
     }
+    __Lsw61:;
     return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), es);
 }
 crl__loc__coral_common__slice__Slice cgAddrOfValue(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId oid, crl__loc__coral_common__slice__Slice vtext) {
@@ -39861,6 +40248,7 @@ crl__loc__coral_common__slice__Slice cgLvalue(crl__loc__coral_backend__codegen__
             return cgExpr(cg, id);
         }
     }
+    __Lsw63:;
     return crl__loc__coral_backend__codegen__stTail((&(cg->ebuf)), es);
 }
 crl__loc__coral_common__slice__Slice cgValBody(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId id) {
@@ -40157,6 +40545,7 @@ crl__loc__coral_common__slice__Slice cgPatTest(crl__loc__coral_backend__codegen_
                 return crl__loc__coral_common__slice__Slice_from(0, 0);
             }
         }
+        __Lsw64:;
     }
     if (((n->kind.tag == 1)))
     {
@@ -40392,13 +40781,16 @@ void crl__loc__coral_backend__codegen__cgEmitSwitchChain(crl__loc__coral_backend
     }
 }
 void crl__loc__coral_backend__codegen__cgEmitSwitch(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_common__slice__Slice scrut, uint32_t scrutTy, crl__loc__coral_ast__stmt__SwitchCase* cases, uint32_t casesLen, crl__loc__coral_common__slice__Slice resultTemp) {
-    if (((casesLen > 64)))
+    if (((casesLen > 256)))
     {
-        crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"too many switch cases (cap 64)", 30 });
+        crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"too many switch cases (cap 256)", 31 });
         return;
     }
+    uint32_t swLabel = cg->switchSeq;
+    ((cg->switchSeq)++);
+    crl__loc__coral_backend__codegen__cgPushSwitch(cg, swLabel);
     {
-        uint32_t* bindNames = ((uint32_t*)(crl__loc__coral_build__arena__Arena_alloc(cg->arena, ((64 * 4)), 4)));
+        uint32_t* bindNames = ((uint32_t*)(crl__loc__coral_build__arena__Arena_alloc(cg->arena, ((256 * 4)), 4)));
         uint32_t bindCount = 0;
         if (((bindNames != 0)))
         {
@@ -40413,7 +40805,7 @@ void crl__loc__coral_backend__codegen__cgEmitSwitch(crl__loc__coral_backend__cod
                     if (((pn->kind.tag == 4)))
                     {
                         crl__loc__coral_ast__pat__Pat* pv = (&(pn->kind.u.v4.value));
-                        if (((((((pv->kind.tag == 4))) && (((pv->kind.u.v4.fieldNamesLen > 0))))) && (((bindCount < 64)))))
+                        if (((((((pv->kind.tag == 4))) && (((pv->kind.u.v4.fieldNamesLen > 0))))) && (((bindCount < 256)))))
                         {
                             uint32_t vidx0 = 0;
                             crl__loc__coral_ast__id__NodeId vd0 = crl__loc__coral_backend__codegen__cgFindVariantOfTy(cg, scrutTy, pv->kind.u.v4.variantName, (&(vidx0)));
@@ -40423,7 +40815,7 @@ void crl__loc__coral_backend__codegen__cgEmitSwitch(crl__loc__coral_backend__cod
                                 crl__loc__coral_ast__decl__Decl* vdd = (&(vdn->kind.u.v3.value));
                                 crl__loc__coral_ast__decl__VariantVariant* vv0 = ((vdd->kind.u.v4.variants + vidx0));
                                 uint32_t ff = 0;
-                                while (((((ff < pv->kind.u.v4.fieldNamesLen))) && (((bindCount < 64)))))
+                                while (((((ff < pv->kind.u.v4.fieldNamesLen))) && (((bindCount < 256)))))
                                 {
                                     uint32_t fname = pv->kind.u.v4.fieldNames[ff];
                                     uint32_t kk = 0;
@@ -40471,6 +40863,11 @@ void crl__loc__coral_backend__codegen__cgEmitSwitch(crl__loc__coral_backend__cod
         }
     }
     crl__loc__coral_backend__codegen__cgEmitSwitchChain(cg, scrut, scrutTy, cases, casesLen, 0, resultTemp, 1);
+    crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"__Lsw", 5 });
+    crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(swLabel)));
+    crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)":;", 2 });
+    crl__loc__coral_backend__codegen__cgPopSwitch(cg);
 }
 void crl__loc__coral_backend__codegen__cgStmtBraced(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId id) {
     if (((id.index == 0)))
@@ -40722,6 +41119,14 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
     else if ((s->kind.tag == 4))
     {
         {
+            if (((((cg->breakDepth > 0))) && (((cg->breakKinds[((cg->breakDepth - 1))] == 1)))))
+            {
+                crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
+                crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"goto __Lsw", 10 });
+                crl__loc__coral_backend__codegen__stU64((&(cg->body)), ((uint64_t)(cg->breakLabels[((cg->breakDepth - 1))])));
+                crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
+                return;
+            }
             if (((cg->loopDepth == 0)))
             {
                 crl__loc__coral_backend__codegen__cgError(cg, (_coral_str){ (const uint8_t*)"break outside of loop", 21 });
@@ -40776,7 +41181,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                 crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"while (", 7 });
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), c);
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), ')');
-                ((cg->loopDepth)++);
+                crl__loc__coral_backend__codegen__cgPushLoop(cg);
                 crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v8.body);
                 crl__loc__coral_backend__codegen__cgPopLoop(cg);
                 return;
@@ -40792,7 +41197,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"if (!(", 6 });
             crl__loc__coral_backend__codegen__stPS((&(cg->body)), c);
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)")) break;", 9 });
-            ((cg->loopDepth)++);
+            crl__loc__coral_backend__codegen__cgPushLoop(cg);
             crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v8.body);
             crl__loc__coral_backend__codegen__cgPopLoop(cg);
             ((cg->ind)--);
@@ -40806,7 +41211,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
         {
             crl__loc__coral_backend__codegen__stNL((&(cg->body)), cg->ind);
             crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)"while (1)", 9 });
-            ((cg->loopDepth)++);
+            crl__loc__coral_backend__codegen__cgPushLoop(cg);
             crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v9.body);
             crl__loc__coral_backend__codegen__cgPopLoop(cg);
             return;
@@ -40849,7 +41254,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), p);
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), ')');
-                ((cg->loopDepth)++);
+                crl__loc__coral_backend__codegen__cgPushLoop(cg);
                 crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v10.body);
                 crl__loc__coral_backend__codegen__cgPopLoop(cg);
                 return;
@@ -40875,7 +41280,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                 crl__loc__coral_backend__codegen__stPS((&(cg->body)), c);
                 crl__loc__coral_backend__codegen__stP((&(cg->body)), (_coral_str){ (const uint8_t*)")) break;", 9 });
             }
-            ((cg->loopDepth)++);
+            crl__loc__coral_backend__codegen__cgPushLoop(cg);
             crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v10.body);
             crl__loc__coral_backend__codegen__cgPopLoop(cg);
             if (hasPost)
@@ -40967,7 +41372,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
                 crl__loc__coral_backend__codegen__stCh((&(cg->body)), ']');
             }
             crl__loc__coral_backend__codegen__stCh((&(cg->body)), ';');
-            ((cg->loopDepth)++);
+            crl__loc__coral_backend__codegen__cgPushLoop(cg);
             crl__loc__coral_backend__codegen__cgStmtBraced(cg, s->kind.u.v11.body);
             crl__loc__coral_backend__codegen__cgPopLoop(cg);
             ((cg->ind)--);
@@ -41153,6 +41558,7 @@ void cgStmt(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__
             return;
         }
     }
+    __Lsw65:;
 }
 _Bool crl__loc__coral_backend__codegen__cgDeclIsGeneric(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId declId) {
     if (((cg->mono == 0)))
@@ -41230,6 +41636,7 @@ _Bool crl__loc__coral_backend__codegen__cgTyHasParam(crl__loc__coral_backend__co
             return 0;
         }
     }
+    __Lsw66:;
     return 0;
 }
 void crl__loc__coral_backend__codegen__cgEmitParams(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_backend__codegen__Stream* s, crl__loc__coral_ast__decl__Decl* dd, uint32_t* paramTys, crl__loc__coral_common__slice__Slice owner, crl__loc__coral_mono__mono__MonoInstance* inst) {
@@ -41430,6 +41837,7 @@ void crl__loc__coral_backend__codegen__cgEmitFuncCommon(crl__loc__coral_backend_
     size_t bodyStart = cg->body.len;
     ((cg->tempsLen = 0));
     ((cg->loopDepth = 0));
+    ((cg->breakDepth = 0));
     ((cg->ind = 1));
     ((cg->localNamesLen = 0));
     if (((owner.len != 0)))
@@ -41544,7 +41952,7 @@ void crl__loc__coral_backend__codegen__cgEmitFwd(crl__loc__coral_backend__codege
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw67;
                     }
                     crl__loc__coral_backend__codegen__stP((&(cg->fwd)), (_coral_str){ (const uint8_t*)"typedef struct ", 15 });
                     crl__loc__coral_backend__codegen__stPS((&(cg->fwd)), crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v2.name, 0));
@@ -41558,7 +41966,7 @@ void crl__loc__coral_backend__codegen__cgEmitFwd(crl__loc__coral_backend__codege
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw67;
                     }
                     crl__loc__coral_backend__codegen__stP((&(cg->fwd)), (_coral_str){ (const uint8_t*)"typedef union ", 14 });
                     crl__loc__coral_backend__codegen__stPS((&(cg->fwd)), crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v5.name, 0));
@@ -41572,7 +41980,7 @@ void crl__loc__coral_backend__codegen__cgEmitFwd(crl__loc__coral_backend__codege
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw67;
                     }
                     crl__loc__coral_backend__codegen__stP((&(cg->fwd)), (_coral_str){ (const uint8_t*)"typedef struct ", 15 });
                     crl__loc__coral_backend__codegen__stPS((&(cg->fwd)), crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v4.name, 0));
@@ -41586,6 +41994,7 @@ void crl__loc__coral_backend__codegen__cgEmitFwd(crl__loc__coral_backend__codege
                 {
                 }
             }
+            __Lsw67:;
         }
         ((i)++);
     }
@@ -42208,6 +42617,7 @@ void crl__loc__coral_backend__codegen__cgConstExpr(crl__loc__coral_backend__code
                 {
                 }
             }
+            __Lsw69:;
             crl__loc__coral_backend__codegen__stCh((&(cg->defs)), '(');
             crl__loc__coral_backend__codegen__cgConstExpr(cg, e->kind.u.v24.left);
             crl__loc__coral_backend__codegen__stP((&(cg->defs)), op);
@@ -42221,6 +42631,7 @@ void crl__loc__coral_backend__codegen__cgConstExpr(crl__loc__coral_backend__code
         {
         }
     }
+    __Lsw68:;
     crl__loc__coral_backend__codegen__stPS((&(cg->defs)), cgExpr(cg, id));
 }
 void crl__loc__coral_backend__codegen__cgEmitGlobals(crl__loc__coral_backend__codegen__Codegen* cg) {
@@ -42271,6 +42682,8 @@ void crl__loc__coral_backend__codegen__cgEmitGlobals(crl__loc__coral_backend__co
 }
 void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__codegen__Codegen* cg) {
     uint32_t i = 0;
+    crl__loc__coral_backend__codegen__Stream defsSaved = cg->defs;
+    ((cg->defs = cg->typedefs));
     while (((i < cg->file->declsLen)))
     {
         crl__loc__coral_ast__node__Node* d = crl__loc__coral_backend__codegen__cgNode(cg, cg->file->decls[i]);
@@ -42313,6 +42726,51 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
         }
         ((i)++);
     }
+    ((cg->typedefs = cg->defs));
+    ((cg->defs = defsSaved));
+    if (((cg->mono != 0)))
+    {
+        ((i = 0));
+        while (((i < cg->mono->instancesLen)))
+        {
+            crl__loc__coral_mono__mono__MonoInstance* inst = ((cg->mono->instances + i));
+            if (((inst->kind == crl__loc__coral_mono__mono__MonoInstanceKind_TypeInstance)))
+            {
+                crl__loc__coral_ast__node__Node* d = crl__loc__coral_backend__codegen__cgNode(cg, inst->declaration);
+                if (((d->kind.tag == 3)))
+                {
+                    crl__loc__coral_ast__decl__Decl* dd = (&(d->kind.u.v3.value));
+                    if (((((dd->kind.tag == 2))) || (((dd->kind.tag == 5)))))
+                    {
+                        crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgInstanceName(cg, inst->name, inst->arguments, inst->argumentsLen);
+                        crl__loc__coral_mono__mono__MonoSubstitution* oldSubs = cg->subs;
+                        uint32_t oldSubsLen = cg->subsLen;
+                        ((cg->subs = inst->substitutions));
+                        ((cg->subsLen = inst->substitutionsLen));
+                        if (((dd->kind.tag == 2)))
+                        {
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"struct ", 7 });
+                            crl__loc__coral_backend__codegen__stPS((&(cg->defs)), m);
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)" {", 2 });
+                            crl__loc__coral_backend__codegen__cgEmitStructFields(cg, dd->kind.u.v2.fields, dd->kind.u.v2.fieldsLen, 4);
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"\n};\n", 4 });
+                        }
+                        else
+                        {
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"union ", 6 });
+                            crl__loc__coral_backend__codegen__stPS((&(cg->defs)), m);
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)" {", 2 });
+                            crl__loc__coral_backend__codegen__cgEmitStructFields(cg, dd->kind.u.v5.fields, dd->kind.u.v5.fieldsLen, 4);
+                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"\n};\n", 4 });
+                        }
+                        ((cg->subs = oldSubs));
+                        ((cg->subsLen = oldSubsLen));
+                    }
+                }
+            }
+            ((i)++);
+        }
+    }
     ((i = 0));
     while (((i < cg->file->declsLen)))
     {
@@ -42326,7 +42784,7 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw70;
                     }
                     crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"struct ", 7 });
                     crl__loc__coral_backend__codegen__stPS((&(cg->defs)), crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v2.name, 0));
@@ -42340,7 +42798,7 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw70;
                     }
                     crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"union ", 6 });
                     crl__loc__coral_backend__codegen__stPS((&(cg->defs)), crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v5.name, 0));
@@ -42354,7 +42812,7 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
                 {
                     if (crl__loc__coral_backend__codegen__cgDeclIsGeneric(cg, id))
                     {
-                        break;
+                        goto __Lsw70;
                     }
                     crl__loc__coral_backend__codegen__cgEmitVariantDef(cg, dd, crl__loc__coral_backend__codegen__cgMangle(cg, id, dd->kind.u.v4.name, 0));
                 }
@@ -42364,6 +42822,7 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
                 {
                 }
             }
+            __Lsw70:;
         }
         ((i)++);
     }
@@ -42379,44 +42838,17 @@ void crl__loc__coral_backend__codegen__cgEmitTypeDefs(crl__loc__coral_backend__c
                 if (((d->kind.tag == 3)))
                 {
                     crl__loc__coral_ast__decl__Decl* dd = (&(d->kind.u.v3.value));
-                    crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgInstanceName(cg, inst->name, inst->arguments, inst->argumentsLen);
-                    crl__loc__coral_mono__mono__MonoSubstitution* oldSubs = cg->subs;
-                    uint32_t oldSubsLen = cg->subsLen;
-                    ((cg->subs = inst->substitutions));
-                    ((cg->subsLen = inst->substitutionsLen));
-                    if ((dd->kind.tag == 2))
+                    if (((dd->kind.tag == 4)))
                     {
-                        {
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"struct ", 7 });
-                            crl__loc__coral_backend__codegen__stPS((&(cg->defs)), m);
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)" {", 2 });
-                            crl__loc__coral_backend__codegen__cgEmitStructFields(cg, dd->kind.u.v2.fields, dd->kind.u.v2.fieldsLen, 4);
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"\n};\n", 4 });
-                        }
+                        crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgInstanceName(cg, inst->name, inst->arguments, inst->argumentsLen);
+                        crl__loc__coral_mono__mono__MonoSubstitution* oldSubs = cg->subs;
+                        uint32_t oldSubsLen = cg->subsLen;
+                        ((cg->subs = inst->substitutions));
+                        ((cg->subsLen = inst->substitutionsLen));
+                        crl__loc__coral_backend__codegen__cgEmitVariantDef(cg, dd, m);
+                        ((cg->subs = oldSubs));
+                        ((cg->subsLen = oldSubsLen));
                     }
-                    else if ((dd->kind.tag == 5))
-                    {
-                        {
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"union ", 6 });
-                            crl__loc__coral_backend__codegen__stPS((&(cg->defs)), m);
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)" {", 2 });
-                            crl__loc__coral_backend__codegen__cgEmitStructFields(cg, dd->kind.u.v5.fields, dd->kind.u.v5.fieldsLen, 4);
-                            crl__loc__coral_backend__codegen__stP((&(cg->defs)), (_coral_str){ (const uint8_t*)"\n};\n", 4 });
-                        }
-                    }
-                    else if ((dd->kind.tag == 4))
-                    {
-                        {
-                            crl__loc__coral_backend__codegen__cgEmitVariantDef(cg, dd, m);
-                        }
-                    }
-                    else
-                    {
-                        {
-                        }
-                    }
-                    ((cg->subs = oldSubs));
-                    ((cg->subsLen = oldSubsLen));
                 }
             }
             ((i)++);
@@ -42460,6 +42892,7 @@ crl__loc__coral_common__slice__Slice crl__loc__coral_backend__codegen__cgDeclOwn
             return crl__loc__coral_common__slice__Slice_from(0, 0);
         }
     }
+    __Lsw71:;
     return crl__loc__coral_common__slice__Slice_from(0, 0);
 }
 _Bool crl__loc__coral_backend__codegen__cgOwnerGeneric(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__decl__Decl* dd) {
@@ -42499,6 +42932,7 @@ _Bool crl__loc__coral_backend__codegen__cgOwnerGeneric(crl__loc__coral_backend__
             return 0;
         }
     }
+    __Lsw72:;
     return 0;
 }
 void crl__loc__coral_backend__codegen__cgEmitMethodSet(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__id__NodeId declId, _Bool withBodies) {
@@ -42572,6 +43006,7 @@ void crl__loc__coral_backend__codegen__cgEmitMethodSet(crl__loc__coral_backend__
             return;
         }
     }
+    __Lsw73:;
     uint32_t m = 0;
     while (((m < mlen)))
     {
@@ -42674,6 +43109,22 @@ void crl__loc__coral_backend__codegen__cgEmitInstMethodList(crl__loc__coral_back
 }
 void crl__loc__coral_backend__codegen__cgEmitInstanceMethods(crl__loc__coral_backend__codegen__Codegen* cg, crl__loc__coral_ast__decl__Decl* dd, crl__loc__coral_mono__mono__MonoInstance* inst, _Bool withBodies) {
     crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgInstanceName(cg, inst->name, inst->arguments, inst->argumentsLen);
+    if (withBodies)
+    {
+        if (crl__loc__coral_backend__codegen__cgFnSeen(cg, m, 0))
+        {
+            return;
+        }
+        crl__loc__coral_backend__codegen__cgFnSee(cg, m, 0);
+    }
+    else
+    {
+        if (crl__loc__coral_backend__codegen__cgFnSeen(cg, m, 1))
+        {
+            return;
+        }
+        crl__loc__coral_backend__codegen__cgFnSee(cg, m, 1);
+    }
     crl__loc__coral_ast__id__NodeId* methods = 0;
     uint32_t mlen = 0;
     if ((dd->kind.tag == 2))
@@ -42702,6 +43153,7 @@ void crl__loc__coral_backend__codegen__cgEmitInstanceMethods(crl__loc__coral_bac
         {
         }
     }
+    __Lsw74:;
     if (((methods != 0)))
     {
         crl__loc__coral_backend__codegen__cgEmitInstMethodList(cg, methods, mlen, m, inst, withBodies);
@@ -42804,7 +43256,11 @@ void crl__loc__coral_backend__codegen__cgEmitProtos(crl__loc__coral_backend__cod
             if (((inst->kind == crl__loc__coral_mono__mono__MonoInstanceKind_FunctionInstance)))
             {
                 crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgMangleS(cg, inst->declaration, crl__loc__coral_backend__codegen__cgInstanceNameV(cg, inst->name, inst->arguments, inst->argumentsLen, inst->valueKey), 0);
-                crl__loc__coral_backend__codegen__cgEmitProto(cg, inst->declaration, m, inst->returnType, inst->paramTypes, inst->substitutions, inst->substitutionsLen, crl__loc__coral_common__slice__Slice_from(0, 0), inst);
+                if ((!(crl__loc__coral_backend__codegen__cgFnSeen(cg, m, 1))))
+                {
+                    crl__loc__coral_backend__codegen__cgFnSee(cg, m, 1);
+                    crl__loc__coral_backend__codegen__cgEmitProto(cg, inst->declaration, m, inst->returnType, inst->paramTypes, inst->substitutions, inst->substitutionsLen, crl__loc__coral_common__slice__Slice_from(0, 0), inst);
+                }
             }
             else
             {
@@ -42865,7 +43321,11 @@ void crl__loc__coral_backend__codegen__cgEmitBodies(crl__loc__coral_backend__cod
                 if (((((((dd->kind.u.v9.flags & 8)) != 0))) && (((((dd->kind.u.v9.flags & 2)) == 0)))))
                 {
                     crl__loc__coral_common__slice__Slice m = crl__loc__coral_backend__codegen__cgMangleS(cg, inst->declaration, crl__loc__coral_backend__codegen__cgInstanceNameV(cg, inst->name, inst->arguments, inst->argumentsLen, inst->valueKey), 0);
-                    crl__loc__coral_backend__codegen__cgEmitFuncCommon(cg, inst->declaration, m, inst->returnType, inst->paramTypes, inst->substitutions, inst->substitutionsLen, crl__loc__coral_common__slice__Slice_from(0, 0), 0, inst);
+                    if ((!(crl__loc__coral_backend__codegen__cgFnSeen(cg, m, 0))))
+                    {
+                        crl__loc__coral_backend__codegen__cgFnSee(cg, m, 0);
+                        crl__loc__coral_backend__codegen__cgEmitFuncCommon(cg, inst->declaration, m, inst->returnType, inst->paramTypes, inst->substitutions, inst->substitutionsLen, crl__loc__coral_common__slice__Slice_from(0, 0), 0, inst);
+                    }
                 }
             }
             else
@@ -42907,6 +43367,13 @@ crl__loc__coral_backend__codegen__CodegenResult crl__loc__coral_backend__codegen
     ((cg.ebuf = crl__loc__coral_backend__codegen__stNew(arena, 8192)));
     ((cg.tybuf = crl__loc__coral_backend__codegen__stNew(arena, 16384)));
     ((cg.tdecl = crl__loc__coral_backend__codegen__stNew(arena, 16384)));
+    ((cg.typedefs = crl__loc__coral_backend__codegen__stNew(arena, 8192)));
+    ((cg.protoFnCap = 16384));
+    ((cg.protoFnLen = 0));
+    ((cg.protoFnNames = ((crl__loc__coral_common__slice__Slice*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((16384 * sizeof(crl__loc__coral_common__slice__Slice))), 8)))));
+    ((cg.bodyFnCap = 16384));
+    ((cg.bodyFnLen = 0));
+    ((cg.bodyFnNames = ((crl__loc__coral_common__slice__Slice*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((16384 * sizeof(crl__loc__coral_common__slice__Slice))), 8)))));
     ((cg.subs = 0));
     ((cg.subsLen = 0));
     ((cg.errors = 0));
@@ -42936,6 +43403,10 @@ crl__loc__coral_backend__codegen__CodegenResult crl__loc__coral_backend__codegen
     ((cg.tempArrs = ((uint32_t*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((4096 * sizeof(uint32_t))), 8)))));
     ((cg.loopCap = 64));
     ((cg.loopDepth = 0));
+    ((cg.breakDepth = 0));
+    ((cg.switchSeq = 0));
+    ((cg.breakKinds = ((uint32_t*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((64 * sizeof(uint32_t))), 8)))));
+    ((cg.breakLabels = ((uint32_t*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((64 * sizeof(uint32_t))), 8)))));
     ((cg.regCap = 512));
     ((cg.regLen = 0));
     ((cg.regNames = ((crl__loc__coral_common__slice__Slice*)(crl__loc__coral_build__arena__Arena_alloc(arena, ((512 * sizeof(crl__loc__coral_common__slice__Slice))), 8)))));
@@ -42968,6 +43439,7 @@ crl__loc__coral_backend__codegen__CodegenResult crl__loc__coral_backend__codegen
     crl__loc__coral_backend__codegen__stP((&(cg.out)), (_coral_str){ (const uint8_t*)"static bool _coral_streq(_coral_str a, _coral_str b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n", 116 });
     crl__loc__coral_backend__codegen__stP((&(cg.out)), (_coral_str){ (const uint8_t*)"static bool _coral_strtruth(_coral_str s) { return s.len > 0; }\n", 64 });
     crl__loc__coral_backend__codegen__stPS((&(cg.out)), crl__loc__coral_common__slice__Slice_from(cg.fwd.p, cg.fwd.len));
+    crl__loc__coral_backend__codegen__stPS((&(cg.out)), crl__loc__coral_common__slice__Slice_from(cg.typedefs.p, cg.typedefs.len));
     crl__loc__coral_backend__codegen__stPS((&(cg.out)), crl__loc__coral_common__slice__Slice_from(cg.tdecl.p, cg.tdecl.len));
     crl__loc__coral_backend__codegen__stPS((&(cg.out)), crl__loc__coral_common__slice__Slice_from(cg.defs.p, cg.defs.len));
     crl__loc__coral_backend__codegen__stPS((&(cg.out)), crl__loc__coral_common__slice__Slice_from(cg.protos.p, cg.protos.len));
@@ -43105,8 +43577,7 @@ size_t crl__loc__coral_frontend__compile__appendStr(uint8_t* buf, size_t cap, si
 size_t crl__loc__coral_frontend__compile__appendSlice(uint8_t* buf, size_t cap, size_t len, crl__loc__coral_common__slice__Slice s) {
     return crl__loc__coral_frontend__compile__appendStr(buf, cap, len, crl__loc__coral_common__slice__Slice_asStr((&(s))));
 }
-_Bool crl__loc__coral_frontend__compile__codeHasMain(crl__loc__coral_common__slice__Slice code) {
-    _coral_str pat = (_coral_str){ (const uint8_t*)"int32_t main(", 13 };
+_Bool crl__loc__coral_frontend__compile__codeHasSlice(crl__loc__coral_common__slice__Slice code, _coral_str pat) {
     if (((((code.ptr == 0))) || (((code.len < pat.len)))))
     {
         return 0;
@@ -43132,6 +43603,13 @@ _Bool crl__loc__coral_frontend__compile__codeHasMain(crl__loc__coral_common__sli
         ((i)++);
     }
     return 0;
+}
+_Bool crl__loc__coral_frontend__compile__codeHasMain(crl__loc__coral_common__slice__Slice code) {
+    if (crl__loc__coral_frontend__compile__codeHasSlice(code, (_coral_str){ (const uint8_t*)"int32_t main(", 13 }))
+    {
+        return 1;
+    }
+    return crl__loc__coral_frontend__compile__codeHasSlice(code, (_coral_str){ (const uint8_t*)"void main(", 10 });
 }
 int32_t crl__loc__coral_frontend__compile__compileUnitTo(_coral_str inPath, _coral_str outPath, crl__loc__coral_common__slice__Slice* flagsN, crl__loc__coral_common__slice__Slice* flagsV, uint32_t nFlags, size_t errorLimit, _Bool allowIntPtr, _Bool noPrelude, _Bool quiet, _Bool dryRun, crl__loc__coral_common__slice__Slice* modKeys, crl__loc__coral_common__slice__Slice* modVals, uint32_t modLen) {
     size_t len = 0;
@@ -43392,6 +43870,7 @@ int32_t main(void) {
             return 2;
         }
     }
+    __Lsw75:;
     crl__loc__coral_common__slice__Slice buildPath = opts.buildFile;
     size_t len = 0;
     crl__loc__coral_common__slice__Slice src = crl__loc__coral_frontend__io__readFile(crl__loc__coral_common__slice__Slice_asStr((&(buildPath))), (&(len)));
@@ -43651,6 +44130,7 @@ int32_t main(void) {
         {
         }
     }
+    __Lsw76:;
     crl__loc__coral_build__builder__Builder b;
     ((b.compilePhaseReached = 0));
     int32_t errs = crl__loc__coral_build__builder__builderRunEx(root, (&(a)), opts.force, opts.mapOnly, opts.dryRun, (&(b)));
@@ -44061,6 +44541,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__
             return 0;
         }
     }
+    __Lsw77:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44081,6 +44562,7 @@ crl__lib__std__x86_64__linux__io__fs__File crl__lib__std__x86_64__linux__data__r
             0;
         }
     }
+    __Lsw78:;
 }
 crl__lib__std__x86_64__linux__io__fs__File crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self, crl__lib__std__x86_64__linux__io__fs__File defaultVal) {
     crl__lib__std__x86_64__linux__io__fs__File value;
@@ -44097,6 +44579,7 @@ crl__lib__std__x86_64__linux__io__fs__File crl__lib__std__x86_64__linux__data__r
             return defaultVal;
         }
     }
+    __Lsw79:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44114,6 +44597,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw80:;
 }
 crl__lib__std__x86_64__linux__io__fs__File* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__File value;
@@ -44130,6 +44614,7 @@ crl__lib__std__x86_64__linux__io__fs__File* crl__lib__std__x86_64__linux__data__
             return 0;
         }
     }
+    __Lsw81:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44146,6 +44631,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw82:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__File fn) {
     crl__lib__std__x86_64__linux__io__fs__File value;
@@ -44156,6 +44642,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw83:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44166,6 +44653,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw84:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__File fn) {
     crl__lib__std__x86_64__linux__io__fs__File value;
@@ -44176,6 +44664,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(value)));
         }
     }
+    __Lsw85:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fs__File_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44186,6 +44675,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(error)));
         }
     }
+    __Lsw86:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     intptr_t value;
@@ -44202,6 +44692,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std_
             return 0;
         }
     }
+    __Lsw87:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44222,6 +44713,7 @@ intptr_t crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__s
             0;
         }
     }
+    __Lsw88:;
 }
 intptr_t crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, intptr_t defaultVal) {
     intptr_t value;
@@ -44238,6 +44730,7 @@ intptr_t crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__s
             return defaultVal;
         }
     }
+    __Lsw89:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44255,6 +44748,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw90:;
 }
 intptr_t* crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     intptr_t value;
@@ -44271,6 +44765,7 @@ intptr_t* crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__
             return 0;
         }
     }
+    __Lsw91:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44287,6 +44782,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw92:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_intptr_t_intptr_t fn) {
     intptr_t value;
@@ -44297,6 +44793,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__
             ((*(self) = ((Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw93:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44307,6 +44804,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__
             ((*(self) = ((Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw94:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_intptr_t fn) {
     intptr_t value;
@@ -44317,6 +44815,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__
             ((*(self) = fn(value)));
         }
     }
+    __Lsw95:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_intptr_t_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44327,6 +44826,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_intptr_t_crl__lib__std__
             ((*(self) = fn(error)));
         }
     }
+    __Lsw96:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_isSome(Option__Bool* self) {
     _Bool value;
@@ -44343,6 +44843,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_isSome(Option__Bo
             return 0;
         }
     }
+    __Lsw97:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_isNone(Option__Bool* self) {
     _Bool value;
@@ -44359,6 +44860,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_isNone(Option__Bo
             return 1;
         }
     }
+    __Lsw98:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_unwrap(Option__Bool* self) {
     _Bool value;
@@ -44376,6 +44878,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_unwrap(Option__Bo
             0;
         }
     }
+    __Lsw99:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_unwrapOr(Option__Bool* self, _Bool default_) {
     _Bool value;
@@ -44392,6 +44895,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_unwrapOr(Option__
             return default_;
         }
     }
+    __Lsw100:;
 }
 _Bool* crl__lib__std__x86_64__linux__data__option__Option__Bool_ptr(Option__Bool* self) {
     _Bool value;
@@ -44408,6 +44912,7 @@ _Bool* crl__lib__std__x86_64__linux__data__option__Option__Bool_ptr(Option__Bool
             return 0;
         }
     }
+    __Lsw101:;
 }
 _Bool* const crl__lib__std__x86_64__linux__data__option__Option__Bool_constPtr(Option__Bool* self) {
     _Bool value;
@@ -44422,6 +44927,7 @@ _Bool* const crl__lib__std__x86_64__linux__data__option__Option__Bool_constPtr(O
     {
         return 0;
     }
+    __Lsw102:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__Bool_map(Option__Bool* self, FnP__Bool__Bool fn) {
     _Bool value;
@@ -44432,6 +44938,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__Bool_map(Option__Bool* 
             ((*(self) = ((Option__Bool){ .tag = 1, .u.v1 = {.value = fn(value)}})));
         }
     }
+    __Lsw103:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__Bool_andThen(Option__Bool* self, FnP_Option__Bool__Bool fn) {
     _Bool value;
@@ -44442,6 +44949,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__Bool_andThen(Option__Bo
             ((*(self) = fn(value)));
         }
     }
+    __Lsw104:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__Bool_orElse(Option__Bool* self, FnP_Option__Bool fn) {
     _Bool value;
@@ -44457,6 +44965,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__Bool_orElse(Option__Boo
             ((*(self) = fn()));
         }
     }
+    __Lsw105:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_take(Option__Bool* self) {
     _Bool value;
@@ -44475,6 +44984,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__Bool_take(Option__Bool
             0;
         }
     }
+    __Lsw106:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     _Bool value;
@@ -44491,6 +45001,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x8
             return 0;
         }
     }
+    __Lsw107:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44511,6 +45022,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x8
             0;
         }
     }
+    __Lsw108:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self, _Bool defaultVal) {
     _Bool value;
@@ -44527,6 +45039,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x8
             return defaultVal;
         }
     }
+    __Lsw109:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44544,6 +45057,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw110:;
 }
 _Bool* crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     _Bool value;
@@ -44560,6 +45074,7 @@ _Bool* crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x
             return 0;
         }
     }
+    __Lsw111:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44576,6 +45091,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw112:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP__Bool__Bool fn) {
     _Bool value;
@@ -44586,6 +45102,7 @@ void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86
             ((*(self) = ((Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw113:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44596,6 +45113,7 @@ void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86
             ((*(self) = ((Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw114:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError__Bool fn) {
     _Bool value;
@@ -44606,6 +45124,7 @@ void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86
             ((*(self) = fn(value)));
         }
     }
+    __Lsw115:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result__Bool_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44616,6 +45135,7 @@ void crl__lib__std__x86_64__linux__data__result__Result__Bool_crl__lib__std__x86
             ((*(self) = fn(error)));
         }
     }
+    __Lsw116:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__Dir value;
@@ -44632,6 +45152,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__
             return 0;
         }
     }
+    __Lsw117:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44652,6 +45173,7 @@ crl__lib__std__x86_64__linux__io__fs__Dir crl__lib__std__x86_64__linux__data__re
             0;
         }
     }
+    __Lsw118:;
 }
 crl__lib__std__x86_64__linux__io__fs__Dir crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self, crl__lib__std__x86_64__linux__io__fs__Dir defaultVal) {
     crl__lib__std__x86_64__linux__io__fs__Dir value;
@@ -44668,6 +45190,7 @@ crl__lib__std__x86_64__linux__io__fs__Dir crl__lib__std__x86_64__linux__data__re
             return defaultVal;
         }
     }
+    __Lsw119:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44685,6 +45208,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw120:;
 }
 crl__lib__std__x86_64__linux__io__fs__Dir* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__Dir value;
@@ -44701,6 +45225,7 @@ crl__lib__std__x86_64__linux__io__fs__Dir* crl__lib__std__x86_64__linux__data__r
             return 0;
         }
     }
+    __Lsw121:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44717,6 +45242,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw122:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__Dir fn) {
     crl__lib__std__x86_64__linux__io__fs__Dir value;
@@ -44727,6 +45253,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw123:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44737,6 +45264,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw124:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__Dir fn) {
     crl__lib__std__x86_64__linux__io__fs__Dir value;
@@ -44747,6 +45275,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(value)));
         }
     }
+    __Lsw125:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fs__Dir_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44757,6 +45286,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(error)));
         }
     }
+    __Lsw126:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__text__string__String value;
@@ -44773,6 +45303,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__
             return 0;
         }
     }
+    __Lsw127:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44793,6 +45324,7 @@ crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux_
             0;
         }
     }
+    __Lsw128:;
 }
 crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self, crl__lib__std__x86_64__linux__text__string__String defaultVal) {
     crl__lib__std__x86_64__linux__text__string__String value;
@@ -44809,6 +45341,7 @@ crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux_
             return defaultVal;
         }
     }
+    __Lsw129:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44826,6 +45359,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw130:;
 }
 crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__text__string__String value;
@@ -44842,6 +45376,7 @@ crl__lib__std__x86_64__linux__text__string__String* crl__lib__std__x86_64__linux
             return 0;
         }
     }
+    __Lsw131:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44858,6 +45393,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw132:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__text__string__String fn) {
     crl__lib__std__x86_64__linux__text__string__String value;
@@ -44868,6 +45404,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw133:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44878,6 +45415,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw134:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__text__string__String fn) {
     crl__lib__std__x86_64__linux__text__string__String value;
@@ -44888,6 +45426,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(value)));
         }
     }
+    __Lsw135:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__text__string__String_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44898,6 +45437,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(error)));
         }
     }
+    __Lsw136:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fios__FileHandle value;
@@ -44914,6 +45454,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__
             return 0;
         }
     }
+    __Lsw137:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -44934,6 +45475,7 @@ crl__lib__std__x86_64__linux__io__fios__FileHandle crl__lib__std__x86_64__linux_
             0;
         }
     }
+    __Lsw138:;
 }
 crl__lib__std__x86_64__linux__io__fios__FileHandle crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self, crl__lib__std__x86_64__linux__io__fios__FileHandle defaultVal) {
     crl__lib__std__x86_64__linux__io__fios__FileHandle value;
@@ -44950,6 +45492,7 @@ crl__lib__std__x86_64__linux__io__fios__FileHandle crl__lib__std__x86_64__linux_
             return defaultVal;
         }
     }
+    __Lsw139:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44967,6 +45510,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw140:;
 }
 crl__lib__std__x86_64__linux__io__fios__FileHandle* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fios__FileHandle value;
@@ -44983,6 +45527,7 @@ crl__lib__std__x86_64__linux__io__fios__FileHandle* crl__lib__std__x86_64__linux
             return 0;
         }
     }
+    __Lsw141:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -44999,6 +45544,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw142:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fios__FileHandle fn) {
     crl__lib__std__x86_64__linux__io__fios__FileHandle value;
@@ -45009,6 +45555,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw143:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45019,6 +45566,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = ((Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw144:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fios__FileHandle fn) {
     crl__lib__std__x86_64__linux__io__fios__FileHandle value;
@@ -45029,6 +45577,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(value)));
         }
     }
+    __Lsw145:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_crl__lib__std__x86_64__linux__io__fios__FileHandle_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45039,6 +45588,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_crl__lib__std__x86_64__l
             ((*(self) = fn(error)));
         }
     }
+    __Lsw146:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     size_t value;
@@ -45055,6 +45605,7 @@ _Bool crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x
             return 0;
         }
     }
+    __Lsw147:;
 }
 _Bool crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_isErr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     return (!(crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_isOk(self)));
@@ -45075,6 +45626,7 @@ size_t crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__
             0;
         }
     }
+    __Lsw148:;
 }
 size_t crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapOr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, size_t defaultVal) {
     size_t value;
@@ -45091,6 +45643,7 @@ size_t crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__
             return defaultVal;
         }
     }
+    __Lsw149:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_unwrapErr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45108,6 +45661,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError crl__lib__std__x86_64__linux__data
             0;
         }
     }
+    __Lsw150:;
 }
 size_t* crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_okPtr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     size_t value;
@@ -45124,6 +45678,7 @@ size_t* crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std_
             return 0;
         }
     }
+    __Lsw151:;
 }
 crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_errPtr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45140,6 +45695,7 @@ crl__lib__std__x86_64__linux__io__fs__IoError* crl__lib__std__x86_64__linux__dat
             return 0;
         }
     }
+    __Lsw152:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_mapOk(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_size_t_size_t fn) {
     size_t value;
@@ -45150,6 +45706,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x8
             ((*(self) = ((Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 0, .u.v0 = {.value = fn(value)}})));
         }
     }
+    __Lsw153:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_mapErr(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45160,6 +45717,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x8
             ((*(self) = ((Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError){ .tag = 1, .u.v1 = {.error = fn(error)}})));
         }
     }
+    __Lsw154:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_andThen(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_size_t fn) {
     size_t value;
@@ -45170,6 +45728,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x8
             ((*(self) = fn(value)));
         }
     }
+    __Lsw155:;
 }
 void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_orElse(Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError* self, FnP_Result_size_t_crl__lib__std__x86_64__linux__io__fs__IoError_crl__lib__std__x86_64__linux__io__fs__IoError fn) {
     crl__lib__std__x86_64__linux__io__fs__IoError error;
@@ -45180,6 +45739,7 @@ void crl__lib__std__x86_64__linux__data__result__Result_size_t_crl__lib__std__x8
             ((*(self) = fn(error)));
         }
     }
+    __Lsw156:;
 }
 Vec_crl__lib__std__x86_64__linux__text__string__String crl__lib__std__x86_64__linux__collections__vec__Vec_crl__lib__std__x86_64__linux__text__string__String_new(void) {
     return ((Vec_crl__lib__std__x86_64__linux__text__string__String){.data = 0, .len = 0, .cap = 0});
@@ -45435,6 +45995,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isSome(Optio
             return 0;
         }
     }
+    __Lsw157:;
 }
 _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isNone(Option__coral_str* self) {
     _coral_str value;
@@ -45451,6 +46012,7 @@ _Bool crl__lib__std__x86_64__linux__data__option__Option__coral_str_isNone(Optio
             return 1;
         }
     }
+    __Lsw158:;
 }
 _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrap(Option__coral_str* self) {
     _coral_str value;
@@ -45468,6 +46030,7 @@ _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrap(
             0;
         }
     }
+    __Lsw159:;
 }
 _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrapOr(Option__coral_str* self, _coral_str default_) {
     _coral_str value;
@@ -45484,6 +46047,7 @@ _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_unwrapO
             return default_;
         }
     }
+    __Lsw160:;
 }
 _coral_str* crl__lib__std__x86_64__linux__data__option__Option__coral_str_ptr(Option__coral_str* self) {
     _coral_str value;
@@ -45500,6 +46064,7 @@ _coral_str* crl__lib__std__x86_64__linux__data__option__Option__coral_str_ptr(Op
             return 0;
         }
     }
+    __Lsw161:;
 }
 _coral_str* const crl__lib__std__x86_64__linux__data__option__Option__coral_str_constPtr(Option__coral_str* self) {
     _coral_str value;
@@ -45514,6 +46079,7 @@ _coral_str* const crl__lib__std__x86_64__linux__data__option__Option__coral_str_
     {
         return 0;
     }
+    __Lsw162:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__coral_str_map(Option__coral_str* self, FnP__coral_str__coral_str fn) {
     _coral_str value;
@@ -45524,6 +46090,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__coral_str_map(Option__c
             ((*(self) = ((Option__coral_str){ .tag = 1, .u.v1 = {.value = fn(value)}})));
         }
     }
+    __Lsw163:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__coral_str_andThen(Option__coral_str* self, FnP_Option__coral_str__coral_str fn) {
     _coral_str value;
@@ -45534,6 +46101,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__coral_str_andThen(Optio
             ((*(self) = fn(value)));
         }
     }
+    __Lsw164:;
 }
 void crl__lib__std__x86_64__linux__data__option__Option__coral_str_orElse(Option__coral_str* self, FnP_Option__coral_str fn) {
     _coral_str value;
@@ -45549,6 +46117,7 @@ void crl__lib__std__x86_64__linux__data__option__Option__coral_str_orElse(Option
             ((*(self) = fn()));
         }
     }
+    __Lsw165:;
 }
 _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_take(Option__coral_str* self) {
     _coral_str value;
@@ -45567,6 +46136,7 @@ _coral_str crl__lib__std__x86_64__linux__data__option__Option__coral_str_take(Op
             0;
         }
     }
+    __Lsw166:;
 }
 crl__loc__coral_common__slice__Slice* crl__lib__std__x86_64__linux__memory__mman__alloc_crl__loc__coral_common__slice__Slice(size_t count) {
     if (((count == 0)))

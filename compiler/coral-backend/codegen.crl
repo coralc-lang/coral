@@ -190,6 +190,10 @@ pub struct Codegen
 
     u32 loopDepth;
     u32 loopCap;
+    u32* breakKinds;
+    u32* breakLabels;
+    u32 breakDepth;
+    u32 switchSeq;
 
     /* small inline cache for cgFindDecl — the heaviest per-call scan */
     Str* declCacheNames;
@@ -252,6 +256,33 @@ Slice cgTempName(Codegen* cg, u32 t)
 void cgPopLoop(Codegen* cg)
 {
     if (cg.loopDepth > 0) cg.loopDepth = cg.loopDepth - 1;
+    if (cg.breakDepth > 0) cg.breakDepth = cg.breakDepth - 1;
+}
+
+void cgPushLoop(Codegen* cg)
+{
+    cg.loopDepth = cg.loopDepth + 1;
+    if (cg.breakDepth < 64)
+    {
+        cg.breakKinds[cg.breakDepth] = 0;
+        cg.breakLabels[cg.breakDepth] = 0;
+        cg.breakDepth = cg.breakDepth + 1;
+    }
+}
+
+void cgPushSwitch(Codegen* cg, u32 label)
+{
+    if (cg.breakDepth < 64)
+    {
+        cg.breakKinds[cg.breakDepth] = 1;
+        cg.breakLabels[cg.breakDepth] = label;
+        cg.breakDepth = cg.breakDepth + 1;
+    }
+}
+
+void cgPopSwitch(Codegen* cg)
+{
+    if (cg.breakDepth > 0) cg.breakDepth = cg.breakDepth - 1;
 }
 
 Slice cgIntern(Codegen* cg, Str s)
@@ -3903,9 +3934,9 @@ void cgSwitchBody(Codegen* cg, SwitchCase* c, Slice resultTemp)
 }
 
 /* if/else-if chain over cases[start..]. A guarded case whose guard fails
- * nests the remaining chain in its else. No gotos, no fallthrough — and
- * `break` inside a body is plain C break: it targets the enclosing loop,
- * which is what coral's switch means too. */
+ * nests the remaining chain in its else. No fallthrough. `break` in a case
+ * jumps to the chain's `__Lsw<n>` label (cgPushSwitch/cgPopSwitch) so it
+ * exits the switch only, matching the reference (real C switch). */
 void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 casesLen, u32 start, Slice resultTemp, bool first)
 {
     u32 j = start;
@@ -4010,6 +4041,9 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
         cgError(cg, (u8*)"too many switch cases (cap 256)");
         return;
     }
+    u32 swLabel = cg.switchSeq;
+    cg.switchSeq = cg.switchSeq + 1;
+    cgPushSwitch(cg, swLabel);
 
     /* pattern bindings: declared up front, assigned on case entry */
     {
@@ -4075,6 +4109,11 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
     }
 
     cgEmitSwitchChain(cg, scrut, scrutTy, cases, casesLen, 0, resultTemp, true);
+    stNL(&cg.body, cg.ind);
+    stP(&cg.body, "__Lsw");
+    stU64(&cg.body, (u64)swLabel);
+    stP(&cg.body, ":;");
+    cgPopSwitch(cg);
 }
 
 /* ── statements ──────────────────────────────────────────────── */
@@ -4264,6 +4303,13 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Break => {
+            if (cg.breakDepth > 0 && cg.breakKinds[cg.breakDepth - 1] == 1) {
+                stNL(&cg.body, cg.ind);
+                stP(&cg.body, "goto __Lsw");
+                stU64(&cg.body, (u64)cg.breakLabels[cg.breakDepth - 1]);
+                stCh(&cg.body, ';');
+                return;
+            }
             if (cg.loopDepth == 0) { cgError(cg, (u8*)"break outside of loop"); return; }
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "break;");
@@ -4303,7 +4349,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stP(&cg.body, "while (");
                 stPS(&cg.body, c);
                 stCh(&cg.body, ')');
-                cg.loopDepth = cg.loopDepth + 1;
+                cgPushLoop(cg);
                 cgStmtBraced(cg, s.kind.payload.While.body);
                 cgPopLoop(cg);
                 return;
@@ -4320,7 +4366,7 @@ void cgStmt(Codegen* cg, NodeId id)
             stP(&cg.body, "if (!(");
             stPS(&cg.body, c);
             stP(&cg.body, ")) break;");
-            cg.loopDepth = cg.loopDepth + 1;
+            cgPushLoop(cg);
             cgStmtBraced(cg, s.kind.payload.While.body);
             cgPopLoop(cg);
             cg.ind = cg.ind - 1;
@@ -4332,7 +4378,7 @@ void cgStmt(Codegen* cg, NodeId id)
         StmtKind::Loop => {
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "while (1)");
-            cg.loopDepth = cg.loopDepth + 1;
+            cgPushLoop(cg);
             cgStmtBraced(cg, s.kind.payload.Loop.body);
             cgPopLoop(cg);
             return;
@@ -4365,7 +4411,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stCh(&cg.body, ';');
                 stPS(&cg.body, p);
                 stCh(&cg.body, ')');
-                cg.loopDepth = cg.loopDepth + 1;
+                cgPushLoop(cg);
                 cgStmtBraced(cg, s.kind.payload.For.body);
                 cgPopLoop(cg);
                 return;
@@ -4388,7 +4434,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stPS(&cg.body, c);
                 stP(&cg.body, ")) break;");
             }
-            cg.loopDepth = cg.loopDepth + 1;
+            cgPushLoop(cg);
             cgStmtBraced(cg, s.kind.payload.For.body);
             cgPopLoop(cg);
             if (hasPost) {
@@ -4470,7 +4516,7 @@ void cgStmt(Codegen* cg, NodeId id)
             }
             stCh(&cg.body, ';');
 
-            cg.loopDepth = cg.loopDepth + 1;
+            cgPushLoop(cg);
             cgStmtBraced(cg, s.kind.payload.ForIn.body);
             cgPopLoop(cg);
 
@@ -4845,6 +4891,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     usize bodyStart = cg.body.len;
     cg.tempsLen = 0;
     cg.loopDepth = 0;
+    cg.breakDepth = 0;
     cg.ind = 1;
     /* bound names: fresh set per function — params and `self` are
      * locals (Ident refs to them stay raw) */
@@ -6011,6 +6058,10 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.tempArrs = (u32*)arena.alloc(4096 * @sizeof(u32), 8);
     cg.loopCap = 64;
     cg.loopDepth = 0;
+    cg.breakDepth = 0;
+    cg.switchSeq = 0;
+    cg.breakKinds = (u32*)arena.alloc(64 * @sizeof(u32), 8);
+    cg.breakLabels = (u32*)arena.alloc(64 * @sizeof(u32), 8);
     cg.regCap = 512;
     cg.regLen = 0;
     cg.regNames = (Slice*)arena.alloc(512 * @sizeof(Slice), 8);
