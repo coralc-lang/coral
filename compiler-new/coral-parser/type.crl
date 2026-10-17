@@ -1,4 +1,8 @@
 // parser/type.crl — type parsing
+//
+// base type then suffixes (fn-pointer, pointer, slice, array), with the
+// const/comptime wrappers peeled off in parseType. every constructor here
+// allocates a fresh entry except internKind, which dedups primitives.
 
 import diag { code { ErrorCode }, engine { DiagnosticEngine } };
 import common::token { Token, TokenKind };
@@ -76,6 +80,7 @@ pub extend Parser
         return base;
     }
 
+    // `const T` / `comptime T` wrap whatever the suffix chain produced
     Ty parseType()
     {
         if (self.current.kind == TokenKind::Flag) return self.parseFlagType();
@@ -150,7 +155,8 @@ pub extend Parser
         return false;
     }
 
-    // grow-and-append for the const-int prescan table
+    // grow-and-append for the const-int prescan table. names arrive
+    // interned, so the equality check in lookupConstInt is an id compare
     void addConstInt(Str name, u64 value)
     {
         if (name == 0) return;
@@ -274,6 +280,9 @@ pub extend Parser
         self.constCap = 0;
     }
 
+    /* ── type node constructors ── */
+    // all fresh entries; internKind is the one exception
+
     Ty makeVoid()
     {
         TypeKind k;
@@ -295,6 +304,11 @@ pub extend Parser
         return t;
     }
 
+    /* speculative `<A, B>` generic-argument list. consumeGreater handles
+     * `>>` so nested generics split correctly. on any error (or a missing
+     * `>`) the whole attempt is rewound to before the `<` and the partial
+     * arg array freed — the caller then reads `<` as a less-than. the
+     * error-count guard catches parseType errors, which are non-fatal */
     bool parseGenericArguments(rawptr* outArgs, u32* outLen)
     {
         *outArgs = null;
@@ -417,6 +431,7 @@ pub extend Parser
 
     Ty parseBaseType()
     {
+        // `any T` → `any<T>`; a tag wrapper, not a real generic
         if (self.match(TokenKind::Any))
         {
             Token tTok = self.expect(TokenKind::Ident);
@@ -491,6 +506,8 @@ pub extend Parser
 
         if (self.current.kind == TokenKind::LParen)
         {
+            // `(A, B)` tuple type; unlike expressions, `(A)` stays a
+            // 1-tuple here — sema decides what that means
             self.advance();
             TyListBuilder elems;
             self.ctx.tyListInit(&elems);
@@ -512,6 +529,7 @@ pub extend Parser
 
         if (self.current.kind == TokenKind::Struct)
         {
+            // `struct(A, B)` — the second tuple spelling, same node kind
             self.advance();
             self.expect(TokenKind::LParen);
             TyListBuilder elems;
@@ -532,11 +550,15 @@ pub extend Parser
             return self.makeTuple(values, count);
         }
 
+        // nothing matched: report and eat one token (unless EOF) so the
+        // caller's loop always moves
         self.reportCurrentError(ErrorCode::ParseExpectedType, "expected a type");
         if (!self.atEnd()) self.advance();
         return 0;
     }
 
+    // no callers anywhere: a leftover stub. real slots come from
+    // allocTypeKind — this just reports and hands back 0
     Ty allocType()
     {
         self.reportAllocFailed();

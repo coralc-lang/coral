@@ -1,13 +1,18 @@
-// number and float literal lexer handling.
-// Handles cases like "f64 f = 3.142E+12;"
-
-// flag if not handles anywhere in the compiler.
+// lexer/number.crl: numeric literals
+//
+// 0x/0b/0o prefixes, decimal, and floats with exponents ("3.142E+12").
+// `_` separators are allowed anywhere in digit runs. suffix bits ride on
+// the token into IntLit/FloatLit .flags; sema reads bit0 (unsigned) and
+// bit1 (float); the long flag is collision-checked here, then ignored.
 
 import common { token { TokenKind, Token }, slice { Slice } };
 import base { Lexer };
 
 pub extend Lexer
 {
+    /* digits are re-validated here rather than trusted from the scan;
+     * `_` is skipped. bad digit or overflow reports and stops, returning
+     * whatever accumulated so far */
     u64 parseInteger(Slice data, u32 base)
     {
         u64 value = 0;
@@ -29,6 +34,7 @@ pub extend Lexer
                 break;
             }
             u64 prod = value * (u64)base;
+            // wrapped on multiply; the add-one check below catches the rest
             if (value != 0 && prod / (u64)base != value) {
                 self.reportError(self.bufStart, self.bufEnd, data.ptr + i, "integer literal out of range");
                 break;
@@ -93,6 +99,7 @@ pub extend Lexer
         return 0;
     }
 
+    // prefix only counts right after a leading 0; `0x1F` yes, `10x` no
     Token lexNumber(u8* start)
     {
         if (!self.isAtEnd() && self.cur[0] == 'x' &&
@@ -116,6 +123,9 @@ pub extend Lexer
         return self.lexDecimal(start);
     }
 
+    /* strips the 2-byte prefix off .data (digits only), then grabs the
+     * suffix and converts. the #[[fallthrough]] switch just picks the
+     * base; whatever comes back from parseInteger is already bounded */
     Token makePrefixedToken(TokenKind kind, u8* start)
     {
         Token token = self.makeToken(kind, start);
@@ -141,6 +151,7 @@ pub extend Lexer
             (self.cur[0] >= 'a' && self.cur[0] <= 'f') ||
             (self.cur[0] >= 'A' && self.cur[0] <= 'F')))
         {
+            // a bare `0x` still produces a Hex token, just empty
             self.reportError(self.bufStart, self.bufEnd, start, "hex literal has no digits");
             return self.makePrefixedToken(TokenKind::Hex, start);
         }
@@ -209,6 +220,7 @@ pub extend Lexer
             if (c >= '0' && c <= '9') {
                 self.cur++;
             } else if (c == '.' && !isFloat) {
+                // a second dot means this was `..` (range), not a float
                 if (self.cur + 1 < self.bufEnd && self.cur[1] == '.') {
                     break;
                 }
@@ -217,6 +229,8 @@ pub extend Lexer
             }
             else if (c == 'e' || c == 'E')
             {
+                // peek past the optional sign: only commit to an exponent
+                // if real digits follow, so `3e` stays int 3 + ident `e`
                 u8* digits = self.cur + 1;
                 if (digits < self.bufEnd && (digits[0] == '+' || digits[0] == '-')) digits++;
                 u8* firstDigit = digits;

@@ -1,10 +1,16 @@
 
-import ast::id { Str, NodeId };
-import ast::types { Ty, TypeEntry, TypeKind };
-import ast::node { Node, NodeKind };
-import ast::expr { Expr, ExprKind };
-import ast::decl { Decl, DeclKind, Param, VariantVariant };
-import ast::stmt { SwitchCase };
+/* expr.crl — expression checking. every expression gets a type written back
+ * into the node (resolvedType); the big switch in checkExpr is the entry
+ * point. the helpers above it are where the literal-adoption and assignment
+ * leniency rules live. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    expr { Expr, ExprKind },
+    decl { Decl, DeclKind, Param, VariantVariant },
+    stmt { SwitchCase }
+};
 import scope { Symbol };
 import member { MemberInfo };
 import sema { Sema };
@@ -47,6 +53,11 @@ pub extend Sema
         }
     }
 
+    /* ── lvalues ─────────────────────────────────────────────────────── */
+
+    /* assign-target check: ident, field, index and deref are assignable.
+     * sets the target's type but does not check the value against it — the
+     * caller owns compatibility. constants are rejected here (TC-0008). */
     bool assignExpr(NodeId id)
     {
         if (id.index == 0) return false;
@@ -537,10 +548,6 @@ pub extend Sema
         return false;
     }
 
-    /* assignCompatible + the one diagnostic it cannot phrase itself:
-     * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
-     * non-fatal). Returns false only for ordinary mismatches — the
-     * caller then emits its generic message on the same node. */
     // `x.payload` access node (inside a field chain)
     bool isPayloadAccessNode(NodeId objId)
     {
@@ -582,6 +589,10 @@ pub extend Sema
         return self.isPayloadAccessNode(self.fieldAccessObj(objId));
     }
 
+    /* assignCompatible + the one diagnostic it cannot phrase itself:
+     * int→pointer is TC-0009 (always reported; --allow-int-ptr makes it
+     * non-fatal). Returns false only for ordinary mismatches — the
+     * caller then emits its generic message on the same node. */
     bool checkAssign(NodeId value, Ty fromTy, Ty targetTy)
     {
         if (self.assignCompatible(value, fromTy, targetTy)) return true;
@@ -615,12 +626,18 @@ pub extend Sema
         return t;
     }
 
+    /* binary result typing, roughly in order: variant-vs-tag comparisons,
+     * pointer arithmetic (`+`, `-`, and pointer-minus-pointer below), then
+     * scalar rules. isSub only matters for `-` (byte distance between
+     * pointers). nothing here is checked "forward" — each operand is typed,
+     * then the pair decides the result */
     bool checkBinary(NodeId id, NodeId left, NodeId right, bool isSub)
     {
         if (!self.checkExpr(left)) return false;
         if (!self.checkExpr(right)) return false;
         Ty leftType = self.exprType(left);
         Ty rightType = self.exprType(right);
+        // an untyped side (null) borrows the other side's type
         if (leftType == 0) leftType = rightType;
         if (rightType == 0) rightType = leftType;
         /* `v.tag == V::Case` — a variant value compared against its tag
@@ -642,8 +659,6 @@ pub extend Sema
             self.setExprType(id, self.usizeType());
             return true;
         }
-        // a particular rule makes ths possible, but will throw an error. 
-        // with -fcast casts will be forced. and compilation will be terminated.
         /* no implicit scalar conversion in operators either: same type,
          * or a literal adopting the typed side (`i < 10`, `8 + (u32)x`);
          * mixed typed operands need an explicit cast on one side */
@@ -953,6 +968,11 @@ pub extend Sema
         return true;
     }
 
+    /* ── the walk ────────────────────────────────────────────────────── */
+
+    /* entry point: type every subexpression depth-first, write the result
+     * back via setExprType. id 0 and non-expr nodes pass through silently —
+     * the parser leaves holes (e.g. an omitted then-branch). */
     bool checkExpr(NodeId id)
     {
         if (id.index == 0) return true;
@@ -964,6 +984,8 @@ pub extend Sema
             ExprKind::IntLit => {
                 u64 v = expr->kind.payload.IntLit.value;
                 Ty t;
+                // no suffix: first type it fits wins, i32 → i64 → u64.
+                // `u` (bit 0): straight to u32/u64
                 if ((expr->kind.payload.IntLit.flags & 1) != 0)
                 {
                     /* `u` suffix: unsigned literal. Typed as the widest
@@ -983,6 +1005,7 @@ pub extend Sema
                 self.setExprType(id, t);
                 return true;
             },
+            // flag bit 2 = `f` suffix: f32, everything else f64
             ExprKind::FloatLit => { if ((expr->kind.payload.FloatLit.flags & 2) != 0) self.setExprType(id, self.f32Type()); else self.setExprType(id, self.f64Type()); return true; },
             ExprKind::StringLit => {
                 /* C"..." → NUL-terminated `const cchar*` (no len), the
@@ -994,6 +1017,8 @@ pub extend Sema
             },
             ExprKind::CharLit => { self.setExprType(id, self.charType()); return true; },
             ExprKind::BoolLit => { self.setExprType(id, self.boolType()); return true; },
+            // null stays UNTYPED (Ty 0); compatible() treats from == 0 as
+            // fitting anything, so there's nothing to decide here
             ExprKind::NullLit => { return true; },
             ExprKind::Ident => {
                 if (!self.checkIdent(id, expr->kind.payload.Ident.name)) return false;
@@ -1212,6 +1237,8 @@ pub extend Sema
                 Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
                 Decl* methodDecl = &methodNode->kind.payload.Decl.value;
                 u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
+                // `self` sits at param 0 (flag bit 1) but never appears in
+                // method-call args, so arity and substitution start past it
                 u32 selfOffset = 0;
                 if (paramsLen > 0)
                 {
@@ -1360,7 +1387,7 @@ pub extend Sema
                 if (objectEntry->kind.tag == TypeKind::Array) self.setExprType(id, objectEntry->kind.payload.Array.base);
                 else if (objectEntry->kind.tag == TypeKind::Slice) self.setExprType(id, objectEntry->kind.payload.Slice.base);
                 else if (objectEntry->kind.tag == TypeKind::Pointer) self.setExprType(id, objectEntry->kind.payload.Pointer.base);
-                else if (objectEntry->kind.tag == TypeKind::Str) self.setExprType(id, self.charType());
+                else if (objectEntry->kind.tag == TypeKind::Str) self.setExprType(id, self.charType()); // str[i] → char (the byte type)
                 else
                 {
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot dereference this type");
@@ -1499,6 +1526,9 @@ pub extend Sema
                         self.typeMismatchMsg("compound assignment", self.exprType(av), atgt));
                 return true;
             },
+            /* only += and -= get the int→pointer treatment (pointer
+             * arithmetic); *= /= %= &= |= ^= <<= >>= just walk target and
+             * value — NO type check. `x *= "hi"` type-checks today. */
             ExprKind::AssignMul => {
                 if (!self.assignExpr(expr->kind.payload.AssignMul.target)) return false;
                 if (!self.checkExpr(expr->kind.payload.AssignMul.value)) return false;
@@ -1658,6 +1688,8 @@ pub extend Sema
                 Str* litNames = expr->kind.payload.StructLiteral.fieldNames;
                 while (i < expr->kind.payload.StructLiteral.fieldValuesLen)
                 {
+                    // named fields resolve by name; the arg-list form
+                    // (`Pair { 1, 2 }`) falls back to positional lookup
                     MemberInfo member;
                     if (litNames != 0) member = self.findMember(expr->kind.payload.StructLiteral.typeNode, litNames[i]);
                     else member = self.findMemberByIndex(expr->kind.payload.StructLiteral.typeNode, i);
@@ -1792,6 +1824,8 @@ pub extend Sema
                     usize cpI = 0;
                     while (cpI < msgLen) { msgBuf[cpI] = msgPtr.ptr[cpI]; cpI++; }
                     msgBuf[msgLen] = 0;
+                    // (usize) on a void call: does nothing, the value is dropped.
+                    // leftover artifact, kept exactly as-is
                     (usize)self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, str { .ptr = msgBuf, .len = (usize)msgLen });
                     return false;
                 }
@@ -1811,6 +1845,8 @@ pub extend Sema
                                 lit = true;
                         }
                     }
+                    // sic: both ternary arms are boolType(). lit doesn't pick a
+                    // type — @isFormatLiteral always yields bool
                     self.setExprType(id, lit ? self.boolType() : self.boolType());
                     return true;
                 }
@@ -1967,6 +2003,8 @@ pub extend Sema
             ExprKind::IfExpr => {
                 if (!self.checkExpr(expr->kind.payload.IfExpr.cond)) return false;
                 Ty ifExprCondTy = self.exprType(expr->kind.payload.IfExpr.cond);
+                // unlike statement `if`, the expression form is strict bool
+                // (no C truthiness, no null)
                 if (ifExprCondTy != 0 && ifExprCondTy != self.boolType())
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if-expression condition must be bool");
                 if (!self.checkExpr(expr->kind.payload.IfExpr.thenBody)) return false;
@@ -1975,6 +2013,8 @@ pub extend Sema
                 Ty elseTy = self.exprType(expr->kind.payload.IfExpr.elseBody);
                 if (thenTy == 0) thenTy = elseTy;
                 if (elseTy == 0) elseTy = thenTy;
+                // one branch's type becomes the result; an untyped branch
+                // (null literal) adopted the other's before we got here
                 if (!self.compatible(thenTy, elseTy)) self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "if-expression branch types do not match");
                 self.setExprType(id, thenTy);
                 return true;

@@ -2,6 +2,11 @@
  *
  * Clang-style precedence climbing: one function handles all
  * binary operators, parameterized by minimum precedence.
+ *
+ * the descent chain is parseExpr → parseBinaryExpr → parseUnaryExpr →
+ * parsePostfixExpr → parsePrimaryExpr, one layer per precedence class.
+ * there's no nesting guard anywhere in the parser: a pathological
+ * `((((...` file recurses until the process stack gives out.
  */
 
 import parser;
@@ -23,6 +28,12 @@ import ast {
 
 pub extend Parser
 {
+    /* ── operator table ── */
+
+    /* binding powers for parseBinaryExpr. assignment sits at 1 and is
+     * right-assoc (handled by parseExpr itself); higher number = tighter.
+     * left-assoc operators recurse with p+1, right-assoc with p-1, so a
+     * gap of at least 1 between any two levels is load-bearing */
     i32 prec(TokenKind kind)
     {
         switch (kind)
@@ -61,6 +72,7 @@ pub extend Parser
         }
     }
 
+    // must agree with prec() == 1: parseExpr and parseBinaryExpr both lean on it
     bool isAssignOp(TokenKind kind)
     {
         return kind == TokenKind::Equal ||
@@ -77,6 +89,8 @@ pub extend Parser
                kind == TokenKind::NegEqual;
     }
 
+    // fresh expr node stamped with the last consumed token; resolvedType
+    // starts 0 and sema fills it in later (typecheck.crl)
     NodeId storeExpr(ExprKind kind)
     {
         return self.storeNode(NodeKind::Expr{
@@ -88,6 +102,11 @@ pub extend Parser
         });
     }
 
+    /* ── call arguments ── */
+
+    /* parses `a, b, ...` up to (not including) the closing `)`. trailing
+     * comma is legal. the builder belongs to the caller — finish() hands
+     * the array to the ctx, which owns it until deinit */
     void parseCallArgs(NodeListBuilder* args)
     {
         self.ctx.nodeListInit(args);
@@ -132,6 +151,7 @@ pub extend Parser
             /* `{ .field = … }` — a bare designated struct literal; the type
              * comes from the declarator (patched in during sema) */
             {
+                // `{ .` lookahead: designated fields, not a block
                 ParserMark m = self.save();
                 self.advance();
                 bool designated = self.current.kind == TokenKind::Dot;
@@ -155,8 +175,9 @@ pub extend Parser
         return self.parseExpr();
     }
 
-    /* `T name[] = { … }` — an unsized declarator with a brace initializer
-     * is a C-style array sized from the initializer, not a slice view. */
+    /* `T name[] = { … }`: an empty `[]` declarator parses as a Slice (type.crl
+     * has no "unsized array" kind), but a brace initializer means C's array
+     * sized from its elements. rewrite the type before sema ever sees it. */
     Ty inferArrayFromInit(Ty ty, NodeId init)
     {
         if (ty == 0 || init.index == 0) return ty;
@@ -169,12 +190,15 @@ pub extend Parser
         return self.makeArray(te->kind.payload.Slice.base, (u32)e.kind.payload.ArrayLiteral.elemsLen);
     }
 
+    /* ── the entry level: assignment and ternary ── */
+
+    /* everything funnels through here. assignment binds right (`a = b = c`
+     * is `a = (b = c)`) and ternary branches are full parseExpr calls, so
+     * `a = b ? c : d` means `a = (b ? c : d)` like C. binary parsing starts
+     * at 2 because assignment is prec 1 and handled right here; the op's
+     * text pointer is stashed for stmt.crl's #[[condassign]] check */
     NodeId parseExpr()
     {
-        /* Assignment and ternary sit at the lowest precedence level:
-         * `a = b ? c : d` must parse as `a = (b ? c : d)`, matching C.
-         * The ternary condition excludes assignments (parenthesise
-         * explicitly), and the branches nest recursively. */
         NodeId cond = self.parseBinaryExpr(2);
         if (self.match(TokenKind::Question))
         {
@@ -193,6 +217,9 @@ pub extend Parser
         return cond;
     }
 
+    /* precedence climbing proper: consume operators while they bind at
+     * least as tight as minPrec. the p+1/p-1 recursion split (see prec)
+     * is what makes associativity fall out of one loop */
     NodeId parseBinaryExpr(i32 minPrec)
     {
         NodeId left = self.parseUnaryExpr();
@@ -200,9 +227,11 @@ pub extend Parser
         while (true)
         {
             i32 p = self.prec(self.current.kind);
+            // 0 = not a binary op, or one that binds looser than this level
             if (p == 0 || p < minPrec) break;
 
             Token op = self.advance();
+            // assignment is right-assoc: `a = b = c` means `a = (b = c)`
             bool rightAssoc = self.isAssignOp(op.kind);
             if (rightAssoc) self.lastAssignPtr = op.data.ptr;
             NodeId right;
@@ -249,11 +278,14 @@ pub extend Parser
             TokenKind::CaretEqual => { return self.storeExpr(ExprKind::AssignBitXor{ .target = left, .value = right }); },
             TokenKind::ShlEqual => { return self.storeExpr(ExprKind::AssignShl{ .target = left, .value = right }); },
             TokenKind::ShrEqual => { return self.storeExpr(ExprKind::AssignShr{ .target = left, .value = right }); },
+            /* `~=` is coral's neg-assign; there's no ExprKind for it, so
+             * desugar to Assign(target, BitNot(right)) */
             TokenKind::NegEqual => { return self.storeExpr(ExprKind::Assign{ .target = left, .value = self.storeExpr(ExprKind::BitNot{ .expr = right }) }); },
             else => { return self.allocNode(); }
         }
     }
 
+    // prefix operators; all recurse into parseUnaryExpr so they stack
     NodeId parseUnaryExpr()
     {
         if (self.current.kind == TokenKind::Not) {
@@ -276,6 +308,7 @@ pub extend Parser
             NodeId expr = self.parseUnaryExpr();
             return self.storeExpr(ExprKind::AddressOf{ .expr = expr });
         }
+        // `~` (TokenKind::Neg) is bitwise not; arithmetic negation is Minus
         if (self.current.kind == TokenKind::Neg) {
             self.advance();
             NodeId expr = self.parseUnaryExpr();
@@ -294,6 +327,11 @@ pub extend Parser
         return self.parsePostfixExpr();
     }
 
+    /* ── postfix chains ── */
+
+    /* greedy: call, `.`/`->` field, `.0` tuple index, method call, `::`
+     * path, index, postfix ++/--. call and method nodes get the receiver's
+     * loc via pointAt so a diagnostic points at `foo`, not the `)` */
     NodeId parsePostfixExpr()
     {
         NodeId expr = self.parsePrimaryExpr();
@@ -311,7 +349,9 @@ pub extend Parser
                 expr = self.storeExpr(ExprKind::Call{ .callee = expr, .args = values, .argsLen = count });
                 self.pointAt(expr, callee);
             } else if (self.current.kind == TokenKind::Dot || self.current.kind == TokenKind::Arrow) {
+                // `->` builds the same Field node as `.` — deref is sema's problem
                 self.advance();
+                // `.0` — tuple index; a name after the dot is a field instead
                 if (self.current.kind == TokenKind::Dec) {
                     Token index = self.advance();
                     u32 field = (u32)index.number;
@@ -346,6 +386,7 @@ pub extend Parser
                 NodeId* values = self.ctx.nodeListFinish(&segments);
                 expr = self.storeExpr(ExprKind::Path{ .segments = values, .segmentsLen = count });
                 
+                // `T::V { ... }` — variant literal, type taken from the path head
                 if (self.current.kind == TokenKind::LBrace) {
                     Ty litTy = self.pathHeadType(expr);
                     expr = self.parseLiteralFields(litTy, partName);
@@ -367,8 +408,10 @@ pub extend Parser
         return expr;
     }
 
-    /* flag (NAME) { key => expr, else => expr } — compile-time selection
-     * of a matching arm from the flag table set by `--flag`/manifest. */
+    /* `flag (NAME) { key => expr, ..., else => expr }` — compile-time arm
+     * selection against ctx.flags (`--flag` / manifest). every arm body is
+     * still parsed so its syntax gets checked; only the matching one comes
+     * back. no match and no else arm is an error. */
     NodeId parseFlagExpr()
     {
         self.advance(); // flag
@@ -424,6 +467,8 @@ pub extend Parser
         return self.noneNode();
     }
 
+    /* ── primaries: literals, names, parens, blocks, builtins ── */
+
     NodeId parsePrimaryExpr()
     {
         TokenKind k = self.current.kind;
@@ -451,6 +496,7 @@ pub extend Parser
 
             TokenKind::Float => {
                 Token tok = self.advance();
+                // raw text, interned; the lexer does not parse floats
                 return self.storeExpr(ExprKind::FloatLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = tok.numFlags });
             },
 
@@ -461,6 +507,7 @@ pub extend Parser
 
             TokenKind::CString => {
                 Token tok = self.advance();
+                // flags 1 = c-string: codegen appends the trailing NUL
                 return self.storeExpr(ExprKind::StringLit{ .value = self.ctx.intern(tok.data.asStr()), .flags = 1 });
             },
 
@@ -514,6 +561,8 @@ pub extend Parser
             TokenKind::Ident => {
                 Token nameTok = self.advance();
                 Str name = self.ctx.intern(nameTok.data.asStr());
+                // `T<A, B>` type ref or a plain name; a following `{` makes
+                // it a struct literal instead
                 Ty* genericArgs = null;
                 u32 genericArgsLen = 0;
                 bool hasGenericArgs = self.parseGenericArguments((rawptr*)&genericArgs, &genericArgsLen);
@@ -583,6 +632,9 @@ pub extend Parser
                 {
                     ParserMark cm = self.save();
                     Ty ctype = self.parseType();
+                    // parseType closed on `)` — this really is a cast. the
+                    // save() above bumped specDepth; close it out here since
+                    // the speculative branch won
                     if (self.current.kind == TokenKind::RParen)
                     {
                         self.advance();
@@ -590,6 +642,7 @@ pub extend Parser
                         NodeId cinner = self.parseUnaryExpr();
                         return self.storeExpr(ExprKind::Cast{ .expr = cinner, .targetType = ctype });
                     }
+                    // not a cast after all (plain `(expr)`): rewind everything
                     self.restore(cm);
                 }
                 if (self.current.kind == TokenKind::RParen) {
@@ -609,11 +662,16 @@ pub extend Parser
                 self.expect(TokenKind::RParen);
                 u32 count = elems.len;
                 NodeId* values = self.ctx.nodeListFinish(&elems);
+                // `(x)` is a parenthesized expr, not a one-tuple
                 if (count == 1) return values[0];
                 return self.storeExpr(ExprKind::TupleExpr{ .elems = values, .elemsLen = count });
             },
             
             TokenKind::LBrace => {
+                /* a block in expression position. per item: statement
+                 * keywords go to parseStmt, everything else is an expr, and
+                 * the last item parsed becomes the block's value. bail on
+                 * the first new error so recovery doesn't cascade */
                 self.advance();
                 NodeListBuilder stmts;
                 self.ctx.nodeListInit(&stmts);
@@ -624,10 +682,10 @@ pub extend Parser
                     bool isStatement = false;
                     switch (self.current.kind)
                     {
-                        TokenKind::Return, TokenKind::If, TokenKind::While,
-                        TokenKind::For, TokenKind::Loop, TokenKind::Switch,
-                        TokenKind::Defer, TokenKind::Break, TokenKind::Continue,
-                        TokenKind::LBrace, TokenKind::Comptime, TokenKind::Var,
+                        TokenKind::Return |  TokenKind::If | TokenKind::While | 
+                        TokenKind::For |  TokenKind::Loop | TokenKind::Switch | 
+                        TokenKind::Defer |  TokenKind::Break |  TokenKind::Continue | 
+                        TokenKind::LBrace |  TokenKind::Comptime |  TokenKind::Var | 
                         TokenKind::Const => { isStatement = true; },
                         else => {}
                     }
@@ -738,6 +796,7 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                     return self.storeExpr(ExprKind::Sizeof{ .targetType = szType });
                 }
+                // a couple of builtins lex as keywords, the rest as idents
                 Str bname;
                 if (self.current.kind == TokenKind::BuiltinAssert ||
                     self.current.kind == TokenKind::BuiltinAssertOut ||
@@ -766,6 +825,7 @@ pub extend Parser
             },
             
             else => {
+                // consume a token (unless at EOF) so callers can't spin on us
                 self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected an expression");
                 if (!self.atEnd()) self.advance();
                 return self.noneNode();
@@ -781,6 +841,7 @@ pub extend Parser
     NodeId parseLiteralFields(Ty typeNode, Str variantName)
     {
         self.expect(TokenKind::LBrace);
+        // lookahead: `ident =` means named fields, anything else positional
         bool positional = false;
         if (self.current.kind != TokenKind::RBrace && self.current.kind != TokenKind::Dot)
         {
@@ -810,6 +871,7 @@ pub extend Parser
         {
             while (self.current.kind != TokenKind::RBrace && !self.atEnd())
             {
+                // leading dot is optional inside the braces
                 self.match(TokenKind::Dot);
                 Token field = self.expectName();
                 Str fieldName = self.ctx.intern(field.data.asStr());
@@ -821,6 +883,8 @@ pub extend Parser
             }
         }
         self.expect(TokenKind::RBrace);
+        // positional literals carry values only: fieldNames stays null and
+        // the field count comes from the values array
         u32 count = positional ? values.len : fields.len;
         Str* fieldNames = self.ctx.strListFinish(&fields);
         if (positional) fieldNames = null;
@@ -842,6 +906,10 @@ pub extend Parser
         return 0;
     }
 
+    /* one arm: `pat | pat, pat if guard => body`. flags bit 0 = guard
+     * present (codegen checks it); bit 2 (4) = else arm. the ast header
+     * lists bit 1 as fallthrough, but nothing here sets that — codegen
+     * only ever reads bits 0 and 2 */
     SwitchCase parseSwitchExprCase()
     {
         SwitchCase c;

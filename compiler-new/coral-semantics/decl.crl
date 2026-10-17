@@ -1,8 +1,14 @@
 
-import ast::id { Str, NodeId };
-import ast::types { Ty, TypeEntry, TypeKind };
-import ast::node { Node, NodeKind };
-import ast::decl { File, Decl, DeclKind, ImportSymbol, GenericParam };
+/* decl.crl — declaration checking, two passes over a file's decls:
+ * declareAll binds names/types/signatures first (so extends and cross-file
+ * references resolve in any order), checkBodies then checks bodies. import
+ * binding lives here too. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { File, Decl, DeclKind, ImportSymbol, GenericParam }
+};
 import context::context { InternEntry };
 import scope { Symbol, ScopeStack };
 import sema { Sema };
@@ -11,6 +17,10 @@ import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
+    /* check one decl. `bodies=false` is the declare pass (bind the name and
+     * type, skip bodies); `bodies=true` checks the body. returns false only
+     * for a hard stop (import failure) — ordinary errors are counted and
+     * this still returns true so the walk goes on. */
     bool checkDecl(NodeId id, bool bodies)
     {
         if (id.index == 0) return true;
@@ -18,6 +28,8 @@ pub extend Sema
         if (node->kind.tag != NodeKind::Decl) return true;
         Decl* decl = &node->kind.payload.Decl.value;
         u8 symbolFlags = 0;
+        // scope kind codes (see scope.crl Symbol): 1 var/const, 2 func,
+        // 3 type, 4 generic param, 5 module namespace — filled below
         u8 kind = 0;
         Str name = 0;
         Ty typeNode = 0;
@@ -110,6 +122,8 @@ pub extend Sema
                     if (pn->kind.tag == NodeKind::Decl)
                     {
                         Decl* pd = &pn->kind.payload.Decl.value;
+                        // func flags bit 8 = has a body; one bodyless side
+                        // makes this a prototype/definition pair, one function
                         if (pd->kind.tag == DeclKind::Func &&
                             ((pd->kind.payload.Func.flags & 8) == 0 ||
                              (decl->kind.payload.Func.flags & 8) == 0))
@@ -177,6 +191,10 @@ pub extend Sema
         return true;
     }
 
+    /* methods of one type decl: push a scope holding its generic params
+     * (`T` and friends) and check each method against the self type. when no
+     * explicit list was given (legacy `extend Option<T>`) the param names are
+     * pulled out of the self type's generic args instead. */
     bool checkMethods(NodeId* methods, u32 methodsLen, Ty selfType, NodeId* genericParams, u32 genericParamsLen)
     {
         self.scopes.enter();
@@ -235,6 +253,11 @@ pub extend Sema
         return ok;
     }
 
+    /* does the module's `pub mod name = import ...` line re-export `member`?
+     * symbol flags bit 2 = `*`, which means the whole module is public; a
+     * decl that isn't a ModReexport at all (plain path-only module) exports
+     * everything too, and null (unresolved) stays permissive — the import
+     * binder reports that miss. */
     bool moduleExportsContain(Decl* modDecl, Str member)
     {
         if (modDecl == null) return true;
@@ -252,6 +275,9 @@ pub extend Sema
         return false;
     }
 
+    // "file"/"lib" — the compiler's own root segments, compared as bytes.
+    // a path starting with one is the loader's business, not a module symbol
+    // in this file's scope
     bool isRootSegment(u8* ptr, u32 len)
     {
         if (len == 4 && ptr[0] == 102 && ptr[1] == 105 && ptr[2] == 108 && ptr[3] == 101) return true;
@@ -259,12 +285,11 @@ pub extend Sema
         return false;
     }
 
-    /* Bind every named symbol of an import into THIS file's scope, pointing
-     * at the real declaration. Two direct pulls of the same local name in one
-     * file conflict — alias one with `as` or use a qualified path; the same
-     * name in different files stays legal (mangling keeps them apart). */
     /* module path for one import symbol — the import path plus the symbol's
-     * module prefix (`std::text { string::{String} }` → `std::text::string`) */
+     * module prefix (`std::text { string::{String} }` → `std::text::string`).
+     * careful: the pe->len++ below writes back into the shared intern entry,
+     * so `base` reads one byte longer afterwards. looks accidental; the
+     * buffer arithmetic happens to fit the grown length, so it survives. */
     Str importSymbolModulePath(Decl* decl, Str symbolName)
     {
         Str base = decl->kind.payload.Import.path;
@@ -279,7 +304,7 @@ pub extend Sema
         }
         if (last == 0) return base;
         InternEntry* pe = self.ctx.interns + base;
-        if (last > pe->len++)
+        if (last > pe->len++) // see the warning above
         {
             bool absolute = true;
             usize chk = 0;
@@ -341,6 +366,8 @@ pub extend Sema
                 while (k < segLen && fp[j + k] == pe->ptr[pi + k]) k++;
                 if (k == segLen)
                 {
+                    // 47 '/' either side; 46 '.' on the right so the final
+                    // segment can end at the ".crl" extension
                     bool leftOk = (j == 0) || fp[j - 1] == 47;
                     usize end = j + segLen;
                     bool rightOk = (end >= fl) || fp[end] == 47 || fp[end] == 46;
@@ -354,6 +381,10 @@ pub extend Sema
         return true;
     }
 
+    /* Bind every named symbol of an import into THIS file's scope, pointing
+     * at the real declaration. Two direct pulls of the same local name in one
+     * file conflict — alias one with `as` or use a qualified path; the same
+     * name in different files stays legal (mangling keeps them apart). */
     bool bindImportSymbols(NodeId id, Decl* decl, str notFoundMsg)
     {
         u32 fileId = self.fileOf(id);
@@ -428,6 +459,12 @@ pub extend Sema
         return true;
     }
 
+    /* one import statement:
+     * - path-only (`import foo::bar;`) binds the last segment as a module
+     *   name so qualified calls (`bar::x`) resolve
+     * - import(lib) merges the target's decls flat (flags bit 0)
+     * - a module import checks the target's re-export list before binding
+     * returns false only when binding failed hard. */
     bool checkImportDecl(NodeId id, Decl* decl)
     {
         Str path = decl->kind.payload.Import.path;
@@ -490,6 +527,8 @@ pub extend Sema
                 }
                 if (symbol->kind == 5 && symbol->declaration.index != 0)
                 {
+                    // first segment resolved to a module — the next one has
+                    // to be in its re-export list before we bind anything
                     Node* modNode = self.ctx.nodes + symbol->declaration.index;
                     if (modNode->kind.tag == NodeKind::Decl)
                     {
@@ -536,6 +575,9 @@ pub extend Sema
         return self.bindImportSymbols(id, decl, "symbol not found in imported module");
     }
 
+    /* both passes plus the error sync. analyze.crl drives declareAll and
+     * checkBodies by hand and skips this wrapper (it wants the ScopeStack
+     * to outlive the call for the backend). */
     bool checkFile(File* file)
     {
         if (file == null)
@@ -554,6 +596,8 @@ pub extend Sema
         return self.errors == 0;
     }
 
+    // pass 1: names and types only, no bodies. a Symbol conflict here is a
+    // real duplicate (or a prototype/definition pair, handled in checkDecl).
     void declareAll(File* file)
     {
         if (file == null) return;
@@ -575,6 +619,7 @@ pub extend Sema
         }
     }
 
+    // pass 2: bodies, now that every name in the merged unit is bound
     void checkBodies(File* file)
     {
         if (file == null) return;

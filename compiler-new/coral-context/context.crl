@@ -1,8 +1,12 @@
-/* context/context.crl — AST context with arenas and interning
+/* context/context.crl: AST context, arenas, interning, string ownership
  *
- * Owns all compiler data: interned strings, uniqued types, AST nodes.
- * Bump allocation: single large buffers, bump pointer, free all at once.
- * Follows Clang's ASTContext + BumpPtrAllocator design.
+ * one place for everything the compiler allocates: interned strings,
+ * uniqued types, AST nodes, plus a general `owned` list of pointers freed
+ * at deinit. arenas grow geometrically (types/nodes via growStable so
+ * cached entry pointers stay valid). index 0 of each arena is a reserved
+ * sentinel (no type, no node, no string). Clang's ASTContext +
+ * BumpPtrAllocator were the starting point; unlike that design this one
+ * can grow.
  */
 
 import(lib) std::mman { alloc, dealloc, realloc, zero };
@@ -21,6 +25,10 @@ pub struct InternEntry
     u32 id;
 }
 
+/* append-buffers for list-ish fields. append reallocs through ctx.grow;
+ * Finish hands the block to ctx.track, and then the context owns it until
+ * deinit (Finish deallocs it itself only when tracking fails). init just
+ * clears. */
 pub struct NodeListBuilder
 {
     NodeId* data;
@@ -78,6 +86,9 @@ pub struct AstContext
 
     void init(u32 internCap, u32 typeCap, u32 nodeCap)
     {
+        // caps of 0 mean "don't preallocate; ensureX will grow on demand".
+        // targetArch is resolved at compile time: x86_64 unless the build
+        // was configured for arm64
         self = AstContext {
             .interns = null,
             .internsLen = 0,
@@ -152,6 +163,7 @@ pub struct AstContext
 
     void deinit()
     {
+        // every tracked pointer dies here, then the arenas themselves
         u32 i = 0;
         while (i < self.ownedLen)
         {
@@ -192,6 +204,7 @@ pub struct AstContext
         return true;
     }
 
+    // sticky: once set, allocators short-circuit and intern/alloc return 0
     void setError()
     {
         self.error = 1;
@@ -202,6 +215,7 @@ pub struct AstContext
         return self.error != 0;
     }
 
+    // overflow guard: multiplication that would wrap instead sets error
     bool byteCount(u32 count, usize elementSize, usize* bytes)
     {
         usize maxSize = (usize)0 - 1;
@@ -214,6 +228,9 @@ pub struct AstContext
         return true;
     }
 
+    /* plain moving (or in-place) realloc, cap doubling. only for buffers
+     * nobody holds interior pointers into: owned, interns, builder arrays.
+     * types/nodes go through growStable instead */
     rawptr grow(rawptr data, u32 oldCap, u32* newCap, usize elementSize)
     {
         if (self.error != 0) return null;
@@ -244,6 +261,8 @@ pub struct AstContext
         return result;
     }
 
+    /* ensureX: bring an arena up if init didn't preallocate it, and plant
+     * the index-0 sentinel. growX: only called when len == cap */
     bool ensureInterns()
     {
         if (self.error != 0) return false;
@@ -404,6 +423,9 @@ pub struct AstContext
         return result;
     }
 
+    /* id for a byte string; 0 means empty input or a failed context.
+     * linear scan over distinct strings; O(n) per call, fine until a
+     * profile says otherwise */
     u32 intern(str s)
     {
         if (s.len == 0 || s.ptr == null) return 0;
@@ -425,7 +447,7 @@ pub struct AstContext
             self.setError();
             return 0;
         }
-        /* copy the bytes — callers free their buffers after parsing
+        /* copy the bytes: callers free their buffers after parsing
          * (lib loader candidate paths) while entries live as long as
          * the context, so the table must own its strings */
         u8* copy = alloc<u8>(s.len + 1);
@@ -450,6 +472,7 @@ pub struct AstContext
         return e.id;
     }
 
+    // remember a pointer for deinit to free; nulls are ignored
     bool track(rawptr ptr)
     {
         if (ptr == null) return true;
@@ -671,6 +694,7 @@ pub struct AstContext
         return ptr;
     }
 
+    // typed shims over allocBytes; all null on len 0 or overflow
     NodeId* allocNodeList(u32 len)
     {
         if (len == 0) return null;
@@ -708,6 +732,8 @@ pub struct AstContext
         return (SwitchCase*)self.allocBytes(bytes);
     }
 
+    /* reserve the next arena index. 0 means failure; the sentinel sits at
+     * 0, so real types start at 1 */
     Ty allocTypeSlot()
     {
         if (self.error != 0) return 0;
@@ -723,6 +749,7 @@ pub struct AstContext
         return id;
     }
 
+    // same deal as allocTypeSlot; failure hands back node 0 (Invalid)
     NodeId allocNodeSlot()
     {
         if (self.error != 0) return self.noneNode();

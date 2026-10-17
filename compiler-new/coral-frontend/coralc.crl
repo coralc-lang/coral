@@ -1,4 +1,4 @@
-/* frontend/coralc.crl — the single coralc entry point.
+/* frontend/coralc.crl: the single coralc entry point.
  *
  * One executable: build-file parsing + builder + (later) compile.
  * Args come from /proc/self/cmdline (NUL-separated), not argc/argv.
@@ -19,7 +19,7 @@ import diag::explain { explain };
 
 import(lib) core::cchar { cchar };
 import(lib) std::mman { alloc, dealloc };
-import(lib) platform::libc { printf, write, strlen, system };
+import(lib) platform::libc { printf, system };
 
 pub i32 main()
 {
@@ -99,7 +99,7 @@ pub i32 main()
                 k = 0;
                 while (k < blen) { joined[k] = buildPath.ptr[k]; k++; }
                 usize j = 0;
-                while (j < plen) { joined[blen + j] = c.payload.ptr[j]; j = j + 1; }
+                while (j < plen) { joined[blen + j] = c.payload.ptr[j]; j++; }
                 joined[blen + plen] = 0;
                 usize ilen = 0;
                 Slice isrc = readFile(str { .ptr = joined, .len = blen + plen }, &ilen);
@@ -123,11 +123,11 @@ pub i32 main()
                 while (k < nl) { grown[i + iroot.children.len + k] = root.children.data[i + 1 + k]; k++; }
                 root.children.data = grown;
                 root.children.cap = root.children.len + iroot.children.len;
-                root.children.len = root.children.len + iroot.children.len - 1;
-                i = i + iroot.children.len;
+                root.children.len += iroot.children.len - 1;
+                i += iroot.children.len;
             }
             if (!anyInc) break;
-            idepth = idepth + 1;
+            idepth++;
         }
     }
 
@@ -149,7 +149,7 @@ pub i32 main()
                 usize k = 0;
                 usize nl = 0;
                 
-                while (target.ptr[k] != 0 && k < target.len) { nl = nl + 1; k++; }
+                while (target.ptr[k] != 0 && k < target.len) { nl++; k++; }
                 usize sep = 0;
                 k = 0;
                 
@@ -159,7 +159,7 @@ pub i32 main()
                 
                 while (k < sep) { joined[k] = buildPath.ptr[k]; k++; }
                 usize j = 0;
-                while (j < nl) { joined[sep + j] = target.ptr[j]; j = j + 1; }
+                while (j < nl) { joined[sep + j] = target.ptr[j]; j++; }
                 joined[sep + nl] = 0;
                 usize elen = 0;
                 Slice esrc = readFile(str { .ptr = joined, .len = sep + nl }, &elen);
@@ -198,7 +198,7 @@ pub i32 main()
                         {
                             usize eq = 0;
                             bool same = true;
-                            while (eq < cf.name.len) { if (cf.name.ptr[eq] != bf.name.ptr[eq]) { same = false; break; } eq = eq + 1; }
+                            while (eq < cf.name.len) { if (cf.name.ptr[eq] != bf.name.ptr[eq]) { same = false; break; } eq++; }
                             if (same) { found = true; break; }
                         }
                         f++;
@@ -212,7 +212,7 @@ pub i32 main()
                 c.hasExtends = false;
             }
             if (!anyExt) break;
-            edepth = edepth + 1;
+            edepth++;
         }
     }
 
@@ -236,26 +236,26 @@ pub i32 main()
         while (cf < b.crlbFlagPairs)
         {
             addFlagPair(&opts, b.crlbFlagNames[cf], b.crlbFlagValues[cf]);
-            cf = cf + 1;
+            cf++;
         }
         if (b.crlbAllowIntPtr) opts.allowIntPtr = true;
         if (b.crlbQuiet) opts.quiet = true;
     }
 
     // up to date: nothing stale, the output binary exists, no --force
-    u8* outC = sliceCStr(b.output);
-    if (outC == null || b.output.len == 0)
+    u8* outZ = sliceCStr(b.output);
+    if (outZ == null || b.output.len == 0)
     {
         printf(C"coralc: build block needs output = \"path\" (the linked binary)\n");
         return 3;
     }
     if (!opts.force && !b.anyStale && !opts.dryRun && bFileExists(b.output.asStr()))
     {
-        printf(C"coralc: up to date (%s)\n", outC);
+        printf(C"coralc: up to date (%s)\n", outZ);
         b.compilePhaseReached = true;
         if (opts.cmd == Command::Run)
         {
-            i32 st = system((const cchar*)outC);
+            i32 st = system((const cchar*)outZ);
             if (st != 0) return 3;
         }
         return 0;
@@ -266,16 +266,15 @@ pub i32 main()
      * table first, then falls back to lib-root probing. */
     if (!bMkdirParent(b.output.asStr()))
     {
-        printf(C"coralc: cannot create output directory for %s\n", outC);
+        printf(C"coralc: cannot create output directory for %s\n", outZ);
         return 3;
     }
-    u8* entryC = sliceCStr(b.entryPath);
-    if (entryC == null)
+    if (b.entryPath.ptr == null)
     {
         printf(C"coralc: entry module not resolved\n");
         return 3;
     }
-    i32 rc = compileUnitTo(entryC, outC, opts.flagNames, opts.flagValues, opts.flagsCount,
+    i32 rc = compileUnitTo(b.entryPath.asStr(), b.output.asStr(), opts.flagNames, opts.flagValues, opts.flagsCount,
                            opts.errorLimit, opts.allowIntPtr, opts.noPrelude, opts.quiet, opts.dryRun,
                            b.modKeys, b.modVals, b.modLen);
     if (rc == 0)
@@ -284,7 +283,7 @@ pub i32 main()
         if (!opts.dryRun) bWriteAllFps(&b);
         if (opts.cmd == Command::Run)
         {
-            i32 st = system((const cchar*)outC);
+            i32 st = system((const cchar*)outZ);
             if (st != 0) return 3;
         }
         return 0;

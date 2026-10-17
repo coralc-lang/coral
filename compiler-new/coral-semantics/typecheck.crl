@@ -1,3 +1,7 @@
+/* typecheck.crl — type identity and compatibility: sameType (structural),
+ * compatible (assignment leniency), substituteFieldTy (generic object →
+ * field type), and the singleton getters for primitive types. the dump of
+ * `compatible` rules at the bottom is the one that decides what compiles. */
 import ast::id { Str, NodeId };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -10,6 +14,11 @@ import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
+    /* ── primitive type singletons ───────────────────────────────────── */
+
+    /* synthesize a type-table slot. the local is ceremony; the loc reset is
+     * the point: a synthesized type has no source site, so lookupType falls
+     * back to plain scope lookup instead of file-preferred resolution. */
     Ty allocType(TypeKind kind)
     {
         Ty id = self.ctx.allocTypeSlot();
@@ -17,14 +26,15 @@ pub extend Sema
             self.semaErrorNode(ErrorCode::SemaInternal, self.ctx.noneNode(), "allocTypeSlot failed (type table full)");
             return 0;
         }
-        // placeholder: not really, i just wrote it so it'll show in a search, this 
-        // seeps redndant.
-        TypeEntry* entry = self.ctx.types + id; // what is the point in the entyr variable here
+        TypeEntry* entry = self.ctx.types + id;
         entry->kind = kind;
         entry->loc.data = 0;
         return id;
     }
 
+    /* one singleton per primitive: a linear scan of the type table on every
+     * call. the table only grows and slots are never removed, so the first
+     * hit is stable; yes, it's O(types) each time, no caching. */
     Ty boolType()
     {
         u32 i = 1;
@@ -249,6 +259,9 @@ pub extend Sema
         return self.allocType(kind);
     }
 
+    /* dedup is by bare name: the first Named entry with this name wins even
+     * if it carries generic args — callers that want Vec<i32> build the args
+     * themselves (selfNamedType / the parser). */
     Ty namedType(Str name)
     {
         /* `str` is a builtin — `str::…` static calls route here via the
@@ -265,6 +278,8 @@ pub extend Sema
         return self.allocType(kind);
     }
 
+    // index = the param's position in the generic list; substitution uses it
+    // to find which generic arg replaces this `T`
     Ty typeParamType(Str name, u32 index)
     {
         TypeKind kind = TypeKind::TypeParam { .name = name, .index = index };
@@ -287,6 +302,9 @@ pub extend Sema
         return node->kind.payload.Expr.value.resolvedType;
     }
 
+    /* structural equality. tag must match, then shape: Named compares names
+     * and args, pointers/const/slice/etc recurse. primitive tags fall into
+     * the else and are equal by tag alone. */
     bool sameType(Ty left, Ty right)
     {
         if (left == right) return true;
@@ -355,7 +373,7 @@ pub extend Sema
      * compatibility — they lower to their C base types */
     Ty resolveScalarAlias(Ty t)
     {
-        u32 guard = 0;
+        u32 guard = 0; // alias cycles (A = B; B = A) must not spin forever
         while (t != 0 && guard < 32)
         {
             guard++;
@@ -539,6 +557,9 @@ pub extend Sema
         }
     }
 
+    /* does `t` mention a type parameter anywhere? a bare `T` parsed as Named
+     * still counts via the kind-4 symbol check below. two dependent types
+     * are not interchangeable — see compatible(). */
     bool dependentType(Ty typeNode)
     {
         if (typeNode == 0) return false;
@@ -563,6 +584,9 @@ pub extend Sema
         return false;
     }
 
+    /* is this param a type placeholder rather than a value? true for a
+     * const-wrapped TypeParam, an unnamed param (flags bit 8), or a name
+     * that appears in the function's generic list (`fn f<T>(x: T)`). */
     bool genericArgParam(Decl* decl, Param* param)
     {
         if (decl == null || param == null) return false;
@@ -595,6 +619,8 @@ pub extend Sema
         return false;
     }
 
+    // pull the generic param list out of any decl kind that can carry one;
+    // *outParams is borrowed from the AST, not a copy
     u32 declGenericParams(Decl* decl, NodeId** outParams)
     {
         *outParams = null;
@@ -735,6 +761,11 @@ pub extend Sema
         return true;
     }
 
+    /* replace the object's generic args inside a field type: inside
+     * `Vec<i32>`, `T` becomes i32. wrappers are rebuilt only when a child
+     * actually changed (unchanged types are shared). the fresh args array of
+     * a Named result is handed to ctx.track — the context owns it and frees
+     * it at teardown, because the new TypeEntry points straight into it. */
     Ty substituteFieldTy(Ty fieldType, Ty objectType)
     {
         if (fieldType == 0 || objectType == 0) return fieldType;
@@ -883,6 +914,13 @@ pub extend Sema
         return self.charFamily(a) && self.charFamily(b);
     }
 
+    /* the one compatibility oracle. order matters: identity and typedef
+     * resolution first, then const/comptime strip on both sides, pointer
+     * const-add (T* → const T*), array decay, char family, usize≡u64, and
+     * finally the dependent-type escape hatch.
+     * from == 0 / to == 0 means "no type" (null, an untyped brace literal)
+     * and fits anything — which is why `i32 x = null` quietly type-checks.
+     * pointer targets are the intent there, not a general invitation. */
     bool compatible(Ty from, Ty to)
     {
         if (from == 0 || to == 0) return true;

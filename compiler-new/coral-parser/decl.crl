@@ -1,4 +1,9 @@
-// parser/decl.crl — declaration parsing
+// parser/decl.crl: declaration parsing
+//
+// one entry point (parseDecl) dispatches on the leading keyword, with
+// save/restore peeks where the keyword alone is ambiguous:
+// `struct(...)` is a tuple-returning fn, `const T* name(` is a fn,
+// `var T name` vs `var name`.
 import(lib) std::mman { realloc };
 import(lib) std::text::string { String };
 
@@ -23,6 +28,10 @@ struct ImportSymList
 
 pub extend Parser
 {
+    /* ── node constructors ── */
+
+    // loc comes from the last consumed token. attrs are never materialized:
+    // parseAttrList only surfaces the const bit
     NodeId storeDecl(DeclKind kind)
     {
         return self.storeNode(NodeKind::Decl{
@@ -47,9 +56,10 @@ pub extend Parser
         return self.storeNode(NodeKind::Field{ .value = value });
     }
 
-    /* `#[[name(args), …]]*` — one or more attribute lists.
+    /* `#[[name(args), …]]*`: one or more attribute lists.
      * Returns flags: bit0 = carries `const`. Shared by decl, method and
-     * struct/union member parsing so every position accepts attributes. */
+     * struct/union member parsing so every position accepts attributes.
+     * names and args are skipped wholesale; only `const` is understood */
     u8 parseAttrList()
     {
         u8 flags = 0;
@@ -90,6 +100,13 @@ pub extend Parser
         return flags;
     }
 
+    /* ── top-level dispatch ── */
+
+    /* attrs/pub/extern/static lead; then the keyword decides. two shapes
+     * need a peek because the keyword alone can't tell: `struct` could be
+     * `struct(...)` (tuple-returning fn), and `const` could be a
+     * const-returning fn. both peek via save()/restore(), which drops
+     * diagnostics from the discarded pass */
     NodeId parseDecl()
     {
         u8 attrFlags = self.parseAttrList();
@@ -106,7 +123,7 @@ pub extend Parser
 
         switch (self.current.kind)
         {
-            /* `struct(...) fn name(...)` is a function returning a tuple —
+            /* `struct(...) fn name(...)` is a function returning a tuple;
              * only a bare `struct` starts a struct declaration */
             TokenKind::Struct => {
                 ParserMark m = self.save();
@@ -156,6 +173,8 @@ pub extend Parser
         return self.noneNode();
     }
 
+    // can this start a type in decl position? Ident does; user types look
+    // exactly like values here, hence all the speculating in parseDecl
     bool isTypeStart()
     {
         TokenKind k = self.current.kind;
@@ -190,6 +209,10 @@ pub extend Parser
         }
     }
 
+    /* rewrite Named type refs that actually name one of genericValues
+     * into TypeKind::TypeParam carrying the param's index. runs in place
+     * on freshly parsed entries (nothing shared yet), recursing through
+     * every composite kind, nested generic args included */
     void rebindTypeParams(Ty ty, NodeId* genericValues, u32 genericCount)
     {
         if (ty == 0 || genericCount == 0) return;
@@ -269,10 +292,15 @@ pub extend Parser
         }
     }
 
+    /* RET NAME<gens>(params) body  |  TYPE NAME = init;
+     * decl flags: 1 pub, 2 extern, 4 static, 8 hasBody, 16 const.
+     * generics rebind the return type and every param type; outerGenerics
+     * (the enclosing struct/variant's params) are layered on top so a
+     * method can spell its owner's type params */
     NodeId parseFuncOrVarDecl(bool isPub, bool isExtern, bool isStatic, bool isConst)
     {
         Ty retType = self.parseType();
-        /* `u8 const NAME = …` — type-first constant; `const u8 NAME` is
+        /* `u8 const NAME = …`: type-first constant; `const u8 NAME` is
          * routed to parseConstDecl before we ever get here */
         if (self.match(TokenKind::Const)) isConst = true;
         Token nameTok = self.expectName();
@@ -293,6 +321,7 @@ pub extend Parser
         if (isStatic) flags |= 4;
         if (isConst) flags |= 16;
         
+        // `NAME(`: a function; no parens means a file-scope constant
         if (self.current.kind == TokenKind::LParen) {
             self.advance();
             NodeListBuilder params;
@@ -308,7 +337,7 @@ pub extend Parser
                 }
             }
             self.expect(TokenKind::RParen);
-            // `const` qualifier after the parameter list — const method
+            // `const` qualifier after the parameter list: const method
             if (self.match(TokenKind::Const)) flags |= 16;
             u32 paramCount = params.len;
             NodeId* paramValues = self.ctx.nodeListFinish(&params);
@@ -350,6 +379,8 @@ pub extend Parser
         return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = varType, .value = value, .flags = flags });
     }
 
+    // only the `comptime` flag is parsed; bounds are never spelled yet
+    // (the ast has room for them, no syntax reaches it)
     NodeId parseGenericParam()
     {
         GenericParam param;
@@ -362,6 +393,7 @@ pub extend Parser
         return self.storeNode(NodeKind::GenericParam{ .value = param });
     }
 
+    // `<T, U, comptime N>`: empty `<>` and trailing comma are legal
     void parseGenericParams(NodeListBuilder* params)
     {
         self.expect(TokenKind::Less);
@@ -388,6 +420,10 @@ pub extend Parser
         return self.parseFuncOrVarDecl(false, false, false, isConst);
     }
 
+    /* one parameter. flags: 1 = isSelf, 8 = unnamed/type-only,
+     * 16 = variadic `...` (optionally named). `self`, `self*` and
+     * `const self*` all mark the receiver; the pointer/const wrappers
+     * are peeled off below to recognise it */
     NodeId parseParam()
     {
         Param param;
@@ -407,7 +443,7 @@ pub extend Parser
             param.name = 0;
             param.typeNode = 0;
             param.flags = 16;
-            // `... args` — named variadic package
+            // `... args`: named variadic package
             if (self.current.kind == TokenKind::Ident)
             {
                 Token varTok = self.advance();
@@ -416,7 +452,7 @@ pub extend Parser
             return self.storeParam(param);
         }
         param.typeNode = self.parseType();
-        /* `self`, `self*`, `const self*` — explicit self parameter (the
+        /* `self`, `self*`, `const self*`: explicit self parameter (the
          * receiver is a pointer in the C implementation) */
         {
             Ty resolved = param.typeNode;
@@ -436,6 +472,9 @@ pub extend Parser
                 return self.storeParam(param);
             }
         }
+        // no name after the type (`f(i32, str)`), or a `comptime T`
+        // auto-param. flags 8 = type-only; a bare Named type donates its
+        // name so sema still has something to bind
         if (self.current.kind == TokenKind::Comma || self.current.kind == TokenKind::RParen)
         {
             param.name = 0;
@@ -462,11 +501,15 @@ pub extend Parser
         }
         Token name = self.expectName();
         param.name = self.ctx.intern(name.data.asStr());
-        // `T name[]` / `T name[N]` — C-style declarator array suffix
+        // `T name[]` / `T name[N]`: C-style declarator array suffix
         if (param.typeNode != 0) param.typeNode = self.parseDeclaratorArray(param.typeNode);
         return self.storeParam(param);
     }
 
+    /* members are fields or methods; with no marker to tell them apart
+     * the parser peeks `type ident` and calls it a method only when
+     * `(` or `<` follows. outerGenerics is set for the member loop so
+     * method sigs can reference the struct's params, then cleared */
     NodeId parseStructDecl(bool isPub)
     {
         self.expect(TokenKind::Struct);
@@ -522,7 +565,7 @@ pub extend Parser
             }
 
             Ty fieldType = self.parseType();
-            /* C-style multi-declarator fields: `i32 goo, moo;` — repeat
+            /* C-style multi-declarator fields: `i32 goo, moo;`; repeat
              * the parsed type per declarator (own array suffix/default) */
             while (true)
             {
@@ -562,6 +605,7 @@ pub extend Parser
         });
     }
 
+    // `enum Name : Backing { A, B = 3 }`; flags: 1 hasBacking, 2 isPub
     NodeId parseEnumDecl(bool isPub)
     {
         self.expect(TokenKind::Enum);
@@ -605,6 +649,10 @@ pub extend Parser
         return self.storeDecl(DeclKind::Enum{ .name = name, .backingType = backingType, .variants = variantValues, .variantsLen = variantCount, .flags = flags });
     }
 
+    /* `variant V { Case { T a, U b }, ... }`; cases carry parallel
+     * name/type lists. methods need a leading `pub` (no other marker
+     * distinguishes a method name from a case name). pushes
+     * outerGenerics like struct parsing does */
     NodeId parseVariantDecl(bool isPub)
     {
         self.expect(TokenKind::Variant);
@@ -656,6 +704,8 @@ pub extend Parser
                     if (!self.match(TokenKind::Comma) && !self.match(TokenKind::Semicolon)) break;
                 }
                 self.expect(TokenKind::RBrace);
+                // both lists are parallel: names drive field lookup, types
+                // drive layout. fieldsLen is the shared length
                 variantValue.fieldsLen = fieldNames.len;
                 variantValue.fieldNames = self.ctx.strListFinish(&fieldNames);
                 variantValue.fieldTypes = self.ctx.tyListFinish(&fieldTypes);
@@ -680,6 +730,8 @@ pub extend Parser
         });
     }
 
+    // same shape as a struct body minus defaults and declarator arrays:
+    // union arms are `type name[, name...];`
     NodeId parseUnionDecl(bool isPub)
     {
         self.expect(TokenKind::Union);
@@ -765,6 +817,8 @@ pub extend Parser
         });
     }
 
+    // no fields: every member is a method signature (body optional) or an
+    // extern/static fn
     NodeId parseTraitDecl(bool isPub)
     {
         self.expect(TokenKind::Trait);
@@ -818,6 +872,11 @@ pub extend Parser
         });
     }
 
+    /* `extend<gens> Type` or `extend<gens> Type : Trait { methods }`.
+     * a trait after `:` is either a user name or `@name` for a builtin
+     * (`@drop`, `@toStr`); the `@` is folded into the interned name so
+     * builtin and user traits can't collide. gens are rebound in the
+     * self type before the body is parsed */
     NodeId parseExtendDecl(bool isPub)
     {
         self.expect(TokenKind::Extend);
@@ -884,6 +943,10 @@ pub extend Parser
         return self.storeDecl(DeclKind::Extend{ .selfType = selfType, .genericParams = genericValues, .genericParamsLen = genericCount, .methods = methodValues, .methodsLen = methodCount });
     }
 
+    /* `const T NAME = v` / `const NAME = v` / `const T NAME[N] = v`.
+     * the untyped form is detected after the fact: parseType() has
+     * already eaten the name, so a Named type with no args becomes the
+     * name and the type resets to 0 (sema infers it) */
     NodeId parseConstDecl(bool isPub)
     {
         self.expect(TokenKind::Const);
@@ -891,7 +954,7 @@ pub extend Parser
         Str nameId = 0;
         if (self.current.kind == TokenKind::Equal)
         {
-            /* untyped constant: `const NAME = value;` — what parseType
+            /* untyped constant: `const NAME = value;`; what parseType
              * consumed was actually the constant's name */
             if (typeNode != 0)
             {
@@ -919,7 +982,9 @@ pub extend Parser
     }
 
     /* `var NAME = expr;` (inferred storage) and `var T NAME [N] [= expr];`
-     * (typed storage) at file scope. */
+     * (typed storage) at file scope. `var name` and `var Type name` share
+     * a prefix, so the type is parsed speculatively and committed only if
+     * an ident follows it (`var name = ...` must not eat `name` as a type) */
     NodeId parseVarDecl(bool isPub)
     {
         self.expect(TokenKind::Var);
@@ -932,6 +997,7 @@ pub extend Parser
             if (self.current.kind == TokenKind::Ident)
             {
                 // a name follows the type: `var i32 x = …`
+                // committed: the speculation was real
                 typed = true;
                 ty = parsed;
                 self.endSpeculation();
@@ -949,6 +1015,7 @@ pub extend Parser
         return self.storeDecl(DeclKind::Constant{ .name = name, .typeNode = ty, .value = value, .flags = flags });
     }
 
+    // `typedef Name = Type;`: pure alias, no distinct identity
     NodeId parseTypedefDecl()
     {
         self.expect(TokenKind::Typedef);
@@ -960,6 +1027,8 @@ pub extend Parser
         return self.storeDecl(DeclKind::TypeAlias{ .name = name, .target = target, .flags = 0 });
     }
 
+    // `distinct Name = Type;`: nominal wrapper; a `flag(...)` base picks
+    // the arm per build flags
     NodeId parseDistinctDecl()
     {
         self.expect(TokenKind::Distinct);
@@ -973,10 +1042,12 @@ pub extend Parser
         return self.storeDecl(DeclKind::Distinct{ .name = name, .baseType = base, .flags = 0 });
     }
 
-    /* `flag (NAME) { <key> => { T }, ..., else => { T } }` — a type that
-     * is selected by matching NAME's value against the host. Picked branch
-     * is the distinct alias' base type. For tidiness we use the compiler's
-     * ARM key lookup compares against `ctx->targetArch` (driver-configured; currently defaults to "x86_64"; later it comes from the build manifest's `platform_root`). The `else` arm is the fallback. */
+    /* `flag (NAME) { key => { T }, ..., else => { T } }` in type position,
+     * e.g. `distinct Ptr = flag (target) { aarch64 => {...}, ... };`.
+     * arms are selected by comparing NAME's value in ctx.flags (the same
+     * build-flag table the expression form uses; not targetArch, that's
+     * for @arch). every arm type is parsed so its syntax gets checked,
+     * and `else` covers the no-match case. */
     Ty parseFlagType()
     {
         self.advance(); // flag
@@ -1006,7 +1077,7 @@ pub extend Parser
                 if (self.ctx != null)
                 {
                     Str keyStr = self.ctx.intern(keyTok.data.asStr());
-                    Str anm = nameStrFor; // filled in at top of parseFlagType
+                    Str anm = nameStrFor; // lookup by the planted flag name
                     u32 f1 = 0;
                     while (f1 < self.ctx->flagsLen)
                     {
@@ -1034,6 +1105,10 @@ pub extend Parser
         return r;
     }
 
+    /* file-scope `flag (NAME) { key => { stmts } }`. arm bodies are
+     * parsed then dropped; nothing consumes this form (the flag forms
+     * that matter are driven by ctx.flags in stmt.crl and expr.crl).
+     * returns the invalid node, like parseComptimeDecl */
     NodeId parseFlagDecl()
     {
         self.expect(TokenKind::Flag);
@@ -1056,6 +1131,9 @@ pub extend Parser
         return self.allocNode();
     }
 
+    // joins interned names with `::` and interns the result. parts is
+    // consumed (finished); the result is ctx-owned, the String buffer is
+    // freed here
     Str strListJoin(StrListBuilder* parts)
     {
         u32 count = parts->len;
@@ -1076,6 +1154,9 @@ pub extend Parser
         return result;
     }
 
+    /* `a::b::c`, stopping before a `:: {`; that brace opens the import
+     * symbol list, not a path segment (peek + restore so a wrong guess
+     * never emits a diagnostic) */
     Str parseNamespacePath()
     {
         StrListBuilder parts;
@@ -1102,6 +1183,10 @@ pub extend Parser
         return self.strListJoin(&parts);
     }
 
+    /* `a, b as c, pkg::{d}, *`: recursive over nested groups. `prefix`
+     * is the parent path for `::{...}` symbols, 0 at top level. `*` gets
+     * flags 2 (the ast docs only mention bit 0, but sema reads bit 1),
+     * `as` sets bit 0 and the alias. returns false only on OOM */
     bool parseSymbolList(Str prefix, ImportSymList* list)
     {
         while (self.current.kind != TokenKind::RBrace && !self.atEnd())
@@ -1213,6 +1298,9 @@ pub extend Parser
         return true;
     }
 
+    /* `path::{...}` (path becomes the prefix) or a bare `{...}`; no list
+     * is not an error, just zero symbols. the list buffer is handed to
+     * the ctx; freed at deinit, not by the caller */
     void parseImportSymbols(rawptr* outSymbols, u32* outLen, Str path)
     {
         *outSymbols = null;
@@ -1236,6 +1324,8 @@ pub extend Parser
         *outLen = list.len;
     }
 
+    // `import(lib) path::{...};`: flags bit 0 = the `(pkg)` qualifier.
+    // a string-literal path is rejected with a pointer at the real shape
     NodeId parseImportDecl()
     {
         self.expect(TokenKind::Import);
@@ -1260,6 +1350,7 @@ pub extend Parser
         return self.storeDecl(DeclKind::Import{ .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
 
+    // `mod alias = import[(pkg)] path;`: flags: bit 0 = (pkg), bit 1 = pub
     NodeId parseModReexport(bool isPub)
     {
         self.expect(TokenKind::Mod);
@@ -1289,6 +1380,11 @@ pub extend Parser
         return self.storeDecl(DeclKind::ModReexport{ .alias = alias, .path = path, .symbols = symbols, .symbolsLen = symbolsLen, .flags = flags });
     }
 
+    /* `comptime { decls }` at file scope: a stub. the decls get parsed
+     * (their nodes land in the arena) but the DeclKind::Comptime payload
+     * is never built and nothing consumes it; the invalid node below is
+     * all the caller gets. also note the indentation lies: only
+     * parseDecl() is the loop body, the RBrace expect runs once */
     NodeId parseComptimeDecl()
     {
         self.expect(TokenKind::Comptime);

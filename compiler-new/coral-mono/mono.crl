@@ -1,3 +1,12 @@
+/* mono/mono.crl: monomorphization state and type substitution.
+ *
+ * MonoContext owns the three tables this pass builds: declarations that
+ * mention generics, pending work items (collect enqueues, instantiate
+ * drains), and the concrete instances themselves. Substitution walks
+ * types recursively and interns a FRESH node for every composite it
+ * touches: see typeDigest for why hashes must never compare those Ty
+ * indices across phases. */
+
 import ast::id { Str, NodeId, SourceLoc };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -30,6 +39,9 @@ pub struct MonoDecl
     NodeId declaration;
 }
 
+/* one generic param → concrete type. `index` is the slot for bare `T`
+ * params, `parameter` the name for explicit `<T>` lists: lookups match
+ * whichever the type site can provide. */
 pub struct MonoSubstitution
 {
     Str parameter;
@@ -74,6 +86,9 @@ pub struct MonoInstance
     u32 tailLen;
 }
 
+/* a queued instantiation. Its argument/substitution/literal/tail
+ * arrays are alloc'd copies made by the enqueuer; clear() frees them
+ * per item. */
 pub struct MonoWorkItem
 {
     MonoDeclKind kind;
@@ -108,7 +123,7 @@ pub struct MonoContext
     u32 instancesCap;
     u32 errors;
     /* substitutions of the instance whose body is currently being
-     * re-collected — generic calls inside instance bodies enqueue with
+     * re-collected; generic calls inside instance bodies enqueue with
      * these applied so `alloc<T>` inside Vec<str> yields alloc<str> */
     MonoSubstitution* activeSubs;
     u32 activeSubsLen;
@@ -133,9 +148,13 @@ pub extend MonoContext
         self.errors = 0;
         self.activeSubs = null;
         self.activeSubsLen = 0;
+        /* no ast = nothing to mono; surface it as an error so callers bail */
         if (ast == null) self.errors = 1;
     }
 
+    /* drops every alloc<T> array this context owns. None of it is
+     * arena-backed, so each array goes back through the matching
+     * dealloc<T> below. */
     void clear()
     {
         u32 i = 0;
@@ -202,6 +221,10 @@ pub extend MonoContext
         return 0;
     }
 
+    /* rebuilds `typeNode` with `substitutions` applied. Every composite
+     * node comes back freshly interned: two calls that produce the
+     * same shape hand out different Ty indices, which is exactly why
+     * typeDigest hashes names instead of indices. */
     Ty substituteType(Ty typeNode, MonoSubstitution* substitutions, u32 substitutionsLen)
     {
         if (typeNode == 0) return 0;
@@ -258,7 +281,7 @@ pub extend MonoContext
                 return self.sema.allocType(kind);
             },
 
-            /* fn-pointer params carry the generic params too —
+            /* fn-pointer params carry the generic params too:
              * `bool(T,T) less` must become `bool(i32,i32)` per instance,
              * not stay the first instantiation's spelling */
             TypeKind::FnPtr => {
@@ -277,6 +300,9 @@ pub extend MonoContext
         }
     }
 
+    /* cap-doubling growth; callers check the bool and bail on OOM.
+     * The work set is tiny (one entry per generic call site), so
+     * doubling is plenty. */
     bool reserveDeclarations()
     {
         if (self.declarationsLen < self.declarationsCap) return true;
@@ -325,6 +351,8 @@ pub extend MonoContext
         return true;
     }
 
+    /* heap copies owned by the caller; the source is usually an arena
+     * slice or an interned type table that a later pass rewrites. */
     Ty* copyTypes(Ty* values, u32 len)
     {
         if (len == 0) return null;
@@ -378,7 +406,7 @@ pub extend MonoContext
      * a literal token (string bytes / int / char / bool value) or 'R'
      * for runtime args. Two call sites to the same generic function
      * produce the same valueKey iff their literal args are equal (and
-     * the arity matches) — this is the value half of instance identity
+     * the arity matches): this is the value half of instance identity
      * (Zig-style: `println("a")` and `println("b")` are distinct
      * instances, `println(fmt)` with a runtime fmt shares the runtime
      * instance). Computed identically at collect time (collectCall) and
@@ -390,7 +418,7 @@ pub extend MonoContext
         u32 i = 0;
         while (i < argsLen)
         {
-            u64 tag = 82; // 'R' — runtime value
+            u64 tag = 82; // 'R': runtime value
             u64 val = 0;
             u8* sp = null;
             usize sl = 0;
@@ -443,6 +471,8 @@ pub extend MonoContext
             TypeKind::TypeParam => {
                 Ty st = self.findSubstitution(t, subs, subsLen);
                 if (st != 0 && st != t) return self.typeDigest(st, null, 0);
+                /* still unsubstituted: tag the raw index so it can't be
+                 * mistaken for a primitive's canonical index */
                 return ((u64)t << 1) | 1;
             },
             TypeKind::Named => {
@@ -495,7 +525,7 @@ pub extend MonoContext
         }
     }
 
-    /* valueKey + the substituted resolved type of every call arg — two
+    /* valueKey + the substituted resolved type of every call arg: two
      * call sites with equal value tokens but different runtime argument
      * types (`println("{}", x)` with x:i32 vs y:f64) must not share an
      * instance, and the instance's named tail parameters are typed from
@@ -517,7 +547,7 @@ pub extend MonoContext
     }
 
     /* fill out[genericCount] with the call-arg type bound to each generic
-     * slot — mirrors collectCall's inference (a bare type-param param, or
+     * slot: mirrors collectCall's inference (a bare type-param param, or
      * a param whose type is that type param) so codegen can test whether a
      * call site matches a collected instance. Unfilled slots stay 0. */
     void inferCallArgs(NodeId declaration, NodeId* args, u32 argsLen,
@@ -567,6 +597,7 @@ pub extend MonoContext
                         }
                         else if (te3->kind.tag == TypeKind::Named)
                         {
+                            /* explicit `<T>` param: resolve its slot by name */
                             Str tn = te3->kind.payload.Named.name;
                             u32 gi = 0;
                             while (gi < decl->kind.payload.Func.genericParamsLen)
@@ -608,6 +639,8 @@ pub extend MonoContext
         return self.ast.nodesLen;
     }
 
+    /* 1 = type-ish decl, 2 = func, 0 = anything else. Currently no
+     * callers; the pipeline discriminates decls by tag directly. */
     u8 declarationKind(NodeId id)
     {
         Decl* decl = self.declAt(id);
@@ -640,6 +673,9 @@ pub extend MonoContext
         }
     }
 
+    /* the param's spelling: its name, or, for a bare `T` param, which
+     * has no name: the type name it stands for. Call-arg binding and
+     * slot naming both key off this. */
     Str parameterName(NodeId id)
     {
         Node* node = self.nodeAt(id);
@@ -656,6 +692,9 @@ pub extend MonoContext
         return 0;
     }
 
+    /* a parameter that occupies a generic slot: the parser tags bare
+     * type params (`T`, `comptime T`) with flags & 8, and the resolved
+     * typeNode must still be Named/TypeParam for the slot to count. */
     bool isTypeParameter(NodeId id)
     {
         Node* node = self.nodeAt(id);
@@ -675,6 +714,7 @@ pub extend MonoContext
         return entry->kind.tag == TypeKind::Named || entry->kind.tag == TypeKind::TypeParam;
     }
 
+    /* written `<T, U>` slots only; genericCount adds the implied ones */
     u32 explicitGenericCount(NodeId id)
     {
         Decl* decl = self.declAt(id);
@@ -734,6 +774,9 @@ pub extend MonoContext
         return false;
     }
 
+    /* full generic arity: explicit `<...>` entries plus bare-T params
+     * that weren't named there (`T fmt` style); those count as slots
+     * too, keyed by the parameter's name. */
     u32 genericCount(NodeId id)
     {
         u32 count = self.explicitGenericCount(id);

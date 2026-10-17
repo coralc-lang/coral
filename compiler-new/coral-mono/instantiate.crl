@@ -1,3 +1,9 @@
+/* mono/instantiate.crl: drains the collect queue: turns each work item
+ * into a MonoInstance, checks its signature once, then re-collects its
+ * body with the instance's substitutions active so nested generic calls
+ * (and their callees) enqueue too. run() iterates to a fixpoint because
+ * every pass over the work list can append more work. */
+
 import ast::id { Str, NodeId };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -14,6 +20,10 @@ import(lib) platform::libc { printf };
 
 pub extend MonoContext
 {
+    /* one entry per generic slot, in slot order: explicit `<T, U>`
+     * params first, then bare-T params that weren't named there. Both
+     * name and index are filled because lookup sites have different
+     * information in hand. Caller owns the result. */
     MonoSubstitution* buildSubstitutions(NodeId declaration, Ty* arguments, u32 argumentsLen)
     {
         u32 count = self.genericCount(declaration);
@@ -108,6 +118,9 @@ pub extend MonoContext
         return true;
     }
 
+    /* linear scan for an existing instance. Currently uncalled:
+     * addInstance repeats the same scan inline because it needs the
+     * index, not just a yes/no. */
     bool hasInstance(MonoDeclKind kind, Str name, Ty* arguments, u32 argumentsLen, u64 valueKey)
     {
         u32 i = 0;
@@ -123,6 +136,9 @@ pub extend MonoContext
         return false;
     }
 
+    /* find-or-append keyed by (decl, arg types, valueKey). A new entry
+     * copies everything it needs from the transient work item. Returns
+     * the instance index through outIndex. */
     bool addInstance(NodeId declaration, Ty* arguments, u32 argumentsLen,
                      u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
                      Ty* tailTypes, NodeId* tailNodes, u32 tailLen,
@@ -238,6 +254,8 @@ pub extend MonoContext
         if (decl->kind.tag == DeclKind::Func)
         {
             instance.returnType = self.substituteType(decl->kind.payload.Func.returnType, instance.substitutions, instance.substitutionsLen);
+            /* parallel to the decl's param list, positions kept as-is
+             * (incl. bare-T params) so codegen can match params[i] */
             instance.paramTypesLen = decl->kind.payload.Func.paramsLen;
             if (instance.paramTypesLen > 0)
             {
@@ -260,6 +278,8 @@ pub extend MonoContext
         }
         else
         {
+            /* type instances get a Ty naming the concrete shape:
+             * codegen mangles it into the typedef name */
             TypeKind kind = TypeKind::Named{ .name = name, .genericArgs = instance.arguments, .genericArgsLen = argumentsLen };
             instance.typeNode = self.sema.allocType(kind);
         }
@@ -268,6 +288,10 @@ pub extend MonoContext
         return true;
     }
 
+    /* lazily checks the substituted signature, once per instance:
+     * `validationAttempted` records the try, `validated` the outcome.
+     * Validity is judged by whether sema's error count moved: checkType
+     * reports its own diagnostics, so no need to duplicate them. */
     bool validateInstance(MonoInstance* instance)
     {
         instance.validationAttempted = 1;
@@ -288,6 +312,10 @@ pub extend MonoContext
         return instance.validated != 0;
     }
 
+    /* fixpoint over the work list. Re-collection can append work, and
+     * the loop condition re-reads workLen each pass; instances that fail
+     * validation bump errors but don't stop the drain; the pass as a
+     * whole fails at the end. */
     bool run()
     {
         u32 i = 0;
@@ -323,6 +351,9 @@ pub extend MonoContext
             }
             else if (instance.kind == MonoInstanceKind::TypeInstance)
             {
+                /* queue the type's methods so generic calls in their
+                 * bodies are collected per instance: only struct,
+                 * union and variant decls carry method lists */
                 Node* tdn = self.nodeAt(instance.declaration);
                 if (tdn != null && tdn.kind.tag == NodeKind::Decl)
                 {
@@ -367,7 +398,7 @@ pub extend MonoContext
      * codegen inlines the comptime blocks as before. */
     void evalComptimeBody(MonoInstance* instance)
     {
-        /* only rewire bodies that actually contain a comptime block —
+        /* only rewire bodies that actually contain a comptime block:
          * every other instance skips the evaluator entirely */
         Node* bn = self.nodeAt(instance.body);
         if (bn == null || bn->kind.tag != NodeKind::Stmt) return;
@@ -436,7 +467,7 @@ pub extend MonoContext
                     ct.variadicPackName = lpn->kind.payload.Param.value.name;
                     if (instance.packArity == 0)
                     {
-                        /* this call site passed no trailing args — bind
+                        /* this call site passed no trailing args: bind
                          * the pack to an empty pack so `for (x : args)`
                          * unrolls to zero iterations instead of falling
                          * back to a runtime loop over a pack codegen
@@ -448,7 +479,7 @@ pub extend MonoContext
                         /* bind the recorded call-site tail args: literals
                          * fold to their comptime value; runtime args become
                          * fresh idents naming this instance's own trailing
-                         * C parameters (`_varg0`, …) — the call site passes
+                         * C parameters (`_varg0`, …): the call site passes
                          * every arg positionally, so the names only need to
                          * match what cgEmitParams declares */
                         u32 n = instance.packArity;
@@ -497,9 +528,11 @@ pub extend MonoContext
                                         }
                                     }
                                 }
-                                /* synthesized parameter name — always made
+                                /* synthesized parameter name: always made
                                  * so the emitted C signature has one named
-                                 * parameter per tail arg, in call order */
+                                 * parameter per tail arg, in call order.
+                                 * digits are written reverse-first into
+                                 * sbuf[20..], then copied back in order */
                                 sbuf[0] = 95; sbuf[1] = 118; sbuf[2] = 97; sbuf[3] = 114; sbuf[4] = 103; // "_varg"
                                 u32 w = 5;
                                 u32 dv = k;
@@ -527,6 +560,9 @@ pub extend MonoContext
                         }
                         else
                         {
+                            /* OOM: pack stays unbound: lookup yields
+                             * none-kind, so a bare `...` forward inside
+                             * the body would fold to zero args */
                             if (elems != null) dealloc<CtVal>(elems);
                             if (names != null) dealloc<Str>(names);
                         }
@@ -543,7 +579,7 @@ pub extend MonoContext
             ct.dispose();
             return;
         }
-        /* a type switch with no matching arm — only reported when the
+        /* a type switch with no matching arm: only reported when the
          * author's own @compileError did not already fire (ct.failed) */
         if (ct.typeSwitchMissed)
         {
@@ -552,7 +588,7 @@ pub extend MonoContext
             ct.dispose();
             return;
         }
-        /* replace the body with a Block of the surviving runtime stmts —
+        /* replace the body with a Block of the surviving runtime stmts:
          * length is not a proxy for "unchanged" (one comptime stmt can
          * fold into one different runtime stmt) */
         if (ct.emittedLen > 0)

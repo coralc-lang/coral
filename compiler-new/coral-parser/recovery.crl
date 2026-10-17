@@ -1,4 +1,11 @@
 
+/* parser/recovery.crl: panic-mode error reporting and resynchronisation
+ *
+ * panicMode packs two things into one word (see base.crl): the low 30
+ * bits are the error count, 0x40000000 says "recovery is in progress".
+ * counting lives here, the skip-to-safety loops live below. nothing
+ * reads the in-progress bit today; only begin/endRecovery touch it. */
+
 import(lib) std::text::string { String };
 import common::token { Token, TokenKind };
 import diag::code { ErrorCode };
@@ -7,6 +14,8 @@ import base { Parser };
 
 pub extend Parser
 {
+    /* ── counters and flags ── */
+
     u32 errorCount() { return self.panicMode & 0x3fffffff; }
     bool hasParseErrors() { return self.errorCount() != 0; }
     bool isRecovering() { return (self.panicMode & 0x40000000) != 0; }
@@ -18,6 +27,7 @@ pub extend Parser
     void reportCurrentError(ErrorCode code, str msg) { self.reportError(code, self.current, msg); }
     void reportAllocFailed() { self.reportError(ErrorCode::DriverOutOfMemory, self.current, "out of memory while parsing"); }
 
+    // saturating; the count shares its word with the recovery flag
     void addError()
     {
         u32 count = self.errorCount();
@@ -25,6 +35,9 @@ pub extend Parser
             self.panicMode = (self.panicMode & 0xc0000000) | (count + 1);
     }
 
+    /* diagnostics from speculative passes (cast/decl/type lookaheads) are
+     * dropped on the floor; if the guess is wrong, its errors are noise.
+     * also tolerates a parser with no lexer/diag wired up (tests) */
     void reportError(ErrorCode code, Token token, str msg)
     {
         if (self.isSpeculating()) return;
@@ -64,10 +77,12 @@ pub extend Parser
             self.reportError(ErrorCode::ParseUnexpectedEof, self.current, "unexpected end of file");
             return;
         }
-        /* "expected ';', found 'x'" — built with String; reportError renders
+        /* "expected ';', found 'x'", built with String; reportError renders
          * the view synchronously, the buffer dies with the scope */
         str base = self.expectedTokenText(kind);
         Token t = self.current;
+        // cap the echoed token at 64 bytes; a huge string literal token
+        // otherwise dumps into the diagnostic
         usize tl = t.data.len;
         if (tl > 64) tl = 64;
         String sb = String::from(base);
@@ -82,6 +97,8 @@ pub extend Parser
         self.reportError(ErrorCode::ParseExpectedToken, t, sb.asView());
     }
 
+    // tokens that end a construct on their own and must not be skipped:
+    // swallowing a closer desyncs every enclosing level
     bool isRecoveryBoundary(TokenKind kind)
     {
         return kind == TokenKind::Eof || kind == TokenKind::Semicolon ||
@@ -89,6 +106,12 @@ pub extend Parser
                kind == TokenKind::RBracket || kind == TokenKind::LBrace;
     }
 
+    /* ── resynchronisation ── */
+
+    /* skip to the end of the current declaration. depth counters keep a
+     * `;` inside parens/brackets/braces from ending recovery early; a
+     * closer stops the skip (leave it for the construct that owns it);
+     * a fresh line starting a decl keyword stops it too */
     void synchronize()
     {
         self.beginRecovery();
@@ -131,6 +154,9 @@ pub extend Parser
         self.endRecovery();
     }
 
+    // same idea, statement granularity: consume through the next `;`, or
+    // stop at a closer. no depth tracking; a `;` in a for-header would
+    // end the skip early, which costs one extra diagnostic at worst
     void synchronizeStatement()
     {
         self.beginRecovery();
@@ -150,6 +176,7 @@ pub extend Parser
         self.endRecovery();
     }
 
+    // stop at anything that can follow an expression; consume nothing
     void synchronizeExpression()
     {
         self.beginRecovery();
@@ -165,6 +192,7 @@ pub extend Parser
         self.endRecovery();
     }
 
+    // case granularity: `,` / `=>` / `}` all start the next arm
     void synchronizeCase()
     {
         self.beginRecovery();

@@ -1,3 +1,9 @@
+/* mono/collect.crl: the collect pass: walks the analyzed AST and
+ * enqueues every generic instantiation it can name (type refs, calls),
+ * with bindings and comptime-visible call values attached. instantiate
+ * drains the queue later; this file emits nothing. Assumes sema has
+ * already resolved every expr's type. */
+
 import ast::id { Str, NodeId };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
@@ -14,6 +20,8 @@ import(lib) platform::libc { printf };
 
 pub extend MonoContext
 {
+    /* decl lookup for mono's purposes: this file's decls first, then
+     * sema's merged scope. NodeId 0 means nothing found. */
     NodeId findDeclaration(Str name)
     {
         if (self.file != null)
@@ -25,7 +33,7 @@ pub extend MonoContext
                 i++;
             }
         }
-        /* fallback: sema's merged scope — types like core's `cchar` may be
+        /* fallback: sema's merged scope; types like core's `cchar` may be
          * visible to sema without being merged into this unit's file */
         if (self.sema != null)
         {
@@ -41,7 +49,7 @@ pub extend MonoContext
         return none;
     }
 
-    /* explicit generic args on a named type — prefer the decl whose generic
+    /* explicit generic args on a named type: prefer the decl whose generic
      * arity matches (libc's extern realloc vs mman's realloc<T>) */
     NodeId findGenericDeclaration(Str name, u32 want)
     {
@@ -86,13 +94,16 @@ pub extend MonoContext
         return none;
     }
 
+    /* true when a type can name a concrete instance: recursion is the
+     * point: `Vec<T>` is not concrete until every arg bottoms out in a
+     * declared type. Unresolvable names count as non-concrete. */
     bool isConcreteType(Ty typeNode)
     {
         if (typeNode == 0) return false;
         TypeEntry* entry = self.typeEntryAt(typeNode);
         if (entry == null) return false;
         if (entry->kind.tag == TypeKind::TypeParam) return false;
-        /* builtin scalar/string types are always concrete — they have no
+        /* builtin scalar/string types are always concrete; they have no
          * file declaration for findDeclaration to resolve */
         if (entry->kind.tag == TypeKind::Str || entry->kind.tag == TypeKind::Char ||
             entry->kind.tag == TypeKind::Bool || entry->kind.tag == TypeKind::Void ||
@@ -137,6 +148,9 @@ pub extend MonoContext
         return self.enqueueVal(kind, declaration, arguments, argumentsLen, 0, 0, null, null, 0, null, null, 0);
     }
 
+    /* dedup by (kind, decl, sameType args, valueKey, tail types) before
+     * appending; an enqueue is idempotent. Copies every array into the
+     * work item; the caller keeps ownership of its originals. */
     bool enqueueVal(MonoDeclKind kind, NodeId declaration, Ty* arguments, u32 argumentsLen,
                     u64 valueKey, u32 packArity, Str* literalNames, NodeId* literalNodes, u32 literalsLen,
                     Ty* tailTypes, NodeId* tailNodes, u32 tailLen)
@@ -147,7 +161,14 @@ pub extend MonoContext
             self.errors++;
             return false;
         }
+        /* still contains type params: skip silently; the site gets
+         * re-collected with activeSubs once its enclosing instance is
+         * known (collectType/collectCall substitute before enqueueing) */
         if (!self.areConcreteTypes(arguments, argumentsLen)) return true;
+        /* head check: same decl, same arg types, same valueKey, same
+         * tail arity + types ⇒ same instance, nothing to do. The tail
+         * compare is what lets `println("a", x)` and `println("a", y)`
+         * with x,y:i32 collapse but x:i32,y:str stay separate. */
         u32 i = 0;
         while (i < self.workLen)
         {
@@ -240,6 +261,9 @@ pub extend MonoContext
         return item.arguments != null || argumentsLen == 0;
     }
 
+    /* enqueues the Named type itself (when it has generic args) and
+     * recurses into the args: Pointer/Slice/Array wrappers exist here
+     * only to carry the walk inward. */
     bool collectType(Ty typeNode)
     {
         if (typeNode == 0) return true;
@@ -254,7 +278,7 @@ pub extend MonoContext
                                                           entry->kind.payload.Named.genericArgsLen);
                 if (pref.index != 0) declId = pref;
             }
-            if (declId.index == 0) return true;
+            if (declId.index == 0) return true; /* unresolved name: nothing to enqueue */
             if (entry->kind.payload.Named.genericArgsLen > 0)
             {
                 u32 gaLen = entry->kind.payload.Named.genericArgsLen;
@@ -313,6 +337,10 @@ pub extend MonoContext
         return true;
     }
 
+    /* generic-call detector: resolves the callee, fills one binding per
+     * generic slot from the call args, and enqueues with value key plus
+     * literal/tail metadata. Non-generic and unresolved callees return
+     * true: there is simply nothing to instantiate. */
     bool collectCall(NodeId callId)
     {
         Node* callNode = self.nodeAt(callId);
@@ -325,9 +353,9 @@ pub extend MonoContext
         if (callee->kind.tag != ExprKind::Ident) return true;
         NodeId declaration = self.findDeclaration(callee->kind.payload.Ident.name);
         u32 gcount = self.genericCount(declaration);
-        if (declaration.index == 0 || gcount == 0) return true;
+        if (declaration.index == 0 || gcount == 0) return true; /* not a generic call */
         /* one generic argument per type-param POSITION in the decl's param
-         * list — the call arg at that slot supplies the binding. the
+         * list: the call arg at that slot supplies the binding. the
          * variadic tail and non-generic fixed params are excluded, so
          * `println<comptime T>(T fmt, ...)` binds T from fmt's type alone
          * and `println("{}", 42, x)` enqueues with argumentsLen=1. */
@@ -365,6 +393,7 @@ pub extend MonoContext
             NodeId paramId = gdecl->kind.payload.Func.params[p];
             if (self.isTypeParameter(paramId))
             {
+                /* bare `T` slot: the arg's own type is the binding */
                 if (p < call->kind.payload.Call.argsLen)
                 {
                     arguments[next] = self.sema.exprType(call->kind.payload.Call.args[p]);
@@ -376,7 +405,7 @@ pub extend MonoContext
             else
             {
                 /* named param whose type is a generic (`T fmt`): the type
-                 * is TypeParam{index} after parser rebind — bind the call
+                 * is TypeParam{index} after parser rebind: bind the call
                  * arg at this position to that generic slot */
                 Node* pn = self.nodeAt(paramId);
                 if (pn != null && pn->kind.tag == NodeKind::Param)
@@ -459,7 +488,7 @@ pub extend MonoContext
         /* trailing args past the fixed params are the variadic tail: record
          * each one's concrete type + node so the instance can fold literal
          * tails and give runtime tails named C parameters. A bare `...`
-         * forwards the caller's pack — it is not a concrete tail arg and
+         * forwards the caller's pack: it is not a concrete tail arg and
          * must not count toward the arity (`_printEmit(&out, fmt, ...)`
          * forwarded through `println("hello")` stays an arity-0 site). */
         u32 ti = namedCount;
@@ -483,7 +512,7 @@ pub extend MonoContext
             }
             ti++;
         }
-        u32 arity = tailLen;
+        u32 arity = tailLen; /* pack arity: how many `_vargN` params the instance gets */
         u64 key = self.callValueKeyTyped(call->kind.payload.Call.args, call->kind.payload.Call.argsLen,
                                          self.activeSubs, self.activeSubsLen);
         bool ok = self.enqueueVal(MonoDeclKind::FunctionDecl, declaration, arguments, gcount,
@@ -497,6 +526,10 @@ pub extend MonoContext
         return ok;
     }
 
+    /* expression walk. Only TypeRef (via collectType) and Call can
+     * enqueue; the rest recurse because a type ref may sit deeper in
+     * the tree. Unlisted variants can't carry Named types, so they
+     * fall through. */
     bool collectExpr(NodeId id)
     {
         Node* node = self.nodeAt(id);
@@ -533,7 +566,7 @@ pub extend MonoContext
             },
 
             ExprKind::Path => {
-                /* segment types must be collected too — `Foo<i32>::new(...)`
+                /* segment types must be collected too: `Foo<i32>::new(...)`
                  * carries the instance in a TypeRef segment of the callee */
                 u32 i = 0;
                 while (i < expr->kind.payload.Path.segmentsLen)
@@ -572,6 +605,8 @@ pub extend MonoContext
         }
     }
 
+    /* statement walk, shallow by design: type refs only appear inside
+     * expressions, so each arm just reaches the exprs a stmt owns. */
     bool collectStmt(NodeId id)
     {
         Node* node = self.nodeAt(id);
@@ -608,6 +643,10 @@ pub extend MonoContext
         }
     }
 
+    /* decl surface walk: struct fields, variant case types, func
+     * signatures + bodies. Generic decls contribute little here; their
+     * bodies carry unbound type params and only enqueue once activeSubs
+     * re-collects them per instance. */
     bool collectDecl(NodeId id)
     {
         Decl* decl = self.declAt(id);
@@ -662,6 +701,9 @@ pub extend MonoContext
         }
     }
 
+    /* entry point, called per merged file: rebinding self.file makes
+     * findDeclaration see the right decl list. Any error anywhere fails
+     * the whole pass. */
     bool collectFile(File* file)
     {
         self.file = file;

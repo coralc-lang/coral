@@ -14,6 +14,7 @@ import diag::code { ErrorCode };
 
 pub extend Parser
 {
+    // attrs stay null — nothing past #[[condassign]] is recorded
     NodeId storeStmt(StmtKind kind)
     {
         Stmt s;
@@ -37,6 +38,11 @@ pub extend Parser
         return self.storeNode(NodeKind::Stmt{ .value = s });
     }
 
+    /* ── dispatch ── */
+
+    /* consumes any leading #[[...]] attrs, arms the condassign escape
+     * hatch, then dispatches on keyword; everything else is expr-or-decl.
+     * only the FIRST attribute in each group is checked for `condassign` */
     NodeId parseStmt()
     {
         self.condAssignAttr = false;
@@ -122,7 +128,10 @@ pub extend Parser
     }
 
     /* `=` at the top level of a condition is rejected unless the
-     * statement carries #[[condassign]] */
+     * statement carries #[[condassign]]. lastAssignPtr holds the op's
+     * text pointers (set by expr.crl for both plain and compound assigns,
+     * `~=` included since it desugars to Assign) — the synthetic token is
+     * only here to point the diagnostic at the right columns */
     void checkCondAssign(NodeId cond)
     {
         if (self.condAssignAttr) return;
@@ -169,6 +178,17 @@ pub extend Parser
         return self.storeStmt(StmtKind::While{ .cond = cond, .body = body });
     }
 
+    /* ── for / for-in ── */
+
+    /* three shapes hide behind `for (`:
+     *   for (var i = 0; …)   classic, `var`-init (flags 1)
+     *   for (var x : iter)   for-in, inferred binding
+     *   for (T x : iter)     for-in, typed binding
+     *   for (i = 0; …)       classic, expr init
+     * the typed form needs speculation: `x` could be either the type or
+     * the loop variable, so parse T name and commit only on `:`, else
+     * rewind and let the classic-C path re-read it. flags 2/4 = has
+     * cond/post. ForIn flags: 1 = `var` binding */
     NodeId parseForStmt()
     {
         SourceLoc forLoc = self.tokenLoc(self.current);
@@ -246,6 +266,9 @@ pub extend Parser
         return self.storeStmt(StmtKind::Loop{ .body = body });
     }
 
+    /* same loop shape as parseBlock: track errors and cursor progress so
+     * a case that eats nothing (and reports nothing) can't spin forever;
+     * after any error, sync to the next `,`/`=>`/`}` */
     NodeId parseSwitchStmt()
     {
         self.advance();
@@ -275,6 +298,8 @@ pub extend Parser
         return self.storeStmt(StmtKind::Switch{ .expr = sexpr, .cases = values, .casesLen = count });
     }
 
+    /* one arm, statement flavour: `pat | pat, pat if guard => body`.
+     * flags bit 0 = guard, bit 2 (4) = else arm (see expr.crl) */
     SwitchCase parseSwitchStmtCase()
     {
         SwitchCase c;
@@ -320,6 +345,7 @@ pub extend Parser
         return c;
     }
 
+    // `=> { ... }` or `=> single stmt` — both produce one body
     NodeId parseSwitchCaseBody()
     {
         if (self.current.kind == TokenKind::LBrace) return self.parseBlock();
@@ -335,6 +361,9 @@ pub extend Parser
         return self.storeStmt(StmtKind::Defer{ .stmt = stmt });
     }
 
+    /* block loop with the standard progress + error guard: if a stmt ate
+     * nothing (and reported nothing) force one token, and after any error
+     * skip to the next `;`/closer before trying again */
     NodeId parseBlock()
     {
          self.expect(TokenKind::LBrace);
@@ -429,6 +458,8 @@ pub extend Parser
         self.reportCurrentError(ErrorCode::ParseExpectedStmt, "no arm of this flag statement matched; add an `else` arm");
         return self.noneNode();
     }
+    // like parseComptimeStmt's, but the DeclKind-level `comptime` is the
+    // stub; here a real StmtKind::Comptime node is built
     NodeId parseComptimeStmt()
     {
         self.advance();
@@ -459,6 +490,7 @@ pub extend Parser
          u8 flags = 0;
          if (self.match(TokenKind::Volatile)) flags = 1;
          self.expect(TokenKind::Asm);
+         // `volatile` may precede or follow `asm`; either way bit 0 gets set
          if (self.match(TokenKind::Volatile)) flags = 1;
          self.expect(TokenKind::LBrace);
          NodeListBuilder template;
@@ -563,6 +595,12 @@ pub extend Parser
              .flags = flags });
      }
 
+    /* ── expr-or-decl (the statement ambiguity) ── */
+
+    /* `var`/`const`/`static` are unambiguous here. the general `T name …`
+     * form is not: peek `type ident` and call it a decl only when `=`,
+     * `;` or `[` follows; everything else is an expression statement.
+     * VarDecl flags: 1 const, 2 hasInit, 4 static (ast/stmt.crl) */
     NodeId parseExprOrDecl()
     {
         if (self.current.kind == TokenKind::Var || self.current.kind == TokenKind::Const ||

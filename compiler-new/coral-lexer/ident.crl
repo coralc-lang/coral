@@ -1,8 +1,15 @@
-// Identifier handler for the colarc compiler frontend.
+// lexer/ident.crl: UTF-8 decoding and identifier classification
+//
+// decodeUtf8 rejects overlongs, surrogates and out-of-range codepoints
+// (outLen 0 = malformed). isXidStart/isXidContinue are a hand-trimmed XID
+// table, not full UAX #31; enough for the scripts this corpus sees.
 
 import common::token { TokenKind, Token, IdentifierInfo };
 import base { Lexer };
 
+/* one codepoint. outLen gets the byte count, or 0 when the sequence is
+ * malformed (bad continuation bytes, overlong encoding, surrogate half,
+ * beyond U+10FFFF). callers treat len 0 as "not a character" */
 pub u32 decodeUtf8(u8* buf, u8* bufEnd, usize* outLen)
 {
     if (buf >= bufEnd) { outLen[0] = 0; return 0; }
@@ -44,6 +51,7 @@ pub u32 decodeUtf8(u8* buf, u8* bufEnd, usize* outLen)
     return 0;
 }
 
+// ranges picked by hand from the XID tables; ASCII is the only exact part
 pub bool isXidStart(u32 cp)
 {
     if (cp < 128) return (cp | 0x20) >= 'a' && (cp | 0x20) <= 'z' || cp == '_';
@@ -74,6 +82,7 @@ pub bool isXidStart(u32 cp)
     return false;
 }
 
+// start chars, digits, combining marks (the 0x0300 etc blocks)
 pub bool isXidContinue(u32 cp)
 {
     if (isXidStart(cp)) return true;
@@ -90,6 +99,10 @@ pub bool isXidContinue(u32 cp)
 
 pub extend Lexer
 {
+    /* scans XID_Continue codepoints, then looks the text up in the
+     * identifier table: a hit turns keywords into their own TokenKind and
+     * stashes the IdentifierInfo on the token. no table (tests, early
+     * bootstrap) means every word stays a plain Ident */
     Token lexIdentifier(u8* start)
     {
         while (!self.isAtEnd())

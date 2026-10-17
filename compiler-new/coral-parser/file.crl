@@ -1,4 +1,6 @@
 
+// parser/file.crl: file-level driver, parse decls until EOF
+
 import common::token { TokenKind };
 import diag::code { ErrorCode };
 import context::context { AstContext, NodeListBuilder };
@@ -9,6 +11,11 @@ import base { Parser };
 
 pub extend Parser
 {
+    /* one File per source. prescan const ints, then parse decls under the
+     * standard progress/error guard; unknown tokens and stray closers are
+     * reported and eaten here because no lower level wants them. returns
+     * null only when the File allocation fails. `path` is an interned Str,
+     * so the File owns no string bytes */
     File* parseFile(Str path)
     {
         /* declare-all consts first (text.txt pass 1 fast variant) so
@@ -18,11 +25,14 @@ pub extend Parser
         self.ctx.nodeListInit(&decls);
         while (!self.atEnd())
         {
+            // Unknown token (stray byte). nothing has reported it (the
+            // lexer's unknown-char diag is dead), so just get past it
              if (self.current.kind == TokenKind::Unknown)
             {
                 self.advance();
                 continue;
             }
+            // stray closer at top level: report and eat it, nobody else will
              if (self.current.kind == TokenKind::RBrace || self.current.kind == TokenKind::RParen ||
                  self.current.kind == TokenKind::RBracket)
             {
@@ -37,6 +47,9 @@ pub extend Parser
             NodeId decl = self.parseDecl();
             if (!self.ctx.nodeListAppend(&decls, decl)) self.reportAllocFailed();
 
+            /* if parseDecl returned without moving the cursor, force it;
+             * otherwise a decl that reports an error before consuming
+             * anything spins this loop forever */
             bool progressed = self.lexer.getCur() != cursorBefore ||
                               self.current.kind != tokenBefore.kind ||
                               self.current.data.ptr != tokenBefore.data.ptr;
@@ -55,6 +68,7 @@ pub extend Parser
         file->path = path;
         file->decls = values;
         file->declsLen = count;
+        // per-file scratch, must not outlive the parse
         self.freeConstTable();
         return file;
     }

@@ -1,4 +1,8 @@
 
+/* scope.crl: the lexical scope stack: one Scope per block, symbols in a
+ * growable array, lookup walks parent pointers. top-level decls remember
+ * their source file so same-named decls merged from different files stay
+ * distinct (the backend mangles them apart). */
 import ast::id { Str, NodeId };
 import ast::types { Ty };
 
@@ -7,13 +11,17 @@ import(lib) std::mman { alloc, dealloc, realloc, zero };
 pub struct Symbol
 {
     Str name;
+    /* kind codes: 1 var/const, 2 func, 3 type, 4 generic param, 5 module
+     * namespace (set at declare time by decl.crl) */
     u8 kind;
     Ty typeNode;
     NodeId declaration;
+    /* bit 0 = const: assignment is rejected (TC-0008). bit 1 = assigned to
+     * at least once (set by assign(); nothing reads it back yet) */
     u8 flags;
     /* source file the declaration lives in (diagnostic file id). symbols
      * with the same name from different files are distinct (the backend
-     * mangles their names apart) — see coral-docs/mangle_asm.md */
+     * mangles their names apart); see coral-docs/mangle_asm.md */
     u32 fileId;
 }
 
@@ -40,6 +48,9 @@ pub struct ScopeStack
 
 pub extend ScopeStack
 {
+    /* cap 0 = init failed / stack deliberately dead: enter() refuses and the
+     * first real push grows from 4. scopes[] holds Scope* as rawptr because
+     * Scope is defined above but the array is just addresses. */
     void init(u32 cap)
     {
         self.scopes = null;
@@ -57,6 +68,8 @@ pub extend ScopeStack
         }
     }
 
+    // pop everything still open (early-return leaks land here); leave()
+    // normally owns this per scope
     void deinit()
     {
         while (self.len > 0)
@@ -79,6 +92,9 @@ pub extend ScopeStack
         return (Scope*)self.scopes[self.len - 1];
     }
 
+    /* push a scope parented to the current one; pair every success with
+     * leave() (an imbalance isn't fatal; deinit sweeps leftovers, but
+     * lookups will see the wrong set of names in the meantime) */
     bool enter()
     {
         if (self.scopes == null) return false;
@@ -123,6 +139,11 @@ pub extend ScopeStack
         return true;
     }
 
+    /* add to the innermost scope. identity is (name, fileId): a same-name
+     * symbol from another merged file coexists. re-declaring the very same
+     * node (declare pass then body pass) returns true, not a dup.
+     * on failure, lastDeclFail says 1 = duplicate (dupSymbol set) or
+     * 2 = OOM, and the counter was already bumped. */
     bool declare(Str name, u8 kind, Ty typeNode, NodeId declaration, u8 flags, u32 fileId)
     {
         self.lastDeclFail = 0;
@@ -139,7 +160,7 @@ pub extend ScopeStack
         {
             if (scope->symbols[i].name == name)
             {
-                /* different source file: distinct (mangled) symbols —
+                /* different source file: distinct (mangled) symbols are
                  * allowed; this also lets an import binding coexist with
                  * the real merged declaration it points at */
                 if (scope->symbols[i].fileId != fileId)
@@ -147,7 +168,7 @@ pub extend ScopeStack
                     i++;
                     continue;
                 }
-                if (scope->symbols[i].declaration.index == declaration.index) return true;
+                if (scope->symbols[i].declaration.index == declaration.index) return true; // same node: idempotent
                 self.lastDeclFail = 1;
                 self.dupSymbol = scope->symbols + i;
                 self.errors++;
@@ -221,7 +242,7 @@ pub extend ScopeStack
         return null;
     }
 
-    /* every symbol named `name`, innermost scope first — lets callers
+    /* every symbol named `name`, innermost scope first; lets callers
      * resolve ambiguous names (the same name declared in several merged
      * files, e.g. libc's extern realloc vs mman's realloc<T>) by a
      * secondary criterion such as generic arity */
@@ -246,6 +267,9 @@ pub extend ScopeStack
         return n;
     }
 
+    /* mark a name as written to. only kind 1 (variable) is assignable and
+     * a const (flags bit 0) never is; everything else fails silently here;
+     * the caller already reported the shape problem */
     bool assign(Str name, NodeId target)
     {
         Symbol* symbol = self.lookup(name);

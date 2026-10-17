@@ -1,8 +1,13 @@
 
-import ast::id { Str, NodeId };
-import ast::types { Ty, TypeEntry, TypeKind };
-import ast::node { Node, NodeKind };
-import ast::decl { Decl, DeclKind };
+/* member.crl: field and method resolution on a receiver type: struct/union
+ * fields, variant tag/payload/case fields, builtin str { ptr, len }, and
+ * methods from the type's own decl plus its `extend` blocks. */
+import ast {
+    id { Str, NodeId },
+    types { Ty, TypeEntry, TypeKind },
+    node { Node, NodeKind },
+    decl { Decl, DeclKind }
+};
 import scope { Symbol };
 import sema { Sema };
 
@@ -10,11 +15,14 @@ pub struct MemberInfo
 {
     Ty typeNode;
     NodeId declaration;
+    // 0 = not found, 1 = field, 2 = method
     u8 kind;
 }
 
 pub extend Sema
 {
+    // peel the wrappers that don't change which fields exist: a pointer
+    // auto-derefs (`x.f` works on `x: T*`), const/comptime qualifiers lift
     Ty stripType(Ty typeNode)
     {
         while (typeNode != 0)
@@ -32,6 +40,9 @@ pub extend Sema
         return typeNode;
     }
 
+    /* field lookup on the stripped receiver. typeNode == 0 means "no such
+     * member": callers report it; this never errors itself. builtin str
+     * answers ptr/len, variants answer tag/payload plus any case field. */
     MemberInfo findMember(Ty receiver, Str name)
     {
         MemberInfo none;
@@ -110,6 +121,9 @@ pub extend Sema
                 {
                     if (decl->kind.payload.Variant.variants[i].fieldNames[p] == name)
                     {
+                        // case fields match across ALL cases (`.value` finds
+                        // any case that has it). declaration stays 0: there
+                        // is no single Field node to point at.
                         none.typeNode = decl->kind.payload.Variant.variants[i].fieldTypes[p];
                         none.declaration.index = 0;
                         none.kind = 1;
@@ -123,7 +137,7 @@ pub extend Sema
         return none;
     }
 
-    /* `x.payload.Case.field` — resolve the case field's type directly
+    /* `x.payload.Case.field`: resolve the case field's type directly
      * from the variant decl (no payload/case type is materialized) */
     Ty findVariantCaseFieldTy(Ty variantTy, Str caseName, Str fieldName)
     {
@@ -156,6 +170,7 @@ pub extend Sema
         return 0;
     }
 
+    // does the variant decl have a case named `caseName`? (payload access guard)
     bool variantHasCase(Ty variantTy, Str caseName)
     {
         variantTy = self.stripType(variantTy);
@@ -177,7 +192,7 @@ pub extend Sema
         return false;
     }
 
-    /* true when `t` (after stripping) is a named variant decl type —
+    /* true when `t` (after stripping) is a named variant decl type:
      * drives the `v.tag == V::Case` / `kind.tag = V::Case` allowances */
     bool isVariantNamedTy(Ty t)
     {
@@ -245,6 +260,9 @@ pub extend Sema
         return none;
     }
 
+    /* method lookup: the type's own decl methods win over extends, and
+     * extends are scanned in collection order; first name match returns.
+     * builtin `str` has no decl, so it only ever resolves through extends. */
     MemberInfo findMethod(Ty receiver, Str name)
     {
         MemberInfo none;
@@ -254,7 +272,7 @@ pub extend Sema
         receiver = self.stripType(receiver);
         if (receiver == 0) return none;
         TypeEntry* typeEntry = self.ctx.types + receiver;
-        /* builtin receivers (`str`) carry no decl — they resolve through
+        /* builtin receivers (`str`) carry no decl, so they resolve through
          * `extend` blocks only; Named walks its own decl's method list first */
         if (typeEntry->kind.tag != TypeKind::Named && typeEntry->kind.tag != TypeKind::Str) return none;
         if (typeEntry->kind.tag == TypeKind::Named)
@@ -346,6 +364,7 @@ pub extend Sema
                                 return none;
                             }
                         }
+                        // m++1 (sic). i know. it's staying.
                         m++1;
                     }
                 }

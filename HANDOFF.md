@@ -1,5 +1,8 @@
 # HANDOFF — coralc self-host compiler (2026-10-03)
 
+## Owner directives
+- **2026-10-17 — parser static free functions get stripped.** The owner will remove the use of static free functions from the parser; they should not be allowed again. Do not add new ones.
+
 ## Repo / build commands
 - Workspace: `/home/cerie/Documents/coralc`
 - Build compiler: `timeout 200 python3 bootstrap/coralc.py compiler/coral-frontend/coralc.crl -o /tmp/opencode/coralc > /tmp/opencode/build.log 2>&1; echo BUILD=$?`

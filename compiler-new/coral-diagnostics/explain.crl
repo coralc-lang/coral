@@ -1,4 +1,4 @@
-/* diagnostics/explain.crl — `coralc --explain CODE` long-form help.
+/* diagnostics/explain.crl: `coralc --explain CODE` long-form help.
  *
  * One entry per stable diagnostic code (see code.crl). Output goes to
  * stdout: a bold header, a short summary, then "why" and "how to fix"
@@ -7,6 +7,9 @@
 
 import(lib) platform::libc { write };
 import(lib) std::text::string { String };
+
+// tiny helpers so the code table below reads like a mini DSL; exBufStr's
+// empty guard is the only real logic here. the output goes to stdout (fd 1)
 
 void exBufStr(String* b, str s)
 {
@@ -19,6 +22,7 @@ void exBufByte(String* b, u8 c)
     b->pushByte(c);
 }
 
+// alias for str.equals: keeps the giant if-chain below flavour-free
 bool exEq(str a, str b)
 {
     return a.equals(b);
@@ -38,6 +42,8 @@ void exWhy(String* b, str s) { exBufStr(b, "why:  "); exBufStr(b, s); exBufStr(b
 void exFix(String* b, str s) { exBufStr(b, "fix:  "); exBufStr(b, s); exBufStr(b, "\n"); }
 
 // returns true when the code was recognised
+// one if per code; linear, but this runs once per --explain invocation,
+// and staying data-in-code beats dragging in a hash table
 bool exOne(String* b, str code)
 {
     if (exEq(code, "LEX-0001"))
@@ -67,6 +73,9 @@ bool exOne(String* b, str code)
     {
         exTitle(b, code, "unterminated block comment");
         exWhy(b, "a '/*' is missing its closing '*/'.");
+        // heads up: skip_ws.crl stops at the first `*/`, so the "may nest"
+        // part of this string is a lie, but the text is user-visible and
+        // off-limits, so fix the lexer or the string together
         exFix(b, "close the comment; block comments may nest, so count the levels.");
         return true;
     }
@@ -282,6 +291,7 @@ bool exOne(String* b, str code)
     return false;
 }
 
+// catch-all when exOne didn't recognise the code: point at the index
 void exIndex(String* b)
 {
     exBufStr(b, "No explanation available for this code.\n\nAvailable codes:\n");
@@ -294,6 +304,8 @@ void exIndex(String* b)
 
 pub void explain(str code)
 {
+    // build the whole thing, then one write; unknown codes fall through
+    // to the index
     String b = String::new();
     if (!exOne(&b, code)) exIndex(&b);
     exBufByte(&b, 10);

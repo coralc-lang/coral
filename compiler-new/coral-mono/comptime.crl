@@ -1,4 +1,4 @@
-/* mono/comptime.crl — staging evaluator for `comptime { … }` blocks.
+/* mono/comptime.crl: staging evaluator for `comptime { … }` blocks.
  *
  * Runs during generic instantiation with the call site's actual values
  * bound: type params → concrete types, value params → literals or
@@ -28,9 +28,11 @@ import mono { MonoContext, MonoSubstitution };
 
 import(lib) std::mman { alloc, dealloc, realloc, zero };
 
-/* CtVal.kind tags — the bootstrap does not emit file-scope scalar consts
+/* CtVal.kind tags: the bootstrap does not emit file-scope scalar consts
  * (only array consts) or forward-declare non-variant enums before extend
- * bodies, so the tags are inlined as numeric literals at use sites. */
+ * bodies, so the tags are inlined as numeric literals at use sites.
+ * For the record: 0 none, 1 int, 2 bool, 3 str, 4 type, 5 runtime-expr,
+ * 6 pack. */
 pub struct CtVal
 {
     u8 kind;
@@ -74,7 +76,7 @@ pub struct CtEval
     bool typeSwitchMissed;
     bool declEmitted;
     u32 loopDepth;
-    /* names of locals declared in this evaluation — used to fold
+    /* names of locals declared in this evaluation: used to fold
      * `local = comptime` onto uninitialized locals and to emit each
      * runtime declaration once even when an unrolled loop re-runs the
      * same VarDecl statement */
@@ -199,6 +201,8 @@ pub extend CtEval
         if (smT != null) v.ty = smT.strType();
         if (n == 0) { v.sptr = null; v.slen = 0; return v; }
         v.sptr = alloc<u8>(n);
+        /* OOM: silently yields an empty string; there is no path back
+         * to the caller from here anyway */
         if (v.sptr == null) return v;
         usize i = 0;
         while (i < n) { v.sptr[i] = p[i]; i++; }
@@ -272,6 +276,8 @@ pub extend CtEval
     void sinkPush()
     {
         u32 d = self.sinkDepth;
+        /* depth cap: past 8 the push no-ops and emit() misses its
+         * intended sink, landing in the enclosing one instead */
         if (d >= 8) return;
         self.sinkBufs[d] = null;
         self.sinkLens[d] = 0;
@@ -364,6 +370,8 @@ pub extend CtEval
 
     void fail(str msg)
     {
+        /* first failure wins; a later one in the same eval must not
+         * bury the original message */
         if (self.failed) return;
         self.failed = true;
         self.errMsg = msg;
@@ -395,7 +403,7 @@ pub extend CtEval
     /* ---- type-switch pattern matching ----
      * the parser stores every name-like switch pattern as PatKind::Ident
      * (it cannot tell a binding from a type from a trait name at parse
-     * time), so type switches resolve the name here — Zig-style, at
+     * time), so type switches resolve the name here, Zig-style, at
      * comptime: builtin keywords, named types, and the `const T*` / `T*`
      * source-text forms resolve as types; anything unresolvable falls
      * back to Rust-style trait matching (`rerooted toStr` → the receiver
@@ -408,7 +416,7 @@ pub extend CtEval
         return true;
     }
 
-    /* singleton Ty for a unit TypeKind — scans the table first so a
+    /* singleton Ty for a unit TypeKind; scans the table first so a
      * keyword always maps to the same entry */
     Ty kindSingleton(TypeKind k)
     {
@@ -426,13 +434,13 @@ pub extend CtEval
      * order matters: the scope table first (typedefs resolve through
      * symbol.typeNode, which sema sets to the alias target; struct/enum/
      * trait names map to their Named entry), then the language keyword
-     * map (builtin keywords like i32/void are never declared as symbols —
+     * map (builtin keywords like i32/void are never declared as symbols:
      * parseBaseType maps them from token kinds), then a by-name scan for
      * named types built purely by name with no symbol (cchar). */
     Ty resolvePatBase(Str bn, SourceLoc loc)
     {
         if (bn == 0) return 0;
-        // 1. symbol table — typedef/alias/struct names
+        // 1. symbol table: typedef/alias/struct names
         Sema* s = self.mono.sema;
         Symbol* sym = s.lookupType(bn, loc);
         if (sym != null && (sym->kind == 3 || sym->kind == 4) && sym->typeNode != 0)
@@ -476,7 +484,7 @@ pub extend CtEval
         if (bn == self.internStr("usize")) { k.tag = TypeKind::Usize; return self.kindSingleton(k); }
         if (bn == self.internStr("isize")) { k.tag = TypeKind::Isize; return self.kindSingleton(k); }
         if (bn == self.internStr("rawptr")) { k.tag = TypeKind::Rawptr; return self.kindSingleton(k); }
-        /* named types (String, cchar, Hex, Spaces, …) — match an existing
+        /* named types (String, cchar, Hex, Spaces, …): match an existing
          * non-generic entry; unknown names resolve to 0 so the caller can
          * try trait matching */
         u32 i = 1;
@@ -555,7 +563,7 @@ pub extend CtEval
         if (a == 0 || b == 0) return false;
         TypeEntry* ea = self.mono.ast.types + a;
         TypeEntry* eb = self.mono.ast.types + b;
-        /* usize/isize are the platform word types — mutually assignable
+        /* usize/isize are the platform word types: mutually assignable
          * with u64/i64 on the 64-bit target (typecheck compatible()), so
          * a `switch (@typeof(T))` arm spelled either way matches (this is
          * what lets ios's `_fprintOne` u64 arm print a usize) */
@@ -574,7 +582,7 @@ pub extend CtEval
     }
 
     /* the Ty a name-like switch pattern denotes, spelled exactly (leading
-     * `const`, trailing `*`s and `[]` included) — 0 when the name does not
+     * `const`, trailing `*`s and `[]` included): 0 when the name does not
      * resolve to a type. `*plain` reports a bare, undecorated name (the
      * shape a trait pattern like `rerooted toStr` must have). */
     Ty typeFromNameText(Str name, SourceLoc loc, bool* plain)
@@ -596,7 +604,7 @@ pub extend CtEval
             off = 5;
             if (off < n && p[off] == 32) off++;
         }
-        /* trailing `[]` slice suffix, then trailing `*`s — mirroring how
+        /* trailing `[]` slice suffix, then trailing `*`s; mirroring how
          * parseTypeSuffix stacks Pointer under Slice */
         if (end >= off + 2 && p[end - 1] == 93 && p[end - 2] == 91)
         {
@@ -629,7 +637,7 @@ pub extend CtEval
         Ty base = self.typeFromNameText(name, loc, &plain);
         if (base == 0)
         {
-            /* trait pattern: `rerooted toStr` / a bare trait-name arm — the
+            /* trait pattern: `rerooted toStr` / a bare trait-name arm: the
              * receiver implements the method */
             if (plain)
             {
@@ -639,7 +647,7 @@ pub extend CtEval
             }
             return false;
         }
-        /* a bare type-param pattern names the scrutinee's own parameter —
+        /* a bare type-param pattern names the scrutinee's own parameter:
          * it always applies once the parameter is instantiated */
         TypeEntry* be = self.mono.ast.types + base;
         if (be->kind.tag == TypeKind::TypeParam && plain) return true;
@@ -647,7 +655,7 @@ pub extend CtEval
     }
 
     /* the Ty a type-switch pattern names, exactly as spelled (no alias
-     * resolution) — 0 for non-type patterns (wildcards, trait names, …) */
+     * resolution): 0 for non-type patterns (wildcards, trait names, …) */
     Ty patToTy(NodeId patId)
     {
         Node* pn = self.nodeAt(patId);
@@ -739,7 +747,7 @@ pub extend CtEval
         return self.mkExpr(ExprKind::IntLit{ .value = v, .flags = 0 }, t);
     }
 
-    /* fresh string literal from comptime bytes — codegen reads StringLit
+    /* fresh string literal from comptime bytes: codegen reads StringLit
      * intern text with surrounding quotes, so build a quoted form with
      * backslash and quote escaped */
     NodeId mkStrLit(u8* p, usize n)
@@ -756,7 +764,7 @@ pub extend CtEval
             Sema* sm2 = self.mono.sema;
             t = sm2.strType();
         }
-        u8* buf = alloc<u8>(n * 2 + 2);
+        u8* buf = alloc<u8>(n * 2 + 2); /* worst case escapes double + two quotes */
         if (buf == null) { self.mono.errors++; return NodeId{ .index = 0 }; }
         usize w = 0;
         buf[w] = 34; w++;
@@ -805,7 +813,7 @@ pub extend CtEval
 
     /* CtVal → a NodeId usable in emitted code. comptime ints/bools become
      * fresh literals; str becomes a runtime expr only if we have one
-     * (otherwise unsupported — the caller should have kept it runtime);
+     * (otherwise unsupported: the caller should have kept it runtime);
      * runtime-exprs pass through; types have no runtime form. */
     NodeId valToNode(CtVal v)
     {
@@ -838,7 +846,7 @@ pub extend CtEval
         return true;
     }
 
-    /* comptime str VALUE of a source string literal — intern text keeps
+    /* comptime str VALUE of a source string literal: intern text keeps
      * the surrounding quotes (codegen strips them when re-emitting); the
      * value bytes are what sits inside the quotes */
     CtVal strLitVal(NodeId id)
@@ -859,7 +867,7 @@ pub extend CtEval
     {
         Str bname = e->kind.payload.BuiltinCall.name;
         u32 n = e->kind.payload.BuiltinCall.argsLen;
-        // @compileError("msg") — reached during eval = hard error
+        // @compileError("msg"): reached during eval = hard error
         if (bname == self.internStr("compileError"))
         {
             str msg = "@compileError tripped";
@@ -882,7 +890,7 @@ pub extend CtEval
             self.fail(msg);
             return self.makeNone();
         }
-        /* @isFormatLiteral(x) — true iff x is a comptime-known string
+        /* @isFormatLiteral(x): true iff x is a comptime-known string
          * value (a literal in scope, or a call-site literal bound for
          * this instance; runtime strings evaluate to kind 5 and stay
          * false) */
@@ -895,14 +903,14 @@ pub extend CtEval
             }
             return self.makeBool(false);
         }
-        /* @typeof(expr) — the type of a comptime-known value; for runtime
+        /* @typeof(expr): the type of a comptime-known value; for runtime
          * exprs the resolvedType is already on the node */
         if (bname == self.internStr("typeof"))
         {
             if (n == 1)
             {
                 CtVal a = self.evalExpr(e->kind.payload.BuiltinCall.args[0]);
-                /* an unsubstituted param type arrives as a raw TypeParam —
+                /* an unsubstituted param type arrives as a raw TypeParam:
                  * resolve it through the instance bindings so
                  * `switch (@typeof(v))` folds on the concrete type */
                 if (a.kind == 4)
@@ -1013,6 +1021,8 @@ pub extend CtEval
         u32 argc = 0;
         if (rawArgs > 0)
         {
+            /* +8: slack for packs expanded by `...` at this call site;
+             * each spread arg can contribute several elements */
             argv = alloc<CtVal>((usize)(rawArgs + 8));
             if (argv == null) return self.makeNone();
             zero<CtVal>(argv, (usize)(rawArgs + 8));
@@ -1027,7 +1037,7 @@ pub extend CtEval
                     CtVal pack;
                     if (spreadInner.index == 0)
                     {
-                        // bare `...` — forward the enclosing variadic pack
+                        // bare `...`: forward the enclosing variadic pack
                         pack = self.lookup(self.variadicPackName);
                     }
                     else
@@ -1036,6 +1046,9 @@ pub extend CtEval
                     }
                     if (pack.kind == 6)
                     {
+                        /* elements past the slack cap are dropped; a
+                         * 9+-element pack spelled out at a call site
+                         * silently loses its tail here */
                         u32 k = 0;
                         while (k < pack.elemsLen && argc < rawArgs + 8)
                         {
@@ -1053,7 +1066,8 @@ pub extend CtEval
             }
         }
 
-        // depth guard
+        // depth guard: recursion cap so runaway comptime expansion fails
+        // with a diagnostic instead of blowing the C stack
         if (self.depth > 24)
         {
             if (argv != null) dealloc<CtVal>(argv);
@@ -1102,7 +1116,7 @@ pub extend CtEval
                     Param* pp = &pn->kind.payload.Param.value;
                     if ((pp->flags & 16) != 0)
                     {
-                        /* variadic — bind the rest as a pack; when the
+                        /* variadic: bind the rest as a pack; when the
                          * caller passed no trailing args (or forwarded an
                          * empty pack through bare `...`) bind an EMPTY
                          * pack so `for (x : args)` unrolls to zero
@@ -1194,7 +1208,7 @@ pub extend CtEval
             /* evaluate every comptime block in the body; also keep non-comptime
              * statements as emitted runtime code */
             /* a return/break/continue inside the callee only halts the
-             * callee's frame — save and clear the caller's control state */
+             * callee's frame; save and clear the caller's control state */
             bool savedReturned = self.returned;
             bool savedBroken = self.broken;
             bool savedContinued = self.continued;
@@ -1211,17 +1225,17 @@ pub extend CtEval
             // drop the inlined frame (keep outer bindings)
             self.bindingsLen = savedLen;
             if (argv != null) dealloc<CtVal>(argv);
-            /* inlined functions return nothing useful to the caller here —
+            /* inlined functions return nothing useful to the caller here:
              * print's callees are all void */
             return self.makeNone();
         }
 
-        // not inlinable — emit a runtime call with whatever we have
+        // not inlinable; emit a runtime call with whatever we have
         if (argv != null) dealloc<CtVal>(argv);
         return self.makeNone();
     }
 
-    /* `receiver.method(args)` — when the receiver (or an arg) is bound to
+    /* `receiver.method(args)`: when the receiver (or an arg) is bound to
      * a caller-side node (`val` in `(any toStr)` → the instance's tail
      * param / the inlined arg node), return a fresh MethodCall re-rooted
      * onto it so the emitted C call resolves. An untouched runtime
@@ -1355,7 +1369,7 @@ pub extend CtEval
                     }
                 }
                 /* ptr-of-comptime-str indexed: track via a side table is
-                 * overkill — the format scanner indexes f.ptr[i] where f
+                 * overkill; the format scanner indexes f.ptr[i] where f
                  * is comptime; handle DerefField-of-Field shape below */
                 return self.makeRt(id, rt);
             },
@@ -1485,7 +1499,7 @@ pub extend CtEval
             StmtKind::ExprStmt => { return self.evalExprStmt(s); },
             StmtKind::Return => {
                 /* a return in the instance's own frame is runtime code; a
-                 * return inside an inlined callee only halts that frame —
+                 * return inside an inlined callee only halts that frame;
                  * the caller continues after the call site. The returned
                  * expression may still be runtime code that must be
                  * emitted (e.g. `return _fprintPtr(out, …);`). */
@@ -1580,7 +1594,7 @@ pub extend CtEval
             localId = self.mkExpr(ExprKind::Ident{ .name = name }, v.ty);
             if (localId.index != 0) self.bind(name, self.makeRt(localId, v.ty));
         }
-        /* emit the runtime declaration once per name — an unrolled loop
+        /* emit the runtime declaration once per name: an unrolled loop
          * re-evaluating the same VarDecl must not duplicate the C decl.
          * Inside an unrolled body the single declaration lands in the
          * flat emitted block, so it stays visible to later statements.
@@ -1654,7 +1668,7 @@ pub extend CtEval
         {
             if (val.kind != 1 && val.kind != 2 && val.kind != 3) return false;
             /* plain `=` rebinds only an existing comptime value of the
-             * same kind — anything else stays as runtime code (the decl
+             * same kind; anything else stays as runtime code (the decl
              * was emitted, so the reference is valid) */
             if (cur.kind == val.kind && (cur.kind == 1 || cur.kind == 2 || cur.kind == 3))
             {
@@ -1737,13 +1751,13 @@ pub extend CtEval
         if (en != null && en->kind.tag == NodeKind::Expr)
         {
             Expr* e = &en->kind.payload.Expr.value;
-            // a bare call — try the inlining evaluator
+            // a bare call: try the inlining evaluator
             if (e->kind.tag == ExprKind::Call)
             {
                 u32 before = self.emitCount();
                 CtVal r = self.evalCall(eid, e);
                 /* evalCall emits whatever runtime stmts the inlined body
-                 * produced; a non-inlinable call falls through as none —
+                 * produced; a non-inlinable call falls through as none:
                  * re-emit the original so it is not lost. comptime-known
                  * identifier/literal args are folded into fresh literals
                  * first so the emitted call never references
@@ -1752,7 +1766,7 @@ pub extend CtEval
                     r.rid.index != 0 && r.rid.index != eid.index)
                 {
                     /* a re-rooted runtime call (method call on a bound
-                     * receiver/args) — emit the fresh call node */
+                     * receiver/args): emit the fresh call node */
                     NodeId wrap = self.mkStmt(StmtKind::ExprStmt{ .expr = r.rid });
                     self.emit(wrap);
                     return;
@@ -1854,7 +1868,7 @@ pub extend CtEval
             if (self.assignExprTag(e->kind))
             {
                 if (self.tryFoldAssign(eid, e)) return;
-                // not foldable — emit as runtime code
+                // not foldable; emit as runtime code
                 NodeId wrap = self.mkStmt(StmtKind::ExprStmt{ .expr = eid });
                 self.emit(wrap);
                 return;
@@ -1874,7 +1888,7 @@ pub extend CtEval
     }
 
     /* collect names assigned inside a runtime loop body that currently
-     * hold comptime values — they must act as runtime variables for the
+     * hold comptime values; they must act as runtime variables for the
      * loop (a comptime-unrolled loop folds them; a runtime loop cannot) */
     void collectLoopAssigns(NodeId stmtId, Str* names, u32* len, u32 cap)
     {
@@ -2137,13 +2151,13 @@ pub extend CtEval
                 self.evalStmt(s->kind.payload.If.elseBody);
             return;
         }
-        /* runtime condition — rewrite the bodies so references bound in
+        /* runtime condition: rewrite the bodies so references bound in
          * an inlined frame resolve, then emit the rebuilt if */
         if (self.depth > 0) self.emit(self.rwStmt(id));
         else self.emit(id);
     }
 
-    /* evaluate a switch arm's body without the Block scope-restore —
+    /* evaluate a switch arm's body without the Block scope-restore:
      * an assignment the arm makes to an outer comptime local
      * (`f = fmt;` inside `str => { ... }`) must survive the arm so the
      * statements after the switch fold against it */
@@ -2193,7 +2207,7 @@ pub extend CtEval
                 }
                 e0++;
             }
-            /* pass 2: loose matching — alias/underlying resolution,
+            /* pass 2: loose matching, alias/underlying resolution,
              * usize≡u64, trait arms (`rerooted toStr`), type params */
             u32 i = 0;
             while (i < s->kind.payload.Switch.casesLen)
@@ -2213,7 +2227,7 @@ pub extend CtEval
                 }
                 i++;
             }
-            /* no arm matched — record it so the end of the comptime block
+            /* no arm matched: record it so the end of the comptime block
              * can report it; an author's trailing @compileError still fires
              * first during fall-through and wins the message */
             self.typeSwitchMissed = true;
@@ -2247,12 +2261,12 @@ pub extend CtEval
                 }
                 i++;
             }
-            /* no arm matched — emit the switch so the runtime fall-through
+            /* no arm matched: emit the switch so the runtime fall-through
              * (C semantics) survives instead of vanishing silently */
             self.emit(id);
             return;
         }
-        // runtime switch — emit as-is
+        // runtime switch: emit as-is
         self.emit(id);
     }
 
@@ -2269,6 +2283,8 @@ pub extend CtEval
         {
             u32 guard = 0;
             u32 before = self.emitCount();
+            /* 4096 iterations max: past that the loop is emitted as
+             * runtime code instead of being unrolled */
             while (guard < 4096)
             {
                 CtVal cc = self.evalExpr(s->kind.payload.While.cond);
@@ -2287,7 +2303,7 @@ pub extend CtEval
                 if (self.failed || self.returned) return;
                 if (self.declEmitted)
                 {
-                    /* unroll-unsafe — rewind what we have and keep the
+                    /* unroll-unsafe: rewind what we have and keep the
                      * loop as runtime code */
                     self.declEmitted = false;
                     self.broken = false;
@@ -2306,7 +2322,7 @@ pub extend CtEval
                 self.continued = false;
                 guard++;
             }
-            // guard exhausted — not safely unrollable
+            // guard exhausted: not safely unrollable
             self.emitRewind(before);
             if (self.depth > 0) self.emit(self.rwStmt(id));
             else self.emit(id);
@@ -2318,11 +2334,11 @@ pub extend CtEval
 
     void evalForIn(NodeId id, Stmt* s)
     {
-        // for (var x : pack) — unroll over comptime pack elements
+        // for (var x : pack): unroll over comptime pack elements
         CtVal it = self.evalExpr(s->kind.payload.ForIn.iterExpr);
         if (it.kind == 3)
         {
-            /* comptime string literal — unroll over its bytes (the
+            /* comptime string literal: unroll over its bytes (the
              * `{..}` spread over a literal str); the element binds as a
              * comptime int so casts and calls fold per byte */
             Str bindNameS = s->kind.payload.ForIn.bindName;
@@ -2372,7 +2388,7 @@ pub extend CtEval
         }
         if (it.kind != 6)
         {
-            /* runtime iterable — rewrite the iterable onto its bound
+            /* runtime iterable: rewrite the iterable onto its bound
              * caller-side node and the body so references resolve
              * (`for (… : val)` in an inlined callee body becomes
              * `for (… : _varg0)` with `out`/`elem` re-rooted). The bind
@@ -2420,7 +2436,7 @@ pub extend CtEval
             if (self.declEmitted)
             {
                 /* a declaration inside the body would be duplicated per
-                 * element — keep the loop as runtime code */
+                 * element; keep the loop as runtime code */
                 self.declEmitted = false;
                 self.broken = false;
                 self.continued = false;

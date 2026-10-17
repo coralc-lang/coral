@@ -1,8 +1,11 @@
-/* frontend/codegen.crl — backend: analyzed AST → flat C.
+/* backend/codegen.crl: analyzed AST → flat C.
  *
  * Output shape: labels + gotos for control flow, three-address temporaries
  * for expression evaluation (declared at function entry). Types come from
- * Sema's resolvedType / the TypeKind table only — no name heuristics.
+ * Sema's resolvedType / the TypeKind table only: no name heuristics.
+ *
+ * The C is built into per-section Streams (all arena-owned) and assembled
+ * once at the end by generateC; nothing is written to disk here.
  */
 import context::context { AstContext, InternEntry };
 import build::arena { Arena };
@@ -27,8 +30,6 @@ import ast {
 import(lib) std::mman { alloc, dealloc, realloc, zero };
 
 // use platform libc, and then for allocations, i will refactor the whole allocator to use std::mman::alloc
-// extern("C") usize strlen(u8* s);
-// extern("C") rawptr memcpy(rawptr dst, rawptr src, usize n);
 
 pub struct CodegenResult
 {
@@ -36,6 +37,10 @@ pub struct CodegenResult
     u32 errors;
 }
 
+/* append-only output buffer; every section of the generated C (typedefs,
+ * prototypes, bodies, …) is one. All streams live in the codegen arena:
+ * individual buffers are never freed, the whole arena dies at once.
+ * NUL-terminated after every write, so stTail slices pass as C strings. */
 pub struct Stream
 {
     u8* p;
@@ -108,18 +113,24 @@ void stI64(Stream* s, i64 n)
 {
     if (n < 0) {
         stCh(s, '-');
+        /* 0 - n, not -n: negating the most-negative i64 is UB */
         stU64(s, (u64)(0 - n));
     } else {
         stU64(s, (u64)n);
     }
 }
 
+/* slice of [start, len), valid only until the next write: growth
+ * reallocates and every slice points into the old buffer */
 Slice stTail(Stream* s, usize start)
 {
     if (start > s.len) return Slice::from(null, 0);
     return Slice::from(s.p + start, s.len - start);
 }
 
+/* cut back to a length a caller recorded before speculatively emitting
+ * statements (while/for condition probes). The mark is a length, not a
+ * pointer, so a realloc in between is harmless. */
 void stTrunc(Stream* s, usize n)
 {
     if (n > s.len) return;
@@ -137,6 +148,12 @@ void stNL(Stream* s, u32 ind)
     }
 }
 
+/* stream roles: out = the assembled result; fwd = forward typedefs and
+ * import-alias #defines; defs = type defs + file-scope constants;
+ * protos = function prototypes; bodies = finished bodies; body = the
+ * body currently being built (reset per function); ebuf = expression
+ * text scratch; tybuf = C type text / mangled-name scratch; tdecl =
+ * registered slice/tuple/fn-pointer typedefs */
 pub struct Codegen
 {
     AstContext* ctx;
@@ -157,29 +174,35 @@ pub struct Codegen
     u32 subsLen;
     u32 errors;
 
+    /* per-function emission state: __L<labelSeq> gotos, __t<tempsLen>
+     * temporaries (all declared at the function top) */
     u32 labelSeq;
     u32 tempSeq;
+    /* per-temp result type + array length (tempArrs is parallel to
+     * tempTys; only meaningful for array-typed temps) */
     Slice* tempTys;
     u32* tempArrs;
     u32 tempsCap;
     u32 tempsLen;
 
     u32 loopDepth;
-    u32 loopCap;
+    u32 loopCap; /* written, never read; break/continue only look at loopDepth */
 
-    // small inline cache for cgFindDecl — the heaviest per-call scan
+    // small inline cache for cgFindDecl: the heaviest per-call scan
     Str* declCacheNames;
     u32* declCacheIds;
     u32* declCacheTags;
     u32 declCacheLen;
 
     /* names bound in the current function (params, locals, loop/pattern
-     * binds) — Ident refs to these stay raw, everything else goes
+     * binds): Ident refs to these stay raw, everything else goes
      * through cgResolveRef → cgMangle */
     Str* localNames;
     u32 localNamesLen;
     u32 localNamesCap;
 
+    /* registry of emitted slice/tuple/fn-pointer typedef texts: cgRegName
+     * dedups against these and emits dependencies first */
     Slice* regNames;
     u32 regLen;
     u32 regCap;
@@ -204,6 +227,8 @@ u32 cgLabel(Codegen* cg)
     return cg.labelSeq;
 }
 
+/* hand out the next temp slot. arrLen is vestigial: array declarators
+ * are split at the first '[' in cgEmitFuncCommon instead. */
 u32 cgNewTemp(Codegen* cg, Slice ty, u32 arrLen)
 {
     if (cg.tempsLen >= cg.tempsCap) {
@@ -273,7 +298,7 @@ Ty cgSubstTy(Codegen* cg, Ty t)
 }
 
 /* Sanitize a C type spelling into a mangled identifier fragment.
- * tyStr almost always returns a slice of tybuf — in that case rewrite
+ * tyStr almost always returns a slice of tybuf; in that case rewrite
  * in place (each input char maps to exactly one output char), so an
  * enclosing mangled name (cgInstanceName) sees only sanitized chars
  * and never the raw spelling. External slices (tyStr(0) returns a
@@ -310,7 +335,7 @@ Slice cgMangleTy(Codegen* cg, Ty t)
     return stTail(&cg.tybuf, st);
 }
 
-// name + "_" + mangled arg types — the C name for a mono instance.
+// name + "_" + mangled arg types: the C name for a mono instance.
 Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
 {
     usize st = cg.tybuf.len;
@@ -325,6 +350,8 @@ Slice cgInstanceName(Codegen* cg, Str name, Ty* args, u32 argsLen)
     return stTail(&cg.tybuf, st);
 }
 
+/* hex without leading zeros (0 → "0"): value keys end up inside mangled
+ * C identifiers, where only [0-9a-zA-Z_] may appear */
 void cgWriteHex(Stream* s, u64 v)
 {
     str digits = "0123456789abcdef";
@@ -342,7 +369,7 @@ void cgWriteHex(Stream* s, u64 v)
     }
 }
 
-/* instance name with the Zig-style value-specialization key appended —
+/* instance name with the Zig-style value-specialization key appended:
  * `println` of "hello" and of "bye" are distinct C symbols; key 0 (no
  * recorded call-site values) keeps the plain name */
 Slice cgInstanceNameV(Codegen* cg, Str name, Ty* args, u32 argsLen, u64 valueKey)
@@ -392,7 +419,7 @@ void cgMangleSeg(Stream* s, u8* p, usize len)
     }
 }
 
-// declaring name of a decl — 0 for nameless kinds (Import, Extend, …)
+// declaring name of a decl: 0 for nameless kinds (Import, Extend, …)
 Str cgDeclOwnName(Decl* dd)
 {
     Str dn = 0;
@@ -432,7 +459,7 @@ bool cgMangleExempt(Codegen* cg, NodeId declId, Slice name)
 }
 
 /* mangled spelling: path segments from the declaring file, then an
- * optional import alias, then the declaring name — built into a fresh
+ * optional import alias, then the declaring name; built into a fresh
  * arena stream so nested calls never clobber each other's tails */
 Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
 {
@@ -544,7 +571,7 @@ Slice cgMangleS(Codegen* cg, NodeId declId, Slice name, Str alias)
     return stTail(&s, 0);
 }
 
-// Str wrapper — exempt names keep the keyword escape
+// Str wrapper: exempt names keep the keyword escape
 Slice cgMangle(Codegen* cg, NodeId declId, Str name, Str alias)
 {
     if (name == 0) return cgIdent(cg, name);
@@ -578,8 +605,8 @@ NodeId cgFindDeclFrom(Codegen* cg, Str name, u32 tag, u32 refFile)
 }
 
 /* the type-decl a Named type refers to (struct/union/variant/enum/
- * alias/distinct): prefers a decl in the type's own file — TypeEntry.loc
- * records where the name was spelled — else the first match by name */
+ * alias/distinct): prefers a decl in the type's own file: TypeEntry.loc
+ * records where the name was spelled; else the first match by name */
 NodeId cgFindTypeDecl(Codegen* cg, Str name, u32 refFile)
 {
     NodeId none;
@@ -629,7 +656,7 @@ NodeId cgResolveRef(Codegen* cg, Str localName, u32 wantKind, NodeId refSite, St
     if (cg.sema != null && cg.sema.scopes != null)
     {
         /* bind the receiver: a nested chain (`cg.sema.scopes.m(...)`)
-         * lowers as field access — single-level receivers are fine */
+         * lowers as field access: single-level receivers are fine */
         ScopeStack* scopes = cg.sema.scopes;
         Symbol* sym = scopes.lookupFrom(localName, refFile);
         if (sym != null)
@@ -820,7 +847,7 @@ NodeId cgMethodsContain(Codegen* cg, NodeId* methods, u32 mlen, Str methName)
     return none;
 }
 
-/* the method's declaring node for an owner spelling — the type's own
+/* the method's declaring node for an owner spelling: the type's own
  * methods plus every extend whose owner text matches (cgEmitMethodSet /
  * cgEmitInstMethodList compose the same `owner_method` base) */
 
@@ -839,7 +866,7 @@ NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
     none.index = 0;
     if (owner.len == 0 || methName == 0 || cg.file == null) return none;
     /* the builtin `str` type is declared as `extend str` but its methods
-     * mangle by the C typedef name — match the spelling the call site
+     * mangle by the C typedef name: match the spelling the call site
      * produced (the coral type name) */
     owner = cgOwnerSpelling(cg, owner);
     u32 i = 0;
@@ -879,7 +906,7 @@ NodeId cgFindMethodDeclOwner(Codegen* cg, Slice owner, Str methName)
         i++;
     }
     /* monomorphised owner (`Foo_int32_t`): the instance's type decl plus
-     * every extend its self type matches — mirrors cgEmitInstanceMethods */
+     * every extend its self type matches; mirrors cgEmitInstanceMethods */
     if (cg.mono != null)
     {
         i = 0;
@@ -979,6 +1006,8 @@ bool cgIsStructTy(Codegen* cg, NodeId id)
     return d.index != 0;
 }
 
+/* first decl with this name+kind in the current file (decl order wins);
+ * hits are cached in the 32-slot declCache: the miss path rescans */
 NodeId cgFindDecl(Codegen* cg, Str name, u32 tag)
 {
     NodeId none;
@@ -1111,7 +1140,7 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
     }
     /* generic: pick the mono instance whose collected argument types and
      * Zig-style value key match this call site (the key is computed over
-     * the same arg nodes collectCall saw — including the substituted type
+     * the same arg nodes collectCall saw, including the substituted type
      * of every arg, so runtime-tail types select their own instance) */
     u64 callKey = cg.mono.callValueKeyTyped(args, argsLen, cg.subs, cg.subsLen);
     u32 gcount = cg.mono.genericCount(declId);
@@ -1157,12 +1186,15 @@ Slice cgCallFromDecl(Codegen* cg, NodeId declId, Str alias, NodeId* args, u32 ar
     }
     if (want != null) dealloc<Ty>(want);
     if (total == 0) return Slice::from(null, 0);
+    /* preference: exact value-key match; else the lone argument-type
+     * match when it carries no value key; else the first instance of the
+     * decl, with a diagnostic */
     u32 pick = firstTotal;
     if (keyPick != 0) pick = keyPick - 1;
     else if (typeMatches == 1 && cg.mono.instances[typePick - 1].valueKey == 0) pick = typePick - 1;
     else {
         /* no argument+value match, and the fallback (a lone unkeyed
-           instance) is unavailable — surface the mismatch */
+           instance) is unavailable: surface the mismatch */
         cgError(cg, "no unique mono instance for call");
     }
     MonoInstance* p = cg.mono.instances + pick;
@@ -1182,7 +1214,7 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     Slice r = cgCallFromDecl(cg, declId, alias, args, argsLen, outRet, found, outDecl);
     if (*found) return r;
     /* the scope binding (or file preference) pointed at a generic
-     * template with no usable instance — any non-generic decl of the
+     * template with no usable instance: any non-generic decl of the
      * same name still emits (matches the pre-mangling decl-order pick) */
     if (cg.file != null && name != 0)
     {
@@ -1206,7 +1238,7 @@ Slice cgResolveCall(Codegen* cg, Str name, NodeId* args, u32 argsLen, Ty* outRet
     return r;
 }
 
-/* fileId of the file a module import path points at — the path joined
+/* fileId of the file a module import path points at: the path joined
  * with '/' (+ ".crl") must be a suffix of the file's own path (lib files
  * carry extra platform segments in between) */
 u32 cgFileForModulePath(Codegen* cg, Str path)
@@ -1248,7 +1280,7 @@ u32 cgFileForModulePath(Codegen* cg, Str path)
 /* Name for an explicit-generic call `f<T>(...)`: the mono instance bound to
  * the callee's generic arguments. When several instances share the same
  * generic args, the call site's value key (computed from the call's own
- * arg nodes, exactly like cgCallFromDecl) picks the right one — first
+ * arg nodes, exactly like cgCallFromDecl) picks the right one: first
  * match otherwise. Null slice when no instance matches; *outDecl always
  * receives the callee's declaration when found. */
 Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool* found, NodeId* outDecl, NodeId refSite,
@@ -1274,7 +1306,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
     if (glen > 0 && cg.subs != null && cg.subsLen > 0)
     {
         /* inside an instance body the callee's explicit args may be the
-         * template's own params (`dealloc<T>` in realloc<cchar>) — resolve
+         * template's own params (`dealloc<T>` in realloc<cchar>): resolve
          * them through the current substitutions before instance matching */
         gbuf = alloc<Ty>((usize)glen);
         if (gbuf != null)
@@ -1290,7 +1322,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
     }
     /* the declaring file's decl owns the instance (the name may be
      * ambiguous across merged files: libc's extern realloc vs mman's
-     * realloc<T>) — resolve through sema like every other reference */
+     * realloc<T>): resolve through sema like every other reference */
     Str alias = 0;
     NodeId declId = cgResolveRef(cg, fname, (u32)DeclKind::Func, refSite, &alias);
     if (declId.index != 0 && cg.mono != null && cg.sema != null && glen > 0)
@@ -1372,7 +1404,7 @@ Slice cgResolveGenericCall(Codegen* cg, Str fname, Ty namedTy, Ty* outRet, bool*
 }
 
 /* StringLit token text keeps its surrounding quotes (cgExpr strips them
-   on emission) — asm pieces/constraints are stored raw, so unquote here */
+   on emission): asm pieces/constraints are stored raw, so unquote here */
 Slice cgUnquote(Codegen* cg, Slice s)
 {
     if (s.len >= 2 && s.ptr[0] == '"') return Slice::from(s.ptr + 1, s.len - 2);
@@ -1383,7 +1415,7 @@ Slice cgUnquote(Codegen* cg, Slice s)
 
 extern("C") Slice tyStr(Codegen* cg, Ty t);
 
-/* append text at [start, ...) — tyStr arms all write into tybuf so nested
+/* append text at [start, ...): tyStr arms all write into tybuf so nested
    composition never re-appends a slice of the same buffer */
 Slice tyStrPut(Codegen* cg, Slice text, usize start)
 {
@@ -1429,7 +1461,7 @@ Slice tyStr(Codegen* cg, Ty t)
             /* cchar = the C-ABI byte type → C's plain `char` (the platform
              * char signedness matches cchar's flag(i8/u8) arms, and libc
              * prototypes take `char`). coral `char` itself is utf32 and
-             * emits uint32_t — never C's char. */
+             * emits uint32_t, never C's char. */
             if (slEqU8(cgIntern(cg, name), "cchar"))
                 return tyStrPut(cg, Slice::fromStr("char"), start);
             if (k.payload.Named.genericArgsLen > 0) {
@@ -1454,7 +1486,7 @@ Slice tyStr(Codegen* cg, Ty t)
                     i++;
                 }
             }
-            /* mangle through the declaring decl — the type's own file
+            /* mangle through the declaring decl: the type's own file
              * (TypeEntry.loc) picks the right one when several files
              * declare the same type name */
             NodeId td = cgFindTypeDecl(cg, name, locFile(e.loc));
@@ -1502,6 +1534,9 @@ Slice tyStr(Codegen* cg, Ty t)
 
 /* ── registered typedefs (slices, tuples, fn pointers) ───────── */
 
+/* registry of already-emitted typedef names (slices/tuples/fn pointers):
+ * cgRegName dedups against it, cgRegAdd records a fresh name right before
+ * its text lands in tdecl */
 bool cgRegHas(Codegen* cg, Slice name)
 {
     u32 i = 0;
@@ -1541,7 +1576,7 @@ Slice cgRegName(Codegen* cg, Ty t)
         stP(&cg.tybuf, "Slice_");
         tyStr(cg, k.payload.Slice.base);
     } else if (k.tag == TypeKind::FnPtr) {
-        /* name from the SUBSTITUTED spelling — `bool(T,T)` under Vec<str>
+        /* name from the SUBSTITUTED spelling: `bool(T,T)` under Vec<str>
          * and Vec<i32> shares one type id but needs two typedefs */
         stP(&cg.tybuf, "FnP_");
         tyStr(cg, k.payload.FnPtr.returnType);
@@ -1665,7 +1700,7 @@ Slice cgValExprTy(Codegen* cg, NodeId id)
 }
 
 /* --allow-int-ptr lowering: sema waived an integer→pointer bind, but gcc
- * still rejects the bare conversion — emit the explicit C cast instead */
+ * still rejects the bare conversion: emit the explicit C cast instead */
 bool cgIntTyTag(Codegen* cg, Ty t)
 {
     if (t == 0) return false;
@@ -1712,6 +1747,9 @@ Slice cgWrapPtrCast(Codegen* cg, Slice tyText, Slice inner)
     return stTail(&cg.ebuf, rs);
 }
 
+/* C type text for an expression: sema's resolvedType when present, else
+ * derived from the kind (Not → _Bool, AddressOf → base + '*', assignments
+ * → the assigned value's type) */
 Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
 {
     if (e.resolvedType != 0) return tyStr(cg, cgSubstTy(cg, e.resolvedType));
@@ -1725,6 +1763,9 @@ Slice cgResultTy(Codegen* cg, NodeId id, Expr* e)
             usize s = cg.tybuf.len;
             if (cn.kind.tag == NodeKind::Expr)
                 base = cgResultTy(cg, c, &cn.kind.payload.Expr.value);
+            /* base usually IS the tail of tybuf already; appending it
+             * again would print the type twice, so only copy when it
+             * came from somewhere else */
             if (!(base.ptr + base.len == cg.tybuf.p + cg.tybuf.len))
                 stPS(&cg.tybuf, base);
             stCh(&cg.tybuf, '*');
@@ -1767,7 +1808,7 @@ void cgEmitLabel(Codegen* cg, u32 lab)
     stNL(&cg.body, cg.ind);
     stP(&cg.body, "__L");
     stU64(&cg.body, (u64)lab);
-    stP(&cg.body, ": ;");
+    stP(&cg.body, ": ;"); // a label must precede a statement: the empty one
 }
 
 void cgEmitGoto(Codegen* cg, u32 lab)
@@ -1844,7 +1885,7 @@ Slice cgIdent(Codegen* cg, Str name)
 
 bool cgIsCrtFn(Str name, Slice text)
 {
-    /* provided by the preamble headers — compared inline (no local arrays:
+    /* provided by the preamble headers; compared inline (no local arrays:
        bootstrap C emission can't spell array locals) */
     return slEqU8(text, "printf") ||
            slEqU8(text, "write") ||
@@ -1895,8 +1936,8 @@ Slice cgOwnerName(Codegen* cg, Ty selfTy)
     Ty u = selfTy;
     if (e.kind.tag == TypeKind::Pointer) u = e.kind.payload.Pointer.base;
     TypeEntry* ue = cg.ctx->types + u;
-    /* method symbol suffixes key off the bare coral owner name — def and
-     * call sides both compose `owner_method` from it — but tyStr now
+    /* method symbol suffixes key off the bare coral owner name: def and
+     * call sides both compose `owner_method` from it; but tyStr now
      * path-mangles type names, so a plain non-generic Named must not go
      * through it (the self *parameter* uses cgOwnerTypeName instead) */
     if (ue.kind.tag == TypeKind::Named && ue.kind.payload.Named.genericArgsLen == 0)
@@ -1910,7 +1951,7 @@ Slice cgOwnerName(Codegen* cg, Ty selfTy)
 
 /* the receiver's C type name for the self parameter: tyStr (path-mangled
  * through the type's declaring decl), pointer level stripped like
- * cgOwnerName — cgOwnerName stays bare because it also forms symbol
+ * cgOwnerName: cgOwnerName stays bare because it also forms symbol
  * suffixes */
 Slice cgOwnerTypeName(Codegen* cg, Ty selfTy)
 {
@@ -1922,7 +1963,7 @@ Slice cgOwnerTypeName(Codegen* cg, Ty selfTy)
     return tyStr(cg, u);
 }
 
-/* does the receiver's named struct/union declare field `name`? — used to
+/* does the receiver's named struct/union declare field `name`? Used to
  * spot fn-pointer field calls (`p->alloc(ctx, size)` parses as a method) */
 bool cgHasField(Codegen* cg, Ty t, Str name)
 {
@@ -2077,10 +2118,12 @@ Slice cgExpr(Codegen* cg, NodeId id)
             usize begin = 0;
             usize end = s.len;
             if (isC) {
-                // token text is `C"…"` — drop the prefix and both quotes
+                // token text is `C"…"`: drop the prefix and both quotes
                 if (s.len >= 3 && s.ptr[0] == 'C' && s.ptr[1] == '"') { begin = 2; end = s.len - 1; }
             } else if (s.len >= 2 && s.ptr[0] == '"') { begin = 1; end = s.len - 1; }
             usize i = begin;
+            /* decoded length for the slice: every escape counts as ONE
+             * byte, which is what a coral `str` len means */
             usize dlen = 0;
             while (i < end)
             {
@@ -2100,6 +2143,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     dlen++;
                     i++;
                 } else if (c < 32 || c > 126) {
+                    /* non-printables as 3-digit octal so the C literal
+                     * stays portable (hex escapes would eat following
+                     * hex digits of the next char) */
                     stP(&cg.ebuf, "\\");
                     u8 v = c;
                     stCh(&cg.ebuf, (u8)(48 + (v / 64)));
@@ -2124,6 +2170,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
         },
         ExprKind::CharLit => {
             u32 v = e.kind.payload.CharLit.value;
+            /* `'` (39) and `\` (92) need an escape; printable chars go
+             * out as C chars, everything else as a numeric cast */
             if (v == 39 || v == 92) {
                 stCh(&cg.ebuf, '\'');
                 stCh(&cg.ebuf, '\\');
@@ -2404,7 +2452,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stCh(&cg.ebuf, ')');
                 return stTail(&cg.ebuf, cs);
             }
-            /* structs have no C `==` — compare their bytes (like str above,
+            /* structs have no C `==`: compare their bytes (like str above,
              * deterministic for same-type values of POD structs) */
             if (cgIsStructTy(cg, left) &&
                 (e.kind.tag == ExprKind::Eq || e.kind.tag == ExprKind::Ne))
@@ -2482,7 +2530,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     Str s1name = s1->kind.payload.Expr.value.kind.payload.Ident.name;
                     if (!resolved)
                     {
-                        /* qualified member: try the module's own file first —
+                        /* qualified member: try the module's own file first;
                          * lookupFrom prefers the reference site's file, which
                          * for `libc::realloc` points at the wrong (generic)
                          * decl */
@@ -2521,7 +2569,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     }
                     if (!resolved)
                     {
-                        /* `Type::method(...)` / `str::fromParts(...)` — the
+                        /* `Type::method(...)` / `str::fromParts(...)`: the
                          * head is a struct/extend owner, not a module:
                          * resolve the method decl through the owner text */
                         Str rootT = s0->kind.payload.Expr.value.kind.payload.Ident.name;
@@ -2563,7 +2611,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 }
                 else if (s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef)
                 {
-                    // `mod::f<T>(...)` — explicit generic args on the last segment
+                    // `mod::f<T>(...)`: explicit generic args on the last segment
                     calleeText = cgResolveGenericCall(cg, s1->kind.payload.Expr.value.kind.payload.TypeRef.name,
                                                       s1->kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
                                                       &rty, &resolved, &fdecl, id,
@@ -2578,7 +2626,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 else if (s0->kind.tag == NodeKind::Expr && s0->kind.payload.Expr.value.kind.tag == ExprKind::TypeRef &&
                          s1->kind.tag == NodeKind::Expr && s1->kind.payload.Expr.value.kind.tag == ExprKind::Ident)
                 {
-                    /* static method on a generic instance: `Foo<i32>::new(...)` —
+                    /* static method on a generic instance: `Foo<i32>::new(...)`:
                        <instance>_<method>, matching cgEmitInstMethodList */
                     Ty ownerTy = s0->kind.payload.Expr.value.kind.payload.TypeRef.typeNode;
                     Str s1name2 = s1->kind.payload.Expr.value.kind.payload.Ident.name;
@@ -2601,7 +2649,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 }
             }
             else if (cn.kind.tag == NodeKind::Expr && cn.kind.payload.Expr.value.kind.tag == ExprKind::TypeRef) {
-                /* `f<T>(...)` — explicit generic call: pick the mono
+                /* `f<T>(...)`, explicit generic call: pick the mono
                    instance for the callee's generic arguments */
                 calleeText = cgResolveGenericCall(cg, cn.kind.payload.Expr.value.kind.payload.TypeRef.name,
                                                   cn.kind.payload.Expr.value.kind.payload.TypeRef.typeNode,
@@ -2628,7 +2676,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 retTy = cgResultTy(cg, id, e);
             }
             /* comptime (type-level) parameters are erased from the C
-               signature — skip their arguments here as well */
+               signature: skip their arguments here as well */
             Slice argTexts = Slice::from(null, 0);
             u32 n = 0;
             {
@@ -2637,6 +2685,8 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 NodeId* args = e.kind.payload.Call.args;
                 u32 argsLen = e.kind.payload.Call.argsLen;
                 u32 i = 0;
+                /* hard cap of 16 call args; overflow is reported as an
+                 * error after the loop */
                 while (i < argsLen && i < 16) {
                     bool skip = false;
                     bool dec = false;
@@ -2679,7 +2729,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             if (rn.kind.tag == NodeKind::Expr) recvTy = rn.kind.payload.Expr.value.resolvedType;
             Slice owner;
             if (recvTy != 0) {
-                /* `const self*` receivers wrap Pointer in Const — unwrap
+                /* `const self*` receivers wrap Pointer in Const: unwrap
                  * both so the owner name matches the definition side */
                 recvTy = cgTyUnwrap(cg, recvTy);
                 if (recvTy != 0 && (cg.ctx->types + recvTy)->kind.tag == TypeKind::Pointer)
@@ -2700,7 +2750,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             bool mFound = false;
             u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, methName, &mFound);
             /* `p->alloc(ctx, size)` parses as a method call but names a
-             * fn-pointer field — lower to `(p->alloc)(ctx, size)` */
+             * fn-pointer field: lower to `(p->alloc)(ctx, size)` */
             bool fieldCall = !mFound && cgHasField(cg, rawRecvTy, methName);
             Slice callee;
             if (fieldCall)
@@ -2735,7 +2785,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 bool first = true;
                 bool passRecv = recvKind != 0 && !fieldCall;
                 if (passRecv) {
-                    /* self is a pointer in C — pass the address of a value
+                    /* self is a pointer in C: pass the address of a value
                      * receiver (materialized when the receiver is a
                      * temporary), or the receiver itself when already a
                      * pointer */
@@ -2832,7 +2882,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
             }
-            /* `x.payload.Case` — lower to the union member slot of the
+            /* `x.payload.Case`: lower to the union member slot of the
              * case's ordinal: `x.u.v<idx>` (only when the base is a variant
              * and the case exists; a plain `payload` struct field is not) */
             if (cgIsPayloadAccess(cg, obj))
@@ -3129,7 +3179,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stP(&cg.ebuf, "0");
                 return stTail(&cg.ebuf, rs);
             }
-            /* @assertOut(cond) / @assertOut(cond, "msg") — like @assert; with a
+            /* @assertOut(cond) / @assertOut(cond, "msg"): like @assert; with a
              * message the msg text appears in the assertion failure output */
             bool isAssertOut = false;
             if (name.len == 9) {
@@ -3164,7 +3214,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 stP(&cg.ebuf, "0");
                 return stTail(&cg.ebuf, rs);
             }
-            /* @isFormatLiteral(expr) — true only for literal args (static
+            /* @isFormatLiteral(expr): true only for literal args (static
              * comptime-checked gate); everything else is `false`. */
             bool isIsFormatLiteral = false;
             if (name.len == 15) {
@@ -3211,7 +3261,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Spread => {
-            /* `...pack` — after comptime eval the pack is gone; if one
+            /* `...pack`: after comptime eval the pack is gone; if one
              * survives to codegen it is just its inner expression */
             return cgExpr(cg, e.kind.payload.Spread.expr);
         },
@@ -3230,7 +3280,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
     return stTail(&cg.ebuf, es);
 }
 
-/* `&expr` — C cannot take the address of a temporary, so a non-lvalue
+/* `&expr`: C cannot take the address of a temporary, so a non-lvalue
  * operand is materialized into a hidden local first. vtext is the
  * already-lowered operand text. */
 Slice cgAddrOfValue(Codegen* cg, NodeId oid, Slice vtext)
@@ -3287,7 +3337,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
     {
         ExprKind::Ident => {
             Str iname = e.kind.payload.Ident.name;
-            /* self is a pointer parameter — an lvalue assignment to it
+            /* self is a pointer parameter: an lvalue assignment to it
              * writes through the pointer */
             if (cgTyIsPtr(cg, e.resolvedType) && iname == cg.ctx.intern("self")) {
                 stP(&cg.ebuf, "*(");
@@ -3338,7 +3388,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
                 obj = e.kind.payload.DerefField.obj;
                 field = e.kind.payload.DerefField.field;
             }
-            /* `x.payload.Case` — lower to the union member slot of the
+            /* `x.payload.Case`: lower to the union member slot of the
              * case's ordinal: `x.u.v<idx>` (only when the base is a variant
              * and the case exists; a plain `payload` struct field is not) */
             if (cgIsPayloadAccess(cg, obj))
@@ -3368,7 +3418,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
                 Ty ot = on.kind.payload.Expr.value.resolvedType;
                 if (ot != 0 && cgTyIsPtr(cg, ot)) isPtr = true;
             }
-            /* `base->field` — the base is a pointer *value*, so take the
+            /* `base->field`: the base is a pointer *value*, so take the
              * value form (an lvalue deref like `*(self)` would bind as
              * `*((self)->field)`); a plain field still needs an lvalue */
             Slice o = isPtr ? cgExpr(cg, obj) : cgLvalue(cg, obj);
@@ -3401,7 +3451,7 @@ Slice cgLvalue(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, rs);
         },
         else => {
-            // not an lvalue — fall back to value path (error surfaces in C)
+            // not an lvalue: fall back to value path (error surfaces in C)
             return cgExpr(cg, id);
         },
     }
@@ -3444,7 +3494,7 @@ Slice cgValBody(Codegen* cg, NodeId id)
 
 /* ── switch lowering: compare chains + labels ────────────────── */
 
-/* strip Const/Comptime wrappers — `const T*` receivers carry the const
+/* strip Const/Comptime wrappers: `const T*` receivers carry the const
  * on the outside, so Pointer/Array checks must look through it */
 Ty cgTyUnwrap(Codegen* cg, Ty t)
 {
@@ -3486,7 +3536,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
             PatKind::Wildcard => { *isWildcard = true; return Slice::from(null, 0); },
             PatKind::Variant => {
                 /* enum scrutinee: members are C enum constants
-                 * `Root_Name` — compare the value directly (variant decls
+                 * `Root_Name`: compare the value directly (variant decls
                  * are structs and compare their .tag field below) */
                 {
                     Ty et = scrutTy;
@@ -3521,7 +3571,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
                 bool tagField = vd.index != 0;
                 if (vd.index == 0 && p.kind.payload.Variant.typeName != 0)
                 {
-                    /* `switch (x.kind.tag)` — the scrutinee is already the
+                    /* `switch (x.kind.tag)`: the scrutinee is already the
                      * ordinal; resolve the variant behind the pattern head */
                     vd = cgFindDecl(cg, p.kind.payload.Variant.typeName, (u32)DeclKind::Variant);
                     if (vd.index != 0)
@@ -3573,7 +3623,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
             },
             PatKind::Or => {
                 /* Render each alternative, collect the parts, then build the
-                 * wrapping text from scratch — appending each part slice
+                 * wrapping text from scratch: appending each part slice
                  * directly into cg.ebuf duplicates it (inner expr artifacts
                  * + the real text land in the same stream). */
                 Slice altsText = Slice::from(null, 0);
@@ -3638,7 +3688,7 @@ Slice cgPatTest(Codegen* cg, NodeId patId, Slice scrut, Ty scrutTy, bool* isWild
     return Slice::from(null, 0);
 }
 
-/* variant-field bindings for one case's pattern(s) — declared before the
+/* variant-field bindings for one case's pattern(s): declared before the
  * chain, assigned when the case is entered */
 void cgSwitchBinds(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* c)
 {
@@ -3726,7 +3776,7 @@ void cgSwitchBody(Codegen* cg, SwitchCase* c, Slice resultTemp)
 }
 
 /* if/else-if chain over cases[start..]. A guarded case whose guard fails
- * nests the remaining chain in its else. No gotos, no fallthrough — and
+ * nests the remaining chain in its else. No gotos, no fallthrough, and
  * `break` inside a body is plain C break: it targets the enclosing loop,
  * which is what coral's switch means too. */
 void cgEmitSwitchChain(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 casesLen, u32 start, Slice resultTemp, bool first)
@@ -3905,7 +3955,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
 extern("C") void cgStmt(Codegen* cg, NodeId id);
 
 /* a body in statement position must be a block (a bare decl after
- * `if (c)` is invalid C) — wrap non-block bodies in braces */
+ * `if (c)` is invalid C): wrap non-block bodies in braces */
 void cgStmtBraced(Codegen* cg, NodeId id)
 {
     if (id.index == 0) {
@@ -4053,7 +4103,7 @@ void cgStmt(Codegen* cg, NodeId id)
             Slice rv = cgAssignValue(cg, s.kind.payload.Assign.target, s.kind.payload.Assign.value);
             Slice op = cgIntern(cg, s.kind.payload.Assign.op);
             /* plain `=` of an integer into a pointer (only reachable with
-             * --allow-int-ptr) — gcc needs the cast; `+=` is pointer
+             * --allow-int-ptr): gcc needs the cast; `+=` is pointer
              * arithmetic and needs none */
             if (op.len == 1 && op.ptr[0] == 61)
             {
@@ -4131,7 +4181,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 cgPopLoop(cg);
                 return;
             }
-            // the condition carried statements — keep them inside the loop
+            // the condition carried statements: keep them inside the loop
             stTrunc(&cg.body, b0);
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "while (1)");
@@ -4166,7 +4216,7 @@ void cgStmt(Codegen* cg, NodeId id)
             bool hasCond = (s.kind.payload.For.flags & 2) != 0;
             bool hasPost = (s.kind.payload.For.flags & 4) != 0;
             /* plain C `for (init; cond; post)` needs statement-free cond/post
-             * — measure first; statements would have to run each iteration */
+             * measure first; statements would have to run each iteration */
             usize b0 = cg.body.len;
             Slice c = Slice::from(null, 0);
             if (hasCond) c = cgExpr(cg, s.kind.payload.For.cond);
@@ -4329,7 +4379,7 @@ void cgStmt(Codegen* cg, NodeId id)
              * which replaces the enclosing function body with the surviving
              * runtime statements. If codegen reaches a Comptime stmt the
              * block was never instantiated (e.g. a static helper only
-             * called from comptime) — emit nothing; walking it would try
+             * called from comptime): emit nothing; walking it would try
              * to code-gen comptime-only constructs (pack iteration, type
              * switches) that have no runtime form. */
             return;
@@ -4495,7 +4545,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner, M
 {
     bool hadOne = false;
     /* methods without an explicit `self` still take the receiver as their
-     * first parameter — sema declares an implicit `self` for them */
+     * first parameter: sema declares an implicit `self` for them */
     bool explicitSelf = false;
     if (dd.kind.payload.Func.paramsLen > 0)
     {
@@ -4573,6 +4623,7 @@ void cgEmitParams(Codegen* cg, Stream* s, Decl* dd, Ty* paramTys, Slice owner, M
             {
                 Ty pt = p.typeNode;
                 if (paramTys != null) pt = paramTys[i];
+                /* array params decay to pointers: `T name[]` */
                 if (pt != 0 && (cg.ctx->types + pt)->kind.tag == TypeKind::Array)
                 {
                     TypeEntry* te = cg.ctx->types + pt;
@@ -4617,7 +4668,7 @@ void cgEmitProto(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* paramTys
     cg.subsLen = oldSubsLen;
 }
 
-/* the monomorphised instance's rewritten body for this decl + subs —
+/* the monomorphised instance's rewritten body for this decl + subs:
  * comptime blocks were already evaluated into it; 0 when there is no
  * matching instance (callers fall back to the declaration's body) */
 NodeId cgInstanceBody(Codegen* cg, NodeId declId, MonoSubstitution* subs, u32 subsLen, u64 valueKey)
@@ -4669,7 +4720,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     cg.tempsLen = 0;
     cg.loopDepth = 0;
     cg.ind = 1;
-    /* bound names: fresh set per function — params and `self` are
+    /* bound names: fresh set per function; params and `self` are
      * locals (Ident refs to them stay raw) */
     cg.localNamesLen = 0;
     if (owner.len != 0) cgAddLocal(cg, cg.ctx.intern("self"));
@@ -4686,7 +4737,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
             pi++;
         }
     }
-    /* the instance's synthesized tail parameters are locals too — the
+    /* the instance's synthesized tail parameters are locals too: the
      * emitted body references them by name (`_varg0`, …) */
     if (inst != null && inst.tailLen > 0 && inst.tailArgNames != null)
     {
@@ -4731,7 +4782,7 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     {
         stP(&cg.bodies, "\n    ");
         Slice tty = cg.tempTys[t];
-        /* an array type spells as `T[N]` — in a declaration the suffix
+        /* an array type spells as `T[N]`; in a declaration the suffix
          * must follow the name: split at the first '[' */
         usize bi = 0;
         while (bi < tty.len && tty.ptr[bi] != 91) bi++;
@@ -4824,7 +4875,7 @@ void cgEmitFwd(Codegen* cg)
     }
 }
 
-/* import `as` alias refs mangle as `path__alias__name` — map each one
+/* import `as` alias refs mangle as `path__alias__name`: map each one
  * back to the canonical `path__name` definition. Exempt names (main,
  * CRT, extern) never carry the alias segment at the use site, and types
  * resolve through their declaring decl (TypeEntry.loc), so only
@@ -4898,6 +4949,8 @@ void cgEmitEnumDef(Codegen* cg, NodeId declId, Decl* dd)
             stPS(&cg.defs, cgIdent(cg, ev.name));
             if ((ev.flags & 1) != 0 && ev.value.index != 0)
             {
+                /* explicit `= N` resets the auto-increment counter (the
+                 * Neg path covers `= -N`) */
                 Node* valNode = cgNode(cg, ev.value);
                 i64 evVal = 0;
                 bool evNeg = false;
@@ -5020,7 +5073,7 @@ void cgEmitInitValue(Codegen* cg, NodeId v)
         stCh(&cg.defs, '}');
         return;
     }
-    /* const-shaped exprs lower inline — cgExpr would emit statement
+    /* const-shaped exprs lower inline: cgExpr would emit statement
      * temps, which are illegal at file scope */
     if (cgConstAtom(cg, v)) { cgConstExpr(cg, v); return; }
     Slice ev = cgExpr(cg, v);
@@ -5070,6 +5123,7 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
         }
         f++;
     }
+    /* C forbids an empty struct: give it a dummy member instead */
     if (!hadOne) stP(&cg.defs, "\n    char _empty;");
 }
 
@@ -5077,6 +5131,8 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
 {
     stP(&cg.defs, "struct ");
     stPS(&cg.defs, name);
+    /* tag holds the variant's ORDINAL: switch lowering and cgVariantCaseIdx
+       compare against the same 0-based order */
     stP(&cg.defs, " {\n    int32_t tag;");
     if (dd.kind.payload.Variant.variantsLen > 0)
     {
@@ -5086,7 +5142,7 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
         {
             VariantVariant* vv = dd.kind.payload.Variant.variants + v;
             stP(&cg.defs, "\n        struct {");
-            if (vv.fieldsLen == 0) stP(&cg.defs, " char _e;");
+            if (vv.fieldsLen == 0) stP(&cg.defs, " char _e;"); /* empty case still needs a member */
             u32 f = 0;
             while (f < vv.fieldsLen)
             {
@@ -5146,7 +5202,7 @@ bool cgConstAtom(Codegen* cg, NodeId id)
     return false;
 }
 
-/* emit a cgConstAtom expression as inline C into cg.defs — literals go
+/* emit a cgConstAtom expression as inline C into cg.defs: literals go
  * through cgExpr (they emit no statements); operators recurse so file
  * scope never sees a statement temp */
 void cgConstExpr(Codegen* cg, NodeId id)
@@ -5227,7 +5283,7 @@ void cgConstExpr(Codegen* cg, NodeId id)
     stPS(&cg.defs, cgExpr(cg, id));
 }
 
-/* file-scope constants and variables — emitted after the prototypes so
+/* file-scope constants and variables, emitted after the prototypes so
  * fn-pointer initializers (`const A = { .alloc = f }`) see a prior
  * declaration of f */
 void cgEmitGlobals(Codegen* cg)
@@ -5353,7 +5409,7 @@ void cgEmitTypeDefs(Codegen* cg)
         }
         i++;
     }
-    /* sweep 4 (file-scope constants) moved to cgEmitGlobals — it runs
+    /* sweep 4 (file-scope constants) moved to cgEmitGlobals: it runs
      * after the prototypes so fn-pointer initializers see a prior
      * declaration of the function */
     // sweep 5: monomorphised type instances
@@ -5437,7 +5493,7 @@ void cgEmitMethodSet(Codegen* cg, NodeId declId, bool withBodies)
     if (od.kind.tag != NodeKind::Decl) return;
     Decl* dd = &od.kind.payload.Decl.value;
     if (cgOwnerGeneric(cg, dd)) return;
-    /* `owner` = the bare coral name — it forms the `owner_method` symbol
+    /* `owner` = the bare coral name: it forms the `owner_method` symbol
      * suffix both def and call sides agree on. `paramOwner` = the self
      * parameter's C type, path-mangled like every other type reference. */
     Slice owner = cgDeclOwner(cg, dd);
@@ -5482,7 +5538,7 @@ void cgEmitMethodSet(Codegen* cg, NodeId declId, bool withBodies)
                 }
                 else
                 {
-                    /* extern method: emit the prototype too — nothing
+                    /* extern method: emit the prototype too: nothing
                        (system header) declares it for us anymore */
                     cgEmitProto(cg, mid, cname, md.kind.payload.Func.returnType, null, null, 0, paramOwner, null);
                 }
@@ -5600,7 +5656,7 @@ void cgEmitProtos(Codegen* cg)
                 if (cgDeclIsGeneric(cg, id)) { i++; continue; }
                 /* two extern decls of the same C name (libc's printf vs a
                  * user redeclaration with a different pointer type) must
-                 * produce ONE prototype — C allows a name only once per
+                 * produce ONE prototype: C allows a name only once per
                  * translation unit; first declaration wins */
                 if ((dd.kind.payload.Func.flags & 2) != 0)
                 {
@@ -5619,7 +5675,7 @@ void cgEmitProtos(Codegen* cg)
                     }
                     if (j < i) continue;
                 }
-                /* emit prototypes for ALL extern fns too — the system
+                /* emit prototypes for ALL extern fns too: the system
                  * headers are gone, so coral's own decl is the only one */
                 cgEmitProto(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),
                             dd.kind.payload.Func.returnType, null, null, 0, Slice::from(null, 0), null);
@@ -5661,6 +5717,8 @@ void cgEmitProtos(Codegen* cg)
     }
 }
 
+/* emits every body the module owns: non-generic funcs, then each mono
+ * function instance and every type instance's methods */
 void cgEmitBodies(Codegen* cg)
 {
     u32 i = 0;
@@ -5673,6 +5731,7 @@ void cgEmitBodies(Codegen* cg)
             Decl* dd = &d.kind.payload.Decl.value;
             if (dd.kind.tag == DeclKind::Func)
             {
+                /* func flags: 2 = extern (declared, not defined), 4 = static, 8 = has a body */
                 u8 flags = dd.kind.payload.Func.flags;
                 if ((flags & 8) != 0 && (flags & 2) == 0 && !cgDeclIsGeneric(cg, id))
                     cgEmitFuncCommon(cg, id, cgMangle(cg, id, dd.kind.payload.Func.name, 0),
@@ -5736,6 +5795,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.fwd = stNew(arena, 4096);
     cg.defs = stNew(arena, 16384);
     cg.protos = stNew(arena, 8192);
+    /* initial capacities only; stPut doubles a stream when it fills */
     cg.bodies = stNew(arena, 65536);
     cg.body = stNew(arena, 65536);
     cg.ebuf = stNew(arena, 8192);
@@ -5782,7 +5842,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     {
         /* file-scope globals land after the prototypes: their initializers
          * may name functions (`const A = { .alloc = f }`). Re-bind the
-         * stream after emission — growth reallocates the buffer. */
+         * stream after emission; growth reallocates the buffer. */
         Stream defsSaved = cg.defs;
         cg.defs = cg.protos;
         cgEmitGlobals(&cg);
@@ -5792,7 +5852,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cgEmitBodies(&cg);
 
     // assemble: preamble | fwd typedefs | registry typedefs | defs | protos | bodies
-    /* Type/macro headers ONLY — no function-declaring headers (stdio,
+    /* Type/macro headers ONLY; no function-declaring headers (stdio,
      * stdlib, string, unistd). The generated C carries coral's own extern
      * prototypes (libc.crl / `extern` decls) and links against libc; a
      * second set of system prototypes only causes conflicting-types
@@ -5801,10 +5861,10 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
      * prototypes that coral also declares. */
     stP(&cg.out, "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n");
     stP(&cg.out, "#include <assert.h>\n\n");
-    /* memcmp for str/struct equality — a bare prototype, not a header
+    /* memcmp for str/struct equality: a bare prototype, not a header
        (generated C must not include system headers) */
     stP(&cg.out, "extern int memcmp(const void*, const void*, size_t);\n\n");
-    /* limits.crl defines the same names — drop the stdint macros so the
+    /* limits.crl defines the same names: drop the stdint macros so the
        emitted constants win */
     stP(&cg.out, "#undef INT8_MIN\n#undef INT8_MAX\n#undef INT16_MIN\n#undef INT16_MAX\n");
     stP(&cg.out, "#undef INT32_MIN\n#undef INT32_MAX\n#undef INT64_MIN\n#undef INT64_MAX\n\n");

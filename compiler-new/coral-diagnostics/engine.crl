@@ -1,4 +1,4 @@
-/* diagnostics/engine.crl — diagnostic engine
+/* diagnostics/engine.crl: diagnostic engine
  *
  * Owns the file table (file id -> path + buffer) and the error counters.
  * Every diagnostic funnels through error.crl, which owns the formatting.
@@ -32,6 +32,8 @@ pub struct DiagnosticEngine
 
     void init(u8* bufStart, u8* bufEnd)
     {
+        // bufStart/bufEnd are the main file, used when a loc names no
+        // known file. limit of 20 mirrors clang; silenced is -w
         self = DiagnosticEngine {
             .errors = 0,
             .warnings = 0,
@@ -61,7 +63,7 @@ pub struct DiagnosticEngine
     u32 addFile(u8* path, usize pathLen, u8* bufStart, u8* bufEnd)
     {
         u32 id = self.fileCount;
-        /* copy the path — the lib loader frees its candidate paths while
+        /* copy the path; the lib loader frees its candidate paths while
          * this table lives for the whole compile */
         u8* pcopy = alloc<u8>(pathLen + 1);
         if (pcopy != null)
@@ -81,7 +83,9 @@ pub struct DiagnosticEngine
         return id;
     }
 
-    // resolve a SourceLoc to a pointer into the owning file's buffer
+    /* byte pointer for (line, col). walks the file from byte 0 on every
+     * call; O(offset), but this only runs when a diagnostic renders, so
+     * it's cold. line/col are 1-based; 0 means "don't bother" */
     u8* locPtr(SourceLoc loc)
     {
         u32 file = locFile(loc);
@@ -111,6 +115,8 @@ pub struct DiagnosticEngine
 
     void emitError(ErrorCode code, SourceLoc loc, str msg, str help)
     {
+        // count first, maybe render second: over-limit errors still bump
+        // the counter, so hasErrors() stays honest
         self.errors++;
         if (self.tooManyErrors())
         {
@@ -157,7 +163,7 @@ pub struct DiagnosticEngine
         u32 file = locFile(loc);
         if (file >= self.fileCount)
         {
-            // unknown file (e.g. uninitialized file id) — no position to show
+            // unknown file (e.g. uninitialized file id): no position to show
             render(codeStr(code), level, msg, str::empty(), 0, 0, str::empty(), 0, str::empty(), help);
             return;
         }
@@ -173,6 +179,7 @@ pub struct DiagnosticEngine
         u8* fileEnd = self.fileBufEnds.at((usize)file);
 
         u8* lineStart = ptr;
+        // widen [ptr] to the full physical line; harmless to split on \r here
         while (lineStart > fileBuf)
         {
             u8* prev = lineStart - 1;
@@ -195,6 +202,8 @@ pub struct DiagnosticEngine
         usize prevLineNo = 0;
         if (line > 1 && lineStart > fileBuf)
         {
+            // lineStart - 1 is the '\n'; walk back one more line for the
+            // "previous line" context shown above the error line
             u8* prevEnd = lineStart - 1;             // the newline before
             if (prevEnd > fileBuf)
             {

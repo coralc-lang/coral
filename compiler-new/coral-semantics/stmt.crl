@@ -1,3 +1,7 @@
+/* stmt.crl: statement checking and function-body setup (generic params,
+ * self, params). every StmtKind has an arm; says `ok = false` rather than
+ * bailing so one bad statement doesn't hide the rest. Comptime blocks bump
+ * comptimeDepth so @typeof and type-switch arms know where they are. */
 import ast::expr;
 
 import ast::id { Str, NodeId };
@@ -12,6 +16,8 @@ import diag::code { ErrorCode };
 
 pub extend Sema
 {
+    /* ── statements ──────────────────────────────────────────────────── */
+
     bool checkStmt(NodeId id)
     {
         if (id.index == 0) return true;
@@ -21,7 +27,7 @@ pub extend Sema
         switch (stmt->kind.tag)
         {
             StmtKind::VarDecl => {
-                // `{ .field = … }` initializer — typed from the declarator
+                // `{ .field = … }` initializer, typed from the declarator
                 if (stmt->kind.payload.VarDecl.typeNode != 0 && stmt->kind.payload.VarDecl.init.index != 0)
                 {
                     Node* inn = self.ctx.nodes + stmt->kind.payload.VarDecl.init.index;
@@ -46,11 +52,11 @@ pub extend Sema
                     self.coerceArrayLit(stmt->kind.payload.VarDecl.init, declaredType);
                 if (declaredType == 0)
                 {
-                    // `var x = expr;` — infer from the initializer
+                    // `var x = expr;`: infer from the initializer
                     declaredType = actualType;
                     if (declaredType == 0 && stmt->kind.payload.VarDecl.init.index != 0)
                     {
-                        // `var p = null;` — a bare null has no type of its own
+                        // `var p = null;`: a bare null has no type of its own
                         Node* inn = self.ctx.nodes + stmt->kind.payload.VarDecl.init.index;
                         if (inn->kind.tag == NodeKind::Expr && inn->kind.payload.Expr.value.kind.tag == ExprKind::NullLit)
                             declaredType = self.rawptrType();
@@ -64,6 +70,8 @@ pub extend Sema
                 }
                 if (stmt->kind.payload.VarDecl.name != 0)
                 {
+                    // fileId 0: locals resolve by scope/shadowing, not by the
+                    // cross-file mangling that top-level decls need
                     if (!self.scopes.declare(stmt->kind.payload.VarDecl.name, 1, declaredType, id, stmt->kind.payload.VarDecl.flags, 0) &&
                         self.scopes.lastDeclFail == 1)
                         self.dupDeclDiag(stmt->kind.payload.VarDecl.name, id);
@@ -72,6 +80,7 @@ pub extend Sema
             },
             
             StmtKind::Block => {
+                // every block gets a scope; leave() frees the symbol array
                 self.scopes.enter();
                 bool ok = true;
                 u32 i = 0;
@@ -93,6 +102,8 @@ pub extend Sema
             },
             
             StmtKind::If => {
+                // statement conditions are C-truthy (bool, int, pointer);
+                // ternary/if-expr conditions are not; they demand bool
                 if (!self.checkExpr(stmt->kind.payload.If.cond)) return false;
                 Ty ifCondTy = self.exprType(stmt->kind.payload.If.cond);
                 if (ifCondTy != 0 && ifCondTy != self.boolType() && !self.integerType(ifCondTy) && !self.pointerLike(ifCondTy))
@@ -117,7 +128,7 @@ pub extend Sema
                     TypeEntry* ie = self.ctx.types + iterTy;
                     bool isIterable = ie->kind.tag == TypeKind::Slice || ie->kind.tag == TypeKind::Array;
                     /* inside comptime a for-in may iterate a variadic pack
-                     * (`for (var arg : args)`) — the pack has no runtime
+                     * (`for (var arg : args)`): the pack has no runtime
                      * type; the evaluator unrolls it. Only reject outside
                      * comptime where a runtime array/slice is required. */
                     if (!isIterable && self.comptimeDepth == 0)
@@ -135,7 +146,7 @@ pub extend Sema
                     }
                 }
                 self.scopes.enter();
-                self.scopes.declare(stmt->kind.payload.ForIn.bindName, 1, stmt->kind.payload.ForIn.bindType, id, 2, 0);
+                self.scopes.declare(stmt->kind.payload.ForIn.bindName, 1, stmt->kind.payload.ForIn.bindType, id, 2, 0); // flags bit 1 = loop binding
                 bool ok = self.checkStmt(stmt->kind.payload.ForIn.body);
                 self.scopes.leave();
                 return ok;
@@ -158,6 +169,8 @@ pub extend Sema
             },
             
             StmtKind::Comptime => {
+                // depth must unwind even on the early break; the evaluator
+                // and the @typeof/@compileError arms read it later
                 self.comptimeDepth++;
                 u32 i = 0;
                 bool ok = true;
@@ -201,8 +214,10 @@ pub extend Sema
     
             StmtKind::Switch => {
                 if (!self.checkExpr(stmt->kind.payload.Switch.expr)) return false;
+                // each case opens its own scope: pattern bindings must not
+                // bleed into sibling cases (or after the switch)
                 /* comptime switches (inside a comptime block) are desugared
-                 * by the evaluator — it selects the matching arm and emits
+                 * by the evaluator: it selects the matching arm and emits
                  * only that body. Blanket-checking all arms with generic
                  * types would falsely reject type-switch arms like
                  * `str => val.ptr` where val is still typed T. Skip them. */
@@ -241,7 +256,8 @@ pub extend Sema
         }
     }
 
-    // replace the `self` placeholder with the actual type
+    // replace the `self` placeholder with the actual type; only Named /
+    // Pointer / Const nodes are rebuilt; anything else is shared as-is
     Ty resolveSelfTy(Ty t, Ty selfType)
     {
         if (t == 0) return 0;
@@ -266,6 +282,12 @@ pub extend Sema
         }
     }
 
+    /* ── function bodies ─────────────────────────────────────────────── */
+
+    /* check one function body. scope layout, in order: generic params, the
+     * implicit self pointer (when checking a method), then real params, then
+     * the body. currentReturnType is parked here for Return statements and
+     * cleared on the way out; checkFunction does not nest. */
     bool checkFunction(Decl* decl, Ty selfType)
     {
         self.scopes.enter();
@@ -298,7 +320,7 @@ pub extend Sema
         }
         if (selfType != 0 && !hasSelfParam) {
             Str selfStr = self.ctx.intern("self");
-            /* self is a pointer in the C implementation — declare it as one
+            /* self is a pointer in the C implementation: declare it as one
              * so member access emits `self->field` */
             Ty selfPtr = self.allocType(TypeKind::Pointer{ .base = selfType });
             self.scopes.declare(selfStr, 1, selfPtr, decl->kind.payload.Func.body, 0, 0);
@@ -313,13 +335,17 @@ pub extend Sema
                 Param* param = &paramNode->kind.payload.Param.value;
                 if (param->name != 0) {
                     if ((param->flags & 8) != 0) {
+                        // bit 8 = unnamed type-only param: acts as a generic
+                        // type parameter (`T`), index = param position
                         Ty typeNode = self.typeParamType(param->name, i);
                         if (!self.scopes.declare(param->name, 4, typeNode, paramId, 0, 0)) ok = false;
                     } else if ((param->flags & 1) != 0) {
+                        // bit 1 = the `self` receiver (explicit `self`,
+                        // `self*`, `const self*` all end up here)
                         Ty selfTy = param->typeNode;
                         if (selfTy == 0) selfTy = selfType;
                         else selfTy = self.resolveSelfTy(selfTy, selfType);
-                        /* self binds as a pointer in the C implementation —
+                        /* self binds as a pointer in the C implementation;
                          * an explicit value-spelled receiver (`self`,
                          * `const self`) wraps too, so member access emits
                          * `self->field` against the `T*` parameter */
@@ -384,13 +410,15 @@ pub extend Sema
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
         self.currentReturnType = decl->kind.payload.Func.returnType;
         if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
-        self.currentReturnType = 0;
+        self.currentReturnType = 0; // no nesting; nothing to restore to
         self.scopes.leave();
         return ok;
     }
 
     /* declares the fields bound by a variant pattern (`Some { value }`)
-     * in the case scope, typed against the scrutinee's variant decl */
+     * in the case scope, typed against the scrutinee's variant decl.
+     * the caller owns the scope (Switch enters it per case); unknown fields
+     * are reported but the remaining fields still bind. */
     bool declarePatternBindings(NodeId patId, Ty scrutTy)
     {
         if (patId.index == 0) return true;

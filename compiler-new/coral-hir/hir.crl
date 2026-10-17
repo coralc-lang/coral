@@ -15,37 +15,31 @@ import ast::decl { Decl, DeclKind, File, Param };
 import context::context { AstContext };
 import mono::mono { MonoContext, MonoInstance, MonoInstanceKind };
 
-extern("C") rawptr malloc(usize size);
-extern("C") rawptr realloc(rawptr ptr, usize size);
-extern("C") i32 printf(u8* fmt, ...);
+import(lib) core::cchar { cchar };
+import(lib) std::mman { alloc };
+import(lib) std::vec { Vec };
+
+extern("C") i32 printf(const cchar* fmt, ...);
 
 pub struct HirModule
 {
     Str name;         /* module path or file name */
-    Str* items;       /* item names (fn/struct/variant/enum/union) — later: Styles */
-    u32 itemsLen;
-    u32 itemsCap;
-    Str* monos;       /* instance names for mono fns/types */
-    u32 monosLen;
-    u32 monosCap;
+    Vec<Str> items;   /* item names (fn/struct/variant/enum/union) — later: Styles */
+    Vec<Str> monos;   /* instance names for mono fns/types */
 }
 
 pub HirModule* build(AstContext* ctx, File* file, MonoContext* mono, Str name)
 {
-    HirModule* m = (HirModule*)malloc(@sizeof(HirModule));
+    HirModule* m = alloc<HirModule>(1);
     m->name = name;
-    m->items = (Str*)malloc(256 * @sizeof(Str));
-    m->itemsLen = 0;
-    m->itemsCap = 256;
-    m->monos = (Str*)malloc(256 * @sizeof(Str));
-    m->monosLen = 0;
-    m->monosCap = 256;
+    m->items = Vec<Str>::new();
+    m->monos = Vec<Str>::new();
 
     u32 i = 0;
     while (i < file->declsLen)
     {
         Node* dn = ctx->nodes + file->decls[i].index;
-        i = i + 1;
+        i++;
         if (dn.kind.tag != NodeKind::Decl) continue;
         Decl* dd = &dn.kind.payload.Decl.value;
         Str item = 0;
@@ -57,17 +51,7 @@ pub HirModule* build(AstContext* ctx, File* file, MonoContext* mono, Str name)
         else if (dd.kind.tag == DeclKind::Union) { item = dd.kind.payload.Union.name; have = true; }
         if (have)
         {
-            if (m->itemsLen >= m->itemsCap)
-            {
-                u32 newCap = m->itemsCap * 2;
-                rawptr raw = realloc((rawptr)m->items, (usize)newCap * @sizeof(Str));
-                if (raw != null) { m->items = (Str*)raw; m->itemsCap = newCap; }
-            }
-            if (m->itemsLen < m->itemsCap)
-            {
-                m->items[m->itemsLen] = item;
-                m->itemsLen = m->itemsLen + 1;
-            }
+            m->items.push(item);
         }
     }
 
@@ -77,18 +61,8 @@ pub HirModule* build(AstContext* ctx, File* file, MonoContext* mono, Str name)
         while (k < mono->instancesLen)
         {
             MonoInstance* inst = mono->instances + k;
-            if (m->monosLen >= m->monosCap)
-            {
-                u32 newCap = m->monosCap * 2;
-                rawptr raw = realloc((rawptr)m->monos, (usize)newCap * @sizeof(Str));
-                if (raw != null) { m->monos = (Str*)raw; m->monosCap = newCap; }
-            }
-            if (m->monosLen < m->monosCap)
-            {
-                m->monos[m->monosLen] = inst.name;
-                m->monosLen = m->monosLen + 1;
-            }
-            k = k + 1;
+            m->monos.push(inst.name);
+            k++;
         }
     }
     return m;
@@ -96,21 +70,23 @@ pub HirModule* build(AstContext* ctx, File* file, MonoContext* mono, Str name)
 
 pub void printHir(AstContext* ctx, HirModule* m)
 {
-    if (m->name != 0 && m->name < ctx->internsLen) printf((u8*)"module @%.*s\n", (i32)ctx->interns[m->name].len, ctx->interns[m->name].ptr);
+    if (m->name != 0 && m->name < ctx->internsLen) printf(C"module @%.*s\n", (i32)ctx->interns[m->name].len, ctx->interns[m->name].ptr);
 
-    printf((u8*)"  items:\n");
+    printf(C"  items:\n");
     u32 i = 0;
-    while (i < m->itemsLen)
+    while (i < (usize)m->items.len)
     {
-        if (m->items[i] != 0 && m->items[i] < ctx->internsLen) printf((u8*)"    %.*s\n", (i32)ctx->interns[m->items[i]].len, ctx->interns[m->items[i]].ptr);
-        i = i + 1;
+        Str it = m->items.at((usize)i);
+        if (it != 0 && it < ctx->internsLen) printf(C"    %.*s\n", (i32)ctx->interns[it].len, ctx->interns[it].ptr);
+        i++;
     }
-    printf((u8*)"  mono:\n");
+    printf(C"  mono:\n");
     i = 0;
-    while (i < m->monosLen)
+    while (i < (usize)m->monos.len)
     {
-        printf((u8*)"    #%d ", i);
-        if (m->monos[i] != 0 && m->monos[i] < ctx->internsLen) printf((u8*)"%.*s\n", (i32)ctx->interns[m->monos[i]].len, ctx->interns[m->monos[i]].ptr);
-        i = i + 1;
+        printf(C"    #%d ", i);
+        Str it = m->monos.at((usize)i);
+        if (it != 0 && it < ctx->internsLen) printf(C"%.*s\n", (i32)ctx->interns[it].len, ctx->interns[it].ptr);
+        i++;
     }
 }

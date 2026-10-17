@@ -1,4 +1,7 @@
 
+/* sema.crl: the Sema state object shared by the whole semantics pass:
+ * scope stack, error counters, import/alias/extends bookkeeping, and the
+ * diagnostic-message / Ty-spelling helpers the other sema files lean on. */
 import ast::id { Str, NodeId, SourceLoc, locFile };
 import ast::types { Ty };
 import ast::node { Node, NodeKind };
@@ -22,7 +25,7 @@ pub struct Sema
     /* --allow-int-ptr: int→pointer assignments are reported (TC-0009)
      * but non-fatal; without it they fail the build */
     bool allowIntPtr;
-    /* direct (unqualified) import bindings by (file, local name) — a
+    /* direct (unqualified) import bindings by (file, local name): a
      * second direct pull of the same name in one file conflicts */
     Str* directNames;
     u32* directFiles;
@@ -34,14 +37,16 @@ pub struct Sema
     NodeId* aliasDecls;
     u32 aliasLen;
     u32 aliasCap;
-    /* nesting depth of `comptime { … }` blocks currently being checked —
+    /* nesting depth of `comptime { … }` blocks currently being checked.
      * `@typeof` is only legal inside one */
     u32 comptimeDepth;
 }
 
+/* ── state ─────────────────────────────────────────────────────────── */
+
 pub extend Sema
 {
-    // diagnostic file id of the node's source file — 0 for absent ids
+    // diagnostic file id of the node's source file: 0 for absent ids
     u32 fileOf(NodeId id)
     {
         if (id.index == 0) return 0;
@@ -66,6 +71,9 @@ pub extend Sema
         return self.scopes.lookupFrom(name, locFile(loc));
     }
 
+    /* everything here is process-lifetime: the name/alias/extends tables
+     * start empty and grow on first use, deinit hands it all back. the one
+     * alloc<ScopeStack>(1) is element-counted, matching deinit's dealloc. */
     void init(AstContext* ctx, DiagnosticEngine* diag)
     {
         self.ctx = ctx;
@@ -121,7 +129,7 @@ pub extend Sema
         self.aliasCap = 0;
     }
 
-    /* record a direct (unqualified) import binding — false if this file
+    /* record a direct (unqualified) import binding; false if this file
      * already pulled the same local name (conflict; alias with `as`) */
     bool claimDirectImport(u32 fileId, Str name)
     {
@@ -136,6 +144,9 @@ pub extend Sema
             u32 newCap = 16;
             if (self.directCap != 0) newCap = self.directCap * 2;
             Str* n1 = realloc<Str>(self.directNames, (usize)newCap);
+            // OOM: claim success and drop the binding. names may have grown
+            // while files didn't; mismatched arrays, but the run is doomed
+            // anyway, no point in a half-recovery here.
             if (n1 == null) return true;
             self.directNames = n1;
             u32* n2 = realloc<u32>(self.directFiles, (usize)newCap);
@@ -149,9 +160,10 @@ pub extend Sema
         return true;
     }
 
-    // record an import `as` rename — dedup by (alias, decl)
+    // record an import `as` rename: dedup by (alias, decl)
     void addAliasPair(Str alias, NodeId declId)
     {
+        // no alias, or the target is anonymous (module/reexport): nothing to bridge
         if (alias == 0 || declId.index == 0) return;
         u32 i = 0;
         while (i < self.aliasLen)
@@ -176,6 +188,8 @@ pub extend Sema
         self.aliasLen++;
     }
 
+    /* extends are collected during the declare pass so findMethod can scan
+     * them no matter which file/module order the bodies run in */
     void addExtend(NodeId id)
     {
         if (self.extendsLen >= self.extendsCap)
@@ -193,6 +207,9 @@ pub extend Sema
 
     void addError()
     {
+        // both counters: scopes.errors catches writes that never went through
+        // semaError (scope.declare counts its own failures), and checkFile
+        // syncs self.errors back to it at the end of the file.
         if (self.scopes != null) self.scopes.errors++;
         self.errors++;
     }
@@ -204,7 +221,7 @@ pub extend Sema
         self.diag.emitError(code, loc, msg, "");
     }
 
-    /* emit a diagnostic without counting again — used when the failing
+    /* emit a diagnostic without counting again; used when the failing
      * operation (e.g. scopes.declare) already incremented the counter */
     void semaErrorCounted(ErrorCode code, NodeId id, str msg)
     {
@@ -231,8 +248,13 @@ pub extend Sema
         self.semaError(code, loc, msg);
     }
 
-    /* "<prefix><interned name>" — diagnostics name the offending
-     * identifier instead of a bare generic message */
+    /* ── diagnostics plumbing ────────────────────────────────────────── */
+
+    /* "<prefix><interned name>": diagnostics name the offending
+     * identifier instead of a bare generic message.
+     * the buffer is deliberately never freed: emitError renders the message
+     * synchronously (copies the bytes out) and the compiler is one-shot, so
+     * freeing here would only be ceremony. */
     str nameMsg(str prefix, Str name)
     {
         InternEntry* ie = self.ctx.interns + name;
@@ -261,6 +283,7 @@ pub extend Sema
     }
 
     // NUL-terminated scratch buffer → str view (tySpelling sub-buffers)
+    // also the free-standing one: alloc<u8>(n) counts *bytes*, not elements
     str zStr(u8* s)
     {
         usize n = 0;
@@ -290,8 +313,10 @@ pub extend Sema
         buf[*len] = 0;
     }
 
-    /* render a Ty the way the user spelled it — i32, u8*, const cchar*,
-     * str, Vec<i32>, T — into buf; returns buf. used by mismatch diags. */
+    /* render a Ty the way the user spelled it (i32, u8*, const cchar*,
+     * str, Vec<i32>, T) into buf; returns buf. used by mismatch diags.
+     * punctuation goes through tyAppendCh as decimal byte codes: 60 '<',
+     * 62 '>', 42 '*', 91 '[', 93 ']', 40 '(', 41 ')'; read them as ASCII. */
     u8* tySpelling(Ty t, u8* buf, usize cap)
     {
         usize len = 0;
@@ -302,7 +327,7 @@ pub extend Sema
         {
             dealloc<u8>(sub);
             dealloc<u8>(digits);
-            buf[0] = 63; buf[1] = 0;
+            buf[0] = 63; buf[1] = 0; // '?': no room to say anything smarter
             return buf;
         }
         sub[0] = 0;
@@ -373,8 +398,8 @@ pub extend Sema
                 self.tyAppendCh(buf, cap, &len, 91);
                 u32 n = k.payload.Array.len;
                 u32 di = 0;
-                if (n == 0) { digits[0] = 48; di = 1; }
-                while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n /= 10; di++; }
+                if (n == 0) { digits[0] = 48; di = 1; } // "0"
+                while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n /= 10; di++; } // u32 → decimal, backwards
                 while (di > 0) { di--; self.tyAppendCh(buf, cap, &len, digits[di]); }
                 self.tyAppendCh(buf, cap, &len, 93);
             },
@@ -445,7 +470,7 @@ pub extend Sema
         while (i < p3.len) { m[n] = p3.ptr[i]; n++; i++; }
         i = 0;
         while (i < tl) { m[n] = tb[i]; n++; i++; }
-        m[n] = 96; n++;
+        m[n] = 96; n++; // closing backtick; 96 is ASCII '`'
         dealloc<u8>(fb);
         dealloc<u8>(tb);
         return str { .ptr = m, .len = n };
@@ -488,6 +513,8 @@ pub extend Sema
     // duplicate declaration: name it and note where the first one is
     void dupDeclDiag(Str name, NodeId id)
     {
+        // counted already: scopes.declare bumped both error counters when it
+        // refused, so emitting through semaError would count the same dup twice
         self.semaErrorCounted(ErrorCode::SemaDuplicateDecl, id,
             self.nameMsgS("duplicate declaration of `", name, "`"));
         if (self.scopes.dupSymbol != null && self.scopes.dupSymbol->declaration.index != 0 && self.diag != null)

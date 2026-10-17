@@ -1,4 +1,11 @@
 
+// parser/pattern.crl — switch patterns
+//
+// raw tokens to Pat nodes: idents, `T::V {}` / `V {}` variants, struct
+// shapes, tuples, literals, `any <trait>`. type-prefix forms (`const T*`,
+// `T*`) are captured as source text into a scratch buffer, interned, and
+// the buffer freed — no structured type ever comes out of those branches.
+
 import(lib) std::mman { alloc, dealloc };
 import common::token { Token, TokenKind };
 import diag::code { ErrorCode };
@@ -10,6 +17,8 @@ import base { Parser };
 
 pub extend Parser
 {
+    // leading `|` opens an or-group (`| A | B`); the `A | B` delimiter
+    // form is folded by the case parsers, each `|` must be followed by one
     NodeId parseSwitchPattern()
     {
         TokenKind k = self.current.kind;
@@ -97,7 +106,6 @@ pub extend Parser
                 u8* buf = alloc<u8>(256);
                 usize ppos = 0;
                 // prefix with firstName words
-                if (0) {}
                 usize i0 = 0;
                 while (i0 < first.data.len) buf[ppos++] = first.data.ptr[i0++];
                 while (true)
@@ -132,6 +140,7 @@ pub extend Parser
             {
                 Token second = self.expect(TokenKind::Ident);
                 Str secondName = self.ctx.intern(second.data.asStr());
+                // `T::V { .a, .b }` — named fields are optional
                 if (self.current.kind == TokenKind::LBrace)
                 {
                     self.advance();
@@ -168,6 +177,8 @@ pub extend Parser
                 self.expect(TokenKind::RBrace);
                 u32 count = fields.len;
                 Str* names = self.ctx.strListFinish(&fields);
+                // capitalization heuristic: `V { }` names a variant case,
+                // `v { }` names a struct. no stronger signal exists here
                 if (first.data.ptr[0] >= 'A' && first.data.ptr[0] <= 'Z')
                     return self.storePat(PatKind::Variant{ .typeName = 0, .variantName = firstName, .fieldNames = names, .fieldNamesLen = count });
                 return self.storePat(PatKind::Struct{ .name = firstName, .fieldNames = names, .fieldNamesLen = count });
@@ -199,9 +210,13 @@ pub extend Parser
             k == TokenKind::CString || k == TokenKind::CharLit || k == TokenKind::True ||
             k == TokenKind::False || k == TokenKind::Null)
         {
+            // minPrec 5: `1 + 2` or `x <= y` fold into the literal, but a
+            // following `|` (bit-or, prec 4) stays a pattern separator
             NodeId expr = self.parseBinaryExpr(5);
             return self.storePat(PatKind::Lit{ .expr = expr });
         }
+        // at a closer, hand back the none-node and let the caller report;
+        // at anything else eat one token so the case loop keeps moving
         if (self.isRecoveryBoundary(self.current.kind))
         {
             self.reportCurrentError(ErrorCode::ParseExpectedExpr, "expected switch pattern");
@@ -212,6 +227,8 @@ pub extend Parser
         return self.noneNode();
     }
 
+    // expect(Ident), but keyword-shaped names pass too: fields, methods
+    // and import symbols may collide with keywords (`import::return` etc)
     Token expectName()
     {
         if (self.current.kind == TokenKind::Ident ||
@@ -237,20 +254,22 @@ pub extend Parser
         return self.expect(TokenKind::Ident);
     }
 
+    // recovery hint used by recovery.crl's synchronize(): a fresh-line token
+    // from this set probably starts the next decl, so stop skipping there
     bool isDeclarationStart()
     {
         TokenKind kind = self.current.kind;
         switch (kind)
         {
-            TokenKind::Pub, TokenKind::Extern, TokenKind::Static, TokenKind::Struct,
-            TokenKind::Enum, TokenKind::Variant, TokenKind::Union, TokenKind::Trait,
-            TokenKind::Extend, TokenKind::Const, TokenKind::Typedef, TokenKind::Distinct,
-            TokenKind::Flag, TokenKind::Import, TokenKind::Mod, TokenKind::Comptime,
-            TokenKind::Void, TokenKind::Bool, TokenKind::Char, TokenKind::U8,
-            TokenKind::I8, TokenKind::U16, TokenKind::I16, TokenKind::U32,
-            TokenKind::I32, TokenKind::U64, TokenKind::I64, TokenKind::U128,
-            TokenKind::I128, TokenKind::F32, TokenKind::F64, TokenKind::Usize,
-            TokenKind::Isize, TokenKind::Rawptr, TokenKind::Str, TokenKind::Ident,
+            TokenKind::Pub | TokenKind::Extern | TokenKind::Static | TokenKind::Struct |
+            TokenKind::Enum  TokenKind::Variant | TokenKind::Union | TokenKind::Trait |
+            TokenKind::Extend | TokenKind::Const | TokenKind::Typedef | TokenKind::Distinct |
+            TokenKind::Flag | TokenKind::Import | TokenKind::Mod | TokenKind::Comptime |
+            TokenKind::Void | TokenKind::Bool | TokenKind::Char | TokenKind::U8 |
+            TokenKind::I8 | TokenKind::U16 | TokenKind::I16 | TokenKind::U32 |
+            TokenKind::I32 | TokenKind::U64 | TokenKind::I64 | TokenKind::U128  |
+            TokenKind::I128 | TokenKind::F32 | TokenKind::F64 | TokenKind::Usize |
+            TokenKind::Isize | TokenKind::Rawptr | TokenKind::Str | TokenKind::Ident |
             TokenKind::LParen => { return true; },
             else => { return false; },
         }

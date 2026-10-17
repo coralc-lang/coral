@@ -1,4 +1,7 @@
 
+// parser/parser.crl: cursor plumbing: advance/match/expect, node
+// constructors, and the speculative save()/restore() machinery
+
 import diag::code { ErrorCode };
 import common::token { Token, TokenKind };
 import lexer::lexer { Lexer };
@@ -14,6 +17,7 @@ pub extend Parser
 {
     Parser init(Lexer* lexer, AstContext* ctx)
     {
+        // prime the pump: one token buffered before the first advance()
         Token first = lexer.nextToken();
         return Parser {
             .lexer = lexer,
@@ -51,6 +55,9 @@ pub extend Parser
         }
         self.reportExpected(kind);
         if (self.atEnd()) return self.current;
+        /* on mismatch, only consume the offending token when it can't
+         * belong to an enclosing construct; swallowing a `)` or `}` here
+         * would desync every level above us */
         bool closeExpected = kind == TokenKind::RParen ||
                              kind == TokenKind::RBrace ||
                              kind == TokenKind::RBracket;
@@ -106,6 +113,12 @@ pub extend Parser
         return self.storeNode(NodeKind::Invalid{ .flags = 0 });
     }
 
+    /* speculative-parse bookmark. save() bumps specDepth so any diagnostic
+     * from a lookahead is dropped (see recovery.crl reportError); restore()
+     * rewinds everything except the node arena; nodes the discarded pass
+     * allocated stay behind, unreferenced and cheap. only the type table
+     * gets rewound: duplicate primitive entries break sema's index
+     * equality (boolType() returns the FIRST Bool entry). */
     ParserMark save()
     {
         ParserMark m = ParserMark {
@@ -137,6 +150,11 @@ pub extend Parser
         self.lexer.setToken(m.current);
     }
 
+    /* close one `>` of a generic list. `>>` lexes as a single Shr token, so
+     * the first consumeGreater() eats the whole token and remembers that a
+     * second closer is still owed; that's what pendingGreater is for.
+     * parseTypeSuffix/parseBaseType check it before absorbing a `(` as a
+     * fn-type suffix: `zero<E<i32, i32>>(a)` has a call there, not params */
     bool consumeGreater()
     {
         if (self.pendingGreater) {
