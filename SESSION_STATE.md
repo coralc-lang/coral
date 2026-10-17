@@ -26,6 +26,11 @@ Re-verified after the memcpy UB fix (same-day later lineage, fixes included):
 - valgrind (glibc-debug installed): **0 errors** on full matest build; matest
   app itself → ALL PASS
 
+Latest lineage (after the global-lib fallback in `analyze.crl`):
+
+- fullbuild19 + selfbuild19: rc=0, `cmp` **IDENTICAL** (emits 2280236 B C,
+  binary 834792 B) — this is the compiler installed to `~/.coral/bin`
+
 ## Last-commit contents (efc7996, source files)
 
 - `compiler-new/coral-backend/codegen.crl`, `compiler/coral-backend/codegen.crl`:
@@ -64,8 +69,27 @@ Re-verified after the memcpy UB fix (same-day later lineage, fixes included):
    loop; now aligns dest, then uses `usize` chunks when src is 8-aligned,
    `u32` when 4-aligned, bytes otherwise). Found via ASan/UBSan run of the
    compiler; fix verified by re-running the sanitizer build (0 findings).
+5. `compiler-new/coral-semantics/analyze.crl` — global lib fallback:
+   `libGlobalRoot()` = `$CORAL_HOME/lib`, else `$HOME/.coral/lib`; probed
+   after project/CWD `lib` in both the normal and platform-root resolution
+   paths. `compiler/` (stage0) intentionally unchanged.
 
-All edited files pass `python3 coral-docs/check_crl.py` (PASS ×6).
+All edited files pass `python3 coral-docs/check_crl.py` (PASS ×7).
+
+## Global install (~/.coral)
+
+- Layout: `~/.coral/bin/coralc` (self-built, 834792 B) + `~/.coral/lib/**`
+  (copy of repo `lib/`).
+- Import resolution order: project `<input>/../lib` → CWD `lib` →
+  `$CORAL_HOME/lib` / `$HOME/.coral/lib` → platform-root variants of each.
+- Verified from `/tmp/opencode/gtest` (copy of matest, **no** `lib` symlink):
+  `CORAL_TRACE_LOAD=1 ~/.coral/bin/coralc build --force` → rc=0, 25 module
+  loads from `/home/cerie/.coral/lib/`, app ALL PASS.
+- Refresh after source changes (from repo root):
+  `cp compiler-new/build/coralc ~/.coral/bin/coralc`
+  `rm -rf ~/.coral/lib && cp -r lib ~/.coral/lib`
+- Pre-existing stale `~/.coral/coralc` (616968 B, top level) left untouched;
+  remove it if nothing references it.
 
 ### Why libc default now
 

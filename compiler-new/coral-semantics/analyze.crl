@@ -188,6 +188,30 @@ u8* libDir(u8* path)
     return null;
 }
 
+/* installed-toolchain lib root: $CORAL_HOME/lib, else $HOME/.coral/lib */
+u8* libGlobalRoot()
+{
+    u8* base = getenv(C"CORAL_HOME");
+    Slice tail = Slice::fromStr("/lib");
+    if (base == null)
+    {
+        base = getenv(C"HOME");
+        tail = Slice::fromStr("/.coral/lib");
+    }
+    if (base == null) return null;
+    usize bl = 0;
+    while (base[bl] != 0) bl++;
+    if (bl == 0) return null;
+    u8* p = alloc<u8>(bl + tail.len + 1);
+    if (p == null) return null;
+    usize k = 0;
+    while (k < bl) { p[k] = base[k]; k++; }
+    usize j = 0;
+    while (j < tail.len) { p[k] = tail.ptr[j]; k++; j++; }
+    p[k] = 0;
+    return p;
+}
+
 u8* libRead(u8* cpath, usize* outLen)
 {
     *outLen = 0;
@@ -448,8 +472,11 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
     }
     /* `base` stays alive until the platform-root fallback below also
      * probes it (it was freed here first, use-after-free) */
+    u8* gRoot = libGlobalRoot();
     if (result == null)
         result = libResolveSegs(L, segs, n, "lib".ptr, 3, 0);
+    if (result == null && gRoot != null)
+        result = libResolveSegs(L, segs, n, gRoot, libLen(gRoot), 0);
     if (result == null && L->platformRootSegsLen > 0 && n > 1)
     {
         /* platform-first: <module>/<platform_root>/<rest>; neutral paths
@@ -477,11 +504,14 @@ u8* libResolve(LibLoader* L, u8* nsPtr, usize nsLen)
             result = libResolveSegs(L, psegs, k, "lib".ptr, 3, 0);
             if (result == null && base != null)
                 result = libResolveSegs(L, psegs, k, base, libLen(base), 0);
+            if (result == null && gRoot != null)
+                result = libResolveSegs(L, psegs, k, gRoot, libLen(gRoot), 0);
             dealloc<LibSeg>(psegs);
         }
     }
     dealloc<LibSeg>(segs);
     if (base != null) dealloc<u8>(base);
+    if (gRoot != null) dealloc<u8>(gRoot);
     return result;
 }
 

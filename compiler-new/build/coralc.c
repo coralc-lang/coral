@@ -3163,6 +3163,7 @@ size_t crl__loc__coral_semantics__analyze__libLen(uint8_t* s);
 _Bool crl__loc__coral_semantics__analyze__libBytesEq(uint8_t* a, size_t al, uint8_t* b, size_t bl);
 uint8_t* crl__loc__coral_semantics__analyze__libCandidate(uint8_t* dir, size_t dirLen, uint8_t* seg, size_t segLen, _coral_str suffix);
 uint8_t* crl__loc__coral_semantics__analyze__libDir(uint8_t* path);
+uint8_t* crl__loc__coral_semantics__analyze__libGlobalRoot(void);
 uint8_t* crl__loc__coral_semantics__analyze__libRead(uint8_t* cpath, size_t* outLen);
 uint32_t crl__loc__coral_semantics__analyze__libSplit(uint8_t* s, size_t n, crl__loc__coral_semantics__analyze__LibSeg* out, uint32_t max);
 crl__loc__coral_ast__decl__File* crl__loc__coral_semantics__analyze__libParse(crl__loc__coral_semantics__analyze__LibLoader* L, uint8_t* buf, size_t len, uint8_t* cpath, crl__loc__coral_diagnostics__engine__DiagnosticEngine* diag, uint32_t fileId);
@@ -33900,6 +33901,48 @@ uint8_t* crl__loc__coral_semantics__analyze__libDir(uint8_t* path) {
     }
     return 0;
 }
+uint8_t* crl__loc__coral_semantics__analyze__libGlobalRoot(void) {
+    uint8_t* base = getenv("CORAL_HOME");
+    crl__loc__coral_common__slice__Slice tail = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"/lib", 4 });
+    if (((base == 0)))
+    {
+        ((base = getenv("HOME")));
+        ((tail = crl__loc__coral_common__slice__Slice_fromStr((_coral_str){ (const uint8_t*)"/.coral/lib", 11 })));
+    }
+    if (((base == 0)))
+    {
+        return 0;
+    }
+    size_t bl = 0;
+    while (((base[bl] != 0)))
+    {
+        ((bl)++);
+    }
+    if (((bl == 0)))
+    {
+        return 0;
+    }
+    uint8_t* p = crl__lib__std__x86_64__linux__memory__mman__alloc_uint8_t(((((bl + tail.len)) + 1)));
+    if (((p == 0)))
+    {
+        return 0;
+    }
+    size_t k = 0;
+    while (((k < bl)))
+    {
+        ((p[k] = base[k]));
+        ((k)++);
+    }
+    size_t j = 0;
+    while (((j < tail.len)))
+    {
+        ((p[k] = tail.ptr[j]));
+        ((k)++);
+        ((j)++);
+    }
+    ((p[k] = 0));
+    return p;
+}
 uint8_t* crl__loc__coral_semantics__analyze__libRead(uint8_t* cpath, size_t* outLen) {
     (((*(outLen)) = 0));
     crl__loc__coral_common__slice__Slice s = crl__loc__coral_frontend__io__readFile(((_coral_str){.ptr = cpath, .len = crl__loc__coral_semantics__analyze__libLen(cpath)}), outLen);
@@ -34163,9 +34206,14 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
             crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(up);
         }
     }
+    uint8_t* gRoot = crl__loc__coral_semantics__analyze__libGlobalRoot();
     if (((result == 0)))
     {
         ((result = crl__loc__coral_semantics__analyze__libResolveSegs(L, segs, n, (_coral_str){ (const uint8_t*)"lib", 3 }.ptr, 3, 0)));
+    }
+    if (((((result == 0))) && (((gRoot != 0)))))
+    {
+        ((result = crl__loc__coral_semantics__analyze__libResolveSegs(L, segs, n, gRoot, crl__loc__coral_semantics__analyze__libLen(gRoot), 0)));
     }
     if (((((((result == 0))) && (((L->platformRootSegsLen > 0))))) && (((n > 1)))))
     {
@@ -34193,6 +34241,10 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
             {
                 ((result = crl__loc__coral_semantics__analyze__libResolveSegs(L, psegs, k, base, crl__loc__coral_semantics__analyze__libLen(base), 0)));
             }
+            if (((((result == 0))) && (((gRoot != 0)))))
+            {
+                ((result = crl__loc__coral_semantics__analyze__libResolveSegs(L, psegs, k, gRoot, crl__loc__coral_semantics__analyze__libLen(gRoot), 0)));
+            }
             crl__lib__std__x86_64__linux__memory__mman__dealloc_crl__loc__coral_semantics__analyze__LibSeg(psegs);
         }
     }
@@ -34200,6 +34252,10 @@ uint8_t* crl__loc__coral_semantics__analyze__libResolve(crl__loc__coral_semantic
     if (((base != 0)))
     {
         crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(base);
+    }
+    if (((gRoot != 0)))
+    {
+        crl__lib__std__x86_64__linux__memory__mman__dealloc_uint8_t(gRoot);
     }
     return result;
 }
