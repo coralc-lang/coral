@@ -1,0 +1,298 @@
+Chapter 6
+
+Traits, Extend, and Polymorphism
+
+Two Kinds of Reuse
+
+There are two ways a piece of code can serve many types. The first is to write a function once, with a type parameter, and let the compiler produce a version for each type that calls it. The second is to write a function once against an interface, and let the runtime find the right implementation for whatever value shows up. Coral supports both, and it names them clearly. Generics — the subject of the next chapter — are the first. Traits are the second: a named set of method signatures that a type can promise to satisfy, plus the machinery for calling through that promise.
+
+Traits in Coral are deliberately small. A trait is a list of method signatures. A type satisfies a trait by providing those methods in an extend block. There is no inheritance, no virtual table by default, and no class hierarchy. What there is instead is a style of programming that says: define the behaviour you need as a trait, write algorithms against the trait, and let each type opt in by implementing it. This chapter teaches both halves — declaring and implementing traits, and using them as constraints and as objects.
+
+6.1 Methods and Extend
+
+Before traits, methods. Coral can separates a type's data from its behaviour. A struct declares fields; an extend block declares methods. The two are often in the same file, but they are distinct declarations, and the split is what makes traits possible.
+
+    struct Point {
+        f64 x;
+        f64 y;
+    }
+
+    pub extend Point {
+        f64 magnitude() {
+            return sqrt(self.x * self.x + self.y * self.y);
+        }
+
+        Point scaled(f64 factor) {
+            return Point { .x = self.x * factor, .y = self.y * factor };
+        }
+
+        void translate(f64 dx, f64 dy) {
+            self.x += dx;
+            self.y += dy;
+        }
+    }
+
+The receiver is implicit and named self. You do not write it in the parameter list; the language supplies it, and in the generated code it is a pointer. A method that does not mutate self may be marked const, with the attribute or the trailing keyword:
+
+    pub extend Point {
+        #[[const]]
+        f64 magnitudeSquared() {
+            return self.x * self.x + self.y * self.y;
+        }
+    }
+
+or equivalently, at the end of the signature:
+
+    f64 magnitudeSquared() const {
+        return self.x * self.x + self.y * self.y;
+    }
+
+A const method cannot assign to self or to any of its fields. This is not merely documentation; the compiler enforces it, and a const method callable on a const value is one of the reasons Coral can reason about mutation at all. Marking a method const is a promise to every caller that calling it will not change what they are looking at.
+
+A method with no receiver is static, declared with the static keyword. Static methods are how constructors are spelled:
+
+    pub extend Vec2 {
+        static Vec2 new(f64 x, f64 y) {
+            return Vec2 { .x = x, .y = y };
+        }
+
+        static Vec2 zero() {
+            return Vec2 { .x = 0.0, .y = 0.0 };
+        }
+    }
+
+Call a static method on the type: Vec2::zero(). Call an instance method on a value: p.magnitude(). The distinction between :: and . is the distinction between a type and a value, and it is visible at every call site.
+
+6.2 Declaring a Trait
+
+A trait declares a set of method signatures that a type must provide. It is written with the trait keyword, its methods listed inline:
+
+    trait Shape {
+        f64 area();
+        f64 perimeter();
+    }
+
+A trait is a contract, not an implementation. It says: any type that satisfies Shape has an area method returning f64 and a perimeter method returning f64. Trait methods may take receivers implicitly, may take parameters, and may be const. A trait may also provide default implementations, which are inherited by any type that does not override them:
+
+    trait Named {
+        str name();
+        str describe() { return "an object named " + self.name(); }
+    }
+
+describe has a body, so it is a default. name does not, so every implementor must supply it. Defaults are the one place traits carry logic, and they are how a trait can offer convenience on top of a required minimum. The default may call the required methods, which is why the contract's shape comes first in the declaration.
+
+6.3 Implementing a Trait
+
+A type satisfies a trait by an extend block that names the trait after a colon:
+
+    struct Circle {
+        f64 radius;
+    }
+
+    pub extend Circle : Shape {
+        f64 area() {
+            return 3.14159 * self.radius * self.radius;
+        }
+
+        f64 perimeter() {
+            return 2.0 * 3.14159 * self.radius;
+        }
+    }
+
+    struct Square {
+        f64 side;
+    }
+
+    pub extend Square : Shape {
+        f64 area() {
+            return self.side * self.side;
+        }
+
+        f64 perimeter() {
+            return 4.0 * self.side;
+        }
+    }
+
+The extend Trait block is a promise that the type provides every method the trait requires. If it does not — a missing method, a wrong return type, a wrong parameter list — the compiler reports it. A trait conformance is checked structurally at the conformance site and again wherever the type is used as the trait, so a broken promise cannot escape a module. This is Chapter 22's trait-signature and missing-method family of errors: they exist so that "does this type really do what the interface says?" is answered by the compiler rather than by a crash at the call.
+
+A type may satisfy several traits, each with its own extend block:
+
+    pub extend Circle : Shape {}
+    pub extend Circle : Named {
+        str name() { return "circle"; }
+    }
+
+And a type may satisfy the same trait it satisfies elsewhere with a different implementation only if the type is different; a trait conformance is unique per type. That uniqueness is why :: and . can resolve a method in one step: there is exactly one implementation of Shape::area for Circle, so no dispatch decision is needed when the concrete type is known.
+
+6.4 Inherent Methods and Trait Methods Together
+
+A type usually has both inherent methods (its own API) and trait methods (its obligations). They live in separate extend blocks, and the separation is meaningful: inherent methods are the type's own vocabulary; trait methods are the part of the type that some interface requires.
+
+    struct Stack<T> {
+        Vec<T> items;
+    }
+
+    pub extend<T> Stack<T> {
+        static Stack<T> new() {
+            return Stack<T> { .items = Vec<T>::new() };
+        }
+
+        void push(T value) {
+            self.items.push(value);
+        }
+
+        T pop() {
+            return self.items.pop();
+        }
+
+        bool isEmpty() const {
+            return self.items.isEmpty();
+        }
+    }
+
+Now if Stack should be iterable, that is a trait conformance, and it goes in its own block:
+
+    pub extend<T> Stack<T> : Iterable<T> {
+        // the methods the Iterable trait requires
+    }
+
+The point of the split is that the trait block is a small, auditable statement of "here is how Stack fulfils Iterable," separate from the large body of Stack's own methods. When a trait changes, you look at the trait blocks; when the type's own API changes, you look at the inherent block.
+
+6.5 Generic Traits
+
+Traits may be generic, and so may the extends that implement them. The standard library's Result is the clearest example, and it is worth reading as a model:
+
+    pub variant Result<T, E> {
+        Ok  { T value; },
+        Err { E error; }
+    }
+
+    pub extend<T, E> Result<T, E> {
+        bool isOk() { ... }
+        T unwrap() { ... }
+        T unwrapOr(T defaultVal) { ... }
+        void mapOk(T(T) fn) { ... }
+    }
+
+The extend is generic in both T and E, matching the type it extends. Every method is available for every instantiation Result<T, E>, but the compiler monomorphises each instantiation separately, so Result<i32, IoError> and Result<str, ParseError> get their own copies with their own types. A generic extend is not a runtime template; it is a family of methods generated per use.
+
+A generic type can also implement a non-generic trait, which is how a container becomes iterable regardless of what it holds, and a non-generic type can implement a generic trait, which is how a type participates in a family of interfaces parameterised by element type. The two directions are independent, and the standard library uses both.
+
+6.6 Built-in Traits: @drop and @toStr
+
+Coral defines two traits in the language itself, spelled with a leading @ to mark them as compiler-known: @drop and @toStr. They are special because the compiler wires them in automatically rather than requiring a call.
+
+@drop is the destructor trait. A type that implements it has a drop method that the compiler invokes automatically when a value of the type goes out of scope — the RAII mechanism of Chapter 11, expressed as a trait:
+
+    pub extend FileHandle : @drop {
+        void drop() {
+            close(self.fd);
+        }
+    }
+
+Any value whose type implements @drop is cleaned up at the end of its lifetime, including values inside containers, which is what makes a Vec<FileHandle> free its handles when it is dropped. The trait is what turns "the compiler knows when to call a function" from magic into a nameable contract. And it can be turned off: #[[no_drop]] on a variable or block, or #[[no_drop_all]] at the top of a file, disables automatic destruction. The standard library's low-level files use #[[no_drop_all]] because they manage memory by hand and want the compiler to stay out of the way; an ordinary program leaves RAII on.
+
+@toStr is the formatting trait. A type that implements it can be printed or converted to a str wher a str is required, and the compiler finds the implementation at the formatting call site:
+
+    pub extend Point : @toStr {
+        str toStr() {
+            return "Point(" + formatFloat(self.x) + ", " + formatFloat(self.y) + ")";
+        }
+    }
+
+With this conformance, println("{}", point) works, because the printing machinery dispatches to Point::toStr. The std::io::ios module documents that toStr is an inbuilt trait of the same class as @drop: nothing is declared, and the any toStr case in the formatter is where the compiler auto-wires the call. Both built-in traits show the same pattern — the language names a capability, the compiler special-cases that name at the one place it is used, and the type opts in with a normal extend block. If you want to know what a type does automatically, look for @drop and @toStr among its conformances.
+
+6.7 Dynamic Dispatch and any Trait
+
+The conformances above are static: when the concrete type is known, the call to area resolves to the one implementation, with no runtime lookup. But sometimes the concrete type is not known — you have a list of different shapes and you want to call area on each. That is what any Trait is for.
+
+    Vec<any Shape> shapes = Vec<any Shape>::new();
+    shapes.push(Circle { .radius = 1.0 });
+    shapes.push(Square { .side = 2.0 });
+
+    for (any Shape s : shapes) {
+        println("area = {}", s.area());
+    }
+
+A value of type any Shape is a fat pointer: it carries a reference to the value and a reference to its Shape implementation. Calling s.area() dispatches through that reference to the concrete implementation. This is a trait object, and it is the dynamic half of polymorphism: the call site does not know whether it holds a Circle or a Square, and the dispatch resolves it at runtime.
+
+The trade-offs are the usual ones for dynamic dispatch, and Coral makes them visible. A trait object costs an extra indirection per call and cannot generally be inlined across the boundary. It is a pointer-sized pair, so storing one is storing a reference plus a vtable pointer. And it carries only the methods the trait declares: through an any Shape you can call area and perimeter, but not a method Square happens to have that Shape does not. The trait is the window, and you see exactly what it frames.
+
+The recommended design is to keep dynamic dispatch at the boundary where the concrete type is genuinely unknown — a heterogeneous collection, a plugin registry, a callback — and to keep the internals static. A function that takes a generic T with a Shape constraint gets the same behaviour with no indirection when the compiler can see the concrete type; reach for any Shape only when it cannot. The two mechanisms share the trait, so moving between them is a change to one signature rather than a rewrite.
+
+6.8 Traits as Constraints
+
+A generic function can require that its type parameter satisfies a trait. The constraint is written after the parameter, and the compiler checks it at every call site:
+
+    f64 totalArea<T : Shape>(Vec<T> shapes) {
+        f64 sum = 0.0;
+        for (T s : shapes) {
+            sum += s.area();
+        }
+        return sum;
+    }
+
+Inside totalArea, the call s.area() is legal because the constraint T : Shape guarantees every T has an area. At a call site, T is deduced from the argument, and the compiler checks that the deduced type implements Shape. Passing a Vec<str> is a compile error, reported where the call is, not where the method is.
+
+This is static polymorphism: totalArea is monomorphised for each T that calls it, so a call with T = Circle produces a version whose s.area() is a direct call to Circle::area. No vtable, no indirection, no dispatch — the constraint buys type-checking without costing runtime. A constrained generic is the preferred form when the set of types is known at compile time and performance matters; an any Trait is the fallback when it is not.
+
+Constraints compose with the rest of the type system. A type parameter may be constrained by several traits, and a trait may itself require another trait as a supertrait, so an implementation of the derived trait must also implement the base. The standard library uses this to keep its interface hierarchy honest: an iterator that requires element comparison can be declared only for element types that provide it.
+
+6.9 A Worked Example: A Printable Tree
+
+Traits shine when one algorithm must work across many shapes. Consider a general tree whose nodes are printed in several formats, and which supports several node payloads. Define one trait for the payload and one extension for the printing.
+
+    trait TreeNode {
+        str label();
+        Vec<any TreeNode> children();
+    }
+
+    struct FileNode { str path; Vec<any TreeNode> kids; }
+    pub extend FileNode : TreeNode {
+        str label() { return self.path; }
+        Vec<any TreeNode> children() { return self.kids; }
+    }
+
+    struct DirNode { str name; Vec<any TreeNode> kids; }
+    pub extend DirNode : TreeNode {
+        str label() { return self.name; }
+        Vec<any TreeNode> children() { return self.kids; }
+    }
+
+The printing algorithm is written once, against the trait:
+
+    void printTree(any TreeNode root, i32 depth) {
+        for (i32 i = 0; i < depth; i += 1) {
+            print("  ");
+        }
+        println("{}", root.label());
+        for (any TreeNode child : root.children()) {
+            printTree(child, depth + 1);
+        }
+    }
+
+printTree knows nothing about files or directories. It knows the two methods TreeNode declares, and it recurses through them. Add a new node type — a symlink, a device, a network mount — and it participates in printing without a line of printTree changing, provided it implements TreeNode. That is the open/closed property that polymorphism is supposed to give: open to new types, closed to modification of the algorithm.
+
+The example also shows why any TreeNode is the right choice here rather than a generic. The tree is heterogeneous — a directory holds files and directories together — so the children list must hold values of different concrete types, and a common dynamic type is exactly what makes that possible. A generic printTree<T : TreeNode> could print a homogeneous Vec<T>, but not a tree of mixed nodes, because T would have to be one type. The choice between generic and any follows from the data: homogeneous compile-time-known collections are generic; heterogeneous runtime-known collections are any.
+
+6.10 Exercises
+
+1. Comprehension. What is the difference between an inherent extend block and an extend Trait block? Give a method that belongs in each.
+
+2. Comprehension. Explain why a const method can be called on a const value but a non-const method cannot. What would go wrong otherwise?
+
+3. Implementation. Define a trait Comparable with a method lessThan(other) bool, and implement it for Point and for a struct of your choice. Then write a generic minimum<T : Comparable>(T a, T b) T.
+
+4. Implementation. Add a @toStr conformance to a struct of yours that prints all its fields. Print an instance with println("{}", instance) and confirm the output.
+
+5. Built-ins. Give a type that should implement @drop and a type that should not. Explain what the compiler does differently for each.
+
+6. Dispatch. Write a Vec<any Shape> containing three different shapes, sort it conceptually by area, and print each. Why can the Vec not have a concrete element type?
+
+7. Constraints. A generic function takes T : Shape and calls area. Rewrite it to take any Shape. What is the same, what differs at the call site, and what does each version cost at runtime?
+
+8. Defaults. Declare a trait with three methods, one of which has a default implementation that calls the other two. Implement the trait for a type, override the default, and explain when overriding is right.
+
+9. Design. You are designing an interface for a serialisation library. Which should be a trait, which a generic, and which a concrete function? Argue each choice in one sentence.
+
+10. Meta. Coral has no inheritance; a type gets behaviour only by extending or conforming. Argue that this is a limitation, then argue that it is a strength. Which position do you find more convincing, and why?

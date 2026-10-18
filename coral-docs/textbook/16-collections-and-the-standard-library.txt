@@ -1,0 +1,397 @@
+Chapter 16
+
+Collections and the Standard Library
+
+The Shape of the Standard Library
+
+A language without a standard library is a set of keywords. The library is where a language becomes useful: the containers that hold your data, the text and I/O that connect it to the world, the math that computes on it. Coral's standard library is organised around one idea — capability — and the organisation is worth understanding before you use a single function, because it tells you where everything lives and why.
+
+The library root is std. Under it sit modules grouped by what they do: collections, text, io, math, memory, data, crypto, concurrent, parser, fmt, time, testing. Two aliases exist at the top level because the two most common types deserve short names: option is data::option and result is data::result, so you can import(lib) std::option { Option }; without walking the tree. The three most common containers are likewise aliased: vec is collections::vec, arr is collections::arr, so the everyday import is short:
+
+    import(lib) std::vec { Vec };
+    import(lib) std::option { Option };
+    import(lib) std::result { Result };
+
+The full path always works too, and the chapter uses it where it clarifies which module a type comes from:
+
+    import(lib) std::collections::vec { Vec };
+    import(lib) std::collections::map { Map };
+    import(lib) std::collections::set { Set };
+
+The rule for choosing between std and core is simple. std is the portable, platform-independent surface — the same names and signatures everywhere. core holds what the language itself needs: str and its methods, cchar, character utilities, and the numeric limits. A normal program imports from std and never thinks about core; it is mentioned here only so that an import(lib) core::... line in library code does not look mysterious.
+
+16.1 Vec<T>: The Dynamic Array
+
+Vec<T> is the workhorse. It is a growable array: contiguous storage, a length, and a capacity, doubling its allocation as you push past the capacity. Its representation is public, which is unusual and deliberate — it is the type you build on when you outgrow it:
+
+    pub struct Vec<T> {
+        T*    data;
+        usize len;
+        usize cap;
+    }
+
+The three fields tell the whole story. data points at the allocation, len is how many elements are live, cap is how many the allocation can hold. Everything Vec does is bookkeeping on those three numbers, and because they are visible, a Vec is a documented data structure rather than an opaque box.
+
+Create one with new, or with withCap when you know the size in advance:
+
+    Vec<i32> a = Vec<i32>::new();
+    Vec<i32> b = Vec<i32>::withCap(1024);
+
+new allocates nothing and starts empty; the first push allocates a small default. withCap allocates room for n elements up front, which matters when you know you will insert many and want to avoid repeated reallocation. A Vec can also be built from a literal using the designated-field form, which is how the library itself initialises one:
+
+    Vec<i32> empty = Vec<i32> { .data = null, .len = 0, .cap = 0 };
+
+The core operations read like a sentence:
+
+    Vec<i32> v = Vec<i32>::new();
+    v.push(10);                 // append
+    v.push(20);
+    v.push(30);
+
+    i32 last = v.pop();         // 30; removes and returns the last
+    usize n  = v.count();       // number of live elements
+    bool e   = v.isEmpty();     // count() == 0
+
+push appends, growing the capacity if needed; pop removes the last element and returns it. count reports len (it is named count rather than len to avoid colliding with the field). isEmpty is the readable form of count() == 0.
+
+Element access comes in several forms, and the names encode the trade-offs. at returns an element by value with a bounds check; atPtr and atConst return a mutable and a const pointer to the element; ptr and constPtr return a pointer to the backing array:
+
+    v.set(0, 99);               // v[0] = 99
+    i32 x = v.at(0);            // bounds-checked read by value
+    i32* p = v.atPtr(1);        // pointer to element 1
+    const i32* cp = v.atConst(1);
+    i32* base = v.ptr();        // the whole array
+    const i32* cbase = v.constPtr();
+
+The distinction between an index-based and a pointer-based access is part of the language's approach to safety. Indexing a Vec with v[i] is bounds-checked on fixed-size arrays at compile time and on dynamic containers at runtime; atPtr is the unchecked form you reach for when a loop has already established the bound and you want to skip the check. The checked form is the default; the unchecked form is available and named, so an unchecked access is a visible decision in the code rather than an invisible optimisation.
+
+Iterate a Vec by index or by range for:
+
+    for (usize i = 0; i < v.count(); i += 1) {
+        println("{}", v.at(i));
+    }
+
+    for (i32 value : v) {
+        println("{}", value);
+    }
+
+The range-for form is the idiomatic read; it visits each element in order and does not expose the index. Reach for the indexed form only when you need the index itself.
+
+Growing a Vec to fit a range is a pattern worth learning because it recurs: seed the first element, then expand.
+
+    Vec<i32> squares = Vec<i32>::new();
+    squares.push(0);
+    for (i32 i = 1; i <= 10; i += 1) {
+        squares.push(i * i);
+    }
+
+A Vec owns its elements. Dropping a Vec drops each element and frees the backing storage, provided T itself is droppable; a Vec<RawHandle> whose element type has no drop does not leak because there is nothing to free per element, but the array storage is still released. This is the RAII rule of Chapter 11 applied to a container: you do not free a Vec, you let it go out of scope. When a container holds pointers you freed elsewhere, the type should say so — the container's element type is part of its contract.
+
+16.2 Arr<T, N>: Fixed-Size and Small
+
+Vec grows. Arr is its fixed-size sibling: the length is part of the type, known at compile time, and the storage is inline in the value rather than behind a pointer.
+
+    import(lib) std::arr { Arr };
+    Arr<i32, 4> location = Arr<i32, 4> { 1, 2, 3, 4 };
+
+Because the length is a compile-time constant, indexing into an Arr with a constant index is checked by the compiler, and an out-of-range constant is a compile error rather than a runtime trap. This is the container to use when the size is genuinely fixed — a 3-component vector, a 2x2 matrix, a fixed header — because it needs no heap allocation and its size is a fact the compiler can use. A plain Coral array T name[N] is the same idea without the methods; Arr is the array with the container interface attached.
+
+16.3 Map, HashMap, and UnorderedMap
+
+A map associates keys with values. Coral offers a family, and the differences are the usual ones: ordering, hashing, and the guarantees you want from iteration.
+
+    import(lib) std::collections::map { Map };
+    import(lib) std::collections::hashmap { HashMap };
+    import(lib) std::collections::unordered_map { UnorderedMap };
+
+Map<K, V> is the ordered associative container. It keeps its keys sorted, which makes iteration deterministic and range queries possible, at the cost of O(log n) per operation:
+
+    Map<str, i32> ages = Map<str, i32>::new();
+    ages.insert("ada", 36);
+    ages.insert("grace", 45);
+
+    if (ages.contains("ada")) {
+        i32 a = ages.get("ada");
+    }
+    ages.remove("grace");
+
+    for (str name : ages.keys()) {
+        println("{} = {}", name, ages.get(name));
+    }
+
+HashMap<K, V> is the hashed container: average O(1) operations, no ordering. UnorderedMap is its sibling whose iteration order is explicitly unspecified, which lets the implementation choose the fastest representation. Use Map when you will iterate in a meaningful order or need range queries; use HashMap when you only look things up; use UnorderedMap when you want to say, in the type, that you do not care about order, so nobody downstream depends on it by accident.
+
+A map's value is a KeyValue pair when you iterate entries directly, and KeyValue carries the key and the value:
+
+    for (KeyValue<str, i32> entry : ages) {
+        println("{} = {}", entry.key, entry.value);
+    }
+
+The three-map split is a small example of a larger principle in the library: when two behaviours differ, they are two types with two names, not one type with a flag. A flag would let a caller depend on an order a HashMap never promised; two types make the promise explicit in the signature of every function that takes one.
+
+16.4 Set<T>
+
+A set is a map without values: it answers "is this in the collection?" and enforces uniqueness.
+
+    import(lib) std::collections::set { Set };
+
+    Set<str> seen = Set<str>::new();
+    seen.insert("apple");
+    seen.insert("banana");
+    seen.insert("apple");          // no effect; already present
+
+    if (seen.contains("apple")) { ... }
+    seen.remove("banana");
+
+    for (str s : seen) { println("{}", s); }
+
+Set is the right tool for deduplication and membership. A common pattern — print each distinct word in a text — is a Set in four lines:
+
+    Set<str> words = Set<str>::new();
+    for (str w : split(text, " ")) {
+        words.insert(w);
+    }
+    for (str w : words) {
+        println("{}", w);
+    }
+
+Choosing between Set and a Vec-with-a-scan is a question of n. For a handful of items the scan is faster and simpler; for thousands the set's O(1) membership wins by orders of magnitude. The library gives you the tool; the size of your data tells you which to use.
+
+16.5 Queue, Deque, and RingBuf
+
+Order matters as much as membership, and different orders need different structures. Queue is first-in-first-out:
+
+    import(lib) std::collections::queue { Queue };
+
+    Queue<i32> q = Queue<i32>::new();
+    q.push(1);
+    q.push(2);
+    q.push(3);
+    i32 first = q.pop();           // 1 — FIFO
+
+Deque is a double-ended queue: push and pop at either end, which is the structure for a work list that grows at both ends and for a sliding window.
+
+    import(lib) std::collections::deque { Deque };
+
+    Deque<i32> d = Deque<i32>::new();
+    d.pushBack(2);
+    d.pushFront(1);
+    i32 head = d.popFront();       // 1
+    i32 tail = d.popBack();        // 2
+
+RingBuf is a fixed-capacity ring: a queue whose storage is a fixed array with head and tail indices that wrap. It is the right structure when the maximum size is known and allocation must not happen in the hot path — a logging buffer, an audio sample queue, a network window.
+
+    import(lib) std::collections::ringbuf { RingBuf };
+
+    RingBuf<f64> samples = RingBuf<f64>::withCap(1024);
+    samples.push(sample);          // overwrites the oldest once full
+
+The overlap among Queue, Deque, and RingBuf is intentional. Queue is the simplest interface over a general-purpose buffer; Deque adds the other end; RingBuf adds a size bound and the no-allocation guarantee. Pick the one whose constraints you actually need, so the type documents the constraint for the reader.
+
+16.6 PriorityQueue<T>
+
+A priority queue always hands you the smallest (or, with a comparator, the extremal) element.
+
+    import(lib) std::collections::priorityqueue { PriorityQueue };
+
+    PriorityQueue<i32> pq = PriorityQueue<i32>::new();
+    pq.push(5);
+    pq.push(1);
+    pq.push(3);
+    i32 min = pq.pop();            // 1
+
+A priority queue is the engine of Dijkstra's algorithm, of event-driven simulation, and of scheduling. With a comparator that reverses the order, the same structure gives you a max-heap:
+
+    PriorityQueue<Task> byDeadline = PriorityQueue<Task>::new(compareDeadline);
+
+16.7 LinkedList<T>
+
+A linked list is a chain of nodes, each pointing at the next. It is the structure to reach for sparingly — an array beats it for most access patterns because of cache locality — but it is unbeatable when you need O(1) insertion and removal given a cursor, and it expresses an intrusive, pointer-linked structure directly.
+
+    import(lib) std::collections::linkedlist { LinkedList };
+
+    LinkedList<i32> l = LinkedList<i32>::new();
+    l.pushBack(1);
+    l.pushBack(2);
+    l.pushFront(0);
+
+The library provides it because some interfaces and some designs genuinely want it; it does not present it as the default list. The default list is Vec.
+
+16.8 Tree and Trie
+
+Two specialised structures round out the collection family. Tree<T> is a general tree — a node with children — the shape of a file system, a scene graph, an abstract syntax tree, an organisational chart:
+
+    import(lib) std::collections::tree { Tree };
+
+    Tree<str> root = Tree<str>::new("root");
+    root.addChild(Tree<str>::new("docs"));
+    root.addChild(Tree<str>::new("src"));
+
+    for (Tree<str> child : root.children()) {
+        println("{}", child.value());
+    }
+
+Trie is the prefix tree, keyed on characters of a string, ideal for autocomplete, spell-check dictionaries, and IP routing tables, where the query is "all keys with this prefix":
+
+    import(lib) std::collections::trie { Trie };
+
+    Trie<i32> dict = Trie<i32>::new();
+    dict.insert("car", 1);
+    dict.insert("cart", 2);
+    dict.insert("cat", 3);
+
+    if (dict.containsPrefix("ca")) { ... }
+    for (str word : dict.withPrefix("car")) { ... }
+
+16.9 Bitset and Cache
+
+Bitset<N> is a fixed-width set of bits, packed into words. It is the right structure for a dense set of small non-negative integers — a set of visited nodes in a graph, an array of feature flags — where a Set<T> would spend sixty-four bits storing what one bit could hold.
+
+    import(lib) std::collections::bitset { Bitset };
+
+    Bitset<256> visited = Bitset<256>::new();
+    visited.set(42);
+    if (visited.test(42)) { ... }
+    visited.clear(42);
+
+Cache<K, V> is a bounded, eviction-aware map — the standard tool when a map must not grow without limit. An LRU cache is the canonical use, and having it in the standard library means you do not rebuild it, subtly differently, in every project.
+
+    import(lib) std::collections::cache { Cache };
+
+    Cache<str, Page> pages = Cache<str, Page>::withCap(128);
+    if (pages.contains(url)) {
+        Page p = pages.get(url);       // moves it to most-recently-used
+    } else {
+        pages.put(url, fetch(url));    // evicts the least-recently-used
+    }
+
+16.10 iter and sort
+
+Two utilities cut across every container. The sort module implements the algorithms — quick, merge, heap, and insertion sort — each usable on the containers above with a comparator:
+
+    import(lib) std::collections::sort { sort, sortBy };
+
+    Vec<i32> v = Vec<i32>::new();
+    v.push(3); v.push(1); v.push(2);
+    sort(v);                       // ascending
+
+    sortBy(v, compareByLength);    // custom order
+
+The iter module provides the adaptors that make bulk operations readable — map, filter, fold, and their relatives — so a transformation chain is a pipeline rather than a nest of loops:
+
+    import(lib) std::collections::iter { map, filter, fold };
+
+    Vec<i32> doubled = map(v, double);
+    Vec<i32> evens   = filter(v, isEven);
+    i32 total        = fold(v, 0, add);
+
+Each adaptor takes a Vec and a function; the function is a first-class value as Chapter 5 described. The pipeline reads in the order the operations happen, which is the property a loop with a temporary variable loses.
+
+16.11 Ownership: Who Frees What
+
+Every container in this chapter owns its elements, and freeing a container frees what it owns. The rules are the RAII rules of Chapter 11, specialised to containers:
+
+    - A Vec<T> owns its backing array and its elements. Dropping it
+      frees the array and drops each element whose type has a drop.
+    - A Map<K, V> owns its keys and its values. Dropping it frees both.
+    - A BitSet<N> owns a fixed inline array and frees nothing on the heap.
+    - An Arr<T, N> owns inline storage; there is nothing to free.
+    - A container of pointers owns the pointers, not their targets.
+      The target's lifetime is a separate question the type must answer.
+
+That last rule is where bugs live. A Vec<T*> whose element type is a bare pointer frees the array but not the pointees; if the program allocated them, it must free them, and the cleanest way to say so is to use a smart pointer element type — SmartPtr<T> or SharedPtr<T> from memory::smart_ptr and memory::shared_ptr — so that the container's drop cascades into the elements' drop. A container of owning smart pointers is self-managing; a container of raw pointers is a footgun with a clear label.
+
+When a container must be shared between parts of a program, SharedPtr<T> reference-counts it, so the last reference to go away frees it. When a container needs a custom allocator — an arena for a parse tree, a pool for fixed-size nodes — the memory module's Allocator interface and pool::Pool<T> supply it. The standard containers are built on the same allocation primitives the language exposes, so a program that needs a different allocation strategy is not locked out of using the containers; it supplies the allocator rather than the container.
+
+16.12 A Worked Example: Word Frequency
+
+Put the collections to work on a task that needs several of them at once: count how often each word appears in a text and print the ten most frequent.
+
+    import(lib) std::io::ios { println, readLine };
+    import(lib) std::text::strutil { split, toLower };
+    import(lib) std::collections::map { Map };
+    import(lib) std::collections::priorityqueue { PriorityQueue };
+
+    struct WordCount {
+        str word;
+        i32 count;
+    }
+
+    i32 compareCount(WordCount a, WordCount b) {
+        return b.count - a.count;          // most frequent first
+    }
+
+    i32 main() {
+        Map<str, i32> counts = Map<str, i32>::new();
+
+        while (true) {
+            str line = readLine();
+            if (line == "") break;
+            for (str raw : split(line, " ")) {
+                str word = toLower(raw);
+                if (word == "") continue;
+                if (counts.contains(word)) {
+                    counts.insert(word, counts.get(word) + 1);
+                } else {
+                    counts.insert(word, 1);
+                }
+            }
+        }
+
+        PriorityQueue<WordCount> top = PriorityQueue<WordCount>::new(compareCount);
+        for (str word : counts.keys()) {
+            top.push(WordCount { .word = word, .count = counts.get(word) });
+        }
+
+        for (i32 i = 0; i < 10 && !top.isEmpty(); i += 1) {
+            WordCount wc = top.pop();
+            println("{}: {}", wc.word, wc.count);
+        }
+        return 0;
+    }
+
+Four containers, each doing what it is for. A Map accumulates the counts by key. A range-for over its keys collects the results. A PriorityQueue orders them by frequency so the top ten are the first ten pops. A struct packages the pair so the queue has an element type with a comparator. No container does another's job, and the whole program is a paragraph. This is the shape that a good standard library enables: the data structures are right, so the algorithm is short.
+
+16.13 A Worked Example: An LRU Page Cache
+
+The second example uses the Cache container for the task it exists for, then shows what it would cost to build by hand.
+
+    import(lib) std::collections::cache { Cache };
+    import(lib) std::text::string { String };
+
+    struct Page { String contents; }
+
+    Cache<String, Page> pages = Cache<String, Page>::withCap(256);
+
+    Page* fetchPage(String url) {
+        if (pages.contains(url)) {
+            return pages.atPtr(url);       // touched; stays hot
+        }
+        Page fresh = loadFromNetwork(url);
+        pages.put(url, fresh);             // may evict the coldest
+        return pages.atPtr(url);
+    }
+
+The eviction policy is the container's business: put inserts and, if the cache is full, removes the least-recently-used entry. A hand-rolled version of this is thirty lines of doubly-linked-list-plus-map bookkeeping, with a classic bug — forgetting to move an element on a get — that shows up only under load. The library's version has that bug fixed once. Using it is not just less code; it is the difference between a cache that is correct and a cache that is almost correct.
+
+16.14 Exercises
+
+1. Comprehension. You need to look up values by string key and iterate in sorted order. Which map type do you choose, and why not HashMap?
+
+2. Comprehension. Why does Vec expose data, len, and cap as public fields rather than hiding them? Give one advantage and one risk this creates.
+
+3. Implementation. Write a function that, given a Vec<i32>, returns a new Vec<i32> containing each element doubled and the zeros removed. Use the iter adaptors, then rewrite it with an explicit loop and compare.
+
+4. Containers. Build an LRU cache by hand using a HashMap and a LinkedList. Then replace it with Cache. How many lines does each version take, and which operations were easy to get wrong?
+
+5. Ownership. Declare a Vec<T*> of pointers you allocated. Free the Vec and then try to free each pointee. What is the correct order? What happens if you free the pointees first?
+
+6. Sets. Given two Vec<str> of names, compute their intersection as a Set<str>. What is the running time of your approach, and why is it better than the nested-loop version?
+
+7. Priority. Modify the word-frequency program to print the ten least frequent words instead of the most frequent. What changes, and what does not?
+
+8. Between. A circular buffer of audio samples is written fast and read slower than it is written, and it must never allocate. Which container do you use, and why not Deque?
+
+9. Bitset. Represent the adjacency of a graph with 512 nodes as a Bitset<512>. How much storage does this save versus a Set<usize> or a Vec<bool>?
+
+10. Meta. The library offers Map, HashMap, and UnorderedMap, and separately Queue, Deque, and RingBuf. Argue for and against this proliferation of types. Where is the line between a useful distinction and a choice the programmer should make once?

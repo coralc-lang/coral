@@ -1,0 +1,239 @@
+Chapter 14
+
+Modules, Imports, and Visibility
+
+Why Programs Need Seams
+
+A program of two hundred lines fits in your head. A program of two hundred thousand does not, and the only way to keep working on it is to cut it into pieces small enough to hold, then agree on how the pieces may talk to each other. A module system is that agreement. It is not a folder organising convention; it is a contract about names, about reach, and about what a caller is allowed to depend on. Get the module system right and a codebase can be understood one file at a time. Get it wrong and every file knows about every other file, and the only way to change anything is to hold the whole thing in your head at once.
+
+Coral's module system is deliberately small. There is a source file, a module surface, four import forms, and one visibility keyword. That is the entire vocabulary. The complexity that most languages carry — namespace hierarchies, header files, forward declarations, circular-dependency workarounds — is absent, and its absence is a design decision rather than an omission. This chapter explains the pieces and, just as importantly, the rules that keep them predictable.
+
+14.1 Files, Folders, and the Module Surface
+
+A Coral source file ends in .crl. A folder that participates in a build is a module. A module's public face is a file named lib.crl in that folder. Everything the module exports to the rest of the program is listed in lib.crl, and everything lib.crl re-exports becomes the module's namespace.
+
+Consider a folder src/text/:
+
+    src/text/
+    ├── lib.crl          # the module surface
+    ├── string.crl       # String
+    ├── strutil.crl      # free functions on str
+    └── ascii.crl        # ASCII helpers
+
+The surface declares what the module offers:
+
+    // src/text/lib.crl
+    pub mod string  = import string;
+    pub mod strutil = import strutil;
+    pub mod ascii   = import ascii;
+
+Each pub mod NAME = import TARGET; line takes a sibling, gives it a public name, and makes it reachable as text::NAME from outside. Code that does not appear in lib.crl is not part of the module's surface; it is visible only within the module's own files. That single rule — the surface file is the contract — is what lets a module have a large private implementation and a small public face.
+
+14.2 The Four Import Forms
+
+A file brings names into scope with import. There are four forms, and each answers a different question.
+
+The first form imports a sibling file by bare name. There are no quotes and no extension; the name is the file name without .crl, resolved in the importing file's own directory:
+
+    import lexer { Lexer, Token };
+
+This is the form you use inside a module, where files sit next to each other. Because the name is a bare identifier, it is greppable: searching for "import lexer" finds every file that depends on lexer.crl, and a bare name cannot accidentally contain a path that escapes upward. If a dependency is not a sibling, it is not a sibling import; it is one of the following forms.
+
+The second form imports a name from another module through the module table. A double-colon path names the module and the exported item:
+
+    import lexer::table { TokenTable };
+    import common::slice { Slice };
+
+The builder resolves lexer::table against the module map it generated from every module's lib.crl (Section 14.6). The importing file never states a path; it states an identity, and the build system owns the mapping from identity to file.
+
+The third form imports from a library surface, marked with the (lib) qualifier:
+
+    import(lib) std::text::string { String };
+    import(lib) std::collections::vec { Vec };
+    import(lib) std::io::ios { print, println, eprintln };
+    import(lib) std::option { Option };
+    import(lib) std::result { Result };
+
+This is the everyday form for reaching the standard library. std is the library root; the path after it names the module; the braces name the symbols. When you want a module's whole surface rather than specific symbols, drop the braces:
+
+    import(lib) std;
+
+The fourth form imports with an alias:
+
+    import renderer::framebuffer { FrameBuffer as FB };
+
+An alias binds a different local name to the imported symbol. Use it when a name is long, or when two imported names collide and you want to keep both.
+
+Every form accepts a grouped, nested right-hand side, so a file can state several imports in one place without repeating the prefix:
+
+    import(lib) std {
+        io::{ print, println, eprintln },
+        text::string::{ String },
+        collections::vec::{ Vec },
+    };
+
+    import lexer {
+        table::{ TokenTable, TokenKind },
+        ident::{ scanIdent, isIdentStart },
+    };
+
+The nesting is purely textual grouping. The final binding is always the last segment: io::{print} binds the name print. A trailing comma after the last group is allowed, which keeps diffs small when you add an item.
+
+What is deliberately not allowed is as important as what is. There is no string-literal import path, no "…/foo.crl", no ../ to climb directories. A path string is nameless — it introduces no binding a reader can grep for and no constraint a compiler can check — so Coral removed it. If a file is not a sibling, it is reached through a module name, and module names are the builder's business, not the source's.
+
+14.3 Visibility and Enforced Privacy
+
+An item is private to its file and module unless it is marked pub.
+
+    pub struct Point { f64 x; f64 y; }
+    struct Internal { i32 scratch; }        // private to this file
+
+    pub f64 magnitude(Point p) { return ...; }
+    f64 helper(i32 n) { ... }                // not callable from outside
+
+A private item is not merely undocumented; it is invisible. The compiler enforces module privacy: a name that is not pub cannot be called or referenced from outside the module that declares it, and the attempt is an error rather than a warning. Reaching across a module boundary to a private symbol is the kind of coupling that makes refactoring expensive, so the language refuses to allow it by accident. If you need something to be reachable, you mark it pub and it becomes part of the contract you are agreeing to maintain.
+
+Privacy applies at the item level, not only the module level. In the surface file, only pub mod lines export anything. Inside a module, only pub functions, types, constants, and fields are visible to importers. And note that fields are items too: a pub struct may have private fields, in which case outside code can name the type but cannot read or write the fields directly. This is how you make an opaque handle — a type whose representation is the module's business:
+
+    // in module net, file socket.crl
+    pub struct TcpSocket {
+        i32 fd;                    // private field
+    }
+
+    pub Result<TcpSocket, IoError> tcpConnect(str host, u16 port) { ... }
+    pub void tcpSend(TcpSocket* s, const u8[] data) { ... }
+
+Outside code can hold a TcpSocket, pass it to tcpSend, and never touch the descriptor. If the representation changes from an fd to a pointer, no caller notices. That is the whole point of a private field: it makes the type's representation free to change.
+
+For a nominal type that must not be confused with its representation under any circumstance, distinct is the stronger tool (Chapter 4): pub distinct TcpSocket = i32; gives a type that is the fd's bytes but not the fd's type, so no caller can treat a socket as an integer even by accident.
+
+14.4 Qualifying Names
+
+Imported symbols are used by their bare names. When you want to be explicit, or when a name would be ambiguous, you qualify with the module:
+
+    import(lib) std::text::string { String };
+    import(lib) std::collections::vec { Vec };
+    import(lib) std::option { Option };
+
+    String greeting = String::from("hello");
+    Vec<i32> nums = Vec<i32>::new();
+    Option<i32> maybe = Option<i32>::Some { .value = 42 };
+
+The type name is bound by the import; :: is how you reach an associated item (a static method such as new, a variant case such as Some, a constant). This is the same :: that qualifies enum cases and variant cases in Chapter 13, generalised to module members. A module's exported name is the last segment, so std::text::string exports String, std::collections::vec exports Vec, and so on. The standard library is organised in nested folders precisely so that a module name is short and a symbol name is unique within it; you write vec::Vec or just Vec after importing it, never the full folder path.
+
+14.5 Re-exports and Module Aliases
+
+A module may re-export another module under a new name. pub mod NAME = import TARGET; is not a submodule declaration; it is a re-export, a one-line forwarding statement:
+
+    // src/lib.crl — the program's own surface
+    pub mod text   = import(lib) std::text;
+    pub mod bits   = import(lib) std::collections::bitset;
+    pub mod shapes = import shapes;
+
+The first two lines re-expose standard-library modules under the program's own surface; the third exposes a local module. Re-exports are how a library presents a curated view: a program can decline to re-export a std module it does not want to be part of its own API, and it can rename a module whose name is too generic for its domain. Because a re-export is a single line, the module table stays small and a reader can see the whole public surface at a glance.
+
+There is a special case worth remembering: a module whose surface is a single file can be reached as that file. If a folder contains only lib.crl, the module is the file. And conversely, a sibling file that is imported by bare name does not need an entry in lib.crl; only items you want visible outside the module do.
+
+14.6 Cycles, Resolution, and the Module Map
+
+Two files that import each other would, naively, require each to be compiled before the other. Coral resolves this by separating declaration from definition. The compiler reads every file's top-level declarations before it reads any function body, so a function may call a function declared later in the same module, and two modules may refer to each other's types as long as neither needs the other to be fully defined to compute a type's size. This is the same "declare all, then define" prescan that lets array sizes be order-independent within a file, lifted to the module level.
+
+For cross-module imports, the builder does the resolution in a pass of its own, before the compiler runs. It walks every module listed in the build file, reads each lib.crl's pub mod lines, and writes a module map: a plain-text table from a module identity such as lexer::table to the file that implements it.
+
+    # coral modules.map v1 — generated by coralc build, do not edit
+    lexer::base     ->  compiler/coral-lexer/base.crl
+    lexer::table    ->  compiler/coral-lexer/table.crl
+    parser::expr    ->  compiler/coral-parser/expr.crl
+
+The map is text, not JSON, for three reasons the build documentation states plainly: it diffs cleanly in git, it is greppable, and reading it needs no parser. When the compiler sees import lexer::table, it asks the map for a path and the map answers. The compiler never walks the filesystem guessing; the map is the single source of truth for where a module lives. Cycles in the module graph are detected by the builder (E1006, with a trace), so a genuine build-order cycle is reported as a build error rather than hanging.
+
+When a module cannot be resolved, the builder reports it as its own class of error: an unresolved re-export path (E1004), a missing module (E1001), a duplicate module identity (E1002), an alias pointing at a nonexistent module (E1003), or an unresolved module import (E1005). These are build errors, distinct from the compiler's E-codes for source-level problems, and Chapter 20 describes the build pipeline that produces them.
+
+14.7 Standard Library Roots and Resolution Order
+
+The standard library is reached through two roots. std is the portable surface — the modules that every platform provides with the same names, parameters, and return types. core holds the pieces the language itself depends on: str, cchar, char utilities, and the numeric limits. A third root, platform, holds the parts that are genuinely platform-specific, such as libc bindings.
+
+Platform parity is a first-class rule of the standard library: every public API that exists for one platform has a direct equivalent on the other, with the same name, the same parameters, and the same return type including its error type. Internals differ — a Linux build issues one syscall and a Windows build issues another — but a program written against std compiles on both. A user's import does not change when the target changes:
+
+    import(lib) std::io::fs { File, open, read, write };
+    import(lib) std::concurrent::thread { threadCreate, threadJoin };
+
+The same source builds on x86_64 Linux and x86_64 Windows because the module names are the contract. This is why the standard library organises by capability (io, collections, text, concurrent, crypto) rather than by platform: the platform lives behind the surface.
+
+When the compiler resolves an import, it searches, in order, the project's own lib, the current directory's lib, and finally the global library root (the CORAL_HOME/lib or ~/.coral/lib installation), checking the platform subtree before the base subtree. That order means a project can shadow a standard module with its own implementation by placing a lib of the same name next to itself — a deliberate escape hatch, and one to use sparingly, because a shadowed std module is a surprise for the next reader.
+
+14.8 A Worked Example: A log Module
+
+Assemble the pieces. Suppose you are building a module that formats and emits log lines. Create a folder and give it a surface:
+
+    src/log/
+    ├── lib.crl
+    ├── level.crl
+    └── logger.crl
+
+The level file declares the level as an enum and a rendering function, private to the module except for what level.crl marks pub:
+
+    // src/log/level.crl
+    pub enum Level { Debug, Info, Warn, Error, Fatal }
+
+    pub str levelName(Level l) {
+        return switch (l) {
+            Level::Debug => "DEBUG",
+            Level::Info  => "INFO",
+            Level::Warn  => "WARN",
+            Level::Error => "ERROR",
+            Level::Fatal => "FATAL",
+        };
+    }
+
+    str levelTag(Level l) { return levelName(l); }   // private helper
+
+The logger file imports the sibling and uses it:
+
+    // src/log/logger.crl
+    import level { Level, levelName };
+    import(lib) std::io::ios { println };
+
+    pub struct Logger {
+        Level minLevel;
+        str   name;
+    }
+
+    pub void log(Logger* self, Level l, str message) {
+        if (l < self.minLevel) return;
+        println("[{}] {}: {}", self.name, levelName(l), message);
+    }
+
+Now the module's public surface exports exactly what it intends:
+
+    // src/log/lib.crl
+    pub mod level  = import level;
+    pub mod logger = import logger;
+
+Outside the module, code writes:
+
+    import myapp::log::logger { Logger, log };
+    import myapp::log::level { Level };
+
+    var logger = Logger { .minLevel = Level::Info, .name = "server" };
+    log(&logger, Level::Warn, "disk almost full");
+
+Notice what a caller can and cannot see. It can see Logger and log because logger.crl marked them pub and lib.crl re-exported them. It can see Level because level.crl marked it pub. It cannot see levelTag, because that function is not pub. It cannot see Logger's fields being mutated through a private representation it does not know, only the fields the type exposes. Each file's imports name exactly what it uses, so the dependency graph is readable line by line: logger depends on level and on std::io::ios, and nothing else.
+
+14.9 Exercises
+
+1. Comprehension. What is the difference between a module's private items and its lib.crl surface? Which one is the contract?
+
+2. Comprehension. Why does Coral reject import "path/to/file.crl" in favour of import mod::item? Give two concrete costs of the string form.
+
+3. Implementation. Take the log module of 14.8 and add a Sink variant so a Logger can write to stdout, a file, or memory. Keep the union of behaviour behind one public API and make every helper private.
+
+4. Modules. Four files in a folder each import a sibling named token. Which file is token.crl resolved against — the importing file's directory, the module root, or the current working directory? Explain why the answer matters when two modules both have a token.crl.
+
+5. Visibility. A pub struct is declared with a private field. Write an accessor pair (a getter and a setter) and explain what a caller gains over reading the field directly. When would you expose the field instead?
+
+6. Build. Sketch the lib.crl for a module that re-exports two std modules under shorter local names, without copying their implementations. Which import form do you use?
+
+7. Cycles. Two modules refer to each other's types. Explain why this compiles, and give one case where it would not.
+
+8. Meta. The chapter claims privacy is what makes refactoring affordable. Argue the opposite: describe a situation where enforcing privacy costs more than it saves, and say how you would work around it without weakening the rule globally.

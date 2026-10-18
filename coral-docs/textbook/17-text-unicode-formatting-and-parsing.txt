@@ -1,0 +1,277 @@
+Chapter 17
+
+Text, Unicode, Formatting, and Parsing
+
+Strings Are Not an Afterthought
+
+In C, a string is a pointer to bytes with an implicit terminator and no length, and every string bug in the last fifty years descends from that decision. Coral does not repeat it. A string in Coral carries its length, and there are two string types with clearly separated jobs: str, the borrowed view, and String, the owned, growable buffer. Around them sit modules for ASCII, UTF-8, formatting, and parsing, each small and each with a defined place. This chapter is a tour of that text layer, and it ends where text usually ends — turning it into structured data.
+
+17.1 str: The Borrowed View
+
+str is the built-in string type. It is a fat pointer: a pointer to bytes plus a length, declared implicitly by the language rather than by a library:
+
+    // conceptually
+    struct str {
+        const u8* ptr;
+        usize len;
+    }
+
+A string literal is a str. A substring is a str — a pointer and a length into the original buffer, sharing its storage. Passing a string to a function passes two words, not a copy of the characters:
+
+    str greeting = "hello";
+    usize n = greeting.len;               // 5, not a strlen scan
+    u8 first = greeting.ptr[0];           // 'h'
+
+Choosing str for parameters is the default for a reason: a function that only reads a string should take a str, because doing so accepts a literal, a slice of a String, and a window into a larger buffer, all without copying. This is the borrow of Chapter 11 — a str never owns its bytes, and its lifetime is bounded by whatever does. A str stored beyond the function call that produced it is a dangling view unless the buffer outlives it; the type system will not stop you, which is why str is for parameters and short-lived locals, not for struct fields that outlive their source.
+
+Because str carries a length, its operations are safe and cheap. The core::str module extends the type with the methods that read it:
+
+    usize count = s.codepointCount();      // number of Unicode codepoints
+    char cp; usize i = 0;
+    while (s.nextCodepoint(&i, &cp)) { ... }   // decode one codepoint at a time
+
+The methods that read a str without owning it live here and in the text utility modules, and they all respect the length rather than scanning for a terminator.
+
+17.2 String: The Owned Buffer
+
+When you need to build a string — accumulate, edit, grow — you use String, from std::text::string. A String owns a heap buffer with a length and a capacity, exactly like a Vec<u8> with text-aware methods:
+
+    pub struct String {
+        u8*   ptr;
+        usize len;
+        usize cap;
+    }
+
+Construct one from a view, from a C string, or empty:
+
+    String a = String::from("hello");
+    String b = String::fromCstr(cstr);
+    String c = String::new();
+    String d = String::withCap(1024);
+
+The methods cover the operations a text buffer needs. Append with pushView, pushStr, or pushChar; insert and remove in the middle; clear, truncate, shrinkToFit:
+
+    String sb = String::new();
+    sb.pushView("Hello, ");
+    sb.pushStr(&name);
+    sb.pushChar('!');
+    sb.pushRepeat('-', 20);            // "--------------------"
+    sb.truncate(10);
+    str view = sb.asView();            // borrow the contents without copying
+    sb.clear();
+
+Two conversions matter and are easy to confuse. asView returns a str that borrows the String's buffer — cheap, and invalidated if the String is reallocated or freed. clone returns a new String that owns a copy:
+
+    str borrowed = sb.asView();        // no allocation
+    String owned = sb.clone();         // allocates
+
+Use asView to pass a String to a function that takes a str; use clone when the copy must outlive the original. A String is freed by free or by its @drop conformance; a str is never freed because it never owned anything. The pairing — an owned buffer and a borrowed cursor into it — is the same ownership discipline Chapter 11 teaches for pointers, applied to text, and it is worth internalising because every text bug in a systems language is ultimately an ownership mistake.
+
+17.3 ASCII, UTF-8, and Codepoints
+
+Text has layers, and Coral names them. A byte is a u8. An ASCII character is a byte with an ASCII meaning. A codepoint is a Unicode scalar value, up to 21 bits, stored as char. An encoded character is one to four bytes of UTF-8. The text modules keep these layers distinct.
+
+The ascii module classifies and converts bytes, and every function is O(1):
+
+    ascii::isAsciiDigit(b)
+    ascii::isAsciiAlpha(b)
+    ascii::isAsciiAlnum(b)
+    ascii::isAsciiSpace(b)
+    ascii::toAsciiLower(b)
+    ascii::toAsciiUpper(b)
+    ascii::asciiDigitVal(b)          // '7' -> 7
+    ascii::asciiHexVal(b)            // 'f' -> 15
+
+For the common case of lowercasing an ASCII string, this is all you need, and it is faster than any Unicode-aware routine. Reach for it whenever the text is known to be ASCII — identifiers, protocol keywords, command names.
+
+The utf8 module handles the general case: encode and decode codepoints, count them, validate the encoding, and case-convert.
+
+    utf8::encodeCodepoint(cp, out)          // -> bytes written
+    utf8::decodeCodepoint(s, len, &consumed) // -> codepoint
+    utf8::codepointLen(s, len)
+    utf8::countCodepoints(s, len)
+    utf8::isValid(s, len)
+    utf8::toLower(s, len)                   // -> String
+    utf8::toUpper(s, len)                   // -> String
+    utf8::nextChar(s, len, &consumed)       // -> Option<char>
+
+Both modules are thin wrappers over the same logic that char_util in core provides, and the separation lets a caller state which level of text it is working at. A function that claims to count characters and counts bytes instead is one of the classic text bugs; naming the layer in the call — countCodepoints rather than a byte count — is how that bug becomes visible.
+
+The str type itself carries the codepoint-aware methods, so the common iteration is on the value rather than through a free function:
+
+    usize idx = 0;
+    char c;
+    while (s.nextCodepoint(&idx, &c)) {
+        println("{}", c);
+    }
+
+The idx is threaded through so the next call continues where the last stopped, which is how UTF-8 is decoded forward without a separate cursor object. A byte that does not begin a valid sequence decodes to the replacement character, so a malformed string produces visible garbage rather than a crash.
+
+17.4 Formatting
+
+Coral's formatting is checked at compile time, which is what makes it safe and what makes its limits visible. The entry points are the print family in std::io::ios:
+
+    pub void print<comptime T>(T fmt, ...)
+    pub void println<comptime T>(T fmt, ...)
+    pub void eprint<comptime T>(T fmt, ...)
+    pub void eprintln<comptime T>(T fmt, ...)
+
+Each takes a format string and a variadic tail of arguments. The comptime parameter from Chapter 7 is what lets the compiler inspect the format and the argument types together, so a mismatch is a compile error rather than a runtime surprise.
+
+Placeholders are braces. The default is {}, which renders the argument by dispatching on its type:
+
+    println("x = {}, y = {}", x, y);
+    println("name = {}, age = {}", name, age);
+
+The dispatcher handles every built-in scalar, cchar, char, both C strings, str, String, and rawptr, and any type implementing the built-in @toStr trait — the mechanism from Chapter 6. A type that implements neither a built-in printer nor @toStr is a compile error at the call site, which is the correct behaviour: you cannot accidentally print a struct as raw bytes. The error names the type, and the fix is to add a @toStr conformance.
+
+Explicit placeholders select a rendering. {:d} renders an integer in decimal, {:x} in hexadecimal, {:b} in binary, {:p} renders a pointer, and {..} spreads a whole iterable, rendering each element through the default dispatch and separating them with a comma and a space:
+
+    println("value = {:d} hex = {:x} bin = {:b}", n, n, n);
+    println("at {:p}", ptr);
+    println("items: {..}", vec);
+
+The integer formats are integer-only — a non-integer argument is a compile error — so the compiler catches the mistake of formatting a float with {:x} rather than silently producing nonsense. The spread {:..} relies on range-for over the argument and is likewise a compile error on a non-iterable, which means a typo is caught at build time.
+
+For widths and the presentations that placeholders do not cover, the library provides manipulators — small values that render specially when passed as an argument. spaces(n) emits n spaces, repeat(ch, n) repeats a character, hex(value) and bin(value) render an integer in those bases, and fixed(value, precision) renders a float with a set number of decimal places:
+
+    println("{}right-aligned", spaces(10));
+    println("{}", repeat('-', 30));
+    println("{}", hex(0xDEADBEEF));
+    println("{}", fixed(3.14159, 2));       // 3.14
+    println("{}{}", padLeft(s, 10, ' '), "");
+
+padLeft and padRight from std::fmt pad a string to a width with a fill byte, which with the manipulators covers the alignment needs that a formatter usually provides.
+
+One honest caveat belongs in the text. The std::fmt module also exposes a function named format, but it is a stub: it strips braces and substitutes nothing, so it is not a general-purpose formatter. Interpolation lives in print and println, which do substitute, and in the formatX family — formatInt, formatUint, formatFloat, formatHex, formatBin, formatChar — which convert a single value to a String. When you need to build a string from pieces, that is the route: convert each value with the format function it deserves and concatenate with pushView, or use print to stderr if you only need output. The chapter states this plainly because a reader who reaches for format expecting interpolation will be quietly wrong, and a stub that fails silently is exactly the kind of trap a textbook should flag.
+
+17.5 The Parsing Layer
+
+Text becomes structure through the parser modules, and Coral ships enough of them that most programs do not need a dependency. They share a design: a variant models the parsed document, a parse function returns a Result, and a serialise function writes one back.
+
+The JSON parser is the model to learn. It defines a recursive variant for a JSON value:
+
+    pub variant JsonValue {
+        Null,
+        Bool   { bool value; },
+        Number { f64 value; },
+        Str    { String value; },
+        Array  { Vec<JsonValue> items; },
+        Object { Vec<JsonPair> fields; },
+    }
+
+and a parser that returns a Result, so malformed input is a value rather than an exception:
+
+    Result<JsonValue, JsonError> parseJson(str input);
+
+A JSON document is handled with a switch over the variant, exactly as Chapter 13's interpreter handled expressions:
+
+    f64 numberField(JsonValue doc, str key) {
+        switch (doc) {
+            JsonValue::Object { fields } => {
+                for (JsonPair p : fields) {
+                    if (p.key == key) {
+                        switch (p.value) {
+                            JsonValue::Number { value } => return value,
+                            else => return 0.0,
+                        }
+                    }
+                }
+                return 0.0;
+            }
+            else => return 0.0,
+        }
+    }
+
+The same shape recurs across the parser family: a toml module with a TomlValue variant and a TomlDoc document, an ini module with IniFile and IniSection, an xml module with a node tree, and a uuid module for identifiers. Because each models its format as a variant, the exhaustiveness checking of Chapter 13 applies to the results: a switch that forgets a JSON type fails to compile. And because each returns a Result, the failure path is handled as Chapter 15 describes rather than thrown. The library's parsers are a small demonstration of the same principles the rest of this book is about, which is why reading their source is a good exercise once the earlier chapters have landed.
+
+17.6 A Worked Example: A Tiny CSV Reader
+
+Put the layer to work. A comma-separated-values reader must split lines into fields, handle quoted fields, and convert numbers. Each step uses a different part of the text toolkit.
+
+    import(lib) std::text::strutil { trim };
+    import(lib) std::text::string { String };
+    import(lib) std::collections::vec { Vec };
+    import(lib) std::io::ios { parseF64 };
+
+    Vec<str> splitCsvLine(str line, String* scratch) {
+        Vec<str> fields = Vec<str>::new();
+        bool inQuotes = false;
+        usize start = 0;
+
+        for (usize i = 0; i < line.len; i += 1) {
+            u8 c = line.ptr[i];
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                fields.push(trim(substr(line, start, i - start)));
+                start = i + 1;
+            }
+        }
+        fields.push(trim(substr(line, start, line.len - start)));
+        return fields;
+    }
+
+    f64 csvNumber(str field) {
+        bool ok = false;
+        f64 v = parseF64(field, &ok);
+        if (!ok) {
+            eprintln("not a number: {}", field);
+            return 0.0;
+        }
+        return v;
+    }
+
+The reader walks bytes because CSV is a byte-level format, toggles inQuotes on quote characters, and slices fields with substr — a str, so no copying. trim strips the surrounding whitespace; parseF64 in the I/O module converts a str to a number and reports success through an out-parameter, the library's lightweight alternative to a Result when the caller only needs a yes-or-no. This is the shape most text processing takes: scan bytes for structure, slice out views, trim, convert, and only allocate a String when the text must be owned and outlive its source.
+
+17.7 A Worked Example: Human-Readable Sizes
+
+Formatting is as much a part of the text layer as parsing, and a small formatter shows the manipulators in use.
+
+    import(lib) std::io::ios { print, println, fixed };
+    import(lib) std::text::string { String };
+
+    str byteUnit(f64 bytes) {
+        if (bytes < 1024.0)        return "B";
+        if (bytes < 1024.0 * 1024.0) return "KiB";
+        return "MiB";
+    }
+
+    String humanSize(f64 bytes) {
+        str unit = byteUnit(bytes);
+        f64 scaled = bytes;
+        if (unit == "KiB") scaled = bytes / 1024.0;
+        if (unit == "MiB") scaled = bytes / (1024.0 * 1024.0);
+
+        String out = String::new();
+        out.pushView(fixed(scaled, 1).asView());
+        out.pushChar(' ');
+        out.pushView(unit);
+        return out;
+    }
+
+    println("cache: {}", humanSize(1536.0));     // cache: 1.5 KiB
+
+fixed renders the scaled value with one decimal place; the result is a String whose view is appended to the output buffer. The pattern — convert values with the right format function, assemble with pushView, and only print at the end — is how a program builds a message without interpolation for the cases where interpolation is not available. It is more verbose than a single println, and it is the right tool when the string must be returned rather than printed.
+
+17.8 Exercises
+
+1. Comprehension. What is the difference between str and String? Give a function signature for which each is the correct parameter type.
+
+2. Comprehension. Why does countCodepoints exist alongside a byte length? Give a string whose byte length and codepoint count differ, and say which one a text editor should display.
+
+3. Implementation. Write a function that reverses a UTF-8 string by codepoint, not by byte. Use nextCodepoint and a String buffer.
+
+4. Implementation. Write isPalindrome(str) bool that ignores case and non-alphanumeric characters. Which library functions help?
+
+5. Formatting. Print a price table where each column is aligned: a name left-aligned to twenty characters and a price right-aligned to ten. Which manipulators and padding functions do you need?
+
+6. Parsing. Extend the CSV reader to handle quoted fields containing commas. Write the test case that made the original reader fail.
+
+7. Conversion. Write parseI64(str, bool*) by hand without using the library, then compare its behaviour to the library's on the inputs "", "-", "12x", and " 12". Which inputs should fail?
+
+8. Design. Model a small configuration file format as a variant, then write the parser's signature as a Result. Why is a Result the right return type rather than a bool plus out-parameters?
+
+9. Unicode. A user types an emoji (four UTF-8 bytes) into a name field limited to ten characters. Counted in bytes, how many can they type? Counted in codepoints, how many? Which should the limit use, and why?
+
+10. Meta. The formatting system rejects an unprintable type at compile time, whereas a printf in C prints garbage and a Python f-string calls str at runtime. Argue for and against compile-time checking of format strings. Name a case where it is inconvenient.

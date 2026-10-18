@@ -1,0 +1,374 @@
+Chapter 12
+
+Tuples and Destructuring
+
+Two Answers for the Price of One Call
+
+Think about the last time a function needed to hand you back more than one thing. A division wants to give you the quotient and the remainder. A weather reading wants to give you the temperature and the humidity. A collision check wants to give you whether it hit, and where. A parser wants to give you the parsed value and the position it stopped at. You have wanted this hundreds of times, and every language has its own awkward answer for it.
+
+C's answer is the out-parameter. You call `divmod(10, 3, &quotient, &remainder)` and the function writes into storage you had to declare first. It works, but it reads backwards: the answer is in the arguments, the call looks like it is passing data in, and nothing in the call site tells you which arguments are inputs and which are outputs. C++ and Java's answer is to invent a tiny class — `Pair`, `DivResult`, `Bounds` — name it, give it a home, and hope nobody confuses it with the other four `Pair` classes floating around the project. Python and Rust's answer is the tuple: a few values travelling together in one value, with no name and no ceremony. Coral has that answer too.
+
+This chapter is about the tuple: what it is, how to make one, how to take one apart, and — just as important — when a tuple is the wrong tool and you should reach for a struct instead. It is a small feature, but it sits underneath things you will use constantly. The standard library's map lookups, the iterator adaptors, and most of the examples in later chapters lean on it. So it is worth getting the mental picture exactly right rather than memorising the syntax and moving on.
+
+12.1 What a Tuple Actually Is
+
+A tuple is the smallest aggregate a language can offer. An aggregate is just "a value made of several values," and the tuple is the version of that with no field names, no methods, and no identity beyond its shape. A pair is two values. A triple is three. That is the whole idea.
+
+Here is the trouble with inventing a struct every time you want a pair, and it is worth naming precisely, because it is not the typing that hurts. It is the naming. Every throwaway struct needs a name. The name needs a place to live — a file, an import, a spot in the public API. And once a name exists, it acquires gravity: a later reader sees `Point2` in the public headers and assumes it means something, assumes it is part of the domain model, assumes deleting it will break things. A tuple refuses all of that. It says: these two values travel together for the next three lines, and then they stop being a thing.
+
+So a tuple is for ephemeral, positional, local structure. "Positional" is the key word. In a struct, order does not matter, because you reach fields by name: `p.x` and `p.y` do not care which was declared first. In a tuple, order is the only thing that identifies a piece. The first element is the first element, and that is what `.0` means.
+
+Here is the one-line version, and everything else in this chapter is a detail hanging off it:
+
+    var point = (3.0, 4.0);      // a pair: two values in one
+
+That is a tuple. `.0` is `3.0`, `.1` is `4.0`. It has no name, it was not declared anywhere, and it will not survive past the function that made it unless you hand it to someone. That lightness is the entire point.
+
+12.2 Writing a Tuple Type
+
+A tuple type is a parenthesised, comma-separated list of types. The parentheses are doing the aggregating, and the commas are the members:
+
+    (i32, f64)                 // a pair: an integer and a float
+    (u8, u8, u8)               // three bytes, perhaps a colour
+    (String, usize)            // an owned string and a length
+    (i32, (i32, i32))          // a pair whose second element is itself a pair
+    (f64, f64, f64, f64)       // four floats
+
+There is a rule you must meet early because it surprises almost everyone. A tuple with exactly one element must carry a trailing comma:
+
+    (i32)                      // this is just i32 in parentheses
+    (i32,)                     // this is a one-element tuple containing an i32
+
+Hold on — let me explain that more plainly. When you write `(i32)`, the compiler cannot tell whether you meant "the type that is one i32" or "the type `i32`, and I am using parentheses to group it." Parentheses around a single type already have a job: grouping. They do not, on their own, mean "aggregate." So the language requires the trailing comma to say, unambiguously, "I mean a tuple, and it happens to have one field." Python and Rust settled on the same rule, for the same reason.
+
+The one-element tuple is rare but not useless. It shows up when a generic function must return "a T, wrapped as a tuple" to fit a shape, and it shows up when you want a tuple type to be structurally distinct from the bare type. Mostly you will not write one.
+
+Now the empty tuple, written `()`. This is the unit type. It has exactly one value, also written `()`, and it means "no information." A function that returns nothing is, under the hood, returning the unit type. Coral lets you write `void` for that role in most places, and usually you should, because `void` reads as "this returns nothing." But `()` has a job that `void` cannot do: it is a real, usable type when a generic construct needs "a type whose values carry no data." A `Map<str, ()>` is a set of strings. A channel of `()` is a signal. A state-machine transition that yields nothing can yield `()`. Unit is not nothing; it is a type whose only value takes zero bytes.
+
+There is a second spelling for tuple types, and it is worth knowing because you will meet it in the compiler's own output. Where the parser could be confused between "a tuple type" and "a parenthesised expression," you may write `struct(...)`:
+
+    struct(i32, f64)           // exactly the same type as (i32, f64)
+
+`struct(i32, f64)` and `(i32, f64)` are the same type — literally the same, not merely compatible. Use the parenthesised form in ordinary code and keep `struct(...)` in your back pocket for corners where grouping would be misread.
+
+One last idea, and it explains a lot of the rest. Underneath, a tuple is a struct whose fields happen to be numbered. `(i32, f64)` is a struct with a field named `0` of type `i32` and a field named `1` of type `f64`. That is why access is `.0` and `.1`: they are field accesses, the same syntax you use for a named field, with numbers for names because the tuple never gave them names. It is also why the tuple's layout is exactly a struct's layout: declaration order, each element aligned to its natural boundary. No hidden header, no heap, no bookkeeping.
+
+12.3 Writing a Tuple Value
+
+A tuple literal is a comma-separated list of values in parentheses. Its type is inferred from the elements, element by element:
+
+    var pair = (1, 2.5);              // inferred (i32, f64)
+    var rgb = (255u8, 128u8, 0u8);    // (u8, u8, u8)
+    var origin = (0.0, 0.0);          // (f64, f64)
+    var nested = (1, (2, 3));         // (i32, (i32, i32))
+    var swapped = (origin.1, origin.0);  // (f64, f64)
+
+Two tuple literals with the same shape but different element types are different types, and they do not unify. This catches a genuinely common mistake:
+
+    var a = (1, 2);        // (i32, i32)
+    var b = (1, 2.0);      // (i32, f64) — not the same type as a
+
+You cannot assign `b` to a variable of `a`'s type, and you cannot put them in the same vector, because `Vec<(i32, i32)>` and `Vec<(i32, f64)>` are as different as `i32` and `f64`. The good news is that this is exactly what you want: a function that takes a pair of integers should not silently accept a pair of (integer, float).
+
+The unit literal is `()`:
+
+    var nothing = ();      // the one value of the unit type
+
+Tuples are values, and they behave like values. They live on the stack. They are copied when assigned, subject to the move rules you met in the chapters on memory. They are passed by value. There is no implicit boxing and no heap allocation unless you deliberately put a tuple that owns heap data inside something that owns it. A `(i32, i32)` is eight bytes and moves like eight bytes. A `(f64, f64, f64)` is twenty-four bytes and moves like twenty-four bytes. Nothing is hidden.
+
+That "nothing is hidden" quality is why tuples are the right tool for hot paths and low-level code. There is no constructor call, no reference counting, no object header. It is just bytes laid out in order.
+
+12.4 Getting the Pieces Out by Position
+
+Tuples are indexed by position with a dot and a decimal integer:
+
+    var t = (10, 20, 30);
+    var first  = t.0;      // 10
+    var second = t.1;      // 20
+    var third  = t.2;      // 30
+
+Two things distinguish this from array indexing. First, the index is not an expression; it is part of the syntax. `t.0` is valid, `t.i` is not — the compiler will reject the letter. Second, because the index is fixed at compile time, the compiler always knows the exact type of every element. If `t` is `(i32, f64, bool)`, then `t.0` is `i32`, `t.1` is `f64`, and `t.2` is `bool`, known at compile time with no runtime lookup and no bounds check. Compare an array, where `arr[i]` has one element type and the index is computed at runtime.
+
+The reason the index must be a literal is exactly this: it lets the compiler resolve each access to a fixed field. `t.0` compiles to "the first field," not "look up field number zero." That is why a tuple access is free — it is a field access, and the field's position and type are baked in.
+
+You can assign a whole tuple to a mutable variable, and you can reassign a tuple-valued location:
+
+    var p = (1, 2);
+    p = (5, 6);            // p is now (5, 6); the types still match
+
+A tuple is not a place you reach into and edit piece by piece so much as a value you replace wholesale. When you find yourself wanting to change just the second element, that is a hint that you want a struct with named mutable fields, or that you should build a fresh tuple — which, as we are about to see, is often what destructuring is for.
+
+12.5 Taking a Tuple Apart: Destructuring
+
+Reading `t.0`, `t.1`, `t.2` is fine for a pair or a triple, but it gets noisy fast. The clean way to go from one tuple to its parts is destructuring: a binding that names every piece at once.
+
+    var (x, y) = (3.0, 4.0);
+    // x is 3.0, y is 4.0
+
+    var (q, r) = divide(17, 5);
+    // the whole tuple was split in one line
+
+The form is `var (names...) = tuple;`, and the number of names must match the number of elements. You can also state the type instead of asking for inference, which is how you pin down what the pieces are when the compiler could go either way:
+
+    (i32, bool) (q, r) = divide(17, 5);
+    (f64, f64) (x, y) = (3.0, 4.0);
+
+Read the second form as "a binding of type `(i32, bool)` that names its pieces `q` and `r`." This is the same `Type (...) = value;` shape as any other typed local, with the parenthesised pattern standing where the variable name would go. And the pieces are ordinary locals: `x` and `y` are `f64` variables you can read, pass, and reassign like any other.
+
+Patterns nest, because the type nests:
+
+    var (n, (innerX, innerY)) = (1, (2, 3));
+    // n is 1, innerX is 2, innerY is 3
+
+Here is where Coral differs from Rust and Python in a way you must internalise, because the muscle memory is strong. There is no underscore discard placeholder in a Coral pattern. In Rust you would write `let (keep, _) = pair;` to ignore the second piece. Coral has no `_` for that; `_` is not a wildcard. So if you only want one piece of a tuple, you reach for `.0` or `.1` directly rather than destructuring and throwing part away:
+
+    var pair = (10, 20);
+    var keep = pair.0;        // just read the first element
+    // (there is no "var (keep, _) = pair;" in Coral)
+
+Hold on — if the language has no discard, why is destructuring useful at all? Because the common case is that you want all the pieces. A function returned a quotient and a remainder; you want both. A lookup returned a key and a value; you want both. Destructuring is for the case where the tuple's whole point is that it delivered a complete answer. When you only want part of it, the part you want has a position, and `.0` or `.1` is clearer than a pattern that names things it ignores.
+
+12.6 Destructuring in Loops, Switches, and Signatures
+
+The real payoff of patterns is that they show up everywhere a value is bound, not just in a plain `var` line. The most common of these is the range-based `for`, where you iterate over a container of tuples and name the pieces directly:
+
+    Vec<(str, i32)> scores = Vec<(str, i32)>::new();
+    scores.push(("ada", 92));
+    scores.push(("grace", 97));
+
+    for (var (name, score) : scores) {
+        println("{} scored {}", name, score);
+    }
+
+There is no `entry.0` and `entry.1` anywhere; the loop variable is a pattern, and each iteration binds `name` and `score` to the current pair. Written without the pattern, the same loop is `for (var entry : scores) { println("{}", entry.0); }`. Both are correct; the pattern version says what the data means.
+
+Switch arms accept patterns too, and this is where tuples turn a pile of conditionals into a table the compiler can check. Suppose you have a function `divide` that returns `(i32, bool)` — the value and a success flag:
+
+    switch (divide(10, 0)) {
+        (value, true)  => println("ok: {}", value),
+        (value, false) => println("division failed"),
+    }
+
+Each arm is a tuple pattern: it matches the tuple position by position and binds the pieces it names. Because a `bool` has exactly two values and both arms are present, this switch is exhaustive and the compiler confirms it. And `else` still works as the catch-all when you do not want to enumerate every combination:
+
+    switch (signOf(x), signOf(y)) {
+        (1, 1)   => println("both positive"),
+        (0, 0)   => println("both zero"),
+        else     => println("something else"),
+    }
+
+Tuples and patterns together let you encode a decision as a match over small, closed values and hand the completeness check to the compiler. You will see this idiom again in Chapter 13, where patterns over tuples and variants are the main tool for taking data apart.
+
+12.7 Returning Several Values
+
+This is the single best reason tuples exist, so it gets its own section. A function returns one value; a tuple lets that one value be several. The canonical example is a division that reports both the quotient and whether it succeeded:
+
+    (i32, bool) divide(i32 a, i32 b)
+    {
+        if (b == 0) return (0, false);
+        return (a / b, true);
+    }
+
+Call it and take the tuple apart in one line:
+
+    var (quotient, ok) = divide(10, 3);
+    if (ok) {
+        println("quotient is {}", quotient);
+    }
+
+Compare the C convention: `i32 divide(i32 a, i32 b, bool* ok)`. The caller must declare a `bool` first, pass its address, and remember which argument was the output. The tuple puts the whole answer in one place and makes the call site read left to right. If you have ever written code where the out-parameters are threaded through three helper calls, you know exactly why this is better.
+
+The pattern scales. A function can return `(String, usize)` to hand back an owned buffer and its length, `(i32, i32, i32)` for a colour, `(T, T)` for a swap, or `(bool, T)` for a found-flag and a found value. Here is a swap:
+
+    (i32, i32) swap(i32 a, i32 b)
+    {
+        return (b, a);
+    }
+
+    var (lo, hi) = swap(hi, lo);
+
+And here is a lookup that also reports the index it found, which is the shape you want for a search:
+
+    (usize, bool) indexOf(const i32[] data, i32 needle)
+    {
+        for (usize i = 0; i < data.count(); i++) {
+            if (data[i] == needle) return (i, true);
+        }
+        return (0, false);
+    }
+
+A subtle but important point: the caller who wants only one piece should read it by position, and the caller who wants all pieces should destructure. Do not destructure a tuple into four names and use one; that is noise. The test from earlier still holds — if you find yourself writing comments next to `.0` and `.1` to remember what they mean, you have outgrown the tuple, and it is time for a struct.
+
+12.8 Tuples in Generics and Containers
+
+Because a tuple is a type like any other, it can be an element type, a map value, a generic argument, or a return type from a generic helper. This is where tuples earn their keep in the standard library:
+
+    Vec<(str, i32)> scores = Vec<(str, i32)>::new();
+    scores.push(("ada", 92));
+    scores.push(("grace", 97));
+
+    for (var (name, score) : scores) {
+        println("{} scored {}", name, score);
+    }
+
+A `(str, i32)` is a perfectly good key-value pair. When you genuinely do not want to name the concept "score," a tuple is honest about the fact that it is just two things together. If you later decide the pair deserves a name, you promote it to a struct, and the change is local: a definition, a construction site, and the field accesses.
+
+Tuple-shaped return types are common in generic algorithms. A function that splits a vector at the first match can return `(Vec<T>, Vec<T>)` — everything before, everything after — rather than mutating two out-parameters. A function that finds the minimum and maximum in a single pass returns `(T, T)`. A partition operation returns `(Vec<T>, Vec<T>)` for the elements that passed and failed a test. In each case the tuple is the natural "this algorithm produces two answers" shape, and the caller destructures it:
+
+    var (before, after) = splitAt(values, pivot);
+
+Because tuples nest and compose, you can also have a map whose values are tuples, or a tuple of vectors: `(Vec<i32>, Vec<str>)`. The type system keeps them straight. The one thing you cannot do is give a tuple methods or implement a trait for it — a bare tuple has no behaviour of its own. We will come back to that in Section 12.9, because it is the boundary line between tuples and structs.
+
+12.9 Tuple or Struct?
+
+The two look similar and get used for the same job at different scales. The question "should this pair be a tuple or a struct?" comes up constantly, so here is a decision you can apply without agonising.
+
+Reach for a tuple when all of these hold:
+
+    - there are two or three elements,
+    - the order is obvious at the call site from context,
+    - the tuple does not travel far from where it is created,
+    - and you would not want a type name for it in the API documentation.
+
+Reach for a struct when any of these hold:
+
+    - there are more than three or four elements,
+    - callers would need to remember which position means what,
+    - the value crosses a module boundary or appears in a public signature,
+    - the fields have different lifetimes or ownership rules,
+    - or you want to add methods, drop semantics, or trait implementations.
+
+There is also a hard technical difference, and it is the one that settles most arguments: you cannot add a method to a tuple. You cannot write an `extend` block for `(i32, i32)`, and you cannot implement a trait for a bare tuple. A tuple's only behaviour is its layout. When a value needs behaviour — a `drop`, a `toStr`, a comparison, a `clone` — it needs to be a struct, or (as we will see) a `distinct` type.
+
+Here is the wrong way and the right way, side by side. Wrong way: a tuple that has quietly become a concept, with comments standing in for field names.
+
+    // a "user" is (id, name, email, active) — good luck remembering which is which
+    (i64, str, str, bool) user = (1, "ada", "ada@example.com", true);
+    if (user.3) { ... }        // what is .3 again?
+
+Right way: a struct, because the value has a name and a meaning.
+
+    struct User {
+        i64  id;
+        str  name;
+        str  email;
+        bool active;
+    }
+
+    User user = User { .id = 1, .name = "ada", .email = "ada@example.com", .active = true };
+    if (user.active) { ... }   // unambiguous, and it survives a reorder of the fields
+
+The tuple version is not wrong because it is short; it is wrong because the moment a value has a name in your head, the language should have that name too. A tuple that has grown a concept is a struct that has not been written down yet.
+
+12.10 distinct: The Named Tuple
+
+There is a middle ground between an anonymous tuple and a struct, and it is worth knowing because tuple-shaped quantities are the most common place the confusion bites. Suppose you have two measurements, both stored as `f64`: a distance in meters and a distance in feet. As raw floats, they are interchangeable, and one day someone will add meters to feet and get a plausible, wrong number.
+
+    f64 meters = 100.0;
+    f64 feet = meters;         // compiles; wrong, but nothing stops it
+
+A `distinct` type gives you the tuple's data layout with a real name and real type identity, so the two can no longer be mixed:
+
+    pub distinct Meters = f64;
+    pub distinct Feet   = f64;
+    pub distinct Point  = (f64, f64);
+
+    Meters distance = (Meters) 100.0;
+    Feet wrong = (Feet) distance;      // error: distinct types do not convert
+
+Read `(Meters) 100.0` as a cast: `100.0` is an `f64`, and you are deliberately saying "treat this as a Meters value." There is no `as` cast in Coral; a cast is written by putting the target type in parentheses before the value. A `distinct` type is a new nominal type whose representation is the underlying type. It has the tuple's bytes and the struct's identity. When you want the compiler to stop you from mixing up two same-shaped things, `distinct` is the right tool — not a struct wrapper you would have to unwrap at every use site. For `Point`, the representation is a tuple, so you get positional access on top of the type safety.
+
+12.11 A Worked Example: Bounds and Statistics
+
+Put the pieces together on a small, realistic problem, and watch how many of them appear at once.
+
+Suppose you are reading sensor samples — a slice of `i32` — and you want the smallest reading, the largest reading, and how many there were, in one pass. That is one function producing three answers, which is exactly a tuple's job:
+
+    (i32, i32, usize) bounds(const i32[] data)
+    {
+        if (data.count() == 0) return (0, 0, 0);
+        i32 lo = data[0];
+        i32 hi = data[0];
+        for (var v : data) {
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        return (lo, hi, data.count());
+    }
+
+Notice the empty case returns `(0, 0, 0)`, which is a sentinel the caller must interpret. That is a weakness, and later chapters fix it: a `Result` or an `Option` would say "no data" honestly instead of pretending the bounds are zero. For now, let the caller carry the convention.
+
+Callers get all three numbers with no out-parameters and no pre-declared storage:
+
+    var (lo, hi, count) = bounds(values);
+    println("{} readings, range {}..{}", count, lo, hi);
+
+A caller who only cares about the range reads the two positions it wants and ignores the count entirely:
+
+    var (lo, hi, _) = bounds(values);      // WRONG: there is no _ in Coral
+    var lo = theBounds.0;                  // RIGHT: read the positions you want
+
+Wait — that first line is exactly the mistake the chapter warned about. Coral has no `_` discard, so the moment you only want two of three pieces, destructuring is the wrong tool and positional access is the right one:
+
+    var theBounds = bounds(values);
+    println("range {}..{}", theBounds.0, theBounds.1);
+
+And a caller who wants to switch on emptiness destructures right in the arm:
+
+    switch (bounds(values)) {
+        (lo, hi, 0) => println("no data"),
+        (lo, hi, n) => println("{} readings span {}", n, lo, hi),
+    }
+
+The first arm matches only when the count is exactly zero and binds the two zeroes into `lo` and `hi` (which you ignore by not using them). The second arm is a catch-all binding pattern that names all three pieces. Because there is no wildcard, the catch-all is a full binding pattern, and it comes last, so the compiler accepts it.
+
+Now add a second function that turns the bounds into a report string, to see the tuple flow through a pipeline:
+
+    str describe(const i32[] data)
+    {
+        var b = bounds(data);
+        if (b.2 == 0) return "no readings";
+        return "min " + toStr(b.0) + ", max " + toStr(b.1) + ", n " + toStr(b.2);
+    }
+
+And a third that splits the samples at a threshold, returning two vectors — the generic tuple return in action:
+
+    (Vec<i32>, Vec<i32>) partition(const i32[] data, i32 threshold)
+    {
+        Vec<i32> low  = Vec<i32>::new();
+        Vec<i32> high = Vec<i32>::new();
+        for (var v : data) {
+            if (v < threshold) low.push(v);
+            else               high.push(v);
+        }
+        return (low, high);
+    }
+
+The call site reads like a sentence:
+
+    var (below, above) = partition(samples, 50);
+    println("{} below the threshold, {} above", below.count(), above.count());
+
+This is the pattern to internalise for the whole chapter: one function returns a tuple, one line destructures it, and positional binding replaces a pile of out-parameters and pre-declared storage. Where the tuple's meaning stops being obvious — which happens as soon as it holds three or more same-typed values and travels across a function boundary — you promote it to a struct, and the compiler starts helping you again.
+
+12.12 Exercises
+
+1. Comprehension. What is the difference between `(i32)` and `(i32,)`? Why does the language require the trailing comma rather than treating `(T)` as a one-tuple?
+
+2. Comprehension. Given `var t = (1, 2.0, true)`, what is the type of `t`, and what is the type of `t.2`? Explain why `t.x` (with a letter) is a syntax error rather than something the compiler resolves at runtime.
+
+3. Comprehension. Coral has no underscore discard in patterns. Given `var counts = (3, 7, 11)`, write the line that gives you only the third value, and explain why you cannot write it as a destructuring pattern.
+
+4. Implementation. Write `(i32, i32)` `minMax(const i32[] data)` returning the minimum and maximum in a single pass. Decide what to return for empty input and justify the choice in a comment. Then write the call site that destructures it.
+
+5. Implementation. Write `(str, str)` `splitAt(str s, u8 delim)`: the part before the first `delim` and the part after it. Return `(s, "")` when the delimiter is absent. Use a byte-scanning helper or `str`'s search from the core library.
+
+6. Patterns. Given a `Vec<(str, i32)>` of (name, score) pairs, write two loops that print only the pairs above 90: one that iterates each pair as a whole and reads `.1`, and one that destructures in the loop pattern. Which reads better, and when would each be preferred?
+
+7. Design. You have a function returning `(bool, String)` where the bool says whether parsing succeeded and the String holds either the value or an error message. Rewrite the API so the success path cannot read the error message as a value by accident. (Hint: this is a case for a `Result`, which Chapter 15 covers; explain in two sentences why a tuple is the wrong shape here.)
+
+8. Distinct. Define `pub distinct Celsius = f64;` and `pub distinct Fahrenheit = f64;`, plus a `toCelsius(Fahrenheit) Celsius` converter. Then try to pass a `Celsius` where a `Fahrenheit` is expected and describe the error. Why is `distinct` better than two raw `f64`s here, and better than a one-field struct?
+
+9. Containers. Build a `Vec<(u8, u8)>` of twenty pairs, sort it by the first element, then check that no two adjacent pairs share a first element. Which parts get simpler when you read the pairs with `for` patterns?
+
+10. Meta. The chapter claims "if you are writing comments next to `.0` and `.1`, you wanted a struct." Find a place in the code you have written recently where a tuple carried a concept. Rewrite it as a struct. What broke, what got clearer, and was the trade worth it?

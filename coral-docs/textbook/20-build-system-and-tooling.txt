@@ -1,0 +1,278 @@
+Chapter 20
+
+The Build System and Tooling
+
+From One File to a Project
+
+Everything in this book so far has been about a single source file. Real programs are many files, and many files need a system that decides what compiles in what order, what depends on what, what has changed since last time, and what the final artifact is called. That system is the build system, and in Coral it is small enough to learn in an afternoon because it was designed to be. The compiler coralc, the build file coral.crlb, and the generated module map are the whole apparatus.
+
+This chapter is deliberately practical. It walks through creating a project, explaining each field of the build file, running the compiler, and understanding the module map that ties the whole thing together. It ends where the previous chapter began: the module system and the build system are two faces of one mechanism, and after this chapter the two should read as a single design.
+
+20.1 Naming
+
+A few names are worth fixing before we use them.
+
+    Coral           the language, extension .crl
+    Coral Build     the build file, extension .crlb
+    coralc          the compiler and the builder, one executable
+    modules.map     the generated module table
+    .coral/         the per-project cache and generated files
+
+One binary plays both roles. coralc compiles a single file when given a file, and it builds a project when run inside one. There is no separate linker driver to learn and no makefile dialect to memorise.
+
+20.2 Creating a Project
+
+The fast path is coralc init:
+
+    $ coralc init myproject
+    $ cd myproject
+
+This scaffolds a working project:
+
+    myproject/
+    ├── coral.crlb          # the build file
+    ├── .gitignore          # ensures **/.coral/ is ignored
+    ├── .coral/             # cache and generated files
+    └── src/
+        └── lib.crl         # a hello-world main, so `coralc run` works
+
+init refuses to overwrite an existing coral.crlb, and it appends **/.coral/ to .gitignore if that pattern is not already present, creating the file if absent. The generated project runs immediately:
+
+    $ coralc run
+    Hello, World!
+
+That is the whole ceremony. From here you add files under src/, and the build system finds them.
+
+20.3 The Build File
+
+The build file is coral.crlb. It is declarative — not Coral source, but a small, purpose-built configuration language — and it describes the project rather than performing steps. Here is a complete example:
+
+    build "myproject" {
+        root       = "."
+        entry      = "src"
+        target     = "native-x86_64"
+        opt        = "debug"
+        output     = "build/myproject"
+        module_map = ".coral/modules.map"
+        cache_dir  = ".coral/cache"
+
+        flags = ["--strict", "--warn-unused"]
+
+        modules = ["src", "src/log", "src/text"]
+        skip    = ["vendor", "target"]
+    }
+
+The fields mean what they say. root is the directory the other paths are relative to. entry names the module that contains main — the executable's root. target selects the backend: native-x86_64, native-arm64, wasm32, or bytecode. opt is the optimisation profile, one of debug, release, or size. output is where the binary lands. module_map and cache_dir place the generated table and the cache.
+
+The two list fields matter most day to day. modules is the required list of which folders are build modules; only folders listed here are scanned, so a vendor tree sitting in the project does not slow the build or pollute the module table. skip excludes subfolders during any scan. Between them you control exactly what the build sees.
+
+A build block may also carry per-module overrides, so one module can build differently from its siblings:
+
+    override "src/parser" {
+        opt   = "release"
+        flags = ["--no-inline"]
+    }
+
+Override blocks merge their fields over the base build, with the child winning. This is how a hot parser gets release optimisation while the rest of the project stays in debug with symbols — a common and useful split.
+
+20.4 Aliases
+
+Module imports use short names, and aliases are how those short names are defined. A module's folder often has a long, prefixed name; an alias gives it a name that source code actually writes:
+
+    alias lexer  = "compiler/coral-lexer/lib.crl";
+    alias parser = "compiler/coral-parser/lib.crl";
+    alias common = "compiler/coral-common/lib.crl";
+
+With these in the build file, source writes:
+
+    import lexer::table { TokenTable };
+    import common::token { Token };
+
+and not:
+
+    import coral-lexer::table { TokenTable };
+    import coral-common::token { Token };
+
+The builder applies aliases when it writes the module map, so the compiler only ever sees the short names. An alias must point at a folder that is in modules, and an alias name must not collide with another alias or with a bare folder name. Getting either wrong is a build error caught by coralc doctor, described below.
+
+20.5 Tasks
+
+A task is a named unit of work with an optional command to run and optional dependencies to satisfy first.
+
+    task "run" {
+        after = ["build"];
+        exec  = "build/myproject";
+    }
+
+    task "test" {
+        after = ["build"];
+        exec  = "build/myproject --self-test";
+    }
+
+after names tasks that must complete first; the pseudo-task "build" is already satisfied once the project is built. exec names a command to run when the task executes. If exec names a directory, output is redirected into it; otherwise it is printed. Run a task by name:
+
+    $ coralc run            # runs the task "run", or the output binary
+    $ coralc test
+
+When a task called "run" exists, coralc run executes it; otherwise coralc run builds and launches the output binary directly. coralc NAME runs any task. Tasks let you keep the project's entry points — run, test, bench, clean — in the build file rather than in a shell script nobody maintains.
+
+20.6 Running the Build
+
+The build pipeline is a sequence of well-defined steps:
+
+    coralc build
+      1. read coral.crlb
+      2. resolve root, modules, skip, and aliases
+      3. for each module, read its lib.crl surface
+      4. resolve every re-export and register it in the module table
+      5. detect duplicate module identities and aliases pointing nowhere
+      6. write .coral/modules.map
+      7. scan each source file's module imports, build the dependency graph
+      8. detect unresolved imports and cycles (with a trace)
+      9. topologically sort the modules
+     10. for each module in order, hash its inputs; skip if unchanged
+     11. compile the modules that changed
+     12. link the entry module into the output
+
+Step ten is the cache. Each module gets a fingerprint computed from its lib.crl, every source file in its folder, and the fingerprints of its dependencies. If the fingerprint is unchanged since the last build, the module is skipped. A dependency changing invalidates its dependents transitively, so the cache is always sound with respect to the source; it is conservative about what changed, never optimistic. When the cache is suspect, coralc build --force ignores it.
+
+The everyday subcommands:
+
+    coralc init [dir]      scaffold a project
+    coralc build           build using the cache
+    coralc build --force   ignore the cache
+    coralc build --module M    build one module and its dependencies
+    coralc build --emit-map    write modules.map and stop
+    coralc run             build, then run
+    coralc map             rescan the tree, refresh modules
+    coralc clean           wipe the cache and the build directory
+    coralc graph           dump .coral/graph.dot
+    coralc doctor          validate the build file, aliases, and cycles
+
+coralc map is worth calling out. It walks root, finds every folder containing a lib.crl, adds missing folders to modules, removes listed folders that no longer have a surface, refreshes modules.map, and reports the diff:
+
+    $ coralc map
+    + added   src/log
+    ~ updated modules.map  (14 entries, 3 aliases)
+
+With --dry it prints the diff without writing. This is the command that keeps the modules list honest as a project grows, so that a new folder is one command away from being part of the build rather than a mystery about why a file is not compiling.
+
+20.7 The Module Map
+
+The generated .coral/modules.map is the bridge between the previous chapter's imports and this chapter's build. It is a plain-text table from a module identity to the file that implements it:
+
+    # coral modules.map v1 — generated by `coralc build`, do not edit
+    lexer::base     ->  compiler/coral-lexer/base.crl
+    lexer::ident    ->  compiler/coral-lexer/ident.crl
+    lexer::lexer    ->  compiler/coral-lexer/lexer.crl
+    lexer::table    ->  compiler/coral-lexer/table.crl
+    parser::expr    ->  compiler/coral-parser/expr.crl
+
+    # aliases (from the build file)
+    @common::token  ->  compiler/coral-common/token.crl
+
+When the compiler resolves import lexer::table, it consults this map. The map is text on purpose: it diffs cleanly in source control, it is greppable, reading it needs no parser, and loading it is one line scan. It is a build artifact, not a source file; it is regenerated on every build and belongs in .gitignore with the rest of .coral/.
+
+20.8 The Language Server
+
+coralc carries a language-server mode, coralc --serve, which speaks the Language Server Protocol over standard input and output. It is the same compiler, so the diagnostics an editor shows are the diagnostics a build would produce: type information comes from the compiler's own resolved types, and a whole-project analysis publishes errors for the entry module's entire import closure.
+
+The server uses only the standard library's I/O — no libc, no diversion of stdout — so the protocol owns the streams cleanly. Its behaviour follows the protocol specification in detail: it rejects requests before initialize with -32002, rejects a second initialize with -32600, reports malformed JSON as -32700, and uses UTF-16 code units for diagnostic and hover positions, as the protocol requires. On shutdown it exits zero; without a shutdown it exits one. Closing a document clears that document's markers.
+
+Editor integration is a matter of pointing the editor at the binary. In an editor that configures language servers by command, the setting is the executable and the argument:
+
+    command: coralc
+    args:    ["--serve"]
+
+Hover returns real types — the compiler sets a resolved type on every identifier expression — so hovering a variable shows its type, hovering a function shows its signature. Document symbols, go-to-definition, references, and completion are the natural next steps and are tracked alongside the rest of the tooling roadmap.
+
+20.9 Diagnostics and Warnings
+
+The compiler's diagnostics are a first-class part of the tooling, not an afterthought. Every diagnostic carries an error code — E0103 for a Unicode homoglyph that looks like an ASCII letter, E0201 for a cyclic type layout of infinite size, E0608 for a non-exhaustive switch, and so on through the catalogue that Chapter 22 surveys. Codes make a diagnostic searchable, suppressible, and testable. The --strict flag promotes warnings to errors for a release build; --warn-unused enables the unused-variable, unused-import, and unused-parameter warnings; and --explain CODE prints a longer explanation of a single code.
+
+Two warnings deserve early adoption. E0801 (unused variable) and E0802 (unused import) catch the debris of a refactor: a binding that stopped being read, an import that stopped being used. Both are noise in a build only until the first time they catch a real mistake, after which they are missed in any project that lacks them. Turning them on from the start is cheaper than turning them on later and drowning in a thousand existing warnings.
+
+20.10 A Worked Build
+
+Put the pieces together for a small program with a library module. The layout:
+
+    myapp/
+    ├── coral.crlb
+    └── src/
+        ├── lib.crl
+        ├── main.crl
+        └── math/
+            ├── lib.crl
+            └── vec2.crl
+
+The build file lists both modules:
+
+    build "myapp" {
+        root   = "."
+        entry  = "src"
+        target = "native-x86_64"
+        opt    = "debug"
+        output = "build/myapp"
+        modules = ["src", "src/math"]
+    }
+
+The math module declares a small vector type and its surface:
+
+    // src/math/vec2.crl
+    import(lib) std::math::math { sqrt };
+
+    pub struct Vec2 { f64 x; f64 y; }
+
+    pub Vec2 vec2Add(Vec2 a, Vec2 b) {
+        return Vec2 { .x = a.x + b.x, .y = a.y + b.y };
+    }
+
+    pub f64 vec2Length(Vec2 v) {
+        return sqrt(v.x * v.x + v.y * v.y);
+    }
+
+    // src/math/lib.crl
+    pub mod vec2 = import vec2;
+
+The entry imports it through the module identity:
+
+    // src/main.crl
+    import(lib) std::io::ios { println };
+    import math::vec2 { Vec2, vec2Add, vec2Length };
+
+    i32 main() {
+        Vec2 a = Vec2 { .x = 3.0, .y = 4.0 };
+        Vec2 b = Vec2 { .x = 1.0, .y = 2.0 };
+        Vec2 c = vec2Add(a, b);
+        println("sum = ({}, {}), length = {}", c.x, c.y, vec2Length(c));
+        return 0;
+    }
+
+    // src/lib.crl
+    pub mod main = import main;
+
+Build and run:
+
+    $ coralc build
+    $ coralc run
+    sum = (4, 6), length = 7.211102550927978
+
+Change vec2.crl and rebuild; only the math module and its dependent main module recompile. Add a folder under src/ and coralc map absorbs it. The build file stays a dozen lines no matter how large the program grows, because it describes the shape of the tree rather than listing commands. That is the design goal, and it is why the module system and the build system were built together: the import lines in the source are the dependency graph, and the build system's job is to read that graph rather than to have it written out twice.
+
+20.11 Exercises
+
+1. Comprehension. What is the difference between the modules list and the skip list? Give a project layout where both are necessary.
+
+2. Comprehension. Why is modules.map plain text rather than a binary or JSON format? Name three properties the text form preserves.
+
+3. Implementation. Run coralc init, add a second module with a lib.crl, run coralc map, and confirm the new module appears in modules.map. Then run coralc run and confirm it still builds.
+
+4. Build. Write a coral.crlb with a release build for a hot module and a debug build for the rest. Which field does the override set?
+
+5. Tasks. Add a task "lint" that builds and then runs the output with a --check flag. Add a task "clean" that wipes the build directory. Show both task blocks.
+
+6. Caching. You edit a comment in a file that no other file imports. What recompiles on the next build? What recompiles if you edit a file whose module another module imports?
+
+7. Tooling. Point an editor at coralc --serve and hover a variable in a program. What does the editor show? Try hovering an expression such as a call.
+
+8. Meta. The build system derives dependencies from the source's import lines rather than from a list you maintain. Describe one class of bug this eliminates and one class it makes harder to diagnose.

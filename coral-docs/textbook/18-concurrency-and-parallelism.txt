@@ -1,0 +1,271 @@
+Chapter 18
+
+Concurrency and Parallelism
+
+Two Words, Two Problems
+
+Concurrency is about dealing with many things at once; parallelism is about doing many things at once. They are related and they are not the same, and confusing them is the source of a large fraction of the bugs that make concurrent programs hard. This chapter covers both, because Coral supports both, and it starts by being precise about the vocabulary. A thread pool doing work in parallel and an async runtime overlapping I/O on one thread are different tools for different problems; choosing the wrong one is as costly as choosing the wrong data structure.
+
+The chapter also faces the uncomfortable truth that no library makes concurrency easy. Coral gives you correct primitives — threads, atomics, mutexes, a thread pool, an async runtime — and those primitives are the same tools every systems language provides because they are the tools the hardware actually offers. What Coral adds is RAII for locks and a type discipline that makes some mistakes visible. It does not pretend the rest are easy. The honest summary is: concurrency is hard in every language, and the goal is to keep the difficulty where you can see it.
+
+18.1 Threads
+
+The thread module exposes OS threads through a small interface. A thread is created with a function to run and an argument to pass it:
+
+    import(lib) std::concurrent::thread { threadCreate, threadJoin, Thread };
+
+    Thread threadCreate(rawptr(rawptr) fn, rawptr arg);
+
+The entry point takes a rawptr and returns a rawptr, the C signature, so the argument is cast in and the return value cast out. Thread itself is a distinct type over rawptr, so it cannot be confused with any other pointer:
+
+    pub distinct Thread = rawptr;
+
+Create and join:
+
+    rawptr worker(rawptr arg) {
+        i32* n = (i32*)arg;
+        *n = *n * 2;
+        return null;
+    }
+
+    i32 value = 21;
+    Result<Thread, ThreadError> created = threadCreate(worker, (rawptr)&value);
+    if (created.isOk()) {
+        Thread t = created.unwrap();
+        threadJoin(t, null);
+        println("{}", value);          // 42
+    }
+
+But that example is already wrong, and the wrongness is the lesson. The worker writes to *n while the main thread reads value after joining; the join is what makes it correct, because join establishes that the worker has finished. Remove the join and the read races the write. Coral's type system does not forbid the race; it gives you join and expects you to use it. The argument's lifetime is likewise your responsibility: passing a pointer to a local and letting the local die before the join is a use-after-free the compiler cannot catch, which is why the thread's argument type is a rawptr — a signal that the lifetime contract is now yours to keep.
+
+threadCreate returns a Result<Thread, ThreadError> rather than a bare Thread, because thread creation can fail for reasons outside your control: the function pointer was null, the context allocation failed, the OS refused. The error variant names the cause. Treating thread creation as infallible is a bug, and the return type is what makes that bug visible.
+
+A thread can also be detached. A joined thread's resources are reclaimed at the join; a detached thread runs to completion on its own and cleans up after itself. Choosing join means you will wait and the stack is freed deterministically; choosing detach means you will not wait and the cleanup is the runtime's problem. Use join whenever a later computation depends on the thread's result, and detach when the thread is genuinely fire-and-forget.
+
+18.2 Atomics
+
+When two threads share a single value, mutating it is a data race unless the mutation is atomic. The thread module provides atomic integer types, AtomicU32 and AtomicU64, with the operations the hardware supports:
+
+    AtomicU64 counter;
+
+The point of an atomic is that a read-modify-write is a single indivisible operation. An ordinary n += 1 is a load, an add, and a store, and two threads interleaving those three steps lose increments. An atomic increment cannot lose one. Use an atomic when the shared state is one integer: a counter, a flag, a seat number. Use a mutex when it is more than that. And use neither when the state is thread-local, which is the fastest shared state of all.
+
+Atomics also carry an ordering, and the ordering is a promise about how other memory accesses may be reordered around the atomic operation. The common orderings are relaxed — just the atomicity, no ordering with other memory — and acquire/release, which form a pair: a release store by one thread synchronises with an acquire load by another, so everything written before the release is visible after the acquire. The default to reach for is acquire/release, because it is the one that makes a handoff pattern correct: one thread fills a buffer and sets a flag with a release, another reads the flag with an acquire and then reads the buffer. A relaxed flag would let the reader see the flag set before the buffer's contents are visible, which is the subtle bug that atomic orderings exist to prevent. If you are unsure, reach for a mutex instead; a mutex is slower than a relaxed atomic and dramatically easier to get right.
+
+18.3 Mutex, RwLock, and Semaphore
+
+A Mutex is a mutual-exclusion lock. Lock it before touching the shared data, unlock it after:
+
+    import(lib) std::concurrent::mutex { Mutex };
+
+    Mutex m;
+    m.init();
+
+    m.lock();
+    // critical section
+    m.unlock();
+
+    m.destroy();
+
+A Mutex must be initialised before use and destroyed after; init and destroy are explicit because the underlying platform primitive needs explicit setup. initRecursive allows the same thread to lock twice, which is useful when a locked function calls another locked function; prefer to design so you do not need it. tryLock acquires only if the lock is free, without blocking, and returns whether it succeeded:
+
+    if (m.tryLock()) {
+        // got it
+        m.unlock();
+    } else {
+        // someone else holds it
+    }
+
+tryLock is how a program avoids deadlock by refusing to wait, at the cost of having to handle the not-acquired case. A deadlock is when two threads each hold one lock and wait for the other's; the standard defences are to acquire locks in a consistent global order, to hold at most one lock at a time, and to use tryLock with a fallback. The library cannot prevent a deadlock; it can only give you the tools to avoid one, and the design discipline is the same as in any language.
+
+An RwLock is a reader-writer lock: many readers may hold it at once, or one writer, but not both. readLock and writeLock acquire; unlock releases either. It is the right choice when reads vastly outnumber writes and the critical section is long enough that reader concurrency pays for the extra bookkeeping. For short critical sections a plain Mutex is usually faster, because the reader-writer bookkeeping costs more than it saves.
+
+    import(lib) std::concurrent::rwlock { RwLock };
+
+    RwLock rw;
+    rw.init();
+
+    rw.readLock();
+    // many threads may be here at once
+    rw.unlock();
+
+    rw.writeLock();
+    // exclusive
+    rw.unlock();
+
+The library's low-level concurrent files use #[[no_drop_all]] and require explicit destroy because they sit directly on the platform's primitives and must not have their destruction hooked to scope. Ordinary program code rarely needs that; the discipline of pairing lock with unlock, and init with destroy, is the discipline of C with threads, and Coral gives it to you with the same caveats.
+
+A Semaphore is a counting lock: it holds a count, wait decrements and blocks while the count is zero, and post increments and wakes a waiter. It is the tool for limiting concurrency — "at most N workers at once" — and for signalling between threads without a shared variable:
+
+    import(lib) std::concurrent::semaphore { Semaphore };
+
+    Semaphore slots;
+    slots.init(4);              // four concurrent slots
+
+    slots.wait();
+    // do work, at most four threads here
+    slots.post();
+
+A ConditionVar is the companion to a mutex for waiting on a predicate: the waiter holds the mutex, checks the predicate, and waits on the condition variable if it is not satisfied, releasing the mutex while it blocks. The producer changes the predicate under the mutex and signals. Condition variables are the general mechanism behind every "wait until there is work" pattern, and they are also the mechanism most often used incorrectly, because the predicate must be rechecked after every wake — a wake does not guarantee the predicate is true, only that it might be. The rule is a while, never an if:
+
+    while (!hasWork()) {
+        cond.wait(&mutex);
+    }
+
+18.4 Thread Pools
+
+Spawning a thread per task does not scale: the OS charges real costs for thread creation and scheduling, and a program that spawns a thread per request spends most of its time in the kernel. A thread pool keeps a fixed set of worker threads and feeds them tasks from a queue.
+
+    import(lib) std::concurrent::threadpool { ThreadPool };
+
+    ThreadPool pool;
+    pool.init(8);              // eight workers
+
+    pool.submit(work, arg);    // queue a task
+    ...
+    pool.destroy();
+
+The pool owns its workers and its task queue, and it implements @drop, so a pool left to go out of scope is cleaned up; but a pool that must drain before shutdown still wants an explicit destroy. The size of the pool is a tuning decision: one worker per core for CPU-bound work, more for I/O-bound work where workers block, and fewer when the tasks contend for a shared lock. There is no universal answer, which is why the size is a parameter rather than a constant baked into the library.
+
+A thread pool is the right structure for a server that handles independent requests, a batch job that processes independent items, and any workload that is a large number of short tasks. It is the wrong structure for a pipeline with strict ordering between stages, where the queueing discipline matters and a pool's unordered queue is a mismatch.
+
+18.5 Async: Overlapping I/O
+
+Threads are not the only way to do many things at once, and for I/O-bound work they are often the wrong way. A thread blocked on a slow socket holds a stack and a scheduler slot to do nothing. Async programming expresses the same overlap without a thread per operation: a task yields at the point it would block, and the runtime resumes it when the operation completes.
+
+Coral's async module is built on fibers — lightweight stacks the runtime switches between without involving the OS scheduler. The language doesn't support async in the syntaax, so it is manually driven for now. And we hope to achieve support for it in the long run.
+
+    import(lib) std::concurrent::async { init, spawn, await, run, sleep };
+
+    async::init();
+
+    void fetchAndStore(rawptr arg) {
+        // ... do work
+    }
+
+    Result<Future*, AsyncError> f = async::spawn(fetchAndStore, arg);
+    if (f.isOk()) {
+        async::await(f.unwrap());      // resume when it completes
+    }
+
+    async::run();                      // drive the runtime to completion
+
+spawn schedules a function to run as an async task and returns a Future; await suspends the current task until the future completes, returning its result. sleep suspends for a duration without blocking the thread, which is the difference that matters — a thread sleep blocks a thread, an async sleep frees it. run drives the scheduler until all tasks are done; runOnce runs pending tasks once, for callers that need to interleave the runtime with their own loop. poolRun submits an async task onto a thread pool, bridging the two worlds.
+
+The async module also provides AsyncChannel, a queue for passing values between tasks, and like the pool it implements @drop, so channels are cleaned up when they leave scope. The channel is the standard way for tasks to communicate: rather than sharing mutable state and locking it, one task sends and another receives, and the queue handles the synchronisation.
+
+The trade-offs between threads and async are worth stating plainly, because they are a recurring design decision. Threads are simpler to reason about: a thread runs your code straight through, and a blocking call blocks only that thread. Async lets a single thread serve thousands of concurrent I/O operations with a fraction of the memory, at the cost of a different programming model — you must await at the right points, avoid blocking calls inside tasks because they stall the whole runtime, and understand that a task can be suspended and resumed at a yield point. The standard advice is to use async for I/O-bound concurrency at scale, threads for CPU-bound parallelism, and a thread pool for a bounded number of independent CPU-bound tasks. Coral gives you all three because the right answer depends on the workload.
+
+18.6 The Memory Model and Data Races
+
+Beneath every primitive is a memory model, and getting it wrong produces bugs that appear once in a million runs on one machine and never on another. The model has a few rules worth keeping in mind.
+
+A data race is two threads accessing the same location, at least one writing, without synchronisation. A program with a data race has undefined behaviour, full stop. This is not a warning about performance; it means the compiler is entitled to assume the race does not happen and to optimise accordingly, and the result is not a deterministic wrong answer but an unpredictable one.
+
+Synchronisation is what removes the race. A mutex lock and unlock form a happens-before edge: everything before the unlock on one thread is visible after the lock on another. An atomic store-release and load-acquire pair does the same for a single location and the memory around it. A thread join and an async await are edges too. The reason to prefer high-level primitives — mutex, channel, join — is that they contain the edges and you do not have to reason about them; the reason atomics are dangerous is that the edges are yours to place.
+
+Ownership helps. Data that no thread shares cannot race, so the cheapest fix is often to not share: give each thread its own copy, or its own portion of an array, and combine the results at the end. A parallel sum over a large array where each thread accumulates its own partial and the main thread adds them up needs no locks at all. This is the map-reduce pattern, and it is the reason parallel algorithms are often designed around disjoint partitions: no sharing, no synchronisation, no race.
+
+18.7 A Worked Example: A Parallel Sum, Then a Parallel Map
+
+Start with the partition-everything approach, because it is the one with no locks. Sum an array of a million numbers across four threads:
+
+    import(lib) std::concurrent::thread { threadCreate, threadJoin, Thread };
+
+    struct SumJob {
+        const f64* data;
+        usize start;
+        usize end;
+        f64 total;
+    }
+
+    rawptr sumWorker(rawptr arg) {
+        SumJob* job = (SumJob*)arg;
+        f64 sum = 0.0;
+        for (usize i = job.start; i < job.end; i += 1) {
+            sum += job.data[i];
+        }
+        job.total = sum;
+        return null;
+    }
+
+    f64 parallelSum(const f64* data, usize n, usize workers) {
+        SumJob jobs[4];
+        Thread threads[4];
+        usize chunk = n / workers;
+
+        for (usize w = 0; w < workers; w += 1) {
+            jobs[w] = SumJob {
+                .data = data,
+                .start = w * chunk,
+                .end = (w == workers - 1) ? n : (w + 1) * chunk,
+                .total = 0.0,
+            };
+            threadCreate(sumWorker, (rawptr)&jobs[w]);
+        }
+
+        f64 total = 0.0;
+        for (usize w = 0; w < workers; w += 1) {
+            threadJoin(threads[w], null);
+            total += jobs[w].total;
+        }
+        return total;
+    }
+
+(The simplified version above drops the returned Thread values; a real one checks each Result and stores the handle.) Each worker reads its own disjoint slice of data — no shared writes during the parallel phase — and writes only its own jobs[w].total. The threads write to different jobs, so no two threads touch the same memory. The main thread reads the totals only after joining, which is the happens-before edge that makes the reads safe. There is no lock in the program, because there is no shared mutable state, and that is the point: the cheapest synchronisation is the synchronisation you avoid by partitioning.
+
+Now a parallel map, where each task is independent and the pool is the right structure:
+
+    import(lib) std::collections::vec { Vec };
+    import(lib) std::concurrent::threadpool { ThreadPool };
+
+    f64 square(f64 x) { return x * x; }
+
+    void mapRange(rawptr arg) {
+        Range* r = (Range*)arg;
+        for (usize i = r.start; i < r.end; i += 1) {
+            r.out[i] = square(r.in[i]);
+        }
+    }
+
+    void parallelSquare(Vec<f64>* in, Vec<f64>* out, ThreadPool* pool) {
+        Range ranges[8];
+        usize chunk = in.count() / 8;
+        for (usize w = 0; w < 8; w += 1) {
+            ranges[w] = Range {
+                .in = in.ptr(), .out = out.ptr(),
+                .start = w * chunk,
+                .end = (w == 7) ? in.count() : (w + 1) * chunk,
+            };
+            pool->submit(mapRange, (rawptr)&ranges[w]);
+        }
+        // drain the pool before returning
+    }
+
+Same principle, different mechanism. The work is divided into disjoint ranges, each task writes only its range's outputs, and the pool schedules them. The pool is used rather than raw threads because there are many independent tasks with a bounded concurrency, which is exactly the pool's contract. Between the two examples you have the two shapes most parallel programs take: a fixed small number of long-running workers, or a large number of short independent tasks on a bounded pool.
+
+18.8 Exercises
+
+1. Comprehension. State the difference between concurrency and parallelism. Give a workload that is concurrent but not parallel, and one that is parallel but not concurrent.
+
+2. Comprehension. Why does threadCreate return a Result rather than a Thread? Name two ways it can fail.
+
+3. Implementation. Write a program that spawns four threads, each incrementing a shared counter a million times. Run it with an ordinary integer and again with an AtomicU64. Explain the difference in results.
+
+4. Locks. Use a Mutex to protect the shared counter from exercise 3 and compare its throughput to the atomic. Which is faster, and why?
+
+5. Deadlock. Construct a program that deadlocks with two mutexes acquired in opposite orders. Then fix it by imposing a global order.
+
+6. Reader-writer. Convert a Mutex-protected cache into an RwLock-protected one where reads dominate. When does this help, and when does it hurt?
+
+7. Pool. Submit a hundred tasks to a ThreadPool of eight workers and measure the time versus spawning a hundred threads. Why is the pool faster?
+
+8. Async. Write a task that sleeps a hundred milliseconds without blocking its thread, using async::sleep, and confirm that other tasks run during the sleep. What would happen with a thread sleep instead?
+
+9. Races. Find the data race in a program where one thread writes a struct field and another reads it without a lock, and fix it three ways: a mutex, an atomic with acquire/release, and by removing the sharing. Compare.
+
+10. Meta. The chapter claims no library makes concurrency easy. Argue for and against. Could a language design prevent data races statically, and what would it cost?
+
+11. Partitions. Rewrite the parallel sum to handle n not divisible by the number of workers. What is the bug in the naive chunking, and how do you fix it?
+
+12. Channels. Use AsyncChannel to pass results from worker tasks to a collector task. Why is a channel easier to get right than shared memory plus a lock?
