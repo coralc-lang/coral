@@ -1,10 +1,10 @@
-Chapter 34
+Chapter35
 
 Live Examples: Systems and Concurrency
 
 The Machinery You Can See
 
-Chapter 18 told the story of concurrency: what a thread is, why a data race is undefined behaviour, what happens-before means, and how a mutex and a condition variable turn a collection of independently running threads into a correct exchange. This chapter is the workshop. It takes those primitives and builds the eleven structures that every real system is assembled from: a race that a counter loses, a producer and a consumer passing work across a queue, a thread pool draining a task list, a parallel map over a vector, an async pipeline that suspends and resumes, and a semaphore that caps how many things happen at once, followed by a reader–writer lock that admits many readers or one writer, a barrier that holds a group of threads together, a divide-and-conquer parallel sum, the dining philosophers and the lock-ordering rule that saves them, and a token-bucket rate limiter. Each one is short. Each one is a pattern you will meet again, often under a different name.
+Chapter19 told the story of concurrency: what a thread is, why a data race is undefined behaviour, what happens-before means, and how a mutex and a condition variable turn a collection of independently running threads into a correct exchange. This chapter is the workshop. It takes those primitives and builds the eleven structures that every real system is assembled from: a race that a counter loses, a producer and a consumer passing work across a queue, a thread pool draining a task list, a parallel map over a vector, an async pipeline that suspends and resumes, and a semaphore that caps how many things happen at once, followed by a reader–writer lock that admits many readers or one writer, a barrier that holds a group of threads together, a divide-and-conquer parallel sum, the dining philosophers and the lock-ordering rule that saves them, and a token-bucket rate limiter. Each one is short. Each one is a pattern you will meet again, often under a different name.
 
 The promise of this chapter is that the machinery is visible. Coral does not hide the thread behind a keyword, the queue behind a runtime, or the scheduler behind magic. `threadCreate` returns a real operating system thread and a `Result` that says whether it worked. A mutex is a struct you `init` and `lock`. A condition variable is a nap with an alarm. When you read a function in this chapter, you can point at the exact line that establishes the happens-before edge, and that is the point: correctness in concurrent code is not a property you hope for, it is a property you can audit, lock by lock and signal by signal.
 
@@ -12,7 +12,7 @@ Two habits carry through every example, and they are worth naming before the fir
 
 A last word on the shape of a thread's argument. Every thread in Coral runs a function that takes one `rawptr` and returns one `rawptr` (a pool task returns `void`). That single pointer must carry everything the worker needs, so in practice it points at a struct. The pointer is where the lifetime contract begins: if it points at a local that dies before the join, you have a use-after-free the compiler cannot see. Every example below either points at data that outlives the join, or allocates its job and frees it when the task is done.
 
-34.1 The Lost Update: Why a Counter Needs an Atomic
+35.1 The Lost Update: Why a Counter Needs an Atomic
 
 The problem. Two threads each add one to a shared counter a million times. The answer should be two million. Write the obvious code and it is almost always less, and the shortfall changes on every run.
 
@@ -61,13 +61,13 @@ The implementation.
         println("atomic {}", atomic.value.load());  // always 2000000
     }
 
-Cost and notes. `fetchAdd` is a single locked instruction on x86-64 (`lock xadd`), a few tens of cycles, serialising and indivisible. The plain increment is faster in isolation and wrong. The rule of thumb from Chapter 18 is exact: use an atomic when the shared state is one integer (a counter, a flag, a ticket), and use a mutex the moment the state is anything larger. An atomic guards one cell; a mutex guards a region.
+Cost and notes. `fetchAdd` is a single locked instruction on x86-64 (`lock xadd`), a few tens of cycles, serialising and indivisible. The plain increment is faster in isolation and wrong. The rule of thumb from Chapter19 is exact: use an atomic when the shared state is one integer (a counter, a flag, a ticket), and use a mutex the moment the state is anything larger. An atomic guards one cell; a mutex guards a region.
 
 Edge cases. The plain version is a genuine data race and its result is undefined, not merely imprecise. It may occasionally print two million on a fast machine with light contention, which is exactly why it is dangerous. The two threads must write through the same pointer, so the counter's lifetime must exceed both joins. `load`, `store`, `fetchAdd`, `fetchSub`, and `compareExchange` are the whole vocabulary, and each is a hardware guarantee rather than a simulation. And `AtomicU64 { .value = 0 }` is the initialisation; forgetting it leaves the counter holding whatever was on the stack.
 
 Variation. Two threads incrementing and one decrementing, with the result printed after all three join. The expected total is one million regardless of interleaving; confirm that the atomic version always reaches it and the plain version does not. Then try `compareExchange` to build a lock-free "increment only if below a cap" and explain the retry loop.
 
-34.2 Producer and Consumer with a Mutex and a Condition Variable
+35.2 Producer and Consumer with a Mutex and a Condition Variable
 
 The problem. One thread produces values; another consumes them; they must meet in the middle without the producer overrunning a fixed-size buffer and without the consumer spinning on an empty one.
 
@@ -198,7 +198,7 @@ Edge cases. The buffer must never be touched outside the locked region; a single
 
 Variation. Generalise the element type to `rawptr` so the queue carries pointers to arbitrary jobs, which is exactly what the next example's thread pool does. Then add a second consumer thread and confirm the sum is still 5050 — the correctness does not depend on how many consumers there are, only on the lock discipline.
 
-34.3 A Thread-Pool Task Queue
+35.3 A Thread-Pool Task Queue
 
 The problem. `threadCreate` per task does not scale: the operating system charges for a kernel object, a stack, and a scheduler slot, and a program that spawns a thread per request spends its life in the kernel. A pool creates a fixed set of workers once and feeds them tasks from a queue.
 
@@ -324,7 +324,7 @@ Edge cases. The stop path must both set the flag under the lock and broadcast af
 
 Variation. Add a `pending()` method that returns the number of queued tasks under the lock, and use it to build a `drain()` that blocks until the queue is empty. It is the missing piece for a batch program that submits a thousand jobs and then waits for all of them, and it demonstrates that the pool's state is fully visible through the mutex.
 
-34.4 Parallel Map over a Vec
+35.4 Parallel Map over a Vec
 
 The problem. Apply a function to every element of a large vector, using every core. This is the simplest and most common parallel pattern, and it is the one a data-processing pipeline reaches for first.
 
@@ -406,7 +406,7 @@ Edge cases. The output vector must already have `n` slots before the tasks run, 
 
 Variation. Replace the map with a parallel reduction: instead of writing each result, each chunk computes a partial sum and the caller combines the partials. The partials must be written to distinct slots (one per chunk) and combined afterward, because summing into one shared accumulator would need an atomic or a lock. Doing it both ways shows how the pattern changes when the threads must combine rather than partition.
 
-34.5 An Async Pipeline with spawn, await, and a Channel
+35.5 An Async Pipeline with spawn, await, and a Channel
 
 The problem. Coordinate several I/O-shaped stages — fetch, transform, store — so that while one stage waits, the others progress, without dedicating an operating-system thread to each wait.
 
@@ -465,7 +465,7 @@ Edge cases. Calling `await` outside a fiber reports that plainly and returns an 
 
 Variation. Add a second consumer and a second channel, and route values to them in round-robin. It is the skeleton of a worker pipeline, and it shows that a channel per stage is the natural way to express the connections between them.
 
-34.6 Bounding Concurrency with a Semaphore
+35.6 Bounding Concurrency with a Semaphore
 
 The problem. You have a hundred tasks and only four database connections. Every task wants a connection, and if they all grab one the database falls over. You need at most four tasks inside the connection-using region at once, regardless of how many tasks exist.
 
@@ -525,7 +525,7 @@ Edge cases. A `post` without a matching `wait` raises the count above its initia
 
 Variation. Replace the join-one-at-a-time structure with the MiniPool from 34.3: submit all the tasks, have each do `wait`, work, `post`, and use an `AtomicU64` for the completed count. It combines three of this chapter's patterns — a pool, a semaphore, an atomic — into the shape of a real rate-limited service, and watching them fit together is the point of the whole chapter.
 
-34.7 A Reader-Writer Lock
+35.7 A Reader-Writer Lock
 
 The problem. Many threads read a piece of shared data and only a few ever write it. A plain mutex makes every reader wait for every other reader, needlessly serialising the common case. You want a lock that lets any number of readers in at once but gives a writer the room to itself.
 
@@ -612,7 +612,7 @@ Edge cases. A reader that takes the read lock twice on the same thread can deadl
 
 Variation. Remove the `writersWaiting` term to get a reader-preference lock, then run a stream of readers and one writer and observe that the writer is starved. Put the term back and watch the writer get a turn. The difference in behaviour is the whole argument for one policy over the other, and neither is universally right.
 
-34.8 A Barrier (Rendezvous)
+35.8 A Barrier (Rendezvous)
 
 The problem. A group of threads computes in phases, and no thread may begin phase two until every thread has finished phase one. You need a meeting point that holds all of them until the last one arrives, and that can be reused for the next phase.
 
@@ -679,7 +679,7 @@ Edge cases. `count` of zero is meaningless and refused. Every party must call `w
 
 Variation. Add a `phase()` method that returns the current generation so a worker can tell which round it is in, and use it to run a three-phase pipeline where each phase prints a different message. Then write a sense-reversing barrier, which uses a boolean "sense" flag instead of a generation counter, and argue that the two are the same idea with different counters.
 
-34.9 Parallel Sum by Divide and Conquer
+35.9 Parallel Sum by Divide and Conquer
 
 The problem. Sum a large array across several threads, but with a recursive division that mirrors how you would state the algorithm mathematically, rather than the fixed chunking of 34.4. The reduction — combining partial answers — is the pattern this example adds.
 
@@ -776,7 +776,7 @@ Edge cases. A cutoff of zero recurses without end, because a one-element range w
 
 Variation. Replace the `threadCreate` with the `ThreadPool` from 34.3 so the thread count is fixed and the fork becomes a queue push, then time both versions on an array of ten million and find the cutoff where the recursive version stops paying for itself.
 
-34.10 The Dining Philosophers, and How to Avoid Deadlock
+35.10 The Dining Philosophers, and How to Avoid Deadlock
 
 The problem. Five philosophers sit around a table with one fork between each pair. To eat, a philosopher needs both the fork on the left and the fork on the right. Each spends the time alternating between thinking and eating. If every philosopher picks up the left fork first and then waits for the right, all five can hold one fork and wait forever. That is deadlock, and it is the smallest picture of the problem that any real locking code faces.
 
@@ -888,7 +888,7 @@ Edge cases. The ordering rule must be used by every code path that takes both fo
 
 Variation. Implement the waiter solution: a single mutex guarding a bitmask of free forks, with each philosopher becoming "hungry" and the waiter granting both forks only when both are free, signalling the philosopher to eat. It removes the starvation problem and replaces the lock-ordering argument with a single serialisation point, and comparing the two is the best way to see what each buys.
 
-34.11 A Token-Bucket Rate Limiter
+35.11 A Token-Bucket Rate Limiter
 
 The problem. Allow at most a fixed rate of operations — say four database queries per second — while still permitting a short burst when the work arrives in a clump. How do you enforce a rate without a background timer thread burning cycles?
 
@@ -975,7 +975,7 @@ Edge cases. A non-positive rate divides by zero in the deficit computation; the 
 
 Variation. Add a `tryAcquireN(u64 n)` for operations that cost more than one token, and a fairness counter so callers are served in arrival order rather than competing. Then move the sleeping into a background refiller thread that wakes every few milliseconds and signals a condition variable, and compare the two designs on CPU wake-ups and on the accuracy of the rate under load.
 
-34.12 Exercises
+35.12 Exercises
 
 1. Comprehension. Explain why `count += 1` in two threads can lose an increment, and why `fetchAdd` cannot. Then explain why the rule is "atomic for one cell, mutex for a region," and give an example that tempts you to break it.
 

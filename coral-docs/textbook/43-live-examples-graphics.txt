@@ -1,4 +1,4 @@
-Chapter 42
+Chapter43
 
 Live Examples: Graphics (from Scratch)
 
@@ -12,9 +12,9 @@ Two ideas carry the chapter, and they are worth stating before the first line. T
 
 A note on the imports. The framebuffer is a `Vec<u8>` from `import(lib) std::vec { Vec };`. Files are written with `fileOpen`, `fileWrite`, and `fileClose` from `import(lib) std::io::fs`; `std::fmt::format` is a stub in this toolchain, so integer text is built with `formatInt` from `import(lib) std::fmt::fmt` and the `String` type from `import(lib) std::text::string`. Floating-point helpers such as `sqrt`, `floor`, `ceil`, `sin`, `cos`, `minF64`, and `maxF64` come from `import(lib) std::math::math`. `println` comes from `std::io::ios`, and `Vec` and `str` are prelude names.
 
-A note on the shape of every example. Section 42.1 defines the shared scaffolding once: the `Image` framebuffer type, the `Color` type, the byte-conversion helper, and the `writePPM` function. Every later section is a complete program that imports what it needs and reuses that scaffolding, in the same spirit as the `Graph` of Chapter 30 being defined once and used throughout. Only the new algorithm changes from section to section.
+A note on the shape of every example. Section43.1 defines the shared scaffolding once: the `Image` framebuffer type, the `Color` type, the byte-conversion helper, and the `writePPM` function. Every later section is a complete program that imports what it needs and reuses that scaffolding, in the same spirit as the `Graph` of Chapter31 being defined once and used throughout. Only the new algorithm changes from section to section.
 
-42.1 The Framebuffer and the PPM File
+43.1 The Framebuffer and the PPM File
 
 The problem. Represent a rectangular image in memory, set individual pixels, and write the whole thing to a file that an ordinary image viewer can open. This is the foundation every later section stands on.
 
@@ -46,6 +46,7 @@ The implementation.
             return img;
         }
 
+        // Store one RGB triple; out-of-bounds writes are dropped.
         void setPixel(usize x, usize y, u8 r, u8 g, u8 b) {
             if (x >= self.w || y >= self.h) return;   // drop out-of-bounds writes
             usize i = (y * self.w + x) * 3;           // first byte of pixel (x, y)
@@ -61,8 +62,10 @@ The implementation.
         for (usize i = 0; i < s.len; i += 1) out->push(s.ptr[i]);
     }
 
+    // Serialize the framebuffer to a binary P6 PPM file.
     void writePPM(str path, const Image* img) {
         // Assemble the P6 header and the raw bytes in a single output buffer.
+        // Reserve the header slack plus every pixel byte.
         Vec<u8> out = Vec<u8>::withCap(img->px.count() + 32);
         out.push((u8)'P');                          // "P6": binary PPM magic
         out.push((u8)'6');
@@ -78,13 +81,16 @@ The implementation.
         for (usize i = 0; i < img->px.count(); i += 1) out.push(img->px.at(i));
 
         Result<File, IoError> fo = fileOpen(path, "w");  // "w" = create and truncate
+        // Error path: report and return if the file cannot be opened.
         if (fo.isErr()) { println("could not open {}", path); return; }
         File f = fo.unwrap();
 
         usize off = 0;                              // fileWrite may write short; loop
         while (off < out.count()) {
+            // Loop until every byte of the buffer has been written.
             Result<isize, IoError> wr = fileWrite(f, out.ptr() + off, out.count() - off);
             if (wr.isErr()) { println("write failed"); break; }
+            // Guard against a stall: stop if the write makes no progress.
             isize put = wr.unwrap();
             if (put <= 0) break;                    // nothing moved: stop
             off += (usize)put;                      // advance past what got written
@@ -93,10 +99,12 @@ The implementation.
     }
 
     void main() {
+        // A 160-by-100 image.
         Image img = Image::new(160, 100);
         // Two-axis ramp: red grows across, green grows down, blue is fixed.
         for (usize y = 0; y < img.h; y += 1) {
             for (usize x = 0; x < img.w; x += 1) {
+                // Scale each channel to [0, 255], guarding a one-pixel axis.
                 u8 r = img.w > 1 ? (u8)(x * 255 / (img.w - 1)) : 128;
                 u8 g = img.h > 1 ? (u8)(y * 255 / (img.h - 1)) : 128;
                 img.setPixel(x, y, r, g, 96);
@@ -112,7 +120,7 @@ Cost and notes. Building the image is O(w × h) time and space, one byte triple 
 
 Edge cases and variations. The single whitespace byte between the maximum value and the pixel data is the format's one sharp edge. A reader consumes exactly one whitespace character after `255`; write `255\n\n` and the second newline becomes the first pixel's red byte, shifting every pixel by one channel and turning the image into diagonal color garbage. The `w > 1` and `h > 1` guards avoid a divide-by-zero when someone asks for a one-pixel-wide image. `setPixel` clamps by dropping, not by clipping to the nearest in-bounds pixel, which is the right choice for drawing but means a naive "blit" would lose whatever fell outside. The first variation is the ASCII `P3` format: keep the same `Image` and `writePPM` skeleton, but, instead of the `for` loop that copies bytes, write each channel with `appendInt` separated by spaces, and change the magic to `P3`; the file becomes text you can inspect and roughly five times larger. The second is a `getPixel` method that reads a channel triple back, which the exercises ask you to add. And the obvious one: the format supports a maximum value other than 255, so a 16-bit-per-channel variant is a two-byte write and a `65535` in the header, at the cost of twice the bytes.
 
-42.2 Gradients and Color Math
+43.2 Gradients and Color Math
 
 The problem. Fill an image with a smooth blend between two colors. The gradient is the simplest interesting image, and the place to establish the color representation the rest of the chapter uses.
 
@@ -134,7 +142,9 @@ The implementation.
 
     // The single place floats become bytes: clamp, scale by 255, round.
     u8 toByte(f64 v) {
+        // Below zero clamps to black.
         if (v <= 0.0) return 0;
+        // One or above clamps to white.
         if (v >= 1.0) return 255;
         return (u8)(v * 255.0 + 0.5);           // +0.5 rounds to nearest
     }
@@ -148,8 +158,10 @@ The implementation.
         };
     }
 
+    // One color per row, interpolated from top to bottom.
     void fillVerticalGradient(Image* img, Color top, Color bottom) {
         usize denom = img->h > 1 ? img->h - 1 : 1;  // guard a one-row image
+        // Walk each row of the image.
         for (usize y = 0; y < img->h; y += 1) {
             f64 t = (f64)y / (f64)denom;            // 0 at the top row, 1 at the bottom
             Color c = lerpColor(top, bottom, t);
@@ -162,6 +174,7 @@ The implementation.
     }
 
     void main() {
+        // A 160x100 canvas.
         Image img = Image::new(160, 100);
         // Blend from deep blue at the top to warm orange at the bottom.
         fillVerticalGradient(&img,
@@ -177,7 +190,7 @@ Cost and notes. The whole image is one pass, O(w × h), and the color work per r
 
 Edge cases and variations. A one-pixel-tall image divides by the sentinel `1` and maps its single row to `t = 0`, so it takes the top color, which is a defensible convention. Colors whose components exceed `[0, 1]` are clamped by `toByte`, which is what makes it safe to pass a "bright" color that is deliberately above one. The `lerp` is linear, so a gradient from red to blue passes through a muddy purple rather than a bright magenta; blending through some intermediate color, or blending in a different space, is a deliberate artistic choice. The natural variation is a two-dimensional gradient, `t` combined from both axes, or a radial gradient where `t` is the normalized distance from a center point; both are one-line changes to how `t` is computed, and both look dramatically different. A second variation replaces the straight `lerp` with a smoothstep curve, `t * t * (3 - 2 * t)`, which eases the ends and removes the visible seam where a gradient meets a flat region.
 
-42.3 Lines: Bresenham's Algorithm
+43.3 Lines: Bresenham's Algorithm
 
 The problem. Draw a line between two integer pixel coordinates. The catch is that a line is continuous and the grid is not, so the job is choosing the best discrete pixel to represent each step of the ideal line.
 
@@ -190,11 +203,13 @@ The implementation.
     import(lib) std::vec { Vec };
     import(lib) std::io::ios { println };
 
+    // Guard the cast: negative coordinates are off-image.
     void plotSafe(Image* img, isize x, isize y, u8 r, u8 g, u8 b) {
         if (x < 0 || y < 0) return;                 // drop off-image coordinates
         img->setPixel((usize)x, (usize)y, r, g, b);
     }
 
+    // Draw a line between two integer endpoints.
     void plotLine(Image* img, isize x0, isize y0, isize x1, isize y1, u8 r, u8 g, u8 b) {
         // Integer-only; the same loop covers all eight octants.
         isize dx = x1 > x0 ? x1 - x0 : x0 - x1;     // |x1 - x0|
@@ -203,6 +218,7 @@ The implementation.
         isize sy = y0 < y1 ? 1 : -1;                // y step direction
         isize err = dx + dy;                        // err starts at dx - |dy|
 
+        // Plot the current pixel, then step toward the endpoint.
         while (true) {
             plotSafe(img, x0, y0, r, g, b);
             if (x0 == x1 && y0 == y1) break;        // reached the far endpoint
@@ -215,6 +231,7 @@ The implementation.
     void main() {
         Image img = Image::new(200, 200);
         // Fan twelve lines out from a common origin, sweeping slope and color.
+        // Twelve lines whose color tracks the loop index.
         for (usize i = 0; i <= 11; i += 1) {
             isize t = (isize)(i * 255 / 11);        // 0 .. 255 across the fan
             plotLine(&img, 10, 100, 190, t, (u8)(255 - (usize)t), (u8)t, 128);
@@ -229,7 +246,7 @@ Cost and notes. One iteration per pixel on the line, a constant number of additi
 
 Edge cases and variations. A zero-length line (both endpoints equal) plots one pixel and breaks, which is the correct degenerate case. A steep line and a shallow line both work because the decisions are independent. The coordinates are `isize`, and `plotSafe` guards the cast to `usize`, so a line whose endpoint is off the top or left of the image is clipped by dropping the off-screen pixels rather than by refusing to draw; a line that is entirely off-screen simply draws nothing. Coordinates far outside the image still cost work proportional to the line's length, so a robust renderer would clip the line to the image's bounds first. The natural variation is a thick line, drawn by plotting a small square or a disk at each step, though that double-draws overlapping pixels; the clean version offsets the line sample for each of several parallel passes. A second variation is Xiaolin Wu's line algorithm, which antialiases by plotting two pixels per column with intensities proportional to the distance from the ideal line; it computes the fraction Bresenham avoided, and the payoff is a line with no staircase.
 
-42.4 Circles: The Midpoint Algorithm
+43.4 Circles: The Midpoint Algorithm
 
 The problem. Draw the outline of a circle of integer center and radius, again with integer arithmetic and no trigonometry. The circle closes on itself, so a naive step in angle would either leave gaps or overdraw; the right way exploits the circle's symmetry.
 
@@ -242,6 +259,7 @@ The implementation.
     import(lib) std::vec { Vec };
     import(lib) std::io::ios { println };
 
+    // Plot only if in-image; negative coordinates are dropped.
     void plotPixel(Image* img, isize x, isize y, u8 r, u8 g, u8 b) {
         if (x < 0 || y < 0) return;                 // guard the unsigned cast
         img->setPixel((usize)x, (usize)y, r, g, b);
@@ -259,13 +277,16 @@ The implementation.
         plotPixel(img, cx - y, cy - x, r, g, b);
     }
 
+    // Walk the first octant; symmetry fills the rest.
     void drawCircle(Image* img, isize cx, isize cy, isize radius, u8 r, u8 g, u8 b) {
         if (radius < 0) return;
         isize x = radius;                           // start at (radius, 0)
         isize y = 0;
         isize err = 0;                              // midpoint decision variable
+        // Stop at the 45-degree point where x drops below y.
         while (x >= y) {                            // walk the first octant
             plot8(img, cx, cy, x, y, r, g, b);
+            // Advance y every step.
             y += 1;
             if (err <= 0) err += 2 * y + 1;         // midpoint is still inside
             if (err > 0) { x -= 1; err -= 2 * x + 1; }  // step x inward
@@ -289,7 +310,7 @@ Cost and notes. The loop runs about `radius / √2` times, so the cost is O(radi
 
 Edge cases and variations. Radius zero plots the single center pixel eight times, which is harmless. With an even radius the arc's endpoints can plot a pixel twice, once in this octant and once as a mirror, so a caller who cares about exactly-once writes would test before plotting; visually it makes no difference. The guard in `plotPixel` clips a circle that runs off the image. The matching filled version changes `plot8` into a function that, for each scanline, draws a horizontal span from `cx - x` to `cx + x` (or `y`, whichever is wider), turning the outline into a solid disk with the same loop. A second variation is the antialiased circle, which keeps the fractional part of the midpoint test as an intensity and blends the two candidate pixels, exactly as Wu's line does for lines. And because the algorithm works for any monotone arc, the same skeleton with a different midpoint test draws ellipses, though the simple eight-fold symmetry no longer applies and the two axes must be tracked separately.
 
-42.5 Triangles: Barycentric Rasterization
+43.5 Triangles: Barycentric Rasterization
 
 The problem. Fill a triangle whose three vertices are given as floating-point coordinates, interpolating a color across the surface. Triangles are the primitive of every real renderer, because any shape can be broken into them and because three points are always coplanar.
 
@@ -304,6 +325,7 @@ The implementation.
     import(lib) std::math::math { minF64, maxF64, floor, ceil };
 
     // Twice the signed area of triangle (a, b, p): the barycentric edge test.
+    // Half the cross product of (b - a) and (p - a).
     f64 edgeFn(f64 ax, f64 ay, f64 bx, f64 by, f64 px, f64 py) {
         return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
     }
@@ -311,6 +333,7 @@ The implementation.
     void rasterTriangle(Image* img,
                         f64 x0, f64 y0, f64 x1, f64 y1, f64 x2, f64 y2,
                         Color c0, Color c1, Color c2) {
+        // Signed area of the whole triangle.
         f64 area = edgeFn(x0, y0, x1, y1, x2, y2);
         if (area == 0.0) return;                    // degenerate triangle
 
@@ -321,19 +344,23 @@ The implementation.
         f64 maxY = maxF64(y0, maxF64(y1, y2));
 
         // Clip the box out to whole pixel rows and columns.
+        // Round the box outward to integer pixel bounds.
         isize px0 = (isize)floor(minX);
         isize px1 = (isize)ceil(maxX);
         isize py0 = (isize)floor(minY);
         isize py1 = (isize)ceil(maxY);
 
+        // Scan every candidate pixel inside the bounding box.
         for (isize py = py0; py <= py1; py += 1) {
             for (isize px = px0; px <= px1; px += 1) {
                 f64 cx = (f64)px + 0.5;             // test the pixel center
                 f64 cy = (f64)py + 0.5;
                 // Barycentric weight of each corner; divided by area they sum to one.
+                // Weights for each corner at the pixel center.
                 f64 w0 = edgeFn(x1, y1, x2, y2, cx, cy) / area;
                 f64 w1 = edgeFn(x2, y2, x0, y0, cx, cy) / area;
                 f64 w2 = edgeFn(x0, y0, x1, y1, cx, cy) / area;
+                // Inside when all three weights are non-negative.
                 if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) {
                     // Blend the corner colors with the same weights.
                     Color c = Color {
@@ -341,6 +368,7 @@ The implementation.
                         .g = w0 * c0.g + w1 * c1.g + w2 * c2.g,
                         .b = w0 * c0.b + w1 * c1.b + w2 * c2.b
                     };
+                    // Drop pixels that fall outside the image before writing.
                     if (px >= 0 && py >= 0)
                         img->setPixel((usize)px, (usize)py, toByte(c.r), toByte(c.g), toByte(c.b));
                 }
@@ -365,7 +393,7 @@ Cost and notes. The scan visits every pixel in the bounding box, so the cost is 
 
 Edge cases and variations. A degenerate triangle has zero area, and the check returns before dividing by zero; a triangle whose three points are collinear, or two of whose vertices coincide, is the case it catches. Pixels exactly on an edge can be assigned to either neighboring triangle, because the `>= 0.0` test is inclusive on all three edges; two triangles sharing an edge may therefore both claim the pixels along it, or, with a strict test, neither, which is the classic "cracks and overdraw" problem and the reason production pipelines use a consistent tie-breaking rule such as `w >= 0` on two edges and `w > 0` on the third. The signed-area normalization means the winding order does not matter, which is convenient but hides a real question: a rasterizer that needs to cull back-facing triangles must preserve the sign instead of dividing it away. The natural variation is perspective-correct texture mapping, where each vertex carries texture coordinates and the barycentric weights are divided by a per-vertex depth before interpolation, which is exactly why a texture on a floor recedes correctly instead of warping. A second variation is the scanline fill, which walks the triangle row by row, computes the two edge crossings on each row, and fills between them, avoiding the bounding-box waste.
 
-42.6 2D Transforms: A Point Type and an Affine Matrix
+43.6 2D Transforms: A Point Type and an Affine Matrix
 
 The problem. Move, rotate, and scale a shape by combining those operations into a single object, so that transforming a point is one matrix multiply rather than a chain of separate calls. This is the machinery that turns a shape defined once into a shape drawn anywhere.
 
@@ -389,22 +417,27 @@ The implementation.
         f64 a; f64 b; f64 c;      // x' = a*x + b*y + c
         f64 d; f64 e; f64 f;      // y' = d*x + e*y + f
 
+        // The do-nothing transform.
         static Affine identity() {
             return Affine { .a = 1.0, .b = 0.0, .c = 0.0,
                             .d = 0.0, .e = 1.0, .f = 0.0 };
         }
+        // Shift x by tx and y by ty.
         static Affine translate(f64 tx, f64 ty) {
             return Affine { .a = 1.0, .b = 0.0, .c = tx,
                             .d = 0.0, .e = 1.0, .f = ty };
         }
+        // Stretch the axes independently.
         static Affine scale(f64 sx, f64 sy) {
             return Affine { .a = sx,  .b = 0.0, .c = 0.0,
                             .d = 0.0, .e = sy,  .f = 0.0 };
         }
+        // Rotation about the origin, in radians.
         static Affine rotate(f64 angle) {
             return Affine { .a = cos(angle), .b = -sin(angle), .c = 0.0,
                             .d = sin(angle), .e =  cos(angle), .f = 0.0 };
         }
+        // Return self composed after other.
         Affine mul(Affine other) {                  // self composed after other
             // The 3x3 matrix product with the constant last row folded away.
             return Affine {
@@ -416,6 +449,7 @@ The implementation.
                 .f = self.d * other.c + self.e * other.f + self.f
             };
         }
+        // Apply the transform to a point.
         P2 apply(P2 p) {                            // point through the transform
             return P2 {
                 .x = self.a * p.x + self.b * p.y + self.c,
@@ -424,8 +458,10 @@ The implementation.
         }
     }
 
+    // Outline a closed polygon by connecting consecutive vertices.
     void drawPolygon(Image* img, const Vec<P2>* pts, u8 r, u8 g, u8 b) {
         usize n = pts->count();
+        // Need at least two points to draw an edge.
         if (n < 2) return;                          // nothing to connect
         for (usize i = 0; i < n; i += 1) {
             P2 p = pts->at(i);
@@ -443,12 +479,14 @@ The implementation.
         square.push(P2 { .x =  1.0, .y =  1.0 });
         square.push(P2 { .x = -1.0, .y =  1.0 });
 
+        // Compose scale, then rotate, then translate (read right to left).
         Affine m = Affine::translate(100.0, 100.0)
                             .mul(Affine::rotate(0.5))
                             .mul(Affine::scale(60.0, 40.0));
 
         // Map each corner through the composed matrix, then outline it.
         Vec<P2> out = Vec<P2>::new();
+        // Push each transformed corner into a new list.
         for (usize i = 0; i < square.count(); i += 1) out.push(m.apply(square.at(i)));
         drawPolygon(&img, &out, 255, 200, 40);
         writePPM("/tmp/coral-transform.ppm", &img);
@@ -461,7 +499,7 @@ Cost and notes. Composing two transforms is a constant number of multiplies and 
 
 Edge cases and variations. A scale of zero collapses the shape to a line or a point and makes the transform non-invertible; nothing here needs the inverse, so it simply draws the collapsed result, but a renderer that maps textures or hit-tests must detect it. The rotation is about the origin, so rotating a shape that is not centered on the origin also swings it around, which is why the example composes translation last; the standard fix, "rotate about a point," is `translate(center).mul(rotate).mul(translate(-center))`. `drawPolygon` closes every shape, so it draws an outline and not an open path; an open-polyline variant is one fewer iteration. The natural variation is a full three-by-three matrix that can also apply shear, which is the same six numbers plus two more, or a two-dimensional camera that stores the inverse transform so a screen coordinate can be turned back into a world coordinate for picking. A second variation keeps the translation separate from the linear part, which is what `std::math::matrix`'s `Mat2` and `Mat4` do, and which is preferable when the same rotation is applied to many objects at different positions.
 
-42.7 Text: A 5x7 Bitmap Font
+43.7 Text: A 5x7 Bitmap Font
 
 The problem. Draw readable text into the image. There is no font engine here, so the letters have to come from a table of pixels built by hand.
 
@@ -480,6 +518,7 @@ The implementation.
         font->push(r4); font->push(r5); font->push(r6);
     }
 
+    // Build the bitmap font table.
     Vec<u8> buildFont() {
         Vec<u8> f = Vec<u8>::new();
         // Order: space, then A..Z, then 0..9; the space glyph is seven zero rows.
@@ -523,27 +562,34 @@ The implementation.
         return f;
     }
 
+    // Map an ASCII byte to its slot in the font table.
     isize glyphIndex(u8 c) {
         if (c == (u8)' ') return 0;
+        // Capital letters follow the space glyph.
         if (c >= (u8)'A' && c <= (u8)'Z') return 1 + (isize)(c - (u8)'A');
+        // Digits follow the capitals.
         if (c >= (u8)'0' && c <= (u8)'9') return 27 + (isize)(c - (u8)'0');
         return -1;                                          // unknown: skipped
     }
 
+    // Render a string at (x0, y0) with the given scale.
     void drawText(Image* img, const Vec<u8>* font, isize x0, isize y0,
                   str text, isize scale, u8 r, u8 g, u8 b) {
         // Walk the string one character at a time.
         for (usize i = 0; i < text.len; i += 1) {
             isize gi = glyphIndex(text.at(i));      // table slot for this character
             if (gi < 0) continue;                   // skip anything not in the table
+            // Seven rows per glyph, top to bottom.
             for (usize row = 0; row < 7; row += 1) {
                 u8 bits = font->at((usize)gi * 7 + row);  // this row's five bits
+                // Five columns per glyph, left to right.
                 for (usize col = 0; col < 5; col += 1) {
                     u8 on = (u8)((bits >> (u32)(4 - col)) & 1u);  // leftmost is the high bit
                     if (on == 0) continue;
                     // A lit bit becomes a scale-by-scale block of pixels.
                     for (isize dy = 0; dy < scale; dy += 1) {
                         for (isize dx = 0; dx < scale; dx += 1) {
+                            // Pen advances six columns (five plus a gap) per character.
                             isize px = x0 + (isize)col * scale + dx + (isize)i * (6 * scale);
                             isize py = y0 + (isize)row * scale + dy;
                             if (px >= 0 && py >= 0)
@@ -559,19 +605,20 @@ The implementation.
         Image img = Image::new(200, 90);
         Vec<u8> font = buildFont();
 
+        // Draw the title large and the subtitle small.
         drawText(&img, &font,  6,  6, "CORAL", 4, 255, 220, 80);
         drawText(&img, &font,  6, 48, "GRAPHICS 42", 2, 120, 220, 255);
         writePPM("/tmp/coral-text.ppm", &img);
         println("wrote /tmp/coral-text.ppm");
     }
 
-The font table is the whole idea, and reading it is the best way to believe the format works. Each glyph is seven rows, top to bottom, and each row is five bits, left to right, so `0b01110` for the top of an `A` is the three pixels of its cap. The glyphs sit in a fixed order, and `glyphIndex` converts an ASCII character into that order with two range checks. `drawText` extracts each bit with a shift and a mask, exactly the bit idiom from Chapter 32, and tests the high bit first for the leftmost column because `4 - col` counts down from four. The pen advances by `6 * scale` per character: five columns of glyph plus one column of letter spacing. Unknown characters are skipped, so an unloaded symbol leaves a blank rather than throwing.
+The font table is the whole idea, and reading it is the best way to believe the format works. Each glyph is seven rows, top to bottom, and each row is five bits, left to right, so `0b01110` for the top of an `A` is the three pixels of its cap. The glyphs sit in a fixed order, and `glyphIndex` converts an ASCII character into that order with two range checks. `drawText` extracts each bit with a shift and a mask, exactly the bit idiom from Chapter33, and tests the high bit first for the leftmost column because `4 - col` counts down from four. The pen advances by `6 * scale` per character: five columns of glyph plus one column of letter spacing. Unknown characters are skipped, so an unloaded symbol leaves a blank rather than throwing.
 
 Cost and notes. Building the font costs a few hundred pushes once, which is why it is hoisted out of `drawText` and built a single time in `main`. Drawing a string of `m` characters at scale `s` writes up to `m * 35 * s²` pixels in the worst case, so the cost grows with the square of the scale, which is the definition of drawing a bigger letter. The bit extraction is a shift and an AND per pixel and is far cheaper than any per-pixel lookup. The whole font is a little over 250 bytes, which is why bitmap fonts were the only ones that fit in early machines.
 
 Edge cases and variations. Lowercase letters, punctuation, and accented characters are simply absent, and `glyphIndex` returns `-1` for them so they vanish rather than draw garbage; adding a glyph is one more `glyph` call and one more line in `glyphIndex`, which is the point of the table. The text is not wrapped or clipped at the right edge: characters that run past the image are dropped by `setPixel`, so a long string is silently truncated rather than wrapping. Scale zero draws nothing, and a negative scale is not meaningful; a robust version clamps it to at least one. The natural variation is a taller or wider font, or one with a "descent" below the baseline for letters like g and p, which just means more rows and a per-glyph vertical offset. A second variation packs the font even more tightly by storing each glyph as five columns of seven bits instead of seven rows of five, which makes vertical scrolling cheaper. The genuine upgrade is a vector font: instead of a bitmap, each glyph is a list of line and curve segments, and `drawText` becomes a series of `plotLine` calls, which is how text stays sharp at any size at the cost of a great deal more code.
 
-42.8 A Ray Tracer for Spheres
+43.8 A Ray Tracer for Spheres
 
 The problem. Produce a shaded image of three-dimensional objects, not by projecting their surfaces but by simulating light. A ray tracer answers one question per pixel: if I shoot a ray from the camera through this pixel, what does it hit, and how is that surface lit? For spheres that question has a closed-form answer.
 
@@ -597,7 +644,9 @@ The implementation.
         f64  dot(Vec3 o) { return self.x * o.x + self.y * o.y + self.z * o.z; }
         // Return a unit-length copy, or the zero vector if this one is zero.
         Vec3 normalize() {
+            // Length is the dot of the vector with itself.
             f64 len = sqrt(self.dot(self));
+            // Avoid dividing by zero for the zero vector.
             if (len == 0.0) return Vec3 { .x = 0.0, .y = 0.0, .z = 0.0 };
             return self.scale(1.0 / len);
         }
@@ -613,6 +662,7 @@ The implementation.
     f64 hitSphere(Sphere s, Vec3 origin, Vec3 dir) {
         Vec3 oc = origin.sub(s.center);             // origin relative to the center
         f64 b = oc.dot(dir);                        // half the linear coefficient
+        // Constant term: offset length squared minus radius squared.
         f64 c = oc.dot(oc) - s.radius * s.radius;
         f64 disc = b * b - c;                       // reduced discriminant, a = 1
         if (disc < 0.0) return -1.0;                // ray misses the sphere
@@ -624,7 +674,9 @@ The implementation.
         return -1.0;                                // both hits behind the eye
     }
 
+    // One ray per pixel from a pinhole camera.
     void render(Image* img, const Vec<Sphere>* spheres) {
+        // Aspect ratio keeps pixels square in view space.
         f64 aspect = (f64)img->w / (f64)img->h;
         Vec3 eye = Vec3::new(0.0, 0.0, 0.0);        // pinhole at the origin
         Vec3 light = Vec3::new(0.5, 0.8, 0.3).normalize();  // one directional light
@@ -632,10 +684,13 @@ The implementation.
         for (usize y = 0; y < img->h; y += 1) {
             for (usize x = 0; x < img->w; x += 1) {
                 // Map the pixel center to the view plane in [-aspect, aspect] x [-1, 1].
+                // Horizontal and vertical view-plane coordinates.
                 f64 u = (2.0 * ((f64)x + 0.5) / (f64)img->w - 1.0) * aspect;
                 f64 v = 1.0 - 2.0 * ((f64)y + 0.5) / (f64)img->h;
+                // The ray points into the scene along -z.
                 Vec3 ray = Vec3::new(u, v, -1.0).normalize();
 
+                // Nearest-hit search across all spheres.
                 f64 bestT = 1e30;
                 isize hit = -1;
                 for (usize i = 0; i < spheres->count(); i += 1) {
@@ -644,11 +699,15 @@ The implementation.
                 }
 
                 Color c;
+                // If a sphere was hit, shade it; otherwise draw sky.
                 if (hit >= 0) {
                     // Shade the nearest surface: Lambert against the light plus ambient.
                     Sphere s = spheres->at((usize)hit);
+                    // Hit point along the ray.
                     Vec3 p = ray.scale(bestT);
+                    // Outward normal is the hit point minus the center.
                     Vec3 n = p.sub(s.center).normalize();
+                    // Lambert: how squarely the surface faces the light.
                     f64 diff = n.dot(light);
                     if (diff < 0.0) diff = 0.0;                 // clamp the Lambert term
                     f64 k = 0.1 + 0.9 * diff;        // ambient plus Lambert
@@ -688,7 +747,7 @@ Cost and notes. The cost is O(width × height × spheres): one quadratic solve p
 
 Edge cases and variations. A ray that misses every sphere, or hits one behind the camera, falls through to the sky, so the background is always defined. A sphere in front of the camera with its center on the viewing axis renders as a clean disk. The shading is flat Lambert with no shadows: a sphere does not block the light from another, which is the most visible simplification. The `normalize` guard returns a zero vector when the light or a ray direction is zero, which prevents a divide by zero but would also mean no shading; in practice the directions here are never zero. The natural variations are almost a curriculum on their own. Add a second light and sum the terms for a brighter, softer look. Cast a shadow ray from the hit point toward the light and darken the pixel if it hits something, which is one more call to `hitSphere`. Add reflection by tracing a second ray reflected about the normal and mixing the returned color with the surface color, which is the recursive step that makes the tracer a tracer. Replace the background function with an environment map and the flat sphere with an implicit surface described by a distance function, and the same loop renders almost anything. `std::math::vector` provides a `Vec3` with these operations already written, which is worth reaching for once the point of this section has landed.
 
-42.9 The Mandelbrot Set
+43.9 The Mandelbrot Set
 
 The problem. Render the Mandelbrot set, the most famous picture in mathematics, which is defined by a rule simple enough to fit in five lines and rich enough that no one has finished describing it.
 
@@ -701,6 +760,7 @@ The implementation.
     import(lib) std::vec { Vec };
     import(lib) std::io::ios { println };
 
+    // Color by escape count; points that never escape stay black.
     Color mandelbrotColor(i32 n, i32 maxIter) {
         if (n >= maxIter) return Color { .r = 0.0, .g = 0.0, .b = 0.0 };  // never escaped
         f64 t = (f64)n / (f64)maxIter;              // 0 = fastest escape, 1 = last ring
@@ -711,16 +771,21 @@ The implementation.
         };
     }
 
+    // Map pixels to a rectangle of the complex plane.
     void renderMandelbrot(Image* img, i32 maxIter) {
         // Rectangular window of the complex plane to render.
+        // Real-axis extent of the window.
         f64 reMin = -2.5, reMax = 1.0;
+        // Imaginary-axis extent of the window.
         f64 imMin = -1.2, imMax = 1.2;
         f64 reSpan = reMax - reMin;
         f64 imSpan = imMax - imMin;
         usize wd = img->w > 1 ? img->w - 1 : 1;     // guard the one-pixel case
         usize hd = img->h > 1 ? img->h - 1 : 1;
 
+        // Walk every pixel in the image.
         for (usize y = 0; y < img->h; y += 1) {
+            // im is the imaginary part of c for this row.
             f64 im = imMin + imSpan * (f64)y / (f64)hd;
             for (usize x = 0; x < img->w; x += 1) {
                 f64 re = reMin + reSpan * (f64)x / (f64)wd;  // map the pixel to c = re + im*i
@@ -728,12 +793,14 @@ The implementation.
                 f64 zi = 0.0;
                 i32 n = 0;
                 // Iterate z <- z*z + c until |z|^2 > 4 or the cap is reached.
+                // Loop until the point escapes or maxIter is reached.
                 while (n < maxIter && zr * zr + zi * zi <= 4.0) {
                     f64 next = zr * zr - zi * zi + re;   // real part of z^2 + c
                     zi = 2.0 * zr * zi + im;             // imaginary part
                     zr = next;
                     n += 1;                              // count survived iterations
                 }
+                // Turn the escape count into a color.
                 Color c = mandelbrotColor(n, maxIter);
                 img->setPixel(x, y, toByte(c.r), toByte(c.g), toByte(c.b));
             }
@@ -742,6 +809,7 @@ The implementation.
 
     void main() {
         Image img = Image::new(200, 150);
+        // 80 iterations is enough to show the shape.
         renderMandelbrot(&img, 80);
         writePPM("/tmp/coral-mandelbrot.ppm", &img);
         println("wrote /tmp/coral-mandelbrot.ppm");
@@ -753,7 +821,7 @@ Cost and notes. The cost is the image size times the average iteration count, so
 
 Edge cases and variations. Points exactly on the boundary of the set are neither strictly inside nor outside on a computer, because the iteration has to stop somewhere; the cap decides, and increasing the cap pulls the boundary in only very slightly, which is why the black region is stable as you raise it. Points in the "black" interior never escape, so their color is constant and the entire visual interest is the escape-time rings just outside. The palette here is a single monotone ramp, which shows the shape but not the bands; a cyclical palette using `n % period` produces the familiar colored stripes, at the cost of needing `floor` or an integer modulo to wrap the count. The natural variations are the zoom, which is six different numbers for the rectangle and nothing else, and the smooth-iteration palette, which uses the fractional escape value `n - log(log|z|) / log 2` to remove the banding; both are small and both change the picture dramatically. A second family is the cousin fractals, the Julia sets, which fix `c` and iterate over each point as the starting `z` instead of starting from zero, so the same loop with the roles of `c` and `z₀` exchanged draws an entirely different universe.
 
-42.10 Exercises
+43.10 Exercises
 
 1. Comprehension. Explain why the byte index of pixel `(x, y)` is `(y * width + x) * 3`, and what would change if the buffer were column-major or if the format stored its channels as blue-green-red. Why does the chapter drop out-of-bounds writes instead of clipping them to the nearest edge?
 
