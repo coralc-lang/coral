@@ -21,14 +21,17 @@ The intuition. Names are documentation that cannot go stale, because the compile
 The before.
 
     pub f64 calc(f64 a, f64 b) {
+        // what is 0.85? the reader has to guess
         return a * b * 0.85;
     }
 
     pub bool chk(u32 n) {
+        // and what does the range 3..24 mean?
         return n >= 3 && n <= 24;
     }
 
     pub void proc(Vec<f64>* d) {
+        // "proc" says nothing about the 1.2 multiplier
         for (usize i = 0; i < d->count(); i += 1)
             d->set(i, d->at(i) * 1.2);
     }
@@ -37,12 +40,15 @@ Every one of these works. Now read a call site: `calc(x, y)`, `chk(n)`, `proc(v)
 
 The after.
 
+    // the magic number now has a name that states the business rule
     pub const f64 WHOLESALE_MARKUP = 0.85;
 
     pub f64 retailPrice(f64 cost, f64 quantity) {
+        // the call site reads as a sentence
         return cost * quantity * WHOLESALE_MARKUP;
     }
 
+    // bounds carry their meaning
     pub const u32 MIN_USERNAME_LENGTH = 3;
     pub const u32 MAX_USERNAME_LENGTH = 24;
 
@@ -53,6 +59,7 @@ The after.
     pub const f64 TAX_RATE = 1.2;
 
     pub void applyTax(Vec<f64>* prices) {
+        // the rate is named, so the intent is visible at the loop
         for (usize i = 0; i < prices->count(); i += 1)
             prices->set(i, prices->at(i) * TAX_RATE);
     }
@@ -74,17 +81,20 @@ The intuition. The real enemy is not extra typing; it is the change that has to 
 The before. Registration validates a username in three places, each with its own slightly different rule.
 
     pub bool registerUser(str name) {
+        // this copy of the username rule...
         if (name.len < 3 || name.len > 24) return false;      // rule A
         if (name.len == 0) return false;
         return true;
     }
 
     pub bool renameUser(str newName) {
+        // ...is duplicated here...
         if (newName.len < 3 || newName.len > 24) return false;  // rule A again
         return true;
     }
 
     pub bool createGuest(str label) {
+        // ...and has already drifted in this third copy
         if (label.len < 2 || label.len > 24) return false;      // rule A', drifted
         return true;
     }
@@ -93,6 +103,7 @@ The first two agree; the third has already drifted to a minimum of two, and nobo
 
 The after. One function owns the rule, and every call site asks it.
 
+    // one authoritative home for the rule
     pub const u32 MIN_USERNAME_LENGTH = 4;
     pub const u32 MAX_USERNAME_LENGTH = 24;
 
@@ -100,6 +111,7 @@ The after. One function owns the rule, and every call site asks it.
         return name.len >= MIN_USERNAME_LENGTH && name.len <= MAX_USERNAME_LENGTH;
     }
 
+    // every caller now asks the same function
     pub bool registerUser(str name) {
         return isValidUsername(name);
     }
@@ -129,6 +141,7 @@ The intuition. Picture a function that reads a file, parses it, computes a stati
 The before. A single `reportSales` does everything.
 
     pub struct SalesSummary {
+        // the summary value the function computes then prints
         f64 total;
         f64 average;
         u32 count;
@@ -140,8 +153,10 @@ The before. A single `reportSales` does everything.
         return sum;
     }
 
+    // this one function carries five reasons to change
     pub void reportSales(const Vec<f64>* values) {
         // load (pretend it happens here)
+        // the statistic is computed inline, not returned
         f64 total = totalOf(values);
         f64 average = values->count() > 0 ? total / (f64)values->count() : 0.0;
 
@@ -157,6 +172,7 @@ The name promises a report; the function computes a summary, decides a format, a
 The after. Each concern gets a name and a home.
 
     pub struct SalesSummary {
+        // the pure result, with no formatting attached
         f64 total;
         f64 average;
         u32 count;
@@ -183,6 +199,7 @@ The after. Each concern gets a name and a home.
 
     // delivery: one reason to change (the destination)
     pub void reportSales(const Vec<f64>* values) {
+        // three-line composition of the three concerns
         SalesSummary s = summarise(values);
         print(formatSummary(&s));
     }
@@ -206,6 +223,7 @@ The before. One struct carrying union-ish fields selected by a kind tag.
     enum RoleKind { Engineer, Manager, Contractor }
 
     pub struct Employee {
+        // the tag selects which of the fields below are even meaningful
         str name;
         RoleKind kind;
         f64 baseSalary;      // meaningful for Engineer and Manager
@@ -215,6 +233,7 @@ The before. One struct carrying union-ish fields selected by a kind tag.
     }
 
     pub f64 pay(const Employee* e) {
+        // every new role means another branch here
         if (e->kind == RoleKind::Contractor)
             return e->hourlyRate * (f64)e->hoursThisWeek;
         return e->baseSalary;
@@ -225,23 +244,27 @@ This is the tagged-union-by-hand trap from Chapter 13: half the fields are meani
 The after. Compose a role and a pay arrangement, each a small own value.
 
     variant Pay {
+        // each case carries exactly the fields it needs
         Salaried { f64 base; }
         Hourly   { f64 rate; u32 hours; }
     }
 
     variant Role {
+        // roles are a closed set of cases
         Engineer,
         Manager   { u32 reports; }
         Contractor,
     }
 
     pub struct Employee {
+        // composed parts, not a family tree
         str name;
         Role role;
         Pay pay;
     }
 
     pub f64 weeklyPay(const Employee* e) {
+        // depends only on the pay arrangement
         return switch (e->pay) {
             Pay::Salaried { base }        => base,
             Pay::Hourly { rate, hours }   => rate * (f64)hours,
@@ -249,6 +272,7 @@ The after. Compose a role and a pay arrangement, each a small own value.
     }
 
     pub bool managesOthers(const Employee* e) {
+        // depends only on the role
         return switch (e->role) {
             Role::Manager { reports } => reports > 0,
             else                      => false,
@@ -274,12 +298,14 @@ The before. One switch that knows every shape.
     enum ShapeKind { Circle, Rectangle, Triangle }
 
     pub struct Shape {
+        // one generic pair of numbers reused by every shape kind
         ShapeKind kind;
         f64 a;
         f64 b;
     }
 
     pub f64 area(const Shape* s) {
+        // adding a shape means editing this very function
         switch (s->kind) {
             ShapeKind::Circle    => return 3.14159 * s->a * s->a,
             ShapeKind::Rectangle => return s->a * s->b,
@@ -294,10 +320,12 @@ The after. A trait the shapes satisfy, and code written against the trait.
     import(lib) std::math::math { pi, sqrt };
 
     trait Shape {
+        // the contract every shape must satisfy
         f64 area();
         f64 perimeter();
     }
 
+    // each shape supplies its own area and perimeter
     pub struct Circle { f64 radius; }
     pub extend Circle : Shape {
         f64 area() { return pi * self.radius * self.radius; }
@@ -313,6 +341,7 @@ The after. A trait the shapes satisfy, and code written against the trait.
     // written against the contract, not against any concrete shape
     pub f64 totalArea<T>(const Vec<T>* shapes) {
         f64 sum = 0.0;
+        // the compiler checks every T really satisfies Shape
         for (usize i = 0; i < shapes->count(); i += 1) sum += shapes->at(i).area();
         return sum;
     }
@@ -334,6 +363,7 @@ The intuition. A registration function that takes a concrete database is welded 
 The before. High-level registration welded to Postgres, and a fat trait that forces useless methods.
 
     trait Database {
+        // the fat interface: six methods, most of them irrelevant here
         bool connect(str url);
         bool save(User u);
         Option<User> find(i32 id);
@@ -342,6 +372,7 @@ The before. High-level registration welded to Postgres, and a fat trait that for
         void vacuum();
     }
 
+    // the high-level function is welded to the concrete interface
     pub bool registerUser(const User* u, Database* db) {
         return db->save(*u);        // needs only save, demands six methods
     }
@@ -353,10 +384,12 @@ The after. Two small traits, and a function that depends only on the one it need
     pub struct User { i32 id; str name; }
 
     trait UserWriter {
+        // the one ability this consumer actually needs
         bool save(User u);
     }
 
     trait UserReader {
+        // a separate, equally small ability
         Option<User> find(i32 id);
     }
 
@@ -384,6 +417,7 @@ The after. Two small traits, and a function that depends only on the one it need
     pub struct FailingStore { bool failNext; }
     pub extend FailingStore : UserWriter {
         bool save(User u) {
+            // the contract permits returning false, so this is substitutable
             if (self.failNext) return false;
             return true;
         }
@@ -414,6 +448,7 @@ The before. Sentinels everywhere.
     }
 
     pub void showAge(str s) {
+        // the caller must remember to check the sentinel
         i32 age = parseAge(s);
         if (age == -1) {
             println("bad age");
@@ -429,6 +464,7 @@ The after. A `Result` with an error variant that names the cause.
     import(lib) std::io::ios { parseI64 };
 
     pub variant AgeError {
+        // each failure mode is a distinct, nameable case
         NotANumber { str text; },
         Negative   { i32 value; },
         TooLarge   { i32 value; },
@@ -437,6 +473,7 @@ The after. A `Result` with an error variant that names the cause.
     pub Result<i32, AgeError> parseAge(str s) {
         bool ok;
         i64 value = parseI64(s, &ok);
+        // the failure and the reason travel in the return type
         if (!ok) return Result<i32, AgeError>::Err { .error = AgeError::NotANumber { .text = s } };
         if (value < 0) return Result<i32, AgeError>::Err { .error = AgeError::Negative { .value = (i32)value } };
         if (value > 150) return Result<i32, AgeError>::Err { .error = AgeError::TooLarge { .value = (i32)value } };
@@ -444,6 +481,7 @@ The after. A `Result` with an error variant that names the cause.
     }
 
     pub void showAge(str s) {
+        // the switch is exhaustive: no success path can ignore the error
         switch (parseAge(s)) {
             Result::Ok { value }  => println("age {}", value),
             Result::Err { error } => switch (error) {
@@ -471,6 +509,7 @@ The intuition. A range of numbers has an invariant: the low bound is not above t
 The before. Public fields, no constructor, defensive checks scattered everywhere.
 
     pub struct Range {
+        // public fields: nothing enforces lo <= hi
         i32 lo;
         i32 hi;
     }
@@ -490,10 +529,12 @@ Every operation carries its own defence against an illegal state that should nev
 The after. A constructor that establishes the invariant, accessors that assume it, and an assertion that names the contract.
 
     pub struct Range {
+        // fields stay private so only make() can create a Range
         i32 lo;
         i32 hi;
 
         static Option<Range> make(i32 lo, i32 hi) {
+            // the one door: the invariant is checked exactly here
             if (lo > hi) return Option<Range>::None;
             return Option<Range>::Some { .value = Range { .lo = lo, .hi = hi } };
         }
@@ -505,6 +546,7 @@ The after. A constructor that establishes the invariant, accessors that assume i
         }
 
         bool contains(i32 x) {
+            // the assertion is a bug check, not input validation
             @assertOut(self.lo <= self.hi, "Range invariant violated: lo > hi");
             return x >= self.lo && x <= self.hi;
         }
@@ -527,11 +569,13 @@ The intuition. The temptation is to "test" by printing results and squinting. Th
 The before. Verification by printing.
 
     pub u64 gcd(u64 a, u64 b) {
+        // Euclid's algorithm, untouched by the "test" below
         while (b != 0) { u64 t = a % b; a = b; b = t; }
         return a;
     }
 
     pub void main() {
+        // printing a result is not testing it: no expectation is checked
         println("{}", gcd(12, 18));    // expect 6
         println("{}", gcd(18, 12));    // expect 6
         println("{}", gcd(17, 5));     // expect 1
@@ -546,6 +590,7 @@ The after. Tests with a runner, including a property that spans many inputs.
     };
 
     pub u64 gcd(u64 a, u64 b) {
+        // the unit under test, unchanged between the two versions
         while (b != 0) { u64 t = a % b; a = b; b = t; }
         return a;
     }
@@ -553,6 +598,7 @@ The after. Tests with a runner, including a property that spans many inputs.
     #[[test]]
     void gcdKnownValues() {
         _testBegin("gcd known values");
+        // the same examples as before, now with assertions that can fail
         assertEq(6u, gcd(12, 18), "gcd(12,18)");
         assertEq(6u, gcd(18, 12), "gcd(18,12)");
         assertEq(1u, gcd(17, 5), "gcd(17,5)");
@@ -563,6 +609,7 @@ The after. Tests with a runner, including a property that spans many inputs.
     #[[test]]
     void gcdIsCommutative() {
         _testBegin("gcd is commutative");
+        // a property checked across a range, not a single example
         for (u64 a = 0; a < 200; a += 1)
             for (u64 b = 0; b < 200; b += 1)
                 assertTrue(gcd(a, b) == gcd(b, a), "commutativity in range");
@@ -572,6 +619,7 @@ The after. Tests with a runner, including a property that spans many inputs.
     #[[test]]
     void gcdDividesBoth() {
         _testBegin("gcd divides both inputs");
+        // the defining property of a GCD, over a quarter million pairs
         for (u64 a = 1; a < 500; a += 1) {
             for (u64 b = 1; b < 500; b += 1) {
                 u64 g = gcd(a, b);
@@ -582,6 +630,7 @@ The after. Tests with a runner, including a property that spans many inputs.
     }
 
     pub i32 main() {
+        // run every test, then exit non-zero if any failed
         gcdKnownValues();
         gcdIsCommutative();
         gcdDividesBoth();
@@ -606,11 +655,13 @@ The intuition. This is the capstone, and it uses every principle at once. What f
 The before.
 
     pub void main() {
+        // parsing, validation, statistics and formatting all in one function
         Vec<f64> scores = Vec<f64>::new();
         u32 bad = 0;
 
         String line = String::new();
         while (readLine(&line)) {
+            // opaque single-letter names: s, v, comma
             str s = line.asView();
             usize comma = s.findByte(',');
             if (comma >= s.len) { bad += 1; continue; }
@@ -618,14 +669,17 @@ The before.
             bool ok;
             f64 v = parseF64(scoreText, &ok);
             if (!ok) { bad += 1; continue; }
+            // the bound 100.0 is a magic number buried inline
             if (v < 0.0 || v > 100.0) { bad += 1; continue; }
             scores.push(v);
         }
 
         f64 total = 0.0;
         for (usize i = 0; i < scores.count(); i += 1) total += scores.at(i);
+        // -1.0 is a sentinel for "no scores", indistinguishable from a real -1
         f64 avg = scores.count() > 0 ? total / (f64)scores.count() : -1.0;
 
+        // the report format is tangled with everything above
         println("=== Report ===");
         println("records: {}", scores.count());
         println("bad:     {}", bad);
@@ -644,6 +698,7 @@ The after.
     import(lib) std::text::string { String };
     import(lib) std::vec { Vec };
 
+    // the bounds are named constants instead of inline magic numbers
     pub const f64 MIN_SCORE = 0.0;
     pub const f64 MAX_SCORE = 100.0;
 
@@ -653,6 +708,7 @@ The after.
     }
 
     pub variant ParseError {
+        // every rejection reason is a distinct case
         NoComma      { str text; },
         BadScore     { str text; },
         OutOfRange   { f64 value; },
@@ -670,6 +726,7 @@ The after.
         f64 value = parseF64(scoreText, &ok);
         if (!ok)
             return Result<Record, ParseError>::Err { .error = ParseError::BadScore { .text = scoreText } };
+        // range check against the named bounds
         if (value < MIN_SCORE || value > MAX_SCORE)
             return Result<Record, ParseError>::Err { .error = ParseError::OutOfRange { .value = value } };
 
@@ -677,6 +734,7 @@ The after.
     }
 
     pub struct Summary {
+        // the computed statistics, ready for display
         u32 valid;
         u32 rejected;
         f64 sum;
@@ -694,6 +752,7 @@ The after.
         println("=== Report ===");
         println("records: {}", s->valid);
         println("bad:     {}", s->rejected);
+        // valid == 0 is the honest test; a zero average prints as zero
         if (s->valid == 0)
             println("average: n/a");
         else
@@ -701,10 +760,12 @@ The after.
     }
 
     pub void main() {
+        // main is now composition: parse, summarise, print
         Vec<Record> records = Vec<Record>::new();
         u32 rejected = 0;
         String line = String::new();
         while (readLine(&line)) {
+            // the Result forces us to count the rejected lines
             switch (parseRecord(line.asView())) {
                 Result::Ok { value }  => records.push(value),
                 Result::Err { error } => rejected += 1,
@@ -735,6 +796,7 @@ The before. A function that reaches through two levels to compare two orders.
     pub struct Order { Customer customer; f64 total; }
 
     pub bool shipsToSameCity(const Order* a, const Order* b) {
+        // a train wreck: three dots deep into the object graph
         return a->customer.address.city.equals(b->customer.address.city);
     }
 
@@ -747,10 +809,12 @@ The after. Each type answers a question at its own level, reaching one step at m
         str postalCode;
 
         bool sameCity(const Address* other) {
+            // each type answers the question at its own level
             return self.city.equals(other->city);
         }
     }
 
+    // each layer hides the one below it
     pub struct Customer {
         Address address;
 
@@ -763,6 +827,7 @@ The after. Each type answers a question at its own level, reaching one step at m
         Customer customer;
 
         bool shipsToSameCityAs(const Order* other) {
+            // reaches exactly one step, no further
             return self.customer.livesInSameCityAs(&other->customer);
         }
     }
@@ -786,16 +851,19 @@ The before. A cart that caches its own total and mutates in place.
     import(lib) std::vec { Vec };
 
     pub struct Cart {
+        // two pieces of state that must be kept in agreement by hand
         Vec<f64> prices;
         f64 total;      // kept in step with prices by hand
     }
 
     pub void addItem(Cart* c, f64 price) {
+        // mutating both fields together is a contract nothing enforces
         c->prices.push(price);
         c->total += price;
     }
 
     pub f64 applyDiscount(Cart* c, f64 percent) {
+        // mutates in place: calling twice discounts twice
         c->total = c->total * (1.0 - percent);
         return c->total;
     }
@@ -806,15 +874,18 @@ The after. A value, plus functions that read it through a `const` pointer and re
 
     import(lib) std::vec { Vec };
 
+    // the only field; total is derived, never stored
     pub struct Cart { Vec<f64> prices; }
 
     pub f64 cartTotal(const Cart* c) {
+        // pure: depends only on c and never mutates it
         f64 sum = 0.0;
         for (usize i = 0; i < c->prices.count(); i += 1) sum += c->prices.at(i);
         return sum;
     }
 
     pub Cart withItem(const Cart* c, f64 price) {
+        // returns a new cart; the original is untouched
         Cart next;
         next.prices = Vec<f64>::new();
         for (usize i = 0; i < c->prices.count(); i += 1) next.prices.push(c->prices.at(i));
@@ -823,6 +894,7 @@ The after. A value, plus functions that read it through a `const` pointer and re
     }
 
     pub Cart discounted(const Cart* c, f64 percent) {
+        // discounting is a value transformation, not an in-place edit
         Cart next;
         next.prices = Vec<f64>::new();
         for (usize i = 0; i < c->prices.count(); i += 1)
@@ -849,6 +921,7 @@ The before. A calculator that switches on an operation tag.
     enum Op { Add, Sub, Mul }
 
     pub f64 compute(Op op, f64 a, f64 b) {
+        // every new operation is a new arm here
         switch (op) {
             Op::Add => return a + b,
             Op::Sub => return a - b,
@@ -862,16 +935,19 @@ The after. The operation is a function value; the consumer knows only its shape.
 
     import(lib) std::vec { Vec };
 
+    // each algorithm is a plain function of the same shape
     pub f64 addOp(f64 a, f64 b) { return a + b; }
     pub f64 subOp(f64 a, f64 b) { return a - b; }
     pub f64 mulOp(f64 a, f64 b) { return a * b; }
 
     pub f64 compute(f64(f64, f64) op, f64 a, f64 b) {
+        // the consumer knows only the function's shape
         return op(a, b);
     }
 
     pub f64 reduce(const Vec<f64>* xs, f64(f64, f64) op) {
         @assertOut(xs->count() > 0, "reduce needs at least one element");
+        // the same strategy value drives a fold
         f64 acc = xs->at(0);
         for (usize i = 1; i < xs->count(); i += 1) acc = op(acc, xs->at(i));
         return acc;
@@ -898,6 +974,7 @@ The before. A process that must check its logger everywhere.
     }
 
     pub void process(ConsoleLogger* logger, u64 taskId) {
+        // every use must re-check for null; one miss is a crash
         if (logger != null) logger->log("start");
         // ... do the work ...
         if (logger != null) logger->log("done");
@@ -908,6 +985,7 @@ The check is repeated at every call, and a caller with no logger must pass `null
 The after. A trait, a real implementation, and a silent one.
 
     trait Logger {
+        // the callable interface, always present
         void log(str msg);
     }
 
@@ -922,6 +1000,7 @@ The after. A trait, a real implementation, and a silent one.
     }
 
     pub void process<T>(T* logger, u64 taskId) {
+        // no null check anywhere: absence is a real object
         logger->log("start");
         // ... do the work ...
         logger->log("done");
@@ -944,6 +1023,7 @@ The intuition. The most common source of breakage is not a broken feature; it is
 The before. A request struct that every caller builds with a literal.
 
     pub struct Request {
+        // public fields mean every caller writes a literal
         str url;
         u32 timeoutMs;
     }
@@ -957,14 +1037,17 @@ The after. A constructor owns the defaults, and new options are additive.
     pub struct Request {
         str url;
         u32 timeoutMs;
+        // new capability added without breaking existing literals
         u32 retries;
     }
 
     pub Request request(str url) {
+        // the constructor owns the defaults; a new field is one line here
         return Request { .url = url, .timeoutMs = 1000, .retries = 0 };
     }
 
     pub Request withTimeout(Request r, u32 ms) {
+        // additive builder step, so existing call sites never move
         r.timeoutMs = ms;
         return r;
     }

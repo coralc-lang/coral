@@ -26,23 +26,27 @@ The implementation.
         threadCreate, threadJoin, Thread, ThreadError, AtomicU64
     };
 
+    // the same field, once plain and once atomic
     struct PlainCounter { u64 value; }
     struct AtomicCounter { AtomicU64 value; }
 
     rawptr bumpPlain(rawptr arg) {
         PlainCounter* c = (PlainCounter*)arg;
+        // read-modify-write as three separate steps: the race lives here
         for (u64 i = 0; i < 1000000u; i += 1) c->value += 1;
         return null;
     }
 
     rawptr bumpAtomic(rawptr arg) {
         AtomicCounter* c = (AtomicCounter*)arg;
+        // one indivisible instruction, so no increment can be lost
         for (u64 i = 0; i < 1000000u; i += 1) c->value.fetchAdd(1u);
         return null;
     }
 
     pub void main() {
         PlainCounter plain = PlainCounter { .value = 0 };
+        // both threads write through the same pointer; the counter must outlive them
         Result<Thread, ThreadError> a = threadCreate(bumpPlain, (rawptr)&plain);
         Result<Thread, ThreadError> b = threadCreate(bumpPlain, (rawptr)&plain);
         if (a.isOk()) threadJoin(a.unwrap(), null);
@@ -80,16 +84,18 @@ The implementation.
     import(lib) std::mman { alloc, dealloc };
 
     pub struct Queue {
+        // all fields below are guarded by this one mutex
         Mutex mutex;
         ConditionVar itemReady;
         ConditionVar roomFree;
         u64* items;
         usize cap;
-        usize head;
-        usize count;
+        usize head;          // index of the oldest live slot
+        usize count;         // how many slots are currently live
         bool closed;
 
         bool init(usize capacity) {
+            // one contiguous block of ring slots
             self.items = alloc<u64>(capacity);
             if (self.items == null) return false;
             self.mutex.init();
@@ -103,6 +109,7 @@ The implementation.
         }
 
         void destroy() {
+            // tear down synchronisation, then free the ring
             self.mutex.destroy();
             self.itemReady.destroy();
             self.roomFree.destroy();
@@ -110,11 +117,15 @@ The implementation.
         }
 
         void push(u64 value) {
+            // take the lock before touching any shared field
             self.mutex.lock();
+            // wait in a loop: recheck the full condition after every wake
             while (self.count == self.cap && !self.closed)
                 self.roomFree.wait(&self.mutex);
+            // shutdown wins over a pending push
             if (self.closed) { self.mutex.unlock(); return; }
 
+            // ring write at the tail; count tracks the live slots
             self.items[(self.head + self.count) % self.cap] = value;
             self.count += 1;
             self.itemReady.signal();
@@ -123,11 +134,14 @@ The implementation.
 
         bool pop(u64* out) {
             self.mutex.lock();
+            // same loop protocol, this time for the empty condition
             while (self.count == 0 && !self.closed)
                 self.itemReady.wait(&self.mutex);
             if (self.count == 0) { self.mutex.unlock(); return false; }
 
+            // the output pointer receives one value on success
             *out = self.items[self.head];
+            // advance head and free a slot, which wakes the producer
             self.head = (self.head + 1) % self.cap;
             self.count -= 1;
             self.roomFree.signal();
@@ -137,7 +151,9 @@ The implementation.
 
         void close() {
             self.mutex.lock();
+            // set the flag under the lock so the wake cannot be missed
             self.closed = true;
+            // broadcast, not signal: every waiter must see the closure
             self.itemReady.broadcast();
             self.roomFree.broadcast();
             self.mutex.unlock();
@@ -146,6 +162,7 @@ The implementation.
 
     rawptr producer(rawptr arg) {
         Queue* q = (Queue*)arg;
+        // push one through one hundred, then poison-pill the queue
         for (u64 i = 1; i <= 100; i += 1) q->push(i);
         q->close();
         return null;
@@ -155,6 +172,7 @@ The implementation.
         Queue* q = (Queue*)arg;
         u64 value;
         u64 sum = 0;
+        // drains until pop reports the queue closed and empty
         while (q->pop(&value)) sum += value;
         println("sum {}", sum);
         return null;
@@ -163,6 +181,7 @@ The implementation.
     pub i32 main() {
         Queue q;
         if (!q.init(16)) return 1;
+        // two threads share the queue; both must join before destroy
         Result<Thread, ThreadError> p = threadCreate(producer, (rawptr)&q);
         Result<Thread, ThreadError> c = threadCreate(consumer, (rawptr)&q);
         if (p.isOk()) threadJoin(p.unwrap(), null);
@@ -196,12 +215,14 @@ The implementation.
     import(lib) std::mman { alloc, dealloc };
 
     struct Task {
+        // a function, its argument, and the next link in the list
         void(rawptr) work;
         rawptr arg;
         Task* next;
     }
 
     pub struct MiniPool {
+        // every field here is protected by mutex
         Mutex mutex;
         ConditionVar cond;
         Thread* workers;
@@ -211,6 +232,7 @@ The implementation.
         bool stop;
 
         bool init(u32 numThreads) {
+            // refuse a pool that could never make progress
             if (numThreads == 0) return false;
             self.mutex.init();
             self.cond.init();
@@ -220,6 +242,7 @@ The implementation.
             self.nthreads = numThreads;
             self.workers = alloc<Thread>((usize)numThreads);
             if (self.workers == null) return false;
+            // start the fixed set of workers once; they then consume the queue
             for (u32 i = 0; i < numThreads; i += 1) {
                 Result<Thread, ThreadError> r = threadCreate(miniEntry, (rawptr)self);
                 if (r.isErr()) { self.shutdown(); return false; }
@@ -230,18 +253,21 @@ The implementation.
 
         bool submit(void(rawptr) work, rawptr arg) {
             if (work == null) return false;
+            // the task lives on the heap because it must outlive submit
             Task* t = alloc<Task>(1);
             if (t == null) return false;
             t->work = work;
             t->arg = arg;
             t->next = null;
 
+            // link the task at the tail under the lock, then signal one worker
             self.mutex.lock();
             if (self.stop) { self.mutex.unlock(); dealloc<Task>(t); return false; }
             if (self.tail != null) self.tail->next = t;
             else self.head = t;
             self.tail = t;
             self.mutex.unlock();
+            // signal after unlocking; one worker wakes and takes it
             self.cond.signal();
             return true;
         }
@@ -249,14 +275,17 @@ The implementation.
         void workerLoop() {
             loop {
                 self.mutex.lock();
+                // sleep until there is work or a shutdown, then recheck
                 while (self.head == null && !self.stop) self.cond.wait(&self.mutex);
                 if (self.stop && self.head == null) { self.mutex.unlock(); return; }
 
+                // pop the head task while still holding the lock
                 Task* t = self.head;
                 self.head = t->next;
                 if (self.head == null) self.tail = null;
                 self.mutex.unlock();
 
+                // run the task and free it outside the lock
                 t->work(t->arg);
                 dealloc<Task>(t);
             }
@@ -264,10 +293,12 @@ The implementation.
 
         void shutdown() {
             self.mutex.lock();
+            // set the stop flag under the lock, broadcast after releasing it
             self.stop = true;
             self.mutex.unlock();
             self.cond.broadcast();
             for (u32 i = 0; i < self.nthreads; i += 1) threadJoin(self.workers[i], null);
+            // drain any tasks queued just before shutdown
             self.mutex.lock();
             while (self.head != null) {
                 Task* t = self.head;
@@ -282,6 +313,7 @@ The implementation.
     }
 
     rawptr miniEntry(rawptr arg) {
+        // thread entry: hand the pool to its worker loop
         ((MiniPool*)arg)->workerLoop();
         return null;
     }
@@ -307,6 +339,7 @@ The implementation.
     import(lib) std::mman { alloc, dealloc };
 
     struct MapJob {
+        // one chunk's inputs, its output range, and the function to apply
         const Vec<f64>* input;
         Vec<f64>* output;
         usize start;
@@ -316,6 +349,7 @@ The implementation.
 
     void runMapChunk(rawptr arg) {
         MapJob* job = (MapJob*)arg;
+        // each task writes only its own disjoint slice: no lock needed
         for (usize i = job->start; i < job->end; i += 1)
             job->output->set(i, job->func(job->input->at(i)));
     }
@@ -324,19 +358,24 @@ The implementation.
 
     pub bool parallelMap(const Vec<f64>* input, Vec<f64>* output, f64(f64) func, u32 workers) {
         usize n = input->count();
+        // preallocate one output slot per input element
         output->clear();
         for (usize i = 0; i < n; i += 1) output->push(0.0);   // reserve the slots
 
+        // never make more chunks than there are elements to give them
         usize chunks = (usize)workers;
         if (chunks > n) chunks = n;
         if (chunks == 0) return true;
 
+        // one job struct per chunk, owned by this function
         MapJob* jobs = alloc<MapJob>(chunks);
         if (jobs == null) return false;
 
+        // the pool owns the worker threads for the duration
         ThreadPool pool;
         if (!pool.init(workers)) { dealloc<MapJob>(jobs); return false; }
 
+        // spread the remainder so the chunks cover every element exactly
         usize per = n / chunks;
         usize extra = n % chunks;
         usize start = 0;
@@ -349,6 +388,7 @@ The implementation.
                 .end = start + len,
                 .func = func
             };
+            // enqueue the chunk; the pool decides which worker runs it
             pool.enqueue(runMapChunk, (rawptr)&jobs[c]);
             start += len;
         }
@@ -381,6 +421,7 @@ The implementation.
 
     pub void producerStage(rawptr arg) {
         async::AsyncChannel* ch = (async::AsyncChannel*)arg;
+        // the producer emits five values with a pause between them
         for (u64 i = 1; i <= 5; i += 1) {
             async::await(async::sleep(10));       // pretend to do I/O
             ch->send((rawptr)i);
@@ -389,8 +430,10 @@ The implementation.
 
     pub void consumerStage(rawptr arg) {
         async::AsyncChannel* ch = (async::AsyncChannel*)arg;
+        // the consumer accumulates whatever it receives
         u64 total = 0;
         for (u64 i = 0; i < 5; i += 1) {
+            // await suspends this fiber, freeing its thread for other work
             Result<rawptr, async::AsyncError> got = async::await(ch->recv());
             if (got.isOk()) total += (u64)got.unwrap();
         }
@@ -398,15 +441,18 @@ The implementation.
     }
 
     pub i32 main() {
+        // bring up the runtime, then a buffered channel
         async::init();
         async::AsyncChannel ch;
         if (!ch.init(4)) return 1;
 
+        // spawn both stages as fibers; each returns a future
         Result<async::Future*, async::AsyncError> p = async::spawn(producerStage, (rawptr)&ch);
         Result<async::Future*, async::AsyncError> c = async::spawn(consumerStage, (rawptr)&ch);
         if (p.isErr() || c.isErr()) return 1;
 
         async::run();     // drive until every spawned fiber has finished
+        // scheduler drained; tear the channel down
         ch.deinit();
         return 0;
     }
@@ -435,20 +481,24 @@ The implementation.
     };
 
     struct Gate {
+        // a permit count and a tally of finished tasks
         Semaphore permits;
         u64* completed;
     }
 
     rawptr limitedTask(rawptr arg) {
         Gate* gate = (Gate*)arg;
+        // acquire a permit: at most maxConcurrent tasks pass this point
         gate->permits.wait();
         // only four threads are ever inside this region at once
         *gate->completed += 1;        // caller guarantees this is the only writer
+        // always release the permit, even conceptually on the way out
         gate->permits.post();
         return null;
     }
 
     pub void runLimited(u32 maxConcurrent, u32 taskCount) {
+        // one shared gate for every task
         Gate gate;
         if (!gate.permits.init(maxConcurrent)) return;
         u64 completed = 0;
@@ -457,10 +507,13 @@ The implementation.
         // in a real program the tasks come from the pool; here they run directly
         Thread* threads = null;       // placeholder for a pool in production
         for (u32 i = 0; i < taskCount; i += 1) {
+            // join each task before the next, so the counter has a single writer
             Result<Thread, ThreadError> t = threadCreate(limitedTask, (rawptr)&gate);
             if (t.isOk()) threadJoin(t.unwrap(), null);
         }
+        // all tasks are joined, so the gate can be torn down
         gate.permits.destroy();
+        // every task finished; report the tally
         println("completed {}", completed);
     }
 
@@ -486,6 +539,7 @@ The implementation.
     import(lib) std::concurrent::thread { ConditionVar };
 
     pub struct RwLock {
+        // one mutex guards the bookkeeping; two condition variables split the waiters
         Mutex mutex;
         ConditionVar canRead;
         ConditionVar canWrite;
@@ -494,6 +548,7 @@ The implementation.
         u32 writersWaiting;
 
         void init() {
+            // start unlocked with no readers and no waiting writers
             self.mutex.init();
             self.canRead.init();
             self.canWrite.init();
@@ -503,6 +558,7 @@ The implementation.
         }
 
         void destroy() {
+            // release the synchronisation primitives
             self.mutex.destroy();
             self.canRead.destroy();
             self.canWrite.destroy();
@@ -510,25 +566,31 @@ The implementation.
 
         void readLock() {
             self.mutex.lock();
+            // block while a writer runs, or while one waits (anti-starvation)
             while (self.writerActive || self.writersWaiting > 0)
                 self.canRead.wait(&self.mutex);
+            // count ourselves in before releasing the mutex
             self.readers += 1;
             self.mutex.unlock();
         }
 
         void readUnlock() {
             self.mutex.lock();
+            // one fewer reader inside
             self.readers -= 1;
+            // last reader out lets a waiting writer in
             if (self.readers == 0) self.canWrite.broadcast();
             self.mutex.unlock();
         }
 
         void writeLock() {
             self.mutex.lock();
+            // announce ourselves before waiting so readers yield to us
             self.writersWaiting += 1;
             while (self.writerActive || self.readers > 0)
                 self.canWrite.wait(&self.mutex);
             self.writersWaiting -= 1;
+            // we are the only writer now
             self.writerActive = true;
             self.mutex.unlock();
         }
@@ -564,6 +626,7 @@ The implementation.
     import(lib) std::concurrent::thread { ConditionVar };
 
     pub struct Barrier {
+        // parties is fixed; waiting and generation change every round
         Mutex mutex;
         ConditionVar cond;
         u32 parties;
@@ -571,29 +634,36 @@ The implementation.
         u64 generation;
 
         bool init(u32 count) {
+            // a barrier of zero parties could never open
             if (count == 0) return false;
             self.mutex.init();
             self.cond.init();
             self.parties = count;
+            // start at generation zero with nobody waiting
             self.waiting = 0;
             self.generation = 0;
             return true;
         }
 
         void destroy() {
+            // release mutex and condition variable
             self.mutex.destroy();
             self.cond.destroy();
         }
 
         void waitAt() {
             self.mutex.lock();
+            // remember which round we arrived in
             u64 myGen = self.generation;
+            // announce our arrival in this generation
             self.waiting += 1;
             if (self.waiting == self.parties) {
+                // last arrival: reset, bump the generation, release everyone
                 self.waiting = 0;
                 self.generation += 1;         // releases everyone waiting on myGen
                 self.cond.broadcast();
             } else {
+                // sleep until the generation changes under us
                 while (self.generation == myGen)
                     self.cond.wait(&self.mutex);
             }
@@ -626,6 +696,7 @@ The implementation.
     };
 
     struct SumJob {
+        // data is read-only; the range is disjoint from every sibling range
         const Vec<f64>* data;
         usize start;
         usize end;
@@ -634,16 +705,20 @@ The implementation.
     }
 
     void sumRange(SumJob* job) {
+        // below the cutoff, just add the numbers sequentially
         if (job->end - job->start <= job->cutoff) {
             f64 s = 0.0;
+            // plain sequential sum over this small range
             for (usize i = job->start; i < job->end; i += 1) s += job->data->at(i);
             job->result = s;
             return;
         }
 
+        // split the range in half at the midpoint
         usize mid = job->start + (job->end - job->start) / 2;
         SumJob* left = alloc<SumJob>(1);
         SumJob* right = alloc<SumJob>(1);
+        // allocation failure falls back to a sequential sum
         if (left == null || right == null) {
             if (left != null) dealloc<SumJob>(left);
             if (right != null) dealloc<SumJob>(right);
@@ -665,22 +740,26 @@ The implementation.
         right->cutoff = job->cutoff;
         right->result = 0.0;
 
+        // one thread does the right half; the current thread does the left
         Result<Thread, ThreadError> t = threadCreate(sumEntry, (rawptr)right);
         sumRange(left);                                // the current thread takes the left half
         if (t.isOk()) threadJoin(t.unwrap(), null);
 
+        // combine only after the join: that is the happens-before edge
         job->result = left->result + right->result;
         dealloc<SumJob>(left);
         dealloc<SumJob>(right);
     }
 
     rawptr sumEntry(rawptr arg) {
+        // thread entry wraps the recursive routine
         sumRange((SumJob*)arg);
         return null;
     }
 
     pub f64 parallelSum(const Vec<f64>* data, usize cutoff) {
         @assertOut(cutoff >= 1, "a cutoff of zero never terminates");
+        // the root job covers the whole vector on the current thread
         SumJob root = SumJob {
             .data = data, .start = 0, .end = data->count(),
             .cutoff = cutoff, .result = 0.0
@@ -714,9 +793,11 @@ The implementation.
     };
 
     const u32 PHILOSOPHERS = 5;
+    // five diners, each eats a fixed number of meals
     const u64 MEALS = 3;
 
     pub struct Table {
+        // one fork (mutex) between each pair of neighbours
         Mutex forks[PHILOSOPHERS];
 
         void init() {
@@ -729,6 +810,7 @@ The implementation.
     }
 
     struct Seat {
+        // each philosopher's seat and its own fork indices
         Table* table;
         u32 index;
     }
@@ -740,10 +822,12 @@ The implementation.
 
         u32 left = (i + PHILOSOPHERS - 1) % PHILOSOPHERS;
         u32 right = (i + 1) % PHILOSOPHERS;
+        // global order: always take the lower-numbered fork first
         u32 first = left < right ? left : right;
         u32 second = left < right ? right : left;
 
         for (u64 meal = 0; meal < MEALS; meal += 1) {
+            // acquire both forks in the fixed order, then release in reverse
             table->forks[first].lock();
             table->forks[second].lock();
             // eat, holding both forks
@@ -756,11 +840,14 @@ The implementation.
 
     pub bool dinner() {
         Table table;
+        // build the five forks before any philosopher starts
         table.init();
 
+        // per-thread seat, handle, and a flag to track successful creation
         Seat* seats = alloc<Seat>((usize)PHILOSOPHERS);
         Thread* threads = alloc<Thread>((usize)PHILOSOPHERS);
         bool* created = alloc<bool>((usize)PHILOSOPHERS);
+        // if any allocation failed, undo what succeeded and bail out
         if (seats == null || threads == null || created == null) {
             if (seats != null) dealloc<Seat>(seats);
             if (threads != null) dealloc<Thread>(threads);
@@ -772,6 +859,7 @@ The implementation.
         for (u32 i = 0; i < PHILOSOPHERS; i += 1) {
             seats[i].table = &table;
             seats[i].index = i;
+            // record success so a failed creation is never joined
             created[i] = false;
             Result<Thread, ThreadError> t = threadCreate(dine, (rawptr)&seats[i]);
             if (t.isOk()) {
@@ -780,9 +868,11 @@ The implementation.
             }
         }
 
+        // join only the threads that were actually created
         for (u32 i = 0; i < PHILOSOPHERS; i += 1)
             if (created[i]) threadJoin(threads[i], null);
 
+        // all joins done, release the bookkeeping
         dealloc<bool>(created);
         dealloc<Thread>(threads);
         dealloc<Seat>(seats);
@@ -814,6 +904,7 @@ The implementation.
     };
 
     pub struct TokenBucket {
+        // mutex guards tokens and last together; rate and capacity are read-only
         Mutex mutex;
         f64 rate;          // tokens added per second
         f64 capacity;      // maximum burst
@@ -821,11 +912,13 @@ The implementation.
         Timespec last;
 
         void init(f64 ratePerSecond, f64 burst) {
+            // a non-positive rate would divide by zero later
             @assertOut(ratePerSecond > 0.0, "rate must be positive");
             self.mutex.init();
             self.rate = ratePerSecond;
             self.capacity = burst;
             self.tokens = burst;              // start full, so the first burst is allowed
+            // remember the refill epoch
             self.last = nowMonotonic();
         }
 
@@ -836,15 +929,18 @@ The implementation.
         // caller must hold the mutex; adds accrued tokens, capped at capacity
         void refill() {
             Timespec now = nowMonotonic();
+            // tokens accrue lazily from elapsed time; no timer thread exists
             f64 elapsed = timespecToF64(subTimespec(now, self.last));
             self.last = now;
             self.tokens += elapsed * self.rate;
+            // a long pause cannot bank more than one full bucket
             if (self.tokens > self.capacity) self.tokens = self.capacity;
         }
 
         bool tryAcquire() {
             self.mutex.lock();
             self.refill();
+            // take one token if there is one, otherwise report failure
             bool ok = self.tokens >= 1.0;
             if (ok) self.tokens -= 1.0;
             self.mutex.unlock();
@@ -852,7 +948,9 @@ The implementation.
         }
 
         void acquire() {
+            // retry loop: sleep, refill, and recheck until a token is available
             while (true) {
+                // re-check under the lock on every attempt
                 self.mutex.lock();
                 self.refill();
                 if (self.tokens >= 1.0) {
@@ -860,6 +958,7 @@ The implementation.
                     self.mutex.unlock();
                     return;
                 }
+                // compute the exact wait until the next token is due
                 f64 deficit = (1.0 - self.tokens) / self.rate;   // seconds until a token
                 self.mutex.unlock();
                 u64 waitMs = (u64)(deficit * 1000.0) + 1u;       // round up a millisecond
