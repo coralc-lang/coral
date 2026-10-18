@@ -12,11 +12,11 @@ The stake is worth making concrete before the details, because "rigor" is an abs
 
 7.2 Type Declarations
 
-A type is declared, and the declaration is a named statement in the module. The declaration forms are the type declarations of the language: `struct`, `enum`, `typedef`, and `distinct`. Each names a type and states what it is, and each is collected by the compiler before any code is checked.
+A type is declared, and the declaration is a named statement in the module. The declaration forms are the type declarations of the language: `struct`, `variant`, `union`, `enum`, `trait`, `typedef`, and `distinct`. Each names a type and states what it is, and each is collected by the compiler before any code is checked.
 
-The `struct` is the product type, the type that holds several fields together. The `enum` is the sum type, the type that holds one of several alternatives. The `typedef` names an existing type, and the `distinct` type creates a new type from an existing one. Each is a way of building a type, and each is the subject of a later section of this chapter.
+The `struct` is the product type, the type that holds several fields together. The `variant` and the `union` are the sum forms that carry payloads: a `variant` is a tagged union, each alternative bearing its own fields and a tag saying which one is live, and a `union` is the untagged overlay, where the alternatives share one storage and the program keeps track of which is live. The `enum` is the simple sum type, the type whose value is one of several named alternatives that carry no payload. A `trait` names a set of methods a type may implement. The `typedef` names an existing type, and the `distinct` type creates a new type from an existing one. Each is a way of building a type, and each is the subject of a later section of this chapter.
 
-The declarations are type-first, like everything else in the language. The keyword comes first, then the name, then the body or the definition. The compiler reads the declaration, records the type, and from then on the name means the type. You will see these four keywords across the standard library constantly — `struct` for every collection, `distinct` for every platform handle, `enum` for the log levels and the error kinds, `typedef` for every named function signature — so learning to read them is learning to read the standard library.
+The declarations are type-first, like everything else in the language. The keyword comes first, then the name, then the body or the definition. The compiler reads the declaration, records the type, and from then on the name means the type. You will see these keywords across the standard library constantly — `struct` for every collection, `variant` for the tagged result and option types, `distinct` for every platform handle, `enum` for the log levels and the error kinds, `typedef` for every named function signature — so learning to read them is learning to read the standard library.
 
 7.3 Primitive Types
 
@@ -26,7 +26,7 @@ The integer types are the signed types `i8`, `i16`, `i32`, and `i64`, and the un
 
 If you are coming from C, this naming may feel like a revelation in miniature. Where C says `int`, Coral says `i32`, and the number is the truth: thirty-two bits, exactly, on every compiler and every machine. C's `int` is "at least sixteen bits, often thirty-two, larger than short," a moving target you cannot trust; a program built on `i32` can trust it absolutely. If you are coming from JavaScript, where every number is a double until something overflows, the fixed width is the whole game: you decide how big your numbers get, and the type enforces that decision. When the standard library counts elements, it uses `usize`; when it stores a nanosecond count that can never be negative in principle but might in practice, it uses `i64` to be safe; the type names tell you exactly how much headroom you have.
 
-The floating-point types are `f32` and `f64`, the single and double precision IEEE 754 types. The boolean type is `bool`, holding `true` or `false`, with no other values and no truthiness — an `if` requires a `bool`, it will not quietly accept an integer the way C does, and this single rule deletes an entire class of C bugs where `if (x = 5)` compiles and runs forever true. The character type is `char`, holding a byte of UTF-8 text, as the chapter on core syntax described. The `void` type is the absence of a value, used for functions that return nothing and for generic pointers.
+The floating-point types are `f32` and `f64`, the single and double precision IEEE 754 types. The boolean type is `bool`, holding `true` or `false`, with no other values and no truthiness — an `if` requires a `bool`, it will not quietly accept an integer the way C does, and this single rule deletes an entire class of C bugs where `if (x = 5)` compiles and runs forever true. The character type is `char`, holding a 32-bit Unicode code point, as the chapter on core syntax described; the byte type is `u8`, holding one byte of UTF-8 text. The `void` type is the absence of a value, used for functions that return nothing and for generic pointers.
 
 The primitive types are the units the compiler reasons about. It knows their sizes, their ranges, their alignment, and their behaviors, because each is a fixed, known type. The limits of the fixed widths are the limits of the types, and the `limits` module states them as constants — but the type itself states the most important limit: its name is its width, and its width is its range.
 
@@ -63,9 +63,9 @@ Consider what the standard library would look like without generics. A vector of
 
 The generic is the third option. Write the structure once, with a placeholder standing in for the element type, and let the compiler stamp out a concrete version for each type the program actually uses. The placeholder is the type parameter. The convention is to call the first one T, the second U — meaning "the element type, whatever it turns out to be" — and the generic declaration is a recipe rather than a finished type. It becomes a real type the moment the program names the parameter.
 
-Here are three real recipes from the standard library. The `vec` comes from `collections/vec.crl`, the `Pair` from `collections/iter.crl`, and the `arr` from `collections/arr.crl`; only a field has been elided where the ellipsis shows, and everything shown is written exactly as it appears in the library:
+Here are three real recipes from the standard library. The `Vec` comes from `collections/vec.crl`, the `Pair` from `collections/iter.crl`, and the `Arr` from `collections/arr.crl`; only a field has been elided where the ellipsis shows, and everything shown is written exactly as it appears in the library:
 
-    pub struct vec<T>
+    pub struct Vec<T>
     {
         T* data;
         usize len;
@@ -80,7 +80,7 @@ Here are three real recipes from the standard library. The `vec` comes from `col
         U second;
     }
 
-    pub struct arr<T, N>
+    pub struct Arr<T, N>
     {
         T data[N];
 
@@ -89,39 +89,39 @@ Here are three real recipes from the standard library. The `vec` comes from `col
 
 Read the three slowly, field by field, because this is the whole idea of generics and it fits in these lines.
 
-The vec takes one parameter, the element type. The parameter appears in the fields: `T* data` is a pointer to elements of whatever T is, and when the program uses `std.vec<u32>`, that line becomes `u32* data`, the length and capacity stay `u64`, and every method that mentions T follows the same substitution. The parameter is a knob the declaration leaves open, and the use turns the knob.
+The vec takes one parameter, the element type. The parameter appears in the fields: `T* data` is a pointer to elements of whatever T is, and when the program uses `Vec<u32>`, that line becomes `u32* data`, the length and capacity stay `usize`, and every method that mentions T follows the same substitution. The parameter is a knob the declaration leaves open, and the use turns the knob.
 
-The Pair takes two parameters, the types of its two fields, and each field is one of them: `T first` and `U second`. Two knobs, and the use names both. A pair of a string view and a number is `std.Pair<std.strView, u64>`, and the substitution fills both fields.
+The Pair takes two parameters, the types of its two fields, and each field is one of them: `T first` and `U second`. Two knobs, and the use names both. A pair of a string view and a number is `Pair<str, u64>`, and the substitution fills both fields.
 
-The arr is the interesting one, because it takes two different kinds of parameters. The first, T, is a type: `T data[N]` is an array of elements of T. The second, N, is not a type at all — it is a *count*, a compile-time value, and the declaration shows the difference in its own syntax: a type parameter is named where a type goes, and a value parameter is named where a value goes, between the brackets of the array. `std.arr<u8, 64>` is an array of sixty-four bytes, and the compiler knows the count before the program runs. The count is part of the type: `std.arr<u8, 64>` and `std.arr<u8, 128>` are two different types, with two different sizes, checked as such.
+The arr is the interesting one, because it takes two different kinds of parameters. The first, T, is a type: `T data[N]` is an array of elements of T. The second, N, is not a type at all — it is a *count*, a compile-time value, and the declaration shows the difference in its own syntax: a type parameter is named where a type goes, and a value parameter is named where a value goes, between the brackets of the array. `Arr<u8, 64>` is an array of sixty-four bytes, and the compiler knows the count before the program runs. The count is part of the type: `Arr<u8, 64>` and `Arr<u8, 128>` are two different types, with two different sizes, checked as such.
 
-A generic type becomes a real type at the use. `std.vec<u32>` picks the element type; `std.map<std.strView, i64>` names the key type and the value type; `std.arr<u8, 64>` names the element and the count. Writing the type name and putting the arguments between the angle brackets is called instantiating the generic, and each instantiation is a complete, ordinary type — nothing about `std.vec<u32>` is unfinished, provisional, or slower than a hand-written struct.
+A generic type becomes a real type at the use. `Vec<u32>` picks the element type; `Map<str, i64>` names the key type and the value type; `Arr<u8, 64>` names the element and the count. Writing the type name and putting the arguments between the angle brackets is called instantiating the generic, and each instantiation is a complete, ordinary type — nothing about `Vec<u32>` is unfinished, provisional, or slower than a hand-written struct.
 
-The instantiation happens at compile time, and the arguments must be knowable at compile time. The count in `std.arr<u8, N>` cannot be a value computed at runtime: `std.arr<u8, someVariable>` fails the moment the compiler cannot know `someVariable`'s value while building. That is what "compile-time value" means in this chapter, and the compiler refuses to guess.
+The instantiation happens at compile time, and the arguments must be knowable at compile time. The count in `Arr<u8, N>` cannot be a value computed at runtime: `Arr<u8, someVariable>` fails the moment the compiler cannot know `someVariable`'s value while building. That is what "compile-time value" means in this chapter, and the compiler refuses to guess.
 
-Generic types compose, and the composition is where they earn their keep. A vector of maps is `std.vec<std.map<std.strView, u64>>`; a map of vectors is `std.map<std.strView, std.vec<f64>>`; a pair of containers is `std.Pair<std.vec<u8>, std.vec<u8>>`. Read nested generics from the inside out: the innermost argument is the element, the next layer is the container, and each layer is a substitution into the layer around it. The standard library composes freely — a JSON value's object field is a vector of pairs of a string view and a `JsonValue`. Written once, the composition reads as its own description:
+Generic types compose, and the composition is where they earn their keep. A vector of maps is `Vec<Map<str, u64>>`; a map of vectors is `Map<str, Vec<f64>>`; a pair of containers is `Pair<Vec<u8>, Vec<u8>>`. Read nested generics from the inside out: the innermost argument is the element, the next layer is the container, and each layer is a substitution into the layer around it. The standard library composes freely — a JSON value's object field is a vector of pairs of a string view and a `JsonValue`. Written once, the composition reads as its own description:
 
-    std.vec<std.Pair<std.strView, JsonValue>> fields;   // a JSON object's list of name-value pairs
+    Vec<Pair<str, JsonValue>> fields;   // a JSON object's list of name-value pairs
 
-Read from the inside out, exactly as the paragraph above says: `JsonValue` is the element, the `Pair` names it along with its string key, and the `vec` is the list. The type states the structure of a JSON object in one line — no comment needed, because the nested generics are the description. The type system checks the composition layer by layer, and a mismatch at any layer is an error at that layer.
+Read from the inside out, exactly as the paragraph above says: `JsonValue` is the element, the `Pair` names it along with its string key, and the `Vec` is the list. The type states the structure of a JSON object in one line — no comment needed, because the nested generics are the description. The type system checks the composition layer by layer, and a mismatch at any layer is an error at that layer.
 
-And because each instantiation is its own type, the checks stay exact. A `std.vec<u64>` is not interchangeable with a `std.vec<std.strView>` — a function that takes one will not accept the other — and the confusion between them, which a void-pointer design would happily absorb at runtime, is a compile error here. The recipe is shared; the results are distinct.
+And because each instantiation is its own type, the checks stay exact. A `Vec<u64>` is not interchangeable with a `Vec<str>` — a function that takes one will not accept the other — and the confusion between them, which a void-pointer design would happily absorb at runtime, is a compile error here. The recipe is shared; the results are distinct.
 
-The same pattern covers the chapter's other generics. The `std.option<T>` is a recipe for "a T or nothing," the `std.Result<T, E>` a recipe for "a T or an E," the `std.map<K, V>` a recipe for key-value storage. Every one of them is a struct like the vec, with type parameters in its fields and methods, and every one is instantiated, checked, and compiled the same way. The type parameter is the language's way of writing the structure once, honestly, instead of copying it forever.
+The same pattern covers the chapter's other generics. The `Option<T>` is a recipe for "a T or nothing," the `Result<T, E>` a recipe for "a T or an E," the `Map<K, V>` a recipe for key-value storage. Every one of them is a struct like the vec, with type parameters in its fields and methods, and every one is instantiated, checked, and compiled the same way. The type parameter is the language's way of writing the structure once, honestly, instead of copying it forever.
 
 7.6 Monomorphization
 
-Generic types and functions are compiled by monomorphization: each use with concrete arguments produces a concrete instance. The compiler takes the generic definition, substitutes the concrete arguments for the parameters, and compiles the result as an ordinary, concrete type. A `std.vec<u32>` and a `std.vec<f64>` are two different compiled types, each generated from the one `vec` definition.
+Generic types and functions are compiled by monomorphization: each use with concrete arguments produces a concrete instance. The compiler takes the generic definition, substitutes the concrete arguments for the parameters, and compiles the result as an ordinary, concrete type. A `Vec<u32>` and a `Vec<f64>` are two different compiled types, each generated from the one `Vec` definition.
 
-Watch one substitution happen, because the whole mechanism is a substitution. The generic definition has a field `T* data` and a method that takes a value of `T`. When the program uses `std.vec<u32>`, the compiler writes out a copy of the definition with every `T` replaced by `u32`: the field becomes `u32* data`, the length and capacity stay `u64`, the push method takes a `u32`, the pop method returns a `u32`. That copy is now an ordinary struct, indistinguishable from one a programmer had written by hand with u32 in all the right places — no hidden type, no runtime tag, no table that says what the elements are. When the same program uses `std.vec<f64>`, the same substitution runs again, producing a second ordinary struct with `f64` everywhere. One recipe, two finished types.
+Watch one substitution happen, because the whole mechanism is a substitution. The generic definition has a field `T* data` and a method that takes a value of `T`. When the program uses `Vec<u32>`, the compiler writes out a copy of the definition with every `T` replaced by `u32`: the field becomes `u32* data`, the length and capacity stay `usize`, the push method takes a `u32`, the pop method returns a `u32`. That copy is now an ordinary struct, indistinguishable from one a programmer had written by hand with u32 in all the right places — no hidden type, no runtime tag, no table that says what the elements are. When the same program uses `Vec<f64>`, the same substitution runs again, producing a second ordinary struct with `f64` everywhere. One recipe, two finished types.
 
-The monomorphization is where the generic's checks happen. The compiler checks each instance against its arguments: the substituted body must be valid for the concrete type. The same generic body is checked once per concrete use, and a use with incompatible arguments fails at the use — the concrete type that breaks is the one that gets the error, at the line that named it. The generality is not unchecked; each instance is checked on its own terms. When you write `std.vec<std.strView>` and the vec's push copies by value, the compiler instantiates the vec body with `std.strView` standing in for T, checks that the body is valid for it — that copies, comparisons, and storage all work for a string view — and only then lets the program continue.
+The monomorphization is where the generic's checks happen. The compiler checks each instance against its arguments: the substituted body must be valid for the concrete type. The same generic body is checked once per concrete use, and a use with incompatible arguments fails at the use — the concrete type that breaks is the one that gets the error, at the line that named it. The generality is not unchecked; each instance is checked on its own terms. When you write `Vec<str>` and the vec's push copies by value, the compiler instantiates the vec body with `str` standing in for T, checks that the body is valid for it — that copies, comparisons, and storage all work for a string view — and only then lets the program continue.
 
-Monomorphization is also where generics get their performance. Each instance is a concrete type with concrete fields and concrete operations, and the compiler optimizes it as it optimizes any concrete type. A `std.vec<u32>`'s push is a `u32` push — the machine's mov and the length increment, no indirection, no consultation of any table, no code shared cleverly with the f64 version. The compiled code is the same code the compiler would have produced for a hand-written u32 vector, which is the point: generality in the source, specialization in the binary.
+Monomorphization is also where generics get their performance. Each instance is a concrete type with concrete fields and concrete operations, and the compiler optimizes it as it optimizes any concrete type. A `Vec<u32>`'s push is a `u32` push — the machine's mov and the length increment, no indirection, no consultation of any table, no code shared cleverly with the f64 version. The compiled code is the same code the compiler would have produced for a hand-written u32 vector, which is the point: generality in the source, specialization in the binary.
 
-The cost is code size. Each instance is real code, and the price of every instance is paid in the binary. A program that uses `std.vec` with four element types has four copies of the vec machinery; a program that uses a heavy generic function with fifty types has fifty bodies. The standard library accepts the trade — speed and simplicity for size — because the alternative, one generic body that consults type information at runtime, is slower, and because most programs use a handful of instances, not fifty. The honest trade is the chapter's theme: generics buy compiled specialization, and the specialization is the code you can see in the binary.
+The cost is code size. Each instance is real code, and the price of every instance is paid in the binary. A program that uses `Vec` with four element types has four copies of the vec machinery; a program that uses a heavy generic function with fifty types has fifty bodies. The standard library accepts the trade — speed and simplicity for size — because the alternative, one generic body that consults type information at runtime, is slower, and because most programs use a handful of instances, not fifty. The honest trade is the chapter's theme: generics buy compiled specialization, and the specialization is the code you can see in the binary.
 
-The compiler may share an instance when the arguments are the same. Two functions that both use `std.vec<u32>` compile to the same `std.vec<u32>`, and the compiler reuses the instance instead of duplicating it. The sharing is a compile-time detail, invisible in the program, and it is why a program with many generic uses does not necessarily grow without bound — the instances are unique types, not unique copies.
+The compiler may share an instance when the arguments are the same. Two functions that both use `Vec<u32>` compile to the same `Vec<u32>`, and the compiler reuses the instance instead of duplicating it. The sharing is a compile-time detail, invisible in the program, and it is why a program with many generic uses does not necessarily grow without bound — the instances are unique types, not unique copies.
 
 7.7 Variance
 
@@ -129,21 +129,21 @@ The guide's section on generics asks about variance: how a generic type relates 
 
 Variance concerns subtyping: if one type is a subtype of another, a generic over the subtype and a generic over the supertype relate in some way. Coral has no subtyping, so the question has no subject. An `i32` is not a subtype of `i64`, a struct is not a subtype of another struct, and there is no inheritance hierarchy in which one type is a kind of another. The absence of subtyping is the C model, and Coral keeps it because it is the simple model: a type is exactly what it is.
 
-The consequence is that generics are invariant: a `std.vec<i32>` is a `std.vec<i32>`, and it is not interchangeable with a `std.vec<i64>` or a `std.vec<i32>` of some "parent type," because there is no parent type. The invariance is what makes the generic checks straightforward. When a function takes a `std.vec<i32>`, it receives a `std.vec<i32>`, and the compiler checks the argument against the exact type. There is no covariance to reason about, because there is no subtyping to be covariant about. If you are coming from Java or C#, where a `List<Circle>` can be passed where `List<Shape>` is expected, that freedom is exactly what Coral does not give you — and the reason is safety: with covariance, the code could put a `Square` into what it believes is a `List<Shape>` and find a `Circle` inside worse.
+The consequence is that generics are invariant: a `Vec<i32>` is a `Vec<i32>`, and it is not interchangeable with a `Vec<i64>` or a `Vec<i32>` of some "parent type," because there is no parent type. The invariance is what makes the generic checks straightforward. When a function takes a `Vec<i32>`, it receives a `Vec<i32>`, and the compiler checks the argument against the exact type. There is no covariance to reason about, because there is no subtyping to be covariant about. If you are coming from Java or C#, where a `List<Circle>` can be passed where `List<Shape>` is expected, that freedom is exactly what Coral does not give you — and the reason is safety: with covariance, the code could put a `Square` into what it believes is a `List<Shape>` and find a `Circle` inside worse.
 
 The guide's other variance terms have the same fate. Use-site variance, where a use of a generic names a relationship, and declaration-site variance, where the generic's definition declares one, both require a subtype relationship to describe. Coral has neither, and it does not need either, because the type system is exact: types are what they are, and a generic over a type is a generic over exactly that type.
 
 7.8 Bounded Quantification
 
-The previous section's generic was unbounded: a `std.vec<T>` works with any type at all, because the vec only stores and copies its elements and never asks them to do anything particular. But a generic function often needs its parameter to be able to do something — to have an `area`, to compare itself, to serialize itself — and then "any type" is no longer a promise the body can trust. The function needs to say: I do not care which type you are, but you must be able to do this. That statement is bounded quantification, and in Coral the bound is a trait: "any type at all, as long as it implements this trait."
+The previous section's generic was unbounded: a `Vec<T>` works with any type at all, because the vec only stores and copies its elements and never asks them to do anything particular. But a generic function often needs its parameter to be able to do something — to have an `area`, to compare itself, to serialize itself — and then "any type" is no longer a promise the body can trust. The function needs to say: I do not care which type you are, but you must be able to do this. That statement is bounded quantification, and in Coral the bound is a trait: "any type at all, as long as it implements this trait."
 
-The problem becomes concrete the moment a generic body uses a method on its parameter. Consider a function that finds the largest area among a collection of shapes. The body wants to call `area()` on every shape, and "shape" is a type parameter — the compiler cannot know, from the generic body alone, that `area()` exists for every possible type that might be passed in. The generic has two options: restrict the parameter, or refuse to compile. In Coral the restriction is written in the signature. A type parameter declared as `Shape T` means "T may be any type, provided it implements the `Shape` trait" — and the declaration, not a hope, is what licenses the body's `area()` calls.
+The problem becomes concrete the moment a generic body uses a method on its parameter. Consider a function that finds the largest area among a collection of shapes. The body wants to call `area()` on every shape, and "shape" is a type parameter — the compiler cannot know, from the generic body alone, that `area()` exists for every possible type that might be passed in. The generic has two options: restrict the parameter, or refuse to compile. In Coral the restriction is written in the signature. A type parameter declared as `any Shape` means "T may be any type, provided it implements the `Shape` trait" — and the declaration, not a hope, is what licenses the body's `area()` calls.
 
-This is the previous chapter's machinery in its full role, and the previous chapter showed the worked example. The `largestArea` function took any `Shape T`, and its body called `area()` and multiplied or compared the results — it could do that only because the trait promised `area()` exists. The generic body is checked against the promise: the body may use exactly the trait's methods, no more, and the compiler checks every call in the body against the trait's signatures. A body that calls a method the trait does not promise is rejected in the body, before any use of the function exists. The transaction is the whole chapter in miniature: the bound is a promise extracted from the type, the body is written against the promise, and the use is checked to keep it.
+This is the previous chapter's machinery in its full role, and the previous chapter showed the worked example. The `largestArea` function took any `any Shape`, and its body called `area()` and multiplied or compared the results — it could do that only because the trait promised `area()` exists. The generic body is checked against the promise: the body may use exactly the trait's methods, no more, and the compiler checks every call in the body against the trait's signatures. A body that calls a method the trait does not promise is rejected in the body, before any use of the function exists. The transaction is the whole chapter in miniature: the bound is a promise extracted from the type, the body is written against the promise, and the use is checked to keep it.
 
-Now the interesting half, the use. The bound is no good if the compiler forgets it at the call site: when `largestArea` is instantiated for `std.vec<Circle>`, the compiler must verify that Circle actually implements Shape, and it does — the implementation block declared it, and the declaration is the fact the use is checked against. When the code instantiates the function for a type that does not implement Shape, the compiler refuses, naming the missing conformance. The promise is checked on both sides: the body trusts it, and every use must keep it. A bound that was only documentation would fail at runtime; a bound in the signature fails at the line that broke it.
+Now the interesting half, the use. The bound is no good if the compiler forgets it at the call site: when `largestArea` is instantiated for `Vec<Circle>`, the compiler must verify that Circle actually implements Shape, and it does — the implementation block declared it, and the declaration is the fact the use is checked against. When the code instantiates the function for a type that does not implement Shape, the compiler refuses, naming the missing conformance. The promise is checked on both sides: the body trusts it, and every use must keep it. A bound that was only documentation would fail at runtime; a bound in the signature fails at the line that broke it.
 
-The bounds also document, and the documentation is a free consequence. A generic function whose parameter is bounded by a trait says, in its signature, what it requires of its argument: the reader sees `Shape T` and knows, before reading a line of the body, that the function measures shapes and that only shape types may be passed. The requirement is part of the signature, and the signature is the whole statement — the same reason every signature in the book states its parameter count, its types, and its return type.
+The bounds also document, and the documentation is a free consequence. A generic function whose parameter is bounded by a trait says, in its signature, what it requires of its argument: the reader sees `any Shape` and knows, before reading a line of the body, that the function measures shapes and that only shape types may be passed. The requirement is part of the signature, and the signature is the whole statement — the same reason every signature in the book states its parameter count, its types, and its return type.
 
 Coral's plainer bounded form is the function parameter, and it is worth naming as the same idea wearing work clothes. When the standard library sorts a vector, it does not invent a `Sortable` trait and require `T` to implement it; it takes an explicit comparison function as a parameter, `bool less(T, T)`, and the requirement is stated in the parameter list — the sort needs to know which of two elements comes first, and the caller provides the knowledge. The trait bound states a promise by name; the function parameter states the promise by value. Both say, in the signature, what the generic needs from its arguments, and both are checked at the call.
 
@@ -157,14 +157,14 @@ The `typedef` names the function type that a signal handler has: a function taki
 
 The `typedef` is a pure alias: it introduces no new type. A variable of type `SigHandler` and a variable of type `void(i32)` have the same type, and the two are interchangeable. The alias exists for the reader, so that a complex type is named and readable, and it exists for the writer, so that the complex type is written once. The alias is the documentation of the type. This is the crucial contrast with the next section: a `typedef` is the same type under a nicer name, so nothing is protected, and a `distinct` is a new type under an honest name, so everything is.
 
-The standard library's most used handle is the generic pointer, and it is worth meeting here because it appears throughout the language's conventions. In `std/misc/any.crl` the library builds `std.any` as a struct of exactly one field, a `void*`:
+The standard library's most used handle is the generic pointer, and it is worth meeting here because it appears throughout the language's conventions. A small helper module can wrap a raw pointer in a struct of exactly one field, a `rawptr`:
 
     
-    pub struct any
+    pub struct Any
     {
-        void* p;
+        rawptr p;
 
-        void* ptr()
+        rawptr ptr()
         {
             return p;
         }
@@ -180,14 +180,14 @@ The standard library's most used handle is the generic pointer, and it is worth 
         }
     }
 
-    pub any wrap(void* value)
+    pub Any wrap(rawptr value)
     {
-        any a;
+        Any a;
         a.p = value;
         return a;
     }
 
-The struct's point is twofold. First, the pointer gains a name and a home for its operations: the module's `wrap` function builds an `std.any` from a raw pointer, the `ptr` method reads the pointer back, `isNull` tests whether it holds null, and the generic `as<T>` method returns the pointer viewed as `T*` — the typed extraction, the cast with the type named in the call, the thread function in the concurrency chapter reading its argument with `arg.as<SumJob>()`. Second, because the handle is its own type rather than a spelling of `void*`, nothing converts implicitly: a raw pointer becomes an `std.any` only through `wrap`, and an `std.any` becomes a typed pointer only through `as<T>` or `ptr`, and every translation is written. That is the honest meaning of the name `any`: it holds anything, and the program states, at the boundary, what anything becomes. It is not `void` protected — the struct carries no provenance, no bounds, no type tag — but unlike a `void*` it has a surface for the operations the handle needs, and unlike a `typedef`, the surface exists because the type is a distinct struct and not an alias.
+The struct's point is twofold. First, the pointer gains a name and a home for its operations: the module's `wrap` function builds an `Any` from a `rawptr`, the `ptr` method reads the pointer back, `isNull` tests whether it holds null, and the generic `as<T>` method returns the pointer viewed as `T*` — the typed extraction, the cast with the type named in the call, the thread function in the concurrency chapter reading its argument with `arg.as<SumJob>()`. Second, because the handle is its own type rather than a spelling of `void*`, nothing converts implicitly: a `rawptr` becomes an `Any` only through `wrap`, and an `Any` becomes a typed pointer only through `as<T>` or `ptr`, and every translation is written. That is the honest meaning of the name `any`: it holds anything, and the program states, at the boundary, what anything becomes. It is not `void*` protected — the struct carries no provenance, no bounds, no type tag — but unlike a `rawptr` it has a surface for the operations the handle needs, and unlike a `typedef`, the surface exists because the type is a distinct struct and not an alias.
 
 7.10 Distinct Types
 
@@ -200,7 +200,7 @@ The standard library is full of them, and they are the perfect introduction beca
     pub distinct TcpSocket = i32;    // io/net.crl
     pub distinct Thread = void*;     // concurrent/thread.crl
 
-A `File` is an `i32` under the hood, but it is not an `i32` in the type system. So is a `TcpSocket` an `i32`, and a file descriptor, a TCP socket, a process id, and a raw error integer can all be the same number — and a program that mixes them up has bugs. The distinct type makes the distinction real. A function that takes a `std.File` does not accept a raw `i32`, and it does not accept a `std.TcpSocket` either, even though both are `i32`s wearing different colors. The compiler refuses to pass a socket where a file is expected, and the confusion it refuses is real confusion that has ended many C programs.
+A `File` is an `i32` under the hood, but it is not an `i32` in the type system. So is a `TcpSocket` an `i32`, and a file descriptor, a TCP socket, a process id, and a raw error integer can all be the same number — and a program that mixes them up has bugs. The distinct type makes the distinction real. A function that takes a `File` does not accept a raw `i32`, and it does not accept a `TcpSocket` either, even though both are `i32`s wearing different colors. The compiler refuses to pass a socket where a file is expected, and the confusion it refuses is real confusion that has ended many C programs.
 
 The distinct type is the newtype of other languages, and it is Coral's answer to the guide's question about newtypes. It is a type that wraps a representation and does not mix with the representation. The distinction is checked by the compiler, so the confusion it prevents is prevented at compile time. It is different from a `struct` with one field in a subtle way: a `struct` creates a type whose fields you reach through `.field`, while a `distinct` gives you back the base type's operations — you can compare two `File`s, pass a `File` to a function expecting the platform's `i32` through a cast, and otherwise treat the handle as the integer it is, just not a raw one.
 
@@ -219,11 +219,11 @@ The addition line is rejected by the compiler, which is the entire point: the va
 
 The other side of the distinct type is the boundary where the handle must become a raw integer for the platform. The library walks to the edge and casts explicitly:
 
-    std.File cfg = openConfig();
+    File cfg = openConfig();
     i32 raw = (i32)cfg;      // the distinct File, reduced to its base at the FFI boundary
     libc.close(raw);
 
-The cast is the visible translation the section promised: inside the program the handle is a `std.File`, and at the platform's edge it becomes the `i32` the platform wants, with the conversion written in the code. Nothing converts on its own — section 7.16 again — so the distinct type stays distinct until the line that says otherwise, and the line that says otherwise is a cast that any reader can see. The boundary cast is the complement of the currency refusal: the type keeps the program safe from itself, and it keeps the platform's door open with a written pass.
+The cast is the visible translation the section promised: inside the program the handle is a `File`, and at the platform's edge it becomes the `i32` the platform wants, with the conversion written in the code. Nothing converts on its own — section 7.16 again — so the distinct type stays distinct until the line that says otherwise, and the line that says otherwise is a cast that any reader can see. The boundary cast is the complement of the currency refusal: the type keeps the program safe from itself, and it keeps the platform's door open with a written pass.
 
 That is also the contrast with the typedef of the previous section, and the two belong side by side. A `typedef` gives a complex type a shorter name, and the name is the same type — a `SigHandler` and its underlying function type are interchangeable, because nothing is protected by the alias. A `distinct` gives a new name a new identity, and the identity is enforced — a `USD` is not a `EUR` even though both are u64s. The alias is a convenience for the reader; the distinct type is a safety boundary for the program. The standard library uses both, in the right places: `typedef` where a name is all that is needed, `distinct` where mixing must be impossible.
 
@@ -235,16 +235,16 @@ The opaque pattern in Coral is a struct whose fields are a fixed block of storag
 
     pub struct Regex
     {
-        void* impl[8];
+        rawptr impl[8];
         bool compiled;
-        u64 groupCount;
+        usize groupCount;
         u8* findBuf;
-        u64 findBufCap;
+        usize findBufCap;
     }
 
-The regex holds eight void pointers and a small set of working fields — an opaque handle to the platform's compiled pattern, a flag saying whether `compile` has run, the number of capture groups, and a buffer for `find` results. The fields are storage, sized to hold the implementation, and the methods interpret the storage: `compile` writes the pattern into it, `matches` reads it. The user of the `Regex` type never touches the storage; the user calls `compile`, `matches`, and `find`, and the type's meaning is its methods. If you ever open `regex.crl`, you will see what goes inside `impl`, but no program that merely uses `std.Regex` ever needs to know, and that is the point.
+The regex holds eight void pointers and a small set of working fields — an opaque handle to the platform's compiled pattern, a flag saying whether `compile` has run, the number of capture groups, and a buffer for `find` results. The fields are storage, sized to hold the implementation, and the methods interpret the storage: `compile` writes the pattern into it, `matches` reads it. The user of the `Regex` type never touches the storage; the user calls `compile`, `matches`, and `find`, and the type's meaning is its methods. If you ever open `regex.crl`, you will see what goes inside `impl`, but no program that merely uses `Regex` ever needs to know, and that is the point.
 
-The opaque type is the boundary between a library and its clients. The library knows the implementation, and the client knows the interface. The type hides the implementation details, so the library can change them — swap the eight pointers for two `u64`s, move the buffer elsewhere — without changing the type, and the client's code does not depend on them. The opacity is the encapsulation, expressed through the type. For the C programmer, the `void* impl[8]` pattern is the one from the classic "handle" APIs — `FILE*` is an opaque handle hiding exactly this idea — and Coral makes the handle a type you can name, size, and store by value.
+The opaque type is the boundary between a library and its clients. The library knows the implementation, and the client knows the interface. The type hides the implementation details, so the library can change them — swap the eight pointers for two `u64`s, move the buffer elsewhere — without changing the type, and the client's code does not depend on them. The opacity is the encapsulation, expressed through the type. For the C programmer, the `rawptr impl[8]` pattern is the one from the classic "handle" APIs — `FILE*` is an opaque handle hiding exactly this idea — and Coral makes the handle a type you can name, size, and store by value.
 
 7.12 The Sum Type: Enums
 
@@ -263,7 +263,9 @@ Here is a real enum from the standard library, the log level from `io/log.crl`:
 
 The `LogLevel` type is one of the five levels, and a value of the type is exactly one of them. The variants are named by the enum, and the type's values are the variants. The enum is how Coral expresses "one of these": a log level is one of five, a file is one of the platform's kinds, an opcode is one of the instruction set, a JSON value is one of the kinds of JSON. Think of the times a dynamic program has checked `if (kind == "circle") ... else if (kind == "square")` — the strings carry the alternatives, and a typo makes a new, silent alternative. An enum removes the strings and the typos: the alternatives are written once, the compiler knows them all, and a value cannot be anything else.
 
-The enum is a tagged union in the sense that the type carries its alternatives, and it is the honest sum type: the alternatives are exhaustive, and a value is always one of them. The compiler knows the alternatives, which is what makes exhaustive checking possible. The `match`-style switch over an enum, described in the control flow chapter, is checked by the compiler against the enum's variants, and a switch that does not cover every variant is reported. The exhaustiveness is the type system's rigor applied to the sum type: add a sixth level tomorrow, and every switch that handled the old five is pointed at for its miss. The compost row of dynamic checks never sees the new case; a dynamic program simply does the wrong thing. Exhaustiveness is the sum type's superpower.
+A `variant` is the same idea with payloads: where an enum's alternatives are bare names, a variant's alternatives each carry their own fields, so a variant value is a tag plus the data for that tag. The variants chapter develops them in full; here the enum is the representative sum type, and the difference is only whether the alternatives carry data.
+
+The enum is a tagged union in the sense that the type carries its alternatives, and it is the honest sum type: the alternatives are exhaustive, and a value is always one of them. The compiler knows the alternatives, which is what makes exhaustive checking possible. The `switch` over an enum, described in the control flow chapter, is checked by the compiler against the enum's variants, and a switch that does not cover every variant is reported. The exhaustiveness is the type system's rigor applied to the sum type: add a sixth level tomorrow, and every switch that handled the old five is pointed at for its miss. The compost row of dynamic checks never sees the new case; a dynamic program simply does the wrong thing. Exhaustiveness is the sum type's superpower.
 
     if (level == LogLevel.Error) { ... }
 
@@ -291,7 +293,7 @@ A value of the enum is one of the three, no more — the typos, the aliases, and
 
 The struct is the product type: a type that holds several values together, each with a name. It is called a "product" type because a value is the combination of all its fields — a time is this many seconds and this many nanoseconds — and the combination carries every field, all at once. The struct is the shape of the language's data, and it is the collection of everything this book has built.
 
-This one is the real `Timespec` from `core/time.crl`:
+This one is the `Timespec` from the time module:
 
     pub struct Timespec
     {
@@ -299,7 +301,7 @@ This one is the real `Timespec` from `core/time.crl`:
         i64 nsec;
     }
 
-The `Timespec` is the product of a second and a nanosecond. The struct's fields are the components, and the struct's value is the tuple of the components. The product type composes: a struct's fields are types, and a field can be a struct, a vector, an option, a result, an enum. The `JsonValue` is a product of a type and the fields for each kind of value, and the product composes the sum, the vectors, and the strings into one type: an enum says which kind of JSON this is, and the fields hold whatever that kind needs — an `i64` for an integer, a `f64` for a float, a `std.vec<std.strView>` for a string array — exactly one of which is meaningful for the marked kind.
+The `Timespec` is the product of a second and a nanosecond. The struct's fields are the components, and the struct's value is the tuple of the components. The product type composes: a struct's fields are types, and a field can be a struct, a vector, an option, a result, an enum. The `JsonValue` is a product of a type and the fields for each kind of value, and the product composes the sum, the vectors, and the strings into one type: an enum says which kind of JSON this is, and the fields hold whatever that kind needs — an `i64` for an integer, a `f64` for a float, a `Vec<str>` for a string array — exactly one of which is meaningful for the marked kind.
 
 The struct's fields are named, and the naming is the point. The product type without names, the tuple, exists in other languages, and Coral's chapter on functions explained why it does not exist here: an unnamed aggregate is a value without meaning. The struct names its fields, and the names carry the meaning. The product is built from named components, and the components' names are part of the type. `ts.sec` and `ts.nsec` tell a reader which is which without a comment; `ts[0]` and `ts[1]` would demand that everyone guess.
 
@@ -309,17 +311,17 @@ The guide's section on null safety asks about nullable types and the operations 
 
 A pointer in Coral can be null, and the pointer's type does not say whether it is null. A `T*` is a pointer that may point at a `T`, and it may be null. This is the C model, and Coral keeps it because pointers are the raw memory interface, and the raw interface cannot promise non-null. When you hold a `void*` from the OS, or a pointer into a buffer the platform gave you, "may be null" is the honest truth, and no amount of type machinery changes what the OS does.
 
-The option type is the safe alternative for the cases where absence is a possibility that should be checked. An `std.option<T>` is a value that is either `some`, carrying a `T`, or `none`, carrying nothing, and the type forces the caller to handle both. The map's lookup returns an option, and the caller handles `some` and `none` before using the value. The option is the checked absence, and the type makes the check visible. Crucially, the option is a *value*, not a pointer: `std.option<u64>` says plainly "I hold a number, or I hold nothing," and the compiler makes you look inside before you use the number. It is the same shape of reasoning the pointer demands, but it is spelled in the type instead of in a comment, and the compiler enforces what the comment only suggested. In `std.hashmap`, `std.set`, and the many library lookup functions, the option is the language's own way of saying "look first, and handle both answers."
+The option type is the safe alternative for the cases where absence is a possibility that should be checked. An `Option<T>` is a value that is either `Some`, carrying a `T`, or `None`, carrying nothing, and the type forces the caller to handle both. The map's lookup returns an option, and the caller handles `Some` and `None` before using the value. The option is the checked absence, and the type makes the check visible. Crucially, the option is a *value*, not a pointer: `Option<u64>` says plainly "I hold a number, or I hold nothing," and the compiler makes you look inside before you use the number. It is the same shape of reasoning the pointer demands, but it is spelled in the type instead of in a comment, and the compiler enforces what the comment only suggested. In `HashMap`, `Set`, and the many library lookup functions, the option is the language's own way of saying "look first, and handle both answers."
 
 The pattern is worth walking once, because it is the everyday shape of absent values in Coral. A phone directory maps names to numbers; asking for a name that is not in the directory has no answer, and the lookup says so in its type:
 
-    std.option<u64> findNumber(std.strView name);
+    Option<u64> findNumber(str name);
 
-    std.option<u64> hit = findNumber(std.strView::fromCstr("ada"));
+    Option<u64> hit = findNumber(str::fromCstr("ada"));
     if (hit.isSome())
-        std.print("found: ", hit.unwrap(), "\n");
+        println("found: {}", hit.unwrap());
     else
-        std.print("no such entry\n");
+        println("no such entry");
 
 The function does not return a sentinel — no 0 meaning "not found," no null, no -1. It returns a value whose type says "a number, or nothing," and the `if` is where the program chooses what each answer means. The alternative in C is a return code plus an out-parameter, or a special value that could be a real phone number, or a null pointer that could be a real address — every one of them a convention the next programmer must learn by reading. The option is the same convention, written in the type and checked by the compiler, and a caller that forgets to look inside is refused at the call. The absence is not an accident of a value; it is the type's statement, and the type is checked.
 
@@ -329,9 +331,9 @@ Coral has no non-null assertion operator and no safe navigation operator. There 
 
 The guide's type system section names several advanced types, and it is worth stating plainly which are not in Coral. The honesty is the point, and the boundaries are the design.
 
-There are no higher-kinded types. A Coral generic is parameterized by types and compile-time values, and there is no type that takes a type constructor as a parameter. The higher-kinded abstractions, the functors and monads of type theory, do not exist in Coral. This is not an accident and not a lack: a `std.vec<u32>` is a concrete, checkable, optimizable thing, and Coral chose the concrete thing over the abstraction to stack on top of it.
+There are no higher-kinded types. A Coral generic is parameterized by types and compile-time values, and there is no type that takes a type constructor as a parameter. The higher-kinded abstractions, the functors and monads of type theory, do not exist in Coral. This is not an accident and not a lack: a `Vec<u32>` is a concrete, checkable, optimizable thing, and Coral chose the concrete thing over the abstraction to stack on top of it.
 
-There are no existential types. A type that hides its type argument, an option of some hidden `T`, is not a Coral type. The types are fully named, and a type's arguments are part of its name. When you see `std.vec<...>` in a signature, the argument is written there; no type in Coral says "I am a vec of something, I just will not say what."
+There are no existential types. A type that hides its type argument, an option of some hidden `T`, is not a Coral type. The types are fully named, and a type's arguments are part of its name. When you see `Vec<...>` in a signature, the argument is written there; no type in Coral says "I am a vec of something, I just will not say what."
 
 There are no phantom types, the types that parameterize a value without affecting its representation. There are no dependent types, the types that depend on values. There are no refinement types, the types that restrict a value by a predicate. A `u64` is a `u64`; Coral does not have a "positive u64" or an "even u64," and a function that needs to enforce such a rule does what functions have always done — document it and check it.
 
@@ -361,7 +363,7 @@ The C-style cast is the type in parentheses before the expression:
 
 The parenthesized type converts the expression to the type. The cast covers every conversion: widening and narrowing, sign changes, float to integer, integer to pointer, pointer to integer, and the pointer conversions. Each cast states its target type, and each is checked by the compiler for validity. When the standard library hands an OS call an integer, it writes `(i32)descriptor`; when it changes a shift width, it writes `(u64)hi`; the parentheses are everywhere, and their meaning is always the same: "I know the type changes here, deliberately, now."
 
-    std.cast<u8*>(&raw)
+    cast<u8*>(&raw)
 
 The `cast` is the same cast in a different syntax, naming the type argument with the angle brackets. The two forms are the two styles of the language: the C style and the generic style, and both are present in the standard library. The `cast<T>` form is a habit you inherit from the generics era of the codebase — for a beginner the parenthesized form reads instantly, and for a veteran the angle brackets slot into the generic grammar.
 
@@ -383,9 +385,9 @@ The absence of promotion is part of the same design as the empty coercion matrix
 
 The guide's section on conversions names string conversion protocols, and Coral's string conversions are the functions of the formatting module and the view operations.
 
-A value converts to text through the formatting functions. The format functions format integers, unsigned integers, and floats, and the pad and join functions shape the text. The conversion is explicit, a function call that returns a string, and the function's name states what it does: `std.formatUint(255, 16, false)` builds the hexadecimal text `"ff"`, `std.formatInt` for the signed forms, `std.formatFloat` for the doubles. The standard library uses these everywhere it turns a number into a message — a counter into a log line, a byte count into a size, a nanosecond into a printed duration — and each is a plain call that says what it converts.
+A value converts to text through the formatting functions. The format functions format integers, unsigned integers, and floats, and the pad and join functions shape the text. The conversion is explicit, a function call that returns a string, and the function's name states what it does: `fmt::formatUint(255, 16, false)` builds the hexadecimal text `"ff"`, `fmt::formatInt` for the signed forms, `fmt::formatFloat` for the doubles. The standard library uses these everywhere it turns a number into a message — a counter into a log line, a byte count into a size, a nanosecond into a printed duration — and each is a plain call that says what it converts.
 
-Text converts to a view or a string through the constructors. A string literal is a view, a C string is a view through `fromCstr`, and a buffer with a length is a view through `fromParts`. A view becomes a string through the string's `fromView` constructor, which copies the text into an owning buffer. The conversions are constructors, and the constructors are the explicit form. The two directions are the chapter's whole lesson: value-to-text is a formatting call, text-to-value is a parsing call, and nothing happens by multiplication or adjacency the way `"" + x` pretends to.
+Text converts to a view or a string through the constructors. A string literal is a view, a C string is a view through `fromCstr`, and a buffer with a length is a view through `fromParts`. A view becomes a string through the string's `from` constructor, which copies the text into an owning buffer. The conversions are constructors, and the constructors are the explicit form. The two directions are the chapter's whole lesson: value-to-text is a formatting call, text-to-value is a parsing call, and nothing happens by multiplication or adjacency the way `"" + x` pretends to.
 
 The standard library's text conversions compose. The print functions convert their arguments to text and write them, using the formatting machinery per argument. The parsers convert text to values, using the parsing machinery. Each conversion is a named function, checked by the compiler, and each says in its signature what it converts and what it produces. The string conversion protocols are the functions, and the functions are explicit.
 
@@ -394,11 +396,12 @@ A worked example ties the conversions together, the way real programs use them. 
     for (u64 i = 1; i <= 10; i++)
     {
         u64 sq = i * i;
-        std.print(std.padRight(std.formatUint(i, 10, false), 3, ' '), "  ",
-                  std.padRight(std.formatUint(sq, 10, false), 6, ' '), "\n");
+        print("{}  {}\n",
+              fmt::padRight(fmt::formatUint(i, 10, false), 3, ' '),
+              fmt::padRight(fmt::formatUint(sq, 10, false), 6, ' '));
     }
 
-Each number is converted with `std.formatUint`, which says what it does in its name — the value, the base, and whether the digits should be uppercase — and the columns are shaped with `std.padRight`, which pads the converted text to a width with a chosen padding character. Nothing in the line happens by magic: no string-concatenation operator pretends to turn a number into text, no "add a string to a number" hides the conversion. The number becomes text because a function was called that makes text, and the reader sees the two facts — convert, then pad — in the same line where they happen. The conversions are visible, and visibility is the point the chapter has been making since the empty matrix: a type change in Coral is never an accident, because it is never unspoken.
+Each number is converted with `fmt::formatUint`, which says what it does in its name — the value, the base, and whether the digits should be uppercase — and the columns are shaped with `fmt::padRight`, which pads the converted text to a width with a chosen padding character. Nothing in the line happens by magic: no string-concatenation operator pretends to turn a number into text, no "add a string to a number" hides the conversion. The number becomes text because a function was called that makes text, and the reader sees the two facts — convert, then pad — in the same line where they happen. The conversions are visible, and visibility is the point the chapter has been making since the empty matrix: a type change in Coral is never an accident, because it is never unspoken.
 
 7.20 Compile-Time Type Reasoning
 
@@ -418,7 +421,7 @@ It helps to see the machinery in the actual shape the standard library uses, bec
     {
         if (T == u64) { _printU64(val); return; }
         if (T == f64) { _printF64(val); return; }
-        if (T == std.strView) { _printView(val); return; }
+        if (T == str) { _printView(val); return; }
         // no match: a compile-time error naming the type
     }
 
@@ -450,22 +453,22 @@ A minimum of machinery makes the design concrete. A storefront calls its payment
     }
 
     struct PayPal { /* provider-specific state */ }
-    
-    PayPal::PaymentProvider
+
+    extend PayPal : PaymentProvider
     {
         void charge(u64 cents) { /* one gateway's protocol */ }
     }
 
     struct Stripe { /* other state */ }
-    
-    Stripe::PaymentProvider
+
+    extend Stripe : PaymentProvider
     {
         void charge(u64 cents) { /* the other gateway's protocol */ }
     }
 
 The checkout function takes the protocol, not a provider:
 
-    void checkout(PaymentProvider provider, u64 cents)
+    void checkout(any PaymentProvider provider, u64 cents)
     {
         provider.charge(cents);
     }
@@ -480,9 +483,9 @@ A type is an agreement between the program and the compiler. When a value has a 
 
 The type is also a promise to the reader. A signature like
 
-    std.Result<Config, ParseError> loadConfig(std.strView path)   // and its call sites
+    Result<Config, ParseError> loadConfig(str path)   // and its call sites
 
-tells the reader everything the code needs to know before the body is read: the function takes text, and it produces either a configuration or a parse error. The reader can see the shape of the program, the paths and the outcomes, without executing a line. This is the sense in which the type system is the documentation: the types say what the program means, and the prose says why. When you read `std.option<u64>` as a return type, the function is telling you the truth it could have hidden: sometimes there is no answer, and you must look. Reading the type tells you what the body is bound to do.
+tells the reader everything the code needs to know before the body is read: the function takes text, and it produces either a configuration or a parse error. The reader can see the shape of the program, the paths and the outcomes, without executing a line. This is the sense in which the type system is the documentation: the types say what the program means, and the prose says why. When you read `Option<u64>` as a return type, the function is telling you the truth it could have hidden: sometimes there is no answer, and you must look. Reading the type tells you what the body is bound to do.
 
 The type is finally a promise the machine keeps. A `u64` is sixty-four bits, an `f64` is the IEEE double format, a pointer is an address, a struct is its fields laid out in order. The type determines the representation, and the representation determines the cost. The rigor of the type system is not academic; it is the same rigor that decides how many bytes a value occupies and how the hardware treats it. The type is where the language's abstraction meets the machine's reality, and the meeting is exact.
 
@@ -492,10 +495,10 @@ The compiler's type checker is the enforcement arm of the type system. It walks 
 
 The checker gives each expression the type the rules say it has. A literal has its type, a variable has its declared type, a function call has its return type, an operator has the type its operands produce. The checker then verifies the seams: an assignment requires the same type on both sides, a function argument requires the declared parameter type, an operation requires the operand types its rules demand. A mismatch is an error at the seam, reported with the code that caused it.
 
-A worked example shows a mismatch caught. The vector's `count()` method returns a `u64`, and a function that uses it where a pointer is expected cannot stand:
+A worked example shows a mismatch caught. The vector's `count()` method returns a `usize`, and a function that uses it where a pointer is expected cannot stand:
 
-    u64  n = v.count();       // correct: u64 from u64
-    u64* p = v.count();       // error: u64 is not u64*, and no conversion exists
+    usize n = v.count();      // correct: usize from usize
+    u64* p = v.count();       // error: usize is not u64*, and no conversion exists
 
 The second line fails because a `u64` is not a pointer to `u64`, and Coral has no implicit conversion that would pretend it is. The checker reports the mismatch at the assignment, where the types meet, and the error names the types involved. The reader sees the error and knows the fix: the program meant a pointer, or the program meant a number, and the types say which. In a dynamic language that same second line would run — and then crash, or worse, corrupt memory, at the first `*p`. Here it never ships.
 
@@ -527,21 +530,21 @@ The item is a struct, a product of its fields, with the category as an enum fiel
 
     pub struct Item
     {
-        std.strView name;
+        str name;
         u64 quantity;
         Category category;
     }
 
 A lookup by name may find an item or nothing, so the lookup returns an option. A restock operation must find the item and then add to it, so the two steps chain through the option's methods:
 
-    std.option<Item> findItem(std.strView name)
+    Option<Item> findItem(str name)
     {
-        return std.option<Item>::none();
+        return Option<Item>::None;
     }
 
-    void restock(std.strView name, u64 amount)
+    void restock(str name, u64 amount)
     {
-        std.option<Item> found = findItem(name);
+        Option<Item> found = findItem(name);
         if (found.isSome())
         {
             Item it = found.unwrap();
@@ -562,12 +565,12 @@ Now the report every inventory needs: how much of each category is on hand. The 
     for (u64 i = 0; i < items.count(); i++)
     {
         Item it = items.at(i);
-        if (it.category == Category.Tool)        tools += it.quantity;
-        else if (it.category == Category.Material) materials += it.quantity;
-        else if (it.category == Category.Consumable) consumables += it.quantity;
+        if (it.category == Category::Tool)        tools += it.quantity;
+        else if (it.category == Category::Material) materials += it.quantity;
+        else if (it.category == Category::Consumable) consumables += it.quantity;
     }
-    std.print("tools: ", tools, "  materials: ", materials,
-              "  consumables: ", consumables, "\n");
+    println("tools: {}  materials: {}  consumables: {}",
+            tools, materials, consumables);
 
 The categories are compared by equality to the enum's variants, and the comparisons are checked: a category value is always one of the three, so the chain covers the world without an else, and a value could not be "gadget" even if a typo tried — there is no such variant to hold. Write the same report with string categories and the compiler cannot help; write it with an enum and the alternatives are the type's own, spelled once, checked everywhere they are used.
 
@@ -597,7 +600,7 @@ The arithmetic is worth seeing once with real structs, because the sizes are the
 
 Interleaved puts a `u64` between two one-byte fields, and each `u8` pays the wide field's alignment: one byte at offset zero, seven bytes of padding, eight for the `u64`, one byte, and seven more bytes of padding — twenty-four bytes. Grouped places the two small fields together, pocketed before the `u64`, and pays one alignment pad of six bytes total: sixteen bytes. Same fields, same types, eight bytes of difference, and `sizeof(Interleaved)` and `sizeof(Grouped)` print 24 and 16 on the platforms Coral targets. A vector of a million Interleaved values holds eight million bytes of padding the Grouped form never pays — real memory, at the price of field order, which is why the wider-fields-first habit is a habit worth having. The padding is the platform's price for alignment, and the order of the fields decides how many times the price is paid.
 
-The fixed-width integers are their widths: a `u8` is one byte, a `u16` two, a `u32` four, a `u64` eight, and a pointer is the platform's word size. An `f32` is four bytes in the single-precision IEEE format, an `f64` eight in the double format. An enum is an integer wide enough for its variants, and a distinct type is exactly its base type's layout. A `vec` is three fields, a pointer and two `u64`s, and its size is the sum with alignment, regardless of how many elements it holds, because the elements live elsewhere, on the heap. The `vec`'s header size is what your struct costs when it holds a `vec`; the elements are a separate bill, paid when they are allocated.
+The fixed-width integers are their widths: a `u8` is one byte, a `u16` two, a `u32` four, a `u64` eight, and a pointer is the platform's word size. An `f32` is four bytes in the single-precision IEEE format, an `f64` eight in the double format. An enum is an integer wide enough for its variants, and a distinct type is exactly its base type's layout. A `Vec` is three fields, a pointer and two length words, and its size is the sum with alignment, regardless of how many elements it holds, because the elements live elsewhere, on the heap. The `Vec`'s header size is what your struct costs when it holds a `Vec`; the elements are a separate bill, paid when they are allocated.
 
 The `sizeof` operator reports a type's size, and the standard library uses it where a size must be known exactly: the memory pool computes its block size as the maximum of the element size and a pointer size, so every block is at least large enough to hold a free-list link. The layout is the C ABI, because Coral's types are C's types, and a struct compiled by Coral has the same layout the platform's C compiler would give it. The layout is not an abstraction; it is the bytes, and the types are the plan for the bytes.
 
@@ -605,9 +608,9 @@ The `sizeof` operator reports a type's size, and the standard library uses it wh
 
 The habit of reading types is the habit the type-first language rewards. A reader who encounters a signature reads it as a sentence: the return type is the result, the parameters are the inputs, and the types carry the meaning.
 
-Reading a generic type means reading its parameters. A `std.hashmap<K, V>` says the keys and values without naming them; a `std.vec<T>` says the elements; an `std.arr<T, N>` says the elements and the count. The generic type's parameters are its whole structure, and the type arguments at the use are the structure made concrete. Reading a bounded type parameter, a `Shape T`, reads the requirement: the type must implement the trait, and the trait is what the body can use. A signature that says `largestArea<Shape T>` tells you the function measures shapes it never named, and the bound is the promise that keeps the body honest.
+Reading a generic type means reading its parameters. A `HashMap<K, V>` says the keys and values without naming them; a `Vec<T>` says the elements; an `Arr<T, N>` says the elements and the count. The generic type's parameters are its whole structure, and the type arguments at the use are the structure made concrete. Reading a bounded type parameter, an `any Shape`, reads the requirement: the type must implement the trait, and the trait is what the body can use. A signature that says `largestArea<any Shape>` tells you the function measures shapes it never named, and the bound is the promise that keeps the body honest.
 
-Reading an option reads the possibility of absence, and reading a `Result` reads the possibility of failure. The types say what the function may not produce, which is as important as what it produces. A function returning an `std.option<u64>` does not promise a `u64`; it promises a `u64` or nothing, and the reader handles both before relying on it. The types are read as the program's honest description, and the honesty is the point of the type-first language: everything that can be said about a value's behavior, the types say it, and the reader reads it.
+Reading an option reads the possibility of absence, and reading a `Result` reads the possibility of failure. The types say what the function may not produce, which is as important as what it produces. A function returning an `Option<u64>` does not promise a `u64`; it promises a `u64` or nothing, and the reader handles both before relying on it. The types are read as the program's honest description, and the honesty is the point of the type-first language: everything that can be said about a value's behavior, the types say it, and the reader reads it.
 
 7.28 The Type System and the Type-First Principle
 
@@ -627,7 +630,7 @@ The primitive types are the fixed-width signed and unsigned integers, the `f32` 
 
 The `var` declaration infers a variable's type from its initializer, and the inference is local, not a Hindley-Milner global reconstruction.
 
-Generic types are parameterized by types and compile-time values, and the generic collections — `std.vec<T>`, `std.map<K, V>`, `std.arr<T, N>`, `std.Pair<T, U>`, `std.option<T>`, `std.Result<T, E>` — are the standard examples.
+Generic types are parameterized by types and compile-time values, and the generic collections — `Vec<T>`, `Map<K, V>`, `Arr<T, N>`, `Pair<T, U>`, `Option<T>`, `Result<T, E>` — are the standard examples.
 
 Generic types and functions are compiled by monomorphization: each concrete use produces a concrete, checked, optimized instance, and identical instances may be shared.
 
@@ -637,9 +640,9 @@ Bounded quantification is the trait constraint: a generic type parameter bounded
 
 The `typedef` names an existing type, and the name is an alternative spelling of the same type.
 
-A `distinct` type creates a new type from a representation, so `std.File` and `std.TcpSocket` are not interchangeable `i32`s, even both are `i32`s under the hood.
+A `distinct` type creates a new type from a representation, so `File` and `TcpSocket` are not interchangeable `i32`s, even both are `i32`s under the hood.
 
-An opaque type hides its implementation behind storage and methods, as `std.Regex` hides the platform's compiled pattern.
+An opaque type hides its implementation behind storage and methods, as `Regex` hides the platform's compiled pattern.
 
 The enum is the sum type: a value is exactly one of the named variants, and the compiler checks exhaustive switches over them, as `LogLevel` is one of its five levels.
 

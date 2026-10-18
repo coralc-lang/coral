@@ -6,7 +6,7 @@ Data structures are where a language shows what it believes. A language's collec
 
 Coral's collections are built from a consistent set of decisions, and the decisions are the philosophy of the whole language. Every collection is a struct with explicit fields and methods, defined in the standard library rather than hidden in the runtime. Every collection manages its own memory, with the constructor and the dispose method at the head and foot of its definition. Every collection exposes its operations as methods with explicit names, and the operations' costs are visible in their implementations. Nothing is hidden, because in Coral nothing about a collection is hidden.
 
-The consistency is the point. Every collection follows the same shape, so a reader who has learned one has learned the shape of all of them. Each struct begins with its fields, the storage and the bookkeeping, and each struct ends with its dispose method, the release of that storage. A collection may also implement the Drop trait — the compiler-provided trait the memory chapter develops in full — and a collection that does has its release injected automatically at the end of the scope where a value of the collection dies, exactly once, on every exit path, without a call site. Across the standard library the collections support the trait even though the library's modules themselves perform their frees and allocations by hand, deliberately, to avoid the compile-time overhead of RAII tracking and to keep the std compilation times fast; the support is what your code — compiled once, not thousands of times — can spend freely. Each growable collection shares the growth strategy of the vector, which section 6.4 explains once and the rest of the chapter refers back to. Each keyed collection carries its key rules in function fields, which section 6.25 explains once. The collections are not a grab bag of unrelated types; they are one idea, storage plus the rules that govern it, repeated with the variations that different uses demand. This is the guide's promise about collections made concrete: read the struct, and the whole behavior is visible.
+The consistency is the point. Every collection follows the same shape, so a reader who has learned one has learned the shape of all of them. Each struct begins with its fields, the storage and the bookkeeping, and each struct ends with its dispose method, the release of that storage. A collection may also opt into the compiler-provided drop mechanism, written `@drop` — the memory chapter develops it in full — and a collection that does has its release injected automatically at the end of the scope where a value of the collection dies, exactly once, on every exit path, without a call site. Across the standard library the collections support the mechanism even though the library's modules themselves perform their frees and allocations by hand, deliberately, to avoid the compile-time overhead of RAII tracking and to keep the std compilation times fast; the support is what your code — compiled once, not thousands of times — can spend freely. Each growable collection shares the growth strategy of the vector, which section 6.4 explains once and the rest of the chapter refers back to. Each keyed collection carries its key rules in function fields, which section 6.25 explains once. The collections are not a grab bag of unrelated types; they are one idea, storage plus the rules that govern it, repeated with the variations that different uses demand. This is the guide's promise about collections made concrete: read the struct, and the whole behavior is visible.
 
 This chapter walks through the standard collections, the ideas behind them, and the rules each one keeps. The collections are the array, the vector, the linked list, the deque, the queue, the ring buffer, the hash map, the unordered map, the tree map, the generic tree, the trie, the set, the bitset, the priority queue, and the cache. The strings and the text parsers follow, and then the duration and time types. Each section states what the structure is, what it costs, and when it is the right choice. Several sections carry a worked example, because a data structure is best understood doing its job: a stack balancing delimiters, a queue walking a graph, a hash map counting words, a trie answering prefixes, a cache turning an exponential computation into a linear one. The chapter also ends with a section that ties the choice together, because choosing among the collections is the point of knowing them.
 
@@ -14,23 +14,23 @@ This chapter walks through the standard collections, the ideas behind them, and 
 
 The array is the simplest collection: a fixed number of elements, laid out contiguously in memory, one after another. The array type is generic over the element type and the count, and its storage is a fixed-size field.
 
-    pub struct arr<T, N>
+    pub struct Arr<T, N>
     {
         T data[N];
     }
 
-The count is part of the type. An array of eight u64s and an array of sixteen u64s are different types, and the compiler knows each array's size at compile time. (The type is literally named arr — fixed array, so callers write std.arr<std.strView, 3> — but the idea is the array you know from C, and this chapter will keep calling the idea "the array.") The array's storage is the struct's storage: it is in the stack frame when the array is a local, in the containing object when it is a field, and there is no separate heap allocation for the elements. The array is the collection that costs nothing to hold.
+The count is part of the type. An array of eight u64s and an array of sixteen u64s are different types, and the compiler knows each array's size at compile time. (The type is literally named Arr — fixed array, so callers write Arr<str, 3> — but the idea is the array you know from C, and this chapter will keep calling the idea "the array.") The array's storage is the struct's storage: it is in the stack frame when the array is a local, in the containing object when it is a field, and there is no separate heap allocation for the elements. The array is the collection that costs nothing to hold.
 
 The array provides the element operations: at reads an element, set writes one, and both assert that the index is in range. The pointer accessors expose the storage for the operations that need a raw pointer, and front and back read the two ends. The fill operation sets every element, and the copy operations copy the whole array in or out. The count method returns N, the compile-time size, and isEmpty asks whether N is zero.
 
 A small example shows the array doing what it is for: a fixed, known-in-advance set of values, used as a lookup table.
 
-    std.arr<std.strView, 3> months;
-    months.set(0, std.strView::fromCstr("jan"));
-    months.set(1, std.strView::fromCstr("feb"));
-    months.set(2, std.strView::fromCstr("mar"));
+    Arr<str, 3> months;
+    months.set(0, str::fromCstr("jan"));
+    months.set(1, str::fromCstr("feb"));
+    months.set(2, str::fromCstr("mar"));
     for (u64 i = 0; i < months.count(); i++)
-        std.print(months.at(i), "\n");
+        println("{}", months.at(i));
 
 The array's deal is simple: its size is fixed and its layout is contiguous. The reader knows from the type how much memory the array occupies, and the methods know from the type how many elements they can touch. The assertions make the bounds a checked rule: an out-of-range access is caught at the moment it is attempted, with a diagnostic, rather than reading or writing memory outside the array.
 
@@ -42,11 +42,11 @@ The array is the right choice when the count is known at compile time and never 
 
 The vector is the growable array: a contiguous buffer of elements that can grow as elements are added. It is the collection C programmers have written a hundred times, and Coral's vector is that implementation, made a standard type.
 
-    pub struct vec<T>
+    pub struct Vec<T>
     {
         T* data;
-        u64 len;
-        u64 cap;
+        usize len;
+        usize cap;
     }
 
 The vector holds a pointer to its buffer, the number of elements it currently contains, and the number it has room for. The three fields are the whole structure: data points at the memory, len is the count of live elements, cap is the size of the buffer. The invariant is that len is never more than cap, and the buffer always has room for the live elements.
@@ -68,7 +68,7 @@ The push method is the vector in miniature: check the space, grow if needed, sto
 
 A vector in use is the most common loop in programming: build, iterate, read.
 
-    std.vec<u64> squares = std.vec<u64>::withCap(10);
+    Vec<u64> squares = Vec<u64>::withCap(10);
     for (u64 i = 0; i < 10; i++)
         squares.push(i * i);
     u64 total = 0;
@@ -97,9 +97,9 @@ The strategy also makes the growth visible to the programmer who wants to avoid 
 
 The stack is the LIFO collection: last in, first out. It is the collection of "remember this, and give it back in reverse order," and it is so fundamental that every programming language has one running underneath the others: the call stack, which records the functions in flight and returns to them in reverse order of the calls. The call stack is the reason every programmer already knows how a stack behaves, and the standard library's stack is simply that behavior made explicit.
 
-The stack does not need its own type, because the vector already is one. A stack is a vector used at one end: push appends at the back, pop removes from the back, peek reads the back, and isEmpty reports whether anything is there. The vector's push and pop are exactly the stack's push and pop, at the same cost, constant on average. The operations' names are the vector's names, and a program that wants a stack builds it out of a vec and uses the back end. This is the standard library's style: a data structure is not a magic word, it is a storage layout and a set of operations, and when an existing type already provides the layout and the operations, the type is the structure.
+The stack does not need its own type, because the vector already is one. A stack is a vector used at one end: push appends at the back, pop removes from the back, peek reads the back, and isEmpty reports whether anything is there. The vector's push and pop are exactly the stack's push and pop, at the same cost, constant on average. The operations' names are the vector's names, and a program that wants a stack builds it out of a Vec and uses the back end. This is the standard library's style: a data structure is not a magic word, it is a storage layout and a set of operations, and when an existing type already provides the layout and the operations, the type is the structure.
 
-    std.vec<u64> stack = std.vec<u64>::new();
+    Vec<u64> stack = Vec<u64>::new();
     stack.push(1);
     stack.push(2);
     stack.push(3);
@@ -108,22 +108,22 @@ The stack does not need its own type, because the vector already is one. A stack
 
 The canonical use of a stack is matching pairs of delimiters. A program that must check that parentheses and brackets balance reads the text left to right, pushing each opening delimiter onto a stack. When it meets a closing delimiter, the matching opening delimiter must be the last one pushed, the one on top of the stack. If the top does not match, or the stack is empty, the text is unbalanced. When the text ends, the stack must be empty: every opening delimiter must have found its closing one. The stack is the exact shape of the problem, because nesting is LIFO: the most recently opened delimiter is the first one that must be closed.
 
-    pub bool balanced(std.strView text)
+    pub bool balanced(str text)
     {
-        std.vec<u64> stack = std.vec<u64>::new();
+        Vec<u64> stack = Vec<u64>::new();
         for (u64 i = 0; i < text.len; i++)
         {
-            char c = text.at(i);
+            u8 c = text.at(i);
             if (c == '(' || c == '[' || c == '{')
                 stack.push((u64)c);
             else if (c == ')' || c == ']' || c == '}')
             {
                 if (stack.isEmpty()) return false;
                 u64 open = stack.pop();
-                bool match = (c == ')' && open == (u64)'(')
+                bool matched = (c == ')' && open == (u64)'(')
                     || (c == ']' && open == (u64)'[')
                     || (c == '}' && open == (u64)'{');
-                if (!match) return false;
+                if (!matched) return false;
             }
         }
         return stack.isEmpty();
@@ -133,7 +133,7 @@ The balanced function is the stack doing its job. Each opening delimiter is reme
 
 The same LIFO order is an undo history, and the history is a stack of states, pushed on every edit and popped on every undo. The last edit made is the first edit reverted, which is exactly the stack's top:
 
-    std.vec<EditorState> history = std.vec<EditorState>::new();
+    Vec<EditorState> history = Vec<EditorState>::new();
     history.push(snapshot());      // every edit remembers the previous state
     ...
     EditorState back = history.pop();   // the most recent edit is undone first
@@ -152,11 +152,11 @@ The linked list is a chain of nodes, each holding an element and pointers to its
         ListNode<T>* next;
     }
 
-    pub struct linkedlist<T>
+    pub struct LinkedList<T>
     {
         ListNode<T>* head;
         ListNode<T>* tail;
-        u64 len;
+        usize len;
     }
 
 The node is a value and two pointers. The list is two pointers and a count. The structure is explicit, which is the point of showing it: the reader can see what a linked list costs before using one. Each element lives in its own heap-allocated node, and each node carries the overhead of its two pointers. The memory overhead of a linked list is real, and it is visible in the type.
@@ -165,13 +165,13 @@ The list's operations are the operations its structure makes natural. pushFront 
 
 The list in use is the same shape as any other collection, built and walked.
 
-    std.linkedlist<u64> l = std.linkedlist<u64>::new();
+    LinkedList<u64> l = LinkedList<u64>::new();
     l.pushFront(3);
     l.pushBack(7);
     l.pushFront(1);
     pub void showU64(u64 v)
     {
-        std.print(v, " ");
+        print("{} ", v);
     }
 
     l.each(showU64);
@@ -186,13 +186,13 @@ The list is the right choice when the work is at the ends and the elements are i
 
 The deque, short for double-ended queue, is a collection that supports constant-time insertion and removal at both ends. The standard deque is a ring buffer: a contiguous buffer with a head index and a tail index that wrap around.
 
-    pub struct deque<T>
+    pub struct Deque<T>
     {
         T* data;
-        u64 head;
-        u64 tail;
-        u64 cap;
-        u64 mask;
+        usize head;
+        usize tail;
+        usize cap;
+        usize mask;
     }
 
 The mask field is the ring trick. The buffer's capacity is a power of two, the mask is one less than the capacity, and the head and tail indices advance by adding one and masking, which is the same as wrapping around the buffer. The count method subtracts the indices and masks, and the growth operation allocates a new buffer, copies the elements in order from head to tail, and resets the indices. The ring structure is the reason both ends are constant time: no end is special, because both ends are positions in a circle.
@@ -201,7 +201,7 @@ The deque's operations are pushFront and pushBack, popFront and popBack, front a
 
 A two-ended work buffer is the deque's natural shape: take from the front, and hand back what still needs work to the back.
 
-    std.deque<u64> d = std.deque<u64>::new();
+    Deque<u64> d = Deque<u64>::new();
     d.pushBack(1);
     d.pushBack(2);
     d.pushFront(0);
@@ -212,7 +212,7 @@ A two-ended work buffer is the deque's natural shape: take from the front, and h
             d.pushBack(job - 1);
     }
 
-The deque is the choice when both ends matter. A work queue that drains from the front and fills from the back is a deque's natural shape, and so is a buffer that grows at both ends. The ring buffer is the same idea with a fixed capacity, which the standard library provides separately as the ringbuf type.
+The deque is the choice when both ends matter. A work queue that drains from the front and fills from the back is a deque's natural shape, and so is a buffer that grows at both ends. The ring buffer is the same idea with a fixed capacity, which the standard library provides separately as the RingBuf type.
 
 6.8 The Queue and the Ring Buffer
 
@@ -227,18 +227,18 @@ The queue is the shape of fairness: the first to arrive is the first served. Job
 
 The queue's order is also the order of discovery, and the breadth-first walk of a graph is the queue's canonical use. Starting from one node, the walk marks each node and enqueues it; each iteration dequeues a node and enqueues its unmarked neighbors. Because the queue yields in arrival order, every node at distance one is visited before any at distance two — the walk spreads outward one layer at a time, the queue carrying the frontier of the walk.
 
-    pub void bfs(u64 start, const std.vec<std.vec<u64>>* adj, void(u64) fn)
+    pub void bfs(u64 start, const Vec<Vec<u64>>* adj, void(u64) fn)
     {
-        std.arr<u8, 64> seen;              // one mark per node, for a small graph
+        Arr<u8, 64> seen;              // one mark per node, for a small graph
         seen.fill(0);
-        std.queue<u64> frontier = std.queue<u64>::new();
+        Queue<u64> frontier = Queue<u64>::new();
         frontier.enqueue(start);
         seen.set(start, 1);
         while (!frontier.isEmpty())
         {
             u64 node = frontier.dequeue();
             fn(node);
-            std.vec<u64> neighbors = adj->at(node);
+            Vec<u64> neighbors = adj->at(node);
             for (u64 i = 0; i < neighbors.count(); i++)
             {
                 u64 next = neighbors.at(i);
@@ -257,12 +257,12 @@ The ring buffer is the queue with a fixed capacity. Its buffer does not grow; wh
 
 A ring buffer of recent readings shows the pattern: push the newest value, and the buffer keeps only the last N, dropping the oldest silently.
 
-    std.ringbuf<f64> recent = std.ringbuf<f64>::new(16);
+    RingBuf<f64> recent = RingBuf<f64>::new(16);
     recent.push(1.5);
     recent.push(2.5);
     recent.push(3.0);
     if (recent.isFull())
-        std.print("window full, oldest dropped\n");
+        println("window full, oldest dropped");
     f64 oldest = recent.front();
 
 The ring buffer's count tells the caller how full it is, and isFull tells the caller when a push is about to overwrite. The producer and the consumer of a bounded pipeline each rely on the same facts: the producer checks isFull and decides whether to block, to wait, or to drop; the consumer pops in arrival order. The buffer never allocates after its construction, which is what a bounded buffer means: the bound is real, and the buffer lives within it.
@@ -271,12 +271,12 @@ The ring buffer's count tells the caller how full it is, and isFull tells the ca
 
 The hash map is the collection for "given a key, find the value." It stores key-value pairs in a table, and it finds a key by hashing it to a table position instead of searching. The standard hash map is a table of entries with open addressing: the entries live in one array, and each entry records whether it is occupied.
 
-    pub struct hashmap<K, V>
+    pub struct HashMap<K, V>
     {
         HashMapEntry<K, V>* entries;
-        u64 cap;
-        u64 len;
-        u64(K) hashFn;
+        usize cap;
+        usize len;
+        usize(K) hashFn;
         bool(K, K) eqFn;
     }
 
@@ -284,29 +284,29 @@ The map's two function fields define the key for this map: hashFn turns a key in
 
 A hash function is a deterministic scramble. It takes a key of any type and returns a u64, a number in a huge range, and the same key must always produce the same number. The map takes that number and reduces it to a table position, and then the table position is where the search begins. A good hash function spreads its keys across the whole range, so that different keys land in different positions and the map finds them directly. The hash is not an ordering: two keys that hash near each other have no relationship at all, which is why the hash map makes no promise about the order of its entries. The hash function's job is simply to say, for each key, "start looking here."
 
-The lookup works by hashing the key and walking the table from the resulting position. The insert method hashes, probes for an empty slot or a matching key, and stores. The get method hashes, probes, and returns an option: the value when the key is present, and none when it is not. The contains method probes and reports whether the key exists. The getPtr method returns a pointer to the value, so a caller can read or modify it in place.
+The lookup works by hashing the key and walking the table from the resulting position. The insert method hashes, probes for an empty slot or a matching key, and stores. The get method hashes, probes, and returns an Option: the value wrapped in Some when the key is present, and None when it is not. The contains method probes and reports whether the key exists. The getPtr method returns an Option wrapping a pointer to the value, so a caller can read or modify it in place.
 
-    option<V> get(K key)
+    Option<V> get(K key)
     {
-        u64 h = self.hashFn(key) % self.cap;
-        u64 start = h;
+        usize h = self.hashFn(key) % self.cap;
+        usize start = h;
         while (self.entries[h].occupied)
         {
             if (self.eqFn(self.entries[h].key, key))
-                return option<V>::some(self.entries[h].value);
+                return Option<V>::Some { .value = self.entries[h].value };
             h = (h + 1) % self.cap;
             if (h == start) break;
         }
-        return option<V>::none();
+        return Option<V>::None;
     }
 
 The get method is the hash lookup in full. It hashes the key, probes the table, compares with the equality function, and returns a some or a none. The wrap-around probe, moving to the next slot when a slot is occupied, is the collision resolution, and the whole walk is bounded by the start check, which stops the probe if the table is full of occupied entries.
 
 A hash map in use is a symbol table: keys to values, built and queried. The simplest key, a u64, needs a trivial hash and equality, and the pattern shows how any key works.
 
-    pub u64 hashU64(u64 k)
+    pub usize hashU64(u64 k)
     {
-        return k;
+        return (usize)k;
     }
 
     pub bool eqU64(u64 a, u64 b)
@@ -314,14 +314,14 @@ A hash map in use is a symbol table: keys to values, built and queried. The simp
         return a == b;
     }
 
-    std.hashmap<u64, std.strView> names = std.hashmap<u64, std.strView>::new(hashU64, eqU64);
-    names.insert(7, std.strView::fromCstr("seven"));
-    names.insert(11, std.strView::fromCstr("eleven"));
-    std.option<std.strView> found = names.get(7);
+    HashMap<u64, str> names = HashMap<u64, str>::new(hashU64, eqU64);
+    names.insert(7, str::fromCstr("seven"));
+    names.insert(11, str::fromCstr("eleven"));
+    Option<str> found = names.get(7);
     if (found.isSome())
-        std.print(found.unwrap(), "\n");
+        println("{}", found.unwrap());
 
-The get method returns an option, and the caller branches on it. The option is the map's honesty about absence: a lookup either finds a value or does not, and the type of the result says so. This is the pattern the whole language follows, and the map is where it matters most, because a lookup that misses is a normal outcome, not an error. The getPtr method is the alternative for the common case of modifying the value in place: it returns a pointer to the value, or null when the key is absent, and the caller updates the pointed-to value without a second lookup.
+The get method returns an Option, and the caller branches on it. The Option is the map's honesty about absence: a lookup either finds a value or does not, and the type of the result says so. This is the pattern the whole language follows, and the map is where it matters most, because a lookup that misses is a normal outcome, not an error. The getPtr method is the alternative for the common case of modifying the value in place: it returns an Option wrapping a pointer to the value — Some when the key is present, None when it is not — and the caller updates the pointed-to value without a second lookup.
 
 The hash map is the choice for key lookup when order does not matter. Finding a key is constant time on average, independent of the number of entries. The map makes no promise about the order in which its entries are stored or returned, because the hash table's whole point is to arrange entries by hash, not by order. The tree map, the next type, is the ordered alternative.
 
@@ -353,41 +353,44 @@ The hash map's natural job is counting, and the frequency counter is the canonic
 
 The counter's shape is the shape of every accumulate-with-a-map loop: for each item, find its slot, and update the slot's value. The map's getPtr method is built for exactly this, because it combines the lookup and the update in one step: find the value's pointer, and if it exists, increment through the pointer. The alternative, a get followed by an insert, would do the lookup twice. The getPtr pattern is the efficient idiom, and it shows why the map exposes a pointer instead of only values.
 
-    pub u64 hashView(std.strView s)
+    pub usize hashView(str s)
     {
-        u64 h = 5381;
+        usize h = 5381;
         for (u64 i = 0; i < s.len; i++)
-            h = h * 33 + (u64)s.at(i);
+            h = h * 33 + (usize)s.at(i);
         return h;
     }
 
-    pub bool eqView(std.strView a, std.strView b)
+    pub bool eqView(str a, str b)
     {
         return a.equals(b);
     }
 
-    pub void countWords(const std.vec<std.strView>* words)
+    pub void countWords(const Vec<str>* words)
     {
-        std.hashmap<std.strView, u64> counts = std.hashmap<std.strView, u64>::new(hashView, eqView);
+        HashMap<str, u64> counts = HashMap<str, u64>::new(hashView, eqView);
         for (u64 i = 0; i < words->count(); i++)
         {
-            std.strView w = words->at(i);
-            u64* slot = counts.getPtr(w);
-            if (slot != null)
-                *slot = *slot + 1;
+            str w = words->at(i);
+            Option<u64*> slot = counts.getPtr(w);
+            if (slot.isSome())
+            {
+                u64* p = slot.unwrap();
+                *p = *p + 1;
+            }
             else
                 counts.insert(w, 1);
         }
-        std.vec<std.strView> keys = counts.keys();
+        Vec<str> keys = counts.keys();
         for (u64 i = 0; i < keys.count(); i++)
         {
-            std.strView w = keys.at(i);
-            std.option<u64> c = counts.get(w);
-            std.print(w, " : ", c.unwrap(), "\n");
+            str w = keys.at(i);
+            Option<u64> c = counts.get(w);
+            println("{} : {}", w, c.unwrap());
         }
     }
 
-The countWords function shows the whole rhythm of the hash map. The hash and equality functions are written by the caller, because strView is the key and the map cannot invent a hash for it. The loop uses getPtr to update counts in place: the first time a word appears, the slot is null and the word is inserted with a count of one; every later time, the slot exists and the count is incremented through the pointer. The reporting loop collects the keys and reads each count back. The keys come out in hash order, not in the order the words first appeared, because the hash map promises lookup, not order.
+The countWords function shows the whole rhythm of the hash map. The hash and equality functions are written by the caller, because str is the key and the map cannot invent a hash for it. The loop uses getPtr to update counts in place: the first time a word appears, the slot is None and the word is inserted with a count of one; every later time, the slot holds Some pointer and the count is incremented through it. The reporting loop collects the keys and reads each count back. The keys come out in hash order, not in the order the words first appeared, because the hash map promises lookup, not order.
 
 The cost of the counter is the cost of the map. Each word is hashed once, probed a constant number of slots on average, and updated; the whole pass is linear in the number of words. The counter would be quadratic with a linear search over a growing list, and it would be logarithmic with a tree, but the hash map's constant average lookup makes it the natural shape of counting. This is the pattern that appears wherever data is grouped: distinct values collected, occurrences tallied, records keyed by an identifier.
 
@@ -408,22 +411,22 @@ The node holds the pair, the heights of its subtrees are tracked in the height f
 
 A rotation is worth understanding, because it is the whole trick of balance. A binary search tree is balanced when, at every node, the left and right subtrees have nearly equal heights. If the tree is a chain, with every node having one child, it is a list in disguise and every lookup walks the whole thing. A rotation is a local rearrangement: when a node's left subtree is too tall, the node's left child moves up into the node's place, and the node moves down to the child's place, with the middle subtree reattached to preserve the search order. The rotation changes the shape without changing the contents, and the map applies the right rotation at each node where the balance is broken. After an insertion or removal, the tree walks back up the path it changed, rebalancing at each node, which is why the operations are logarithmic: the tree is never deeper than a small constant times the logarithm of its size.
 
-The tree map's operations match the hash map's, with one difference: get returns an option, getPtr returns a pointer, contains reports membership, insert and remove modify, and the entries are stored in order. The ordered iteration walks the tree in order, visiting each node's left subtree, then the node, then the right subtree, which visits the keys from smallest to largest.
+The tree map's operations match the hash map's, with one difference: get returns an Option, getPtr returns an Option wrapping a pointer, contains reports membership, insert and remove modify, and the entries are stored in order. The ordered iteration walks the tree in order, visiting each node's left subtree, then the node, then the right subtree, which visits the keys from smallest to largest.
 
 A tree map in use shows the ordered iteration the hash map cannot give. The map's each method delivers the pairs in key order, and the comparison function is what orders the keys.
 
-    pub i32 cmpView(std.strView a, std.strView b)
+    pub i32 cmpView(str a, str b)
     {
         return a.compare(b);
     }
 
-    std.map<std.strView, u64> scores = std.map<std.strView, u64>::new(cmpView);
-    scores.insert(std.strView::fromCstr("ada"), 42);
-    scores.insert(std.strView::fromCstr("bob"), 7);
-    scores.insert(std.strView::fromCstr("cecile"), 19);
-    pub void printPair(std.strView k, u64 v)
+    Map<str, u64> scores = Map<str, u64>::new(cmpView);
+    scores.insert(str::fromCstr("ada"), 42);
+    scores.insert(str::fromCstr("bob"), 7);
+    scores.insert(str::fromCstr("cecile"), 19);
+    pub void printPair(str k, u64 v)
     {
-        std.print(k, " : ", v, "\n");
+        println("{} : {}", k, v);
     }
 
     scores.each(printPair);
@@ -436,10 +439,10 @@ The tree map is the choice when the keys' order matters. A map whose keys must b
 
 The set is the collection for membership: it holds distinct values, and its operations ask whether a value is present. The standard set is built on the hash map, storing each value as a key with a placeholder value.
 
-    pub struct set<T>
+    pub struct Set<T>
     {
-        hashmap.hashmap<T, bool> inner;
-        u64(T) hashFn;
+        HashMap<T, bool> inner;
+        usize(T) hashFn;
         bool(T, T) eqFn;
     }
 
@@ -449,13 +452,13 @@ The set is the collection for "have I seen this before." The operations are the 
 
 The set's distinctive operations are the set operations: union, intersection, and difference. The union inserts every element of both sets into a new set. The intersection inserts the elements of the first that are in the second. The difference inserts the elements of the first that are not in the second. Each builds a new set, using the set's own hash and equality functions so the result is a proper set.
 
-    set<T> union(const set<T>* other)
+    Set<T> union(const Set<T>* other)
     {
-        set<T> result = set<T>::new(self.hashFn, self.eqFn);
-        vec<T> k = self.toVec();
+        Set<T> result = Set<T>::new(self.hashFn, self.eqFn);
+        Vec<T> k = self.toVec();
         for (u64 i = 0; i < k.count(); i++)
             result.insert(k.at(i));
-        vec<T> ok = other->toVec();
+        Vec<T> ok = other->toVec();
         for (u64 i = 0; i < ok.count(); i++)
             result.insert(ok.at(i));
         return result;
@@ -465,8 +468,8 @@ The set also asks about relationships between sets: isSubset checks whether ever
 
 A set in use is deduplication plus the set relationships. Deduplicating a list, checking for overlap, and combining distinct collections are the set's everyday jobs.
 
-    std.set<u64> seen = std.set<u64>::new(hashU64, eqU64);
-    std.vec<u64> unique = std.vec<u64>::new();
+    Set<u64> seen = Set<u64>::new(hashU64, eqU64);
+    Vec<u64> unique = Vec<u64>::new();
     for (u64 i = 0; i < values.count(); i++)
     {
         u64 v = values.at(i);
@@ -476,7 +479,7 @@ A set in use is deduplication plus the set relationships. Deduplicating a list, 
             unique.push(v);
         }
     }
-    std.set<u64> common = seen.intersection(&other);
+    Set<u64> common = seen.intersection(&other);
 
 The deduplication loop is the set's simplest use: a value is kept the first time it is seen and skipped every time after, and the contains check is constant on average, so the whole pass is linear. The intersection builds a new set of the elements in both, and its cost is the cost of iterating the smaller set and checking membership in the other, linear in the sizes involved. The set and the bitset answer the same question, membership, at different scales: the set for arbitrary values, the bitset for dense ranges of small integers, where a single bit per element is the densest possible encoding.
 
@@ -484,18 +487,18 @@ The deduplication loop is the set's simplest use: a value is kept the first time
 
 The bitset is the set for dense, fixed-size membership: it represents a universe of bits, each bit a yes-or-no answer. It is the collection for "is this one of the small integers in range" and for the flags and masks that games and algorithms use.
 
-    pub struct bitset
+    pub struct Bitset
     {
         u64* words;
-        u64 numBits;
-        u64 numWords;
+        usize numBits;
+        usize numWords;
     }
 
 The bitset stores its bits packed into words of 64 bits each, and the number of words is the number of bits divided by 64, rounded up. The bit operations are the words' bit operations: set turns a bit on, clear turns it off, toggle flips it, and test reads it. Each finds its word and its offset with division and modulus, then applies the bit operation. The countOnes method counts the set bits by the classic trick of clearing the lowest set bit in a loop, and the set-level operations, and, or, xor, and not, apply the word operations across the whole bitset.
 
     void set(u64 bit)
     {
-        assert(bit < self.numBits);
+        @assert(bit < self.numBits);
         u64 word = bit / 64;
         u64 off = bit % 64;
         self.words[word] |= (1u << off);
@@ -505,16 +508,16 @@ The bitset's memory is the point: one bit per element, so a million elements occ
 
 The classic demonstration of the bitset is the sieve of Eratosthenes, which finds all primes below a bound. The sieve starts with a bitset of candidates, marks each composite by stepping through the multiples of each prime, and reads the primes from the bits that remain clear. The bitset is the natural home for the sieve's bookkeeping, because the sieve's universe is exactly a dense range of integers, one bit per integer.
 
-    pub std.vec<u64> primesBelow(u64 n)
+    pub Vec<u64> primesBelow(u64 n)
     {
-        std.bitset composite = std.bitset::new(n);
+        Bitset composite = Bitset::new(n);
         for (u64 i = 2; i * i < n; i++)
         {
             if (composite.test(i)) continue;
             for (u64 j = i * i; j < n; j += i)
                 composite.set(j);
         }
-        std.vec<u64> primes = std.vec<u64>::new();
+        Vec<u64> primes = Vec<u64>::new();
         for (u64 i = 2; i < n; i++)
             if (!composite.test(i))
                 primes.push(i);
@@ -527,11 +530,11 @@ The sieve shows the bitset's strengths together. The bit operations are single m
 
 The priority queue is the collection that always yields the highest-priority element. It is a heap: a complete binary tree stored in an array, arranged so that every parent is higher priority than its children.
 
-    pub struct priorityqueue<T>
+    pub struct PriorityQueue<T>
     {
         T* data;
-        u64 len;
-        u64 cap;
+        usize len;
+        usize cap;
         bool(T, T) less;
     }
 
@@ -561,7 +564,7 @@ A priority queue in use is a scheduler. Deadlines arrive, and the queue must alw
         return a < b;
     }
 
-    std.priorityqueue<u64> deadlines = std.priorityqueue<u64>::new(lessU64);
+    PriorityQueue<u64> deadlines = PriorityQueue<u64>::new(lessU64);
     deadlines.push(30);
     deadlines.push(10);
     deadlines.push(20);
@@ -579,13 +582,13 @@ The priority queue is the choice for "always take the most important thing next"
 
 The cache is the collection that remembers a limited number of entries and forgets the rest. The standard cache is an LRU cache: when the cache is full and a new entry is inserted, the least recently used entry is evicted.
 
-    pub struct cache<K, V>
+    pub struct Cache<K, V>
     {
-        hashmap.hashmap<K, CacheEntry<K, V>*> map;
+        HashMap<K, CacheEntry<K, V>*> map;
         CacheEntry<K, V>* head;
         CacheEntry<K, V>* tail;
-        u64 maxSize;
-        u64(K) hashFn;
+        usize maxSize;
+        usize(K) hashFn;
         bool(K, K) eqFn;
     }
 
@@ -593,12 +596,12 @@ The cache combines a hash map and a doubly linked list. The map finds an entry b
 
 The two structures are each doing the job they are best at, which is why the cache's definition is the chapter's best example of choosing a structure for its cost. The map is there because lookup by key must be constant time, and a hash map is the constant-time key lookup. The list is there because recency must be rearranged on every access, moving an entry to the front in constant time, and a doubly linked list is the constant-time rearrange, with each entry's pointers making the move a few pointer assignments. The cache entry is the node of the list and the value of the map at once, which is why the map stores a pointer to the entry: the map finds the entry, and the entry carries the recency links. Every get is a map lookup plus a list move, and every insert is a map insert, a list push, and at most one eviction, all constant time, so the cache's operations are amortized constant time.
 
-    std.cache<u64, u64> table = std.cache<u64, u64>::new(128, hashU64, eqU64);
+    Cache<u64, u64> table = Cache<u64, u64>::new(128, hashU64, eqU64);
     table.insert(7, 49);
     table.insert(11, 121);
-    std.option<u64> hit = table.get(7);
+    Option<u64> hit = table.get(7);
     if (hit.isSome())
-        std.print(hit.unwrap(), "\n");
+        println("{}", hit.unwrap());
 
 The get method also moves the found entry to the front of the list, because a get is a use, and the cache must remember not just what was inserted but what was used. The constructor's size is what the cache guarantees: the maximum number of entries, set at construction, and the default, when a size of zero is passed, is a cache of sixty-four entries. The cache's each method walks the list from the head, which delivers the entries in recency order, most recent first, and the count method reports how many are held.
 
@@ -610,9 +613,9 @@ The cache's most characteristic use is memoization: turning a computation that r
 
 The classic example is the Fibonacci sequence, whose naive recursion recomputes the same values exponentially many times. The recursive definition, the sum of the two preceding values, is simple and catastrophic: computing the fortieth value calls the function roughly a billion times, because each call recalculates its neighbors from scratch. Memoization makes the same definition linear: the first time a value is needed it is computed and stored, and every later time it is read from the cache. The cache's size is the bound on the memory, and for the Fibonacci sequence the number of distinct arguments is small, so a modest cache holds them all.
 
-    pub u64 fib(u64 n, std.cache<u64, u64>* memo)
+    pub u64 fib(u64 n, Cache<u64, u64>* memo)
     {
-        std.option<u64> hit = memo->get(n);
+        Option<u64> hit = memo->get(n);
         if (hit.isSome())
             return hit.unwrap();
         u64 result;
@@ -626,9 +629,9 @@ The classic example is the Fibonacci sequence, whose naive recursion recomputes 
 
     pub void run()
     {
-        std.cache<u64, u64> memo = std.cache<u64, u64>::new(64, hashU64, eqU64);
+        Cache<u64, u64> memo = Cache<u64, u64>::new(64, hashU64, eqU64);
         u64 answer = fib(40, &memo);
-        std.print(answer, "\n");
+        println("{}", answer);
     }
 
 The memoized fib is the cache's whole promise in miniature. Every call begins with a get; a hit returns the remembered answer, and a miss computes, stores, and returns. The cache is passed through the recursion as an explicit parameter, because in Coral the memory is an object the caller owns and the function borrows. The transformation the cache performs is dramatic: the naive fib is exponential in n, and the memoized fib is linear, because each distinct argument is computed once and every other visit is a constant-time cache read. The exponential became linear by being remembered, and the cache is the collection that does the remembering.
@@ -639,7 +642,7 @@ The cache's bound is the discipline that makes memoization safe to use generally
 
 The collections are only half of the data-structure story; the operations over them are the other half. The standard library provides sorting and searching as functions over the vector.
 
-Sorting is quicksort: partition the vector around a pivot, then sort each side. The partition walks the range, moving elements smaller than the pivot before it, and returns the pivot's final position, and the sort recurses on the two sides. The generic sortBy takes the ordering as a function, the less function that returns whether its first argument comes before its second, so any type can be sorted by any ordering. The specialized sorts, sortI32, sortU64, and sortF64, provide the common cases without the function indirection.
+Sorting is quicksort: partition the vector around a pivot, then sort each side. The partition walks the range, moving elements smaller than the pivot before it, and returns the pivot's final position, and the sort recurses on the two sides. The generic sortBy takes the ordering as a function, the less function that returns whether its first argument comes before its second, so any type can be sorted by any ordering. The specialized sorts, sortI32, sortusize, and sortF64, provide the common cases without the function indirection.
 
 Searching is binary search. On a sorted vector, binary search compares the key to the middle element, and searches the left half or the right half based on the comparison, finding the key in logarithmic time. The generic binarySearchBy takes the comparison function, the same -1/0/1 protocol as the tree map, and the specialized searches provide the common cases. The isSorted methods verify the sortedness that binary search relies on.
 
@@ -649,7 +652,7 @@ Sorting and searching in use go together: define an ordering for a record, sort 
 
     pub struct Record
     {
-        std.strView name;
+        str name;
         u64 age;
     }
 
@@ -663,10 +666,10 @@ Sorting and searching in use go together: define an ordering for a record, sort 
         return a.name.compare(b.name);
     }
 
-    std.vec<Record> people = std.vec<Record>::new();
+    Vec<Record> people = Vec<Record>::new();
     ... fill people ...
-    std.sortBy(&people, byAge);
-    i64 pos = std.binarySearchBy(&people, key, byNameCmp);
+    sort::sortBy(&people, byAge);
+    i64 pos = sort::binarySearchBy(&people, key, byNameCmp);
 
 The sortBy call orders the vector by age, and the binarySearchBy call searches by name, and the two orderings are independent because each is passed as its own function. The ordering functions are the same comparison protocol as the tree map's, and the compiler checks that they have the right shape, so a sort cannot silently use the wrong ordering. The specialized sorts and searches cover the plain-number cases, and the generic versions cover everything else, which is the standard library's pattern: the common case is fast, and the general case is explicit.
 
@@ -706,9 +709,9 @@ The mechanism behind each invalidation is the structure's growth, and each colle
 
 The safe pattern is the one the standard library follows: read while iterating, and write after. Collect the results of a search into a new vector while the original is untouched, then modify the original. The collections themselves follow the pattern, which is why the iter functions build new vectors instead of modifying the ones they walk.
 
-    std.vec<u64> even = std.filter(&scores, isEven);
-    std.vec<u64> doubled = std.map(&scores, timesTwo);
-    u64 sum = std.reduce(&scores, 0, addU64);
+    Vec<u64> even = iter::filter(&scores, isEven);
+    Vec<u64> doubled = iter::map(&scores, timesTwo);
+    u64 sum = iter::reduce(&scores, 0, addU64);
 
 The iter functions are the safe pattern made standard. filter builds a new vector of the elements that pass a predicate, map builds a new vector of the transformed elements, reduce combines the elements into one value, and the whole family, take, skip, any, all, find, countIf, minBy, maxBy, never touches the vector they read. The result is that a program that needs to transform a collection builds the transformed collection in parallel, and the original stays intact until the transformation is done. The write happens after, on the new vector, with nothing invalidated because nothing that was being walked was changed.
 
@@ -718,16 +721,16 @@ The pattern generalizes beyond the functions. A program that must remove element
 
 The unordered map is the hash map under a different name with a different emphasis. Its definition in the standard library is almost entirely delegation:
 
-    pub struct unordered_map<K, V>
+    pub struct UnorderedMap<K, V>
     {
-        hashmap.hashmap<K, V> inner;
+        HashMap<K, V> inner;
     }
 
 The whole type is one field: a hash map. The constructor builds the inner map with the caller's hash and equality, and every operation — insert, get, getPtr, contains, remove, keys, values, each, count — hands the call straight to the inner map. It is hard to imagine a simpler implementation, and that is the point: the unordered map exists not to do new work but to say something about the hash map.
 
-What it says is "no order." The name picks exactly the promise the hash map keeps and nothing else. A caller who writes std.unordered_map<K, V> has told every reader of the program that iteration order is unspecified, that the entries are arranged by hash and probing, and that the program does not rely on any ordering. Two names for the same machinery are not redundancy; they are two statements a reader can put their weight on. The plain hashmap name carries the same facts, but the unordered_map name states them as intent, which matters when the difference between a hash map's order and a tree map's order is the reason the code is correct.
+What it says is "no order." The name picks exactly the promise the hash map keeps and nothing else. A caller who writes UnorderedMap<K, V> has told every reader of the program that iteration order is unspecified, that the entries are arranged by hash and probing, and that the program does not rely on any ordering. Two names for the same machinery are not redundancy; they are two statements a reader can put their weight on. The plain HashMap name carries the same facts, but the UnorderedMap name states them as intent, which matters when the difference between a hash map's order and a tree map's order is the reason the code is correct.
 
-The right question is not "unordered map or hash map," because the answer is always "the same map." The right question is which name to write. When the surrounding program uses ordered structures, or when an ordering might be assumed by careless readers, the name unordered_map makes the absence of order impossible to miss. When the code is dense and the reader knows the terrain, hashmap keeps the line short. Both compile to the same table, and both carry the same load factor and the same constant-time operations; what differs is only what the type says aloud.
+The right question is not "unordered map or hash map," because the answer is always "the same map." The right question is which name to write. When the surrounding program uses ordered structures, or when an ordering might be assumed by careless readers, the name UnorderedMap makes the absence of order impossible to miss. When the code is dense and the reader knows the terrain, HashMap keeps the line short. Both compile to the same table, and both carry the same load factor and the same constant-time operations; what differs is only what the type says aloud.
 
 6.23 The Generic Tree
 
@@ -736,10 +739,10 @@ The generic tree is the collection for things that naturally have one owner and 
     pub struct TreeNode<T>
     {
         T value;
-        vec.vec<TreeNode<T>*> children;
+        Vec<TreeNode<T>*> children;
     }
 
-    pub struct tree<T>
+    pub struct Tree<T>
     {
         TreeNode<T>* root;
     }
@@ -750,17 +753,17 @@ The operations follow from the shape. setRoot plants a root value and returns th
 
 The trick that makes the tree usable is that the node pointers returned by setRoot and addChild are stable. A child is created, and its pointer is what the caller keeps to add grandchildren under it:
 
-    std.tree<std.strView> org = std.tree<std.strView>::new();
-    std.TreeNode<std.strView>* ceo = org.setRoot(std.strView::fromCstr("ceo"));
-    std.TreeNode<std.strView>* eng = org.addChild(ceo, std.strView::fromCstr("engineering"));
-    std.TreeNode<std.strView>* ops = org.addChild(ceo, std.strView::fromCstr("operations"));
-    org.addChild(eng, std.strView::fromCstr("backend"));
-    org.addChild(eng, std.strView::fromCstr("frontend"));
-    org.addChild(ops, std.strView::fromCstr("platform"));
+    Tree<str> org = Tree<str>::new();
+    TreeNode<str>* ceo = org.setRoot(str::fromCstr("ceo"));
+    TreeNode<str>* eng = org.addChild(ceo, str::fromCstr("engineering"));
+    TreeNode<str>* ops = org.addChild(ceo, str::fromCstr("operations"));
+    org.addChild(eng, str::fromCstr("backend"));
+    org.addChild(eng, str::fromCstr("frontend"));
+    org.addChild(ops, str::fromCstr("platform"));
 
-    pub void showOrg(std.strView name)
+    pub void showOrg(str name)
     {
-        std.print(name, "\n");
+        println("{}", name);
     }
 
     org.preOrder(showOrg);
@@ -781,28 +784,28 @@ The trie is the collection for "do many strings share prefixes, and do I care?" 
         bool isEnd;
     }
 
-    pub struct trie
+    pub struct Trie
     {
         TrieNode* root;
-        u64 count;
+        usize count;
     }
 
-The fanout constant says it all: every node carries an array of 256 child pointers, one per possible byte value, and a flag recording whether a complete word ends here. A word is inserted by walking its bytes, creating the missing nodes along the path, and setting isEnd at the final node. Because byte values are the alphabet, the trie is inherently byte-oriented, which fits Coral's strView handling — a trie stores string views, and the views' bytes are the trie's alphabet.
+The fanout constant says it all: every node carries an array of 256 child pointers, one per possible byte value, and a flag recording whether a complete word ends here. A word is inserted by walking its bytes, creating the missing nodes along the path, and setting isEnd at the final node. Because byte values are the alphabet, the trie is inherently byte-oriented, which fits Coral's str handling — a trie stores string views, and the views' bytes are the trie's alphabet.
 
 The trie's operations are the character walk, and each is proportional to the length of the key, not to the number of stored words. contains walks the word's bytes, returning false the moment a child is missing, and true if the final node's isEnd is set — so "cat" is found if its path ends in a word-end, and "ca" is not, even though its path exists. startsWith is the same walk without the word-end check: it answers the prefix question that defines autocomplete. insert creates the path and returns right away. each reconstructs and delivers every stored word. The distinguishing property, and the reason to choose the trie at all, is that a lookup costs the key's length in work and exactly zero comparisons against other stored words.
 
 A trie in use is an autocomplete dictionary: type a prefix, and the trie says instantly whether any stored word starts with it, then hands over the words.
 
-    std.trie dict = std.trie::new();
-    dict.insert(std.strView::fromCstr("cat"));
-    dict.insert(std.strView::fromCstr("cattle"));
-    dict.insert(std.strView::fromCstr("car"));
-    dict.insert(std.strView::fromCstr("dog"));
+    Trie dict = Trie::new();
+    dict.insert(str::fromCstr("cat"));
+    dict.insert(str::fromCstr("cattle"));
+    dict.insert(str::fromCstr("car"));
+    dict.insert(str::fromCstr("dog"));
 
-    if (dict.startsWith(std.strView::fromCstr("ca")))
-        std.print("three candidates: cat, cattle, car\n");
-    if (dict.contains(std.strView::fromCstr("cat")))
-        std.print("'cat' is a word\n");
+    if (dict.startsWith(str::fromCstr("ca")))
+        println("three candidates: cat, cattle, car");
+    if (dict.contains(str::fromCstr("cat")))
+        println("'cat' is a word");
 
 Three words can share the c-a prefix and the trie stores their shared characters once, then forks. The autocomplete check is three small pointer walks — the length of "ca" — regardless of how many thousands of words the dictionary holds. That is the trie's whole value: prefix membership is as cheap as the prefix is short.
 
@@ -812,13 +815,13 @@ The trie's costs are visible in its shape. Each node is 256 pointers, so a long 
 
 The hash map, the set, the cache, and the unordered map all need to hash and compare their keys, and none of them can do it alone, because a generic T has no built-in hash or equality. The collections solve the problem by taking the functions as parameters, and the functions are what define the key.
 
-A hash function takes a key and returns a u64, the hash. Its quality determines the map's performance: a good hash spreads its keys across the table, and a bad one piles them up. The map's probing expects the spread, and the load factor's guarantee is a guarantee about the average spread.
+A hash function takes a key and returns a usize, the hash. Its quality determines the map's performance: a good hash spreads its keys across the table, and a bad one piles them up. The map's probing expects the spread, and the load factor's guarantee is a guarantee about the average spread.
 
-What makes a hash good is what makes any scramble good: it uses the whole key, it varies with every part of the key, and it returns a number spread across the full u64 range. A hash that ignores part of a key, hashing only a record's first field, piles together every record that shares that field. A hash that does not vary, returning a constant for every key, turns the map into a linear search through one giant cluster. A hash that is cheap is also good, because the map pays the hash on every operation, and a hash that costs more than the lookup it saves is a net loss. The classic string hashes, multiplying an accumulator by a small prime and adding each byte, are the model: each byte changes the accumulator, and the whole key is used.
+What makes a hash good is what makes any scramble good: it uses the whole key, it varies with every part of the key, and it returns a number spread across the full range of the integer type. A hash that ignores part of a key, hashing only a record's first field, piles together every record that shares that field. A hash that does not vary, returning a constant for every key, turns the map into a linear search through one giant cluster. A hash that is cheap is also good, because the map pays the hash on every operation, and a hash that costs more than the lookup it saves is a net loss. The classic string hashes, multiplying an accumulator by a small prime and adding each byte, are the model: each byte changes the accumulator, and the whole key is used.
 
 An equality function takes two keys and returns a bool, whether they are equal. It is what the map uses to decide that two hashes that collided are actually the same key. The equality function must be consistent with the hash function: two keys that are equal must hash to the same value, or the map will fail to find them. This is the equality rule, and it is what makes the map work: the hash decides where to look, and equality decides whether what is there is the key.
 
-    static hashmap<K, V> new(u64(K) hf, bool(K, K) ef)
+    static HashMap<K, V> new(usize(K) hf, bool(K, K) ef)
 
 The constructor states the requirement in its signature: the map needs a hash and an equality, and the caller supplies them. The compiler checks the function types, so the map cannot be built without them. The collections carry the functions as fields, so every operation uses the same pair, and the pair is visible in the map's definition.
 
@@ -830,11 +833,11 @@ Writing a hash and an equality for a composite key shows the rules at work. A Po
         i64 y;
     }
 
-    pub u64 hashPoint(Point p)
+    pub usize hashPoint(Point p)
     {
-        u64 h = 17;
-        h = h * 31 + (u64)p.x;
-        h = h * 31 + (u64)p.y;
+        usize h = 17;
+        h = h * 31 + (usize)p.x;
+        h = h * 31 + (usize)p.y;
         return h;
     }
 
@@ -843,11 +846,11 @@ Writing a hash and an equality for a composite key shows the rules at work. A Po
         return a.x == b.x && a.y == b.y;
     }
 
-    std.hashmap<Point, std.strView> labels = std.hashmap<Point, std.strView>::new(hashPoint, eqPoint);
+    HashMap<Point, str> labels = HashMap<Point, str>::new(hashPoint, eqPoint);
     Point origin;
     origin.x = 0;
     origin.y = 0;
-    labels.insert(origin, std.strView::fromCstr("origin"));
+    labels.insert(origin, str::fromCstr("origin"));
 
 The hash starts from a small constant and combines each coordinate by multiplying and adding, so that a change in either coordinate changes the hash, and two points that are equal, with both coordinates equal, hash equally. The equality compares the same two coordinates, so it agrees with the hash on what equality is. The pair is the whole arrangement: hashPoint decides where a point's entry is searched for, and eqPoint decides whether the point found there is the one requested. Violate either half, make the equality and the hash disagree about what a key is, and the map quietly fails, searching in the place the hash names for a key the equality refuses to recognize.
 
@@ -855,22 +858,22 @@ The hash starts from a small constant and combines each coordinate by multiplyin
 
 Strings are the data structure most programs touch most, and Coral's strings are built from the same principles as its collections. The string module provides two types: the view, which observes text it does not own, and the string, which owns and builds text.
 
-    pub struct strView
+    pub struct str
     {
-        const char* ptr;
-        u64 len;
+        const u8* ptr;
+        usize len;
     }
 
-The view is a pointer and a length. It is a window onto text that lives elsewhere: a string literal, a string's buffer, a slice of a larger view, a buffer being parsed. The view owns nothing, so it is cheap to copy and free, and it is immutable: the view's operations read the text and never change it. The view's methods are the read operations: at reads a byte, slice cuts a window, startsWith and endsWith test the edges, findByte and findView search, and equals and compare compare against other text.
+The view is a pointer and a length. It is a window onto text that lives elsewhere: a string literal, a string's buffer, a slice of a larger view, a buffer being parsed. The view owns nothing, so it is cheap to copy and free, and it is immutable: the view's operations read the text and never change it. The view's methods are the read operations: at reads a byte, slice cuts a window, startsWith and endsWith test the edges, findByte and findView search, and equals and compare compare against other text. (The type is built in — the standard library extends str with the operations below rather than declaring its storage from scratch — but its definition is exactly these two fields.)
 
 The view's pointer and length are its whole definition, and the pair matters. A view does not need a sentinel to know where its text ends; the length says so, and a slice of a buffer, with its own pointer and length, is a first-class piece of text. The const pointer is the immutability made explicit: a view's text cannot be changed through the view, because the pointer says so. This is the distinction the guide draws between observing and owning, and the view is the observing type.
 
 The view is the right parameter for a function that reads text. The function receives a window onto the caller's text, with no copying and no ownership. The string operations accept views, the parsers read views, and the print functions write views. The view is the way Coral passes text without passing ownership, and its const pointer says so.
 
-    std.strView full = std.strView::fromCstr("coral");
-    std.strView front = full.slice(0, 3);
-    std.strView back = full.slice(3, 5);
-    std.print(front, "\n");
+    str full = str::fromCstr("coral");
+    str front = full.slice(0, 3);
+    str back = full.slice(3, 5);
+    println("{}", front);
 
 The slice operations are the view's signature move: cutting a window costs nothing, because a slice is just a new pointer and a new length into the same text. Slicing a view of a million bytes yields a view of four bytes with no copying, and the four-byte view is a piece of the original text, addressable by the same rules.
 
@@ -878,18 +881,18 @@ The string is the owning, growable text buffer.
 
     pub struct String
     {
-        char* ptr;
-        u64 len;
-        u64 cap;
+        u8* ptr;
+        usize len;
+        usize cap;
     }
 
-The string owns its buffer, its length, and its capacity, exactly like the vector. Its growth is the doubling strategy, its memory is one allocation, and its operations are the text operations: pushChar and pushView append, insertView and removeRange modify the middle, truncate cuts the end, and the search operations find within the buffer. The string's buffer is null-terminated, so asCstr returns a C string for the functions that need one, and the string is otherwise a vector of characters.
+The string owns its buffer, its length, and its capacity, exactly like the vector. Its growth is the doubling strategy, its memory is one allocation, and its operations are the text operations: pushChar and pushView append, insertView and removeRange modify the middle, truncate cuts the end, and the search operations find within the buffer. The string's buffer is null-terminated, so asCstr returns a C string for the functions that need one, and the string is otherwise a vector of bytes.
 
-    std.String name = std.String::fromView(std.strView::fromCstr("coral"));
+    String name = String::from(str::fromCstr("coral"));
     name.pushChar('!');
-    std.print(name.asView(), "\n");
+    println("{}", name.asView());
 
-The String and the strView meet at asView: the owning string hands out a borrowed view of its text, and the view observes what the string owns. The two types are one text at two levels of commitment: the view borrows, the string owns, and a program that reads takes views while a program that builds returns strings.
+The String and the str meet at asView: the owning string hands out a borrowed view of its text, and the view observes what the string owns. The two types are one text at two levels of commitment: the view borrows, the string owns, and a program that reads takes views while a program that builds returns strings.
 
 6.27 Building Strings
 
@@ -897,21 +900,21 @@ A string is built by appending to it, and the string's append methods are the bu
 
 The building pattern is to create a string, append the pieces, and use the result. The standard library's formatting functions follow the pattern: each builds a string by appending. The pad functions build a string of the right width. The repeat function builds a string by appending the same view many times. The join functions build a string by appending the parts with a separator between them. The format functions build a string by formatting values and appending the formatted text.
 
-    std.String line = std.String::new();
-    line.pushView(std.strView::fromCstr("ada"));
+    String line = String::new();
+    line.pushView(str::fromCstr("ada"));
     line.pushChar(',');
-    line.pushView(std.strView::fromCstr("42"));
+    line.pushView(str::fromCstr("42"));
     line.pushChar('\n');
 
 The CSV line is a string built by appending: a view, a separator, a view, a terminator. The append methods are the vector's push methods for text, and the growth is the same doubling, so building a long line by appending is linear, with the occasional copy amortized over the appends. The string's mutability is the point: text is assembled by change, and the string is the object that changes.
 
 The join functions are the common assembly in one call. A vector of views, joined by a separator, is the classic assembly problem, and join builds it by appending each part and the separator.
 
-    std.vec<std.strView> parts = std.vec<std.strView>::new();
-    parts.push(std.strView::fromCstr("a"));
-    parts.push(std.strView::fromCstr("b"));
-    parts.push(std.strView::fromCstr("c"));
-    std.String joined = std.String::join(std.strView::fromCstr(","), &parts);
+    Vec<str> parts = Vec<str>::new();
+    parts.push(str::fromCstr("a"));
+    parts.push(str::fromCstr("b"));
+    parts.push(str::fromCstr("c"));
+    String joined = String::join(str::fromCstr(","), &parts);
 
 The join builds one string whose text is the parts with the separator between them, and the result is a single owned string. The string's capacity methods give the builder control over its cost: a program that knows the final length can allocate it up front with withCap, and a program that builds and then stops can shrinkToFit to release the spare. The builder's growth is the chapter's growth, visible and amortized.
 
@@ -919,20 +922,22 @@ The string's mutability is its role. The view is immutable because it observes; 
 
 6.28 Formatting
 
-Formatting is turning values into text, and Coral's formatting is a set of explicit functions rather than a format-string mini-language. The guide's mention of a formatting mini-language describes a mechanism Coral does not use, and the reason is the philosophy: a format string is a program in a second language, parsed at runtime, with the type mismatches discovered when they fail. Coral formats with typed functions, checked by the compiler.
+Formatting is turning values into text, and Coral approaches it from two directions that meet in the same place. There are typed formatting functions, one per shape of value, and there is the format-string machinery the print functions use, where a comptime template holds placeholders and the values follow as arguments. Both are checked before the program runs, which is the philosophy: the compiler sees the template and the arguments together, so a formatting mistake is a diagnostic rather than a surprise at run time.
 
 The format functions cover the cases. formatInt and formatUint format integers in any radix, with a flag for uppercase digits. formatFloat formats a float with a chosen precision. formatHex and formatBin format in the two bases with an optional prefix. padLeft and padRight pad a view to a width with a chosen character. Each function takes typed arguments and returns a string, and each is a plain function the compiler can check.
 
-    std.String hex = std.formatUint(255, 16, false);
-    std.String padded = std.padLeft(std.strView::fromCstr("7"), 3, '0');
-    std.print(hex.asView(), "\n");
-    std.print(padded.asView(), "\n");
+    String hex = fmt::formatUint(255, 16, false);
+    String padded = fmt::padLeft(str::fromCstr("7"), 3, '0');
+    println("{}", hex.asView());
+    println("{}", padded.asView());
+    println("the sum is {}", total);
+    String asHex = fmt::format("{:x}", 255);
 
-The formatting functions compose like any other functions, because they are any other functions. formatUint turns a u64 into its hexadecimal text, and padLeft aligns a short view to a width, and both return strings that a caller appends to a builder or passes to a printer. The types flow through the calls: the compiler knows that 255 is a u64, that 16 is a radix, that the result is a string, and every call is checked before the program runs.
+The formatting functions compose like any other functions, because they are any other functions. formatUint turns a u64 into its hexadecimal text, and padLeft aligns a short view to a width, and both return Strings that a caller appends to a builder or passes to a printer. The types flow through the calls: the compiler knows that 255 is a u64, that 16 is a radix, that the result is a String, and every call is checked before the program runs.
 
-The print functions use the formatting machinery. The variadic print functions take any number of arguments of any types, and each argument is formatted by the matching typed helper and written to the descriptor. The calls are checked per argument, so a print call cannot silently format a value wrong; the compiler knows each argument's type and selects the right formatting.
+The print functions use the format-string machinery. print, println, eprint, and eprintln take a comptime format string first and the values after it: a `{}` placeholder is filled by the matching argument, `{{` and `}}` are literal braces, and a spec such as `{:x}` or `{:b}` chooses a base. Because the template is comptime, the compiler parses the placeholders and matches them against the argument types before the program runs, so a mismatch is a diagnostic, not a surprise at the moment of printing. The format function is the same machinery returning a String instead of writing it.
 
-The absence of a formatting mini-language is a deliberate trade. A format string can say things the typed functions say more verbosely, and the verbosity is the price of the checking. Coral's position is the consistent one: the values are typed, the formatting is typed, and the reader sees the types in the code.
+The two approaches are a deliberate pair. The format string says things the typed functions say more verbosely, and the typed functions say things the format string expresses less directly; both are checked, so the choice is about which reads better at the call site. Coral's position is the consistent one: the values are typed, the formatting is typed, and the reader sees the types in the code.
 
 6.29 Regular Expressions
 
@@ -950,12 +955,12 @@ The engine is the platform's, an NFA-based backtracking engine. The trade of an 
 
 A regex in use is compile, then ask. The pattern is compiled once and reused, which is the point of the handle: compiling is the expensive part, and matching a compiled pattern against many inputs is the fast part.
 
-    std.Regex re;
-    re.compile(std.strView::fromCstr("ca[a-z]+"), false);
-    if (re.matches(std.strView::fromCstr("coral")))
-        std.print("matched\n");
-    std.vec<std.strView> groups;
-    re.find(std.strView::fromCstr("coral 42"), &groups);
+    Regex re;
+    re.compile(str::fromCstr("ca[a-z]+"), false);
+    if (re.matches(str::fromCstr("coral")))
+        println("matched");
+    Vec<str> groups;
+    re.find(str::fromCstr("coral 42"), &groups);
 
 The find method fills the groups vector with the captures: the whole match first, and then each capture group in pattern order. The vector is the groups' container, because the number of groups is known only to the pattern, and the caller reads the groups by index. The captures are views, windows onto the input's buffer, with no copying of the matched text.
 
@@ -967,11 +972,11 @@ Coral's text is UTF-8, and the utf8 module is the Unicode machinery. The module'
 
 The utf8 module encodes and decodes codepoints. encodeCodepoint writes a codepoint's UTF-8 bytes into a buffer and returns the number of bytes written. decodeCodepoint reads a codepoint from a buffer, returns it, and reports how many bytes it consumed. codepointLen and countCodepoints count within text, and isValid checks that a buffer is well-formed UTF-8. The toLower and toUpper functions convert text case, working at the codepoint level.
 
-    std.arr<u8, 4> buf;
-    u64 n = std.utf8.encodeCodepoint(0x1F600, buf);
+    Arr<u8, 4> buf;
+    u8 n = utf8.encodeCodepoint(0x1F600, buf.ptr());
     u32 cp;
-    u64 consumed;
-    cp = std.utf8.decodeCodepoint(buf, n, &consumed);
+    usize consumed;
+    cp = utf8.decodeCodepoint(buf.ptr(), n, &consumed);
 
 The encode step writes the codepoint's bytes and returns their count, and the decode step reads the bytes back and reports the codepoint and how many bytes it used. The two functions are each other's inverse, and the buffer between them is a plain fixed array, the chapter's first collection, holding the bytes of one codepoint. The utf8 module's functions are the codepoint layer, and the string operations are the byte layer, and the two meet at buffers like this one.
 
@@ -983,27 +988,23 @@ The guide's section on Unicode names operations Coral does not provide. There is
 
 The text module includes parsers for the common serialization formats: JSON, INI, CSV, TOML, XML, and URI. Each parser follows the same shape, which is the shape of the language's text handling.
 
-A parser takes an input view and produces a structured result. The JSON parser produces a JsonValue, a tagged union with a type and a payload: a type that says whether the value is null, a bool, an integer, a float, a string, an array, or an object, and fields that hold the payload for each type. The object is a vector of pairs, each pair a key and a value, and the array is a vector of values. The parse function walks the input, and the serialize function walks the structure back into text.
+A parser takes an input view and produces a structured result. The JSON parser produces a JsonValue, a tagged union with a type and a payload: a type that says whether the value is null, a bool, an integer, a float, a string, an array, or an object, and fields that hold the payload for each type. The object is a vector of pairs, each pair a key and a value, and the array is a vector of values. The parseJson function walks the input and returns a Result holding the value, and the serialize function walks the structure back into text.
 
     pub enum JsonType { Null, Bool, I64, F64, String, Array, Object }
 
-The parsers are the collections' customers. They tokenize their inputs with the view operations, build their results with the vectors and strings, and report their structure with the option and result types. A reader who knows the string and vector operations can read the parsers, because the parsers are built from the same primitives the rest of the standard library uses.
+The parsers are the collections' customers. They tokenize their inputs with the view operations, build their results with the vectors and strings, and report their structure with the Option and Result types. A reader who knows the string and vector operations can read the parsers, because the parsers are built from the same primitives the rest of the standard library uses.
 
-A JSON parse in use shows the parser as a consumer of the collections. The parse fills a JsonValue, and the switch over the type selects the payload, the pattern the language provides for exactly this decision.
+A JSON parse in use shows the parser as a consumer of the collections. The parse returns a Result holding a JsonValue, and the switch over the type selects the payload, the pattern the language provides for exactly this decision.
 
-    std.JsonValue v;
-    if (std.json.parse(input, &v))
+    Result<JsonValue, ParseError> parsed = parseJson(input);
+    if (parsed.isOk())
     {
+        JsonValue v = parsed.unwrap();
         switch (v.type)
         {
-            case JsonType::I64:
-                std.ios.print(v.i64Val, "\n");
-                break;
-            case JsonType::String:
-                std.ios.print(v.strVal.asView(), "\n");
-                break;
-            default:
-                break;
+            JsonType::I64 => { println("{}", v.i64Val); },
+            JsonType::String => { println("{}", v.strVal.asView()); },
+            else => {},
         }
     }
 
@@ -1033,9 +1034,9 @@ The fromMillis constructor is the unit conversion in miniature: the milliseconds
 
 A duration in use is arithmetic over the two fields. Timeouts, intervals, and delays are built, combined, and compared.
 
-    std.Duration timeout = std.Duration::fromMillis(1500);
-    std.Duration extra = std.Duration::fromSecs(2);
-    std.Duration total = timeout.add(extra);
+    Duration timeout = Duration::fromMillis(1500);
+    Duration extra = Duration::fromSecs(2);
+    Duration total = timeout.add(extra);
     i64 ms = total.asMillis();
 
 The add method sums the seconds and the nanoseconds and normalizes, so a remainder that spills past a billion seconds becomes a second, and a remainder that goes negative borrows from the seconds. The comparison methods order the spans by seconds first and nanoseconds second, and the accessors read the span back in the unit the caller needs. The duration is the type for "how long." A timeout, an interval, a delay, a measurement are durations, and they are built, combined, and compared with the duration's operations. The duration is independent of the clocks, which is the next section's subject, because a span of time is not an instant on a clock.
@@ -1057,10 +1058,10 @@ The difference between the clocks is the difference between the two questions ti
 
 Timing a piece of work is the clocks' everyday use. The monotonic clock is read before, the work runs, the monotonic clock is read again, and the difference is the elapsed time.
 
-    std.Timespec t0 = std.time.nowMonotonic();
+    Timespec t0 = time.nowMonotonic();
     ... do the work ...
-    std.Timespec t1 = std.time.nowMonotonic();
-    f64 elapsed = std.time.timespecToF64(time.subTimespec(t1, t0));
+    Timespec t1 = time.nowMonotonic();
+    f64 elapsed = time.timespecToF64(time.subTimespec(t1, t0));
 
 The subTimespec helper subtracts the two instants, and timespecToF64 turns the difference into fractional seconds. The monotonic clock is the right clock for the measurement because it advances at a steady rate; a wall clock might jump forward or back, for daylight saving or for a network adjustment, and a measurement across such a jump would be wrong. The realtime clock, for its part, is the right clock for a timestamp that must mean the same wall-clock moment to the world, and unixSeconds gives that moment as the second count since the epoch.
 
@@ -1102,7 +1103,7 @@ Chapter 6 Summary
 
 The array is a fixed-size contiguous collection, with the count part of the type and the storage part of the struct.
 
-Every collection manages its own memory, a constructor at the head and a dispose at the foot of its definition — and a collection that implements the Drop trait has that release injected automatically at the end of the scope where a value of the collection dies, exactly once, on every exit path. The std's collections support the trait, even while the library's modules keep their frees and allocations manual to keep the std compilation times fast.
+Every collection manages its own memory, a constructor at the head and a dispose at the foot of its definition — and a collection marked `@drop` has that release injected automatically at the end of the scope where a value of the collection dies, exactly once, on every exit path. The std's collections support the mechanism, even while the library's modules keep their frees and allocations manual to keep the std compilation times fast.
 
 The vector is the growable array, a buffer, a length, and a capacity, and it is the default choice for many elements of one type.
 

@@ -48,7 +48,7 @@ Comments are not part of the program. They carry no meaning to the compiler. The
 
 2.3 Identifiers
 
-An identifier is a name: the name of a variable, a function, a struct, an enum, a module, a type parameter, a field. Coral's rules for what makes a valid identifier are the conventional ones. An identifier begins with a letter or an underscore, and can be followed by letters, underscores, and digits. Names are case sensitive, so value, Value, and VALUE are three distinct identifiers, and the compiler will happily let all three live in the same scope, which means you must be careful that you have not done that by accident. Because source files are UTF-8, letters include Unicode letters, so identifiers can contain characters beyond the ASCII alphabet. A type cannot start with a number or other special character other than underscore.
+An identifier is a name: the name of a variable, a function, a struct, a variant, a module, a type parameter, a field. Coral's rules for what makes a valid identifier are the conventional ones. An identifier begins with a letter or an underscore, and can be followed by letters, underscores, and digits. Names are case sensitive, so value, Value, and VALUE are three distinct identifiers, and the compiler will happily let all three live in the same scope, which means you must be careful that you have not done that by accident. Because source files are UTF-8, letters include Unicode letters, so identifiers can contain characters beyond the ASCII alphabet. A type cannot start with a number or other special character other than underscore.
 
 Coral's naming conventions are C-style and type-first, and the standard library demonstrates the conventions clearly enough that internalizing them is just a matter of reading a little of it.
 
@@ -66,9 +66,9 @@ The receiver of a method is always named self. This is not merely a convention; 
 
 A reserved word is an identifier that the language has claimed for itself. You cannot use it to name a variable, a function, or a type, and the compiler will reject the attempt with a message that is easy to read as "no, that word is taken." The reserved words of Coral are the words that carry the language's structure. They appear throughout this book, and each one is explained where it becomes relevant. Grouped by role:
 
-Declarations: struct, enum, trait, const, var, mod, import, namespace, typedef, distinct, pub, extern, flag.
+Declarations: struct, variant, union, enum, trait, extend, const, var, import, mod, typedef, distinct, pub, extern, static, flag.
 
-Control flow: if, else, while, for, loop, switch, case, default, break, continue, return, defer, assert.
+Control flow: if, else, while, for, loop, switch, break, continue, return, defer, assert.
 
 Types and values: self, null, true, false, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool, char (for C compatibility).
 
@@ -191,30 +191,28 @@ Floating-point literals and constants in Coral follow the conventional forms. A 
 
 2.11 Characters
 
-The char type in Coral is a byte in the UTF-8 universe: a single 8-bit value holding one byte of UTF-8 encoded text. The relationship between a char and a Unicode character is therefore a matter of encoding, and this is one of the most important distinctions a Coral programmer must internalize. Get this one straight and a dozen later confusions simply never arise.
+The char type in Coral is one Unicode scalar value, stored in 32 bits. Hold on — that is a sentence worth slowing down for, because it is the opposite of what a C programmer expects, and getting it right saves a dozen later mistakes.
 
-A Unicode code point is a number that identifies a character in the Unicode standard. An ASCII character, a letter of the Latin alphabet, a digit, a punctuation mark, is a code point in the range 0 to 127, and in UTF-8 each of those code points occupies exactly one byte. A char holding one of those bytes is exactly the character. This is why plain ASCII text in Coral works exactly as it does in C, byte for byte.
+In C, a char is a byte. In Coral, the byte is u8 and the character is char, and they are different widths for a reason: a single human-readable character is not always one byte. Unicode assigns every character a number called a code point, from U+0000 to U+10FFFF. Characters in the ASCII range — the Latin letters, digits, punctuation, and control characters that C was designed around — are code points 0 to 127, and Coral stores each of those in a char with the same bit value ASCII gives it. But a character outside that range, an accented Latin letter, a Greek letter, a Chinese ideograph, an emoji, has a code point above 127, and Coral's 32-bit char holds it directly: one code point per char, with no encoding involved.
 
-A code point beyond the ASCII range occupies two, three, or four bytes in UTF-8. A char holds one of those bytes, and no single char can represent the whole character. Text in a human writing system that uses such characters, which is to say almost every writing system outside the original ASCII set, is therefore a sequence of bytes that the program must decode to understand as characters. This is not a limitation to be hidden; it is the reality of how text is stored, and a systems language must face it directly. A string is not an array of characters; it is an array of bytes, some of which, when taken together, spell a character, and software that pretends otherwise will corrupt text the moment it leaves the ASCII range.
+That last point is the one to hold onto. A char is a code point, and a code point is already a complete character; there is no decode step to read one. When you want the bytes of that character — for a file, a socket, or a byte buffer — you encode the code point to UTF-8, which produces one to four u8 values. The standard library's UTF-8 machinery does exactly that: encode takes a char and writes one to four bytes, decode takes a run of bytes and produces the next char, and the validation and counting helpers work at the same level. A string, as Chapter 17 will show, is a sequence of bytes; turning those bytes into characters is decoding, and turning characters back into bytes is encoding.
 
-The standard library provides the UTF-8 machinery to handle this correctly, and it is implemented exactly the way such machinery should be: as straightforward, explicit code that you can read. Functions encode a code point into one to four bytes, decode a byte sequence back into a code point, count the code points in a byte sequence, and validate whether a byte sequence is well-formed UTF-8. When decoding encounters a byte sequence that is not valid UTF-8, the decoder substitutes the Unicode replacement character, and the substitution is explicit and documented. The library's lowercase and uppercase conversions operate on code points, decoding and re-encoding, because the mapping between a lowercase and an uppercase letter is defined on characters, not on bytes. Lowercase a whole string by guessing at bytes and you will miss exactly the multibyte letters — the accented ones, the Cyrillic ones — that the conversion exists to handle.
-
-The distinction that matters is between a byte and a character, and between a code point and a grapheme cluster. A code point is one Unicode scalar value, which may occupy one to four bytes. A grapheme cluster is what a human perceives as a single character, and a grapheme cluster may be composed of multiple code points. An accented letter may be a single precomposed code point or a base letter followed by a combining accent, and both forms are valid Unicode that displays identically. The char type is a byte; a code point is a decoded unit of up to four bytes; a grapheme cluster is a sequence of code points. Programs that manipulate text correctly keep these three levels distinct, and every such program in the standard library is little more than an exercise in keeping the levels straight.
+The distinction that matters, then, is between a byte and a character, and beneath that, between a code point and a grapheme cluster. A byte is one u8. A code point is one char, and it uses one to four bytes once encoded as UTF-8. A grapheme cluster is what a human perceives as a single character, and it may be composed of several code points: an accented letter can be a single precomposed code point or a base letter followed by a combining accent, and both forms are valid Unicode that displays identically. Coral's char is the code point; u8 is the byte; a grapheme cluster is a sequence of code points. Programs that manipulate text correctly keep these three levels distinct, and every such program in the standard library is little more than an exercise in keeping the levels straight.
 
 2.12 Character Literals
 
-A character literal is a single character or escape sequence between single quotes, and its type is char. The character is a byte in the UTF-8 encoding, so a character literal for an ASCII character is exactly that byte.
+A character literal is a single character or escape sequence between single quotes, and its type is char. In Coral a char is one Unicode code point, so a literal like 'A' is the code point 65, and a literal for a character outside ASCII — an accented letter, say — is its code point directly.
 
-    'A'    // the byte for the uppercase letter A
-    '0'    // the byte for the digit zero
+    'A'    // the code point for the uppercase letter A
+    '0'    // the code point for the digit zero
     '\n'   // newline
     '\t'   // tab
-    '\0'   // null byte
+    '\0'   // the null code point
     ' '    // space
 
-The escape sequences are the conventional ones: \n for newline, \t for tab, \r for carriage return, \0 for the null byte, and backslash escapes for characters that cannot be written literally, such as the backslash itself and the single quote. A hex escape, \x20, writes a byte by its hexadecimal value. These escapes let a program express control characters and byte values that have no visible glyph, which is essential when you are assembling output that carries framing, like a newline at the end of every log line or a null terminator on a C-facing buffer.
+The escape sequences are the conventional ones: \n for newline, \t for tab, \r for carriage return, \0 for the null code point, and backslash escapes for characters that cannot be written literally, such as the backslash itself and the single quote. A hex escape, \x41, writes a code point by its hexadecimal value. A char literal whose value fits in a u8 — anything up to 255 — can initialise a u8 directly, which is how the standard library writes its byte constants: `u8 const newline = '\n';`.
 
-The standard library's character classification functions operate on char values and make the byte-level reality of characters explicit. The functions isDigit, isAlpha, isAlnum, isLower, isUpper, isSpace, isPrint, isControl, and isHexDigit classify a single byte, and toLower and toUpper convert between cases. These functions compare byte values directly: a digit is a byte in the range of the digit characters, an uppercase letter is a byte in the range of the uppercase letters, and so on. The simplicity is the point. Character classification in the ASCII range is a range check on a byte, and the library writes it as exactly that. When you need a parser's hot loop to fly, remembering that isDigit is a couple of comparisons, not a table walk and a culture consultation, tells you exactly how to structure the code around it.
+The standard library's classification functions come in two families, and the split mirrors the byte/character distinction. The char family — charIsDigit, charIsAlpha, charIsAlnum, charIsUpper, charIsLower, charIsSpace, charIsControl, charIsPrint — takes a char and answers about the code point, and charToUpper and charToLower convert between cases. The u8 family — isDigit, isAlpha, isAlnum, isUpper, isLower, isSpace, isPrint, isControl, isHexDigit, toLower, toUpper — takes a byte, for when you are scanning raw text a byte at a time. Both families are ASCII-only on purpose, because Coral ships no Unicode category tables, and both are written as direct range checks rather than table walks. When you need a parser's hot loop to fly, remembering that isDigit is a couple of comparisons tells you exactly how to structure the code around it.
 
 2.13 Booleans
 
@@ -238,7 +236,7 @@ The void type is the type of nothing. It exists because a function that performs
 
     void greet()
     {
-        std.print("Hello.\n");
+        println("Hello.");
     }
 
 Void is not null, and it is not undefined. The distinction is fundamental and is a recurring theme in this book. Null is a value that a pointer of some type can hold, meaning "no object." Void is not a value at all; there is no object of type void, and no variable of type void can exist. A function that returns void returns nothing; a function that returns a pointer may return null, meaning the pointer names no object. The difference is between the absence of a value as the result of a computation, which is void, and the presence of a null reference in a value of pointer type, which is null. Mix these two up in conversation and you will eventually mix them up in code.
@@ -262,7 +260,7 @@ Float literals. A literal with a fractional part, or with an exponent, is a floa
 
 Character literals, as covered above, are single characters or escapes between single quotes.
 
-String literals. A sequence of characters between double quotes is a string literal: "hello". A string literal is text; in the type system it is a sequence of bytes in UTF-8 encoding, and the standard library provides the string type that owns such sequences and the string view type that borrows them. Adjacent string literals can be concatenated, so a long string can be split across source lines as several adjacent literals.
+String literals. A sequence of characters between double quotes is a string literal: "hello". A string literal is text; in the type system it is a sequence of bytes in UTF-8 encoding, and the standard library provides the owning `String` type and the borrowing `str` view for such sequences. Adjacent string literals can be concatenated, so a long string can be split across source lines as several adjacent literals.
 
     "hello"
     "a long message that continues "
@@ -310,7 +308,7 @@ The ranged for loop makes particular use of var. When iterating over a container
 
     for (var arg : args) print(arg);
 
-The element type comes from the container, the loop variable's type follows, and nothing redundant is written. The body does not care what the element type is called; it only needs to agree with the container. (With the book's usual `mod std = import("std*")` in effect, print is `std.print`.)
+The element type comes from the container, the loop variable's type follows, and nothing redundant is written. The body does not care what the element type is called; it only needs to agree with the container. (Printing here means the `print` function imported from the standard library's I/O module, as in `import(lib) std::io::ios { print };`.)
 
 2.18 Mutability
 
@@ -401,15 +399,15 @@ This pattern is safe because the assignments complete before the value is consum
 
 2.23 Swapping and Multiple Assignment
 
-Coral does not provide a syntax for multiple simultaneous assignment or destructuring assignment. The swap of two values is written the explicit way, with a temporary:
+Coral does not provide a syntax for multiple simultaneous assignment or a swapping assignment. The swap of two values is written the explicit way, with a temporary:
 
     u64 tmp = a;
     a = b;
     b = tmp;
 
-The lack of destructuring syntax is consistent with the language's philosophy. Coral keeps its assignment model minimal and transparent, and it provides the library functions that make such operations safe and ergonomic where they are needed. The collections library offers swap and exchange operations that handle the details, and the pattern of assigning through a temporary is idiomatic where a bare swap is needed.
+Coral does not have a multi-name binding declaration, either. You cannot write `var (x, y) = pair;` to name both pieces of a pair on one line; a tuple is taken apart by reading a position (`.0`, `.1`) or by matching it in a `switch`, and Chapter 12 is devoted to those patterns. Reassigning two existing variables at once, and swapping two values without a temporary, are likewise not in the grammar. That restraint is consistent with the language's philosophy. Coral keeps its assignment model minimal and transparent, and it provides library functions for the cases that need more: the collections library offers swap and exchange operations that handle the details, so the pattern of assigning through a temporary is idiomatic where a bare swap is needed.
 
-The standard library provides an atomic exchange operation in its concurrency module, which swaps a value in one step under the memory model, and it provides the sequence of moves that implements a swap of owned data. As with everything in Coral, the simple explicit form is always available, and the library layers convenience on top when the convenience is worth the abstraction. The reason Coral lets a library, rather than the grammar, provide the ergonomic swap is that the grammar-stamped version would have to guess about ownership and aliasing, while the library version can be written with the exact semantics each data type needs.
+The standard library also provides an atomic exchange operation in its concurrency module, which swaps a value in one step under the memory model, and it supplies the sequence of moves that implements a swap of owned data. As with everything in Coral, the simple explicit form is always available, and the library layers convenience on top when the convenience is worth the abstraction. The reason Coral lets a library, rather than the grammar, provide the ergonomic swap is that a grammar-stamped version would have to guess about ownership and aliasing, while a library version can be written with the exact semantics each data type needs.
 
 2.24 Where Variables Live
 
@@ -447,7 +445,7 @@ Integer arithmetic is modular and wraps at the width of the type, matching the h
 
 Floating point follows IEEE 754, cannot represent most decimal fractions exactly, and requires tolerance-based comparison and careful accumulation. NaN compares equal to nothing, not even itself.
 
-A char is a UTF-8 byte. Code points occupy one to four bytes, and grapheme clusters may span multiple code points. The standard library provides explicit encoding, decoding, and validation.
+A char is one Unicode code point, 32 bits wide; a u8 is a byte. A code point occupies one to four bytes once encoded as UTF-8, and a grapheme cluster may span multiple code points. The standard library provides explicit encoding, decoding, and validation.
 
 Booleans have exactly two values, no truthiness, and short-circuiting AND and OR.
 

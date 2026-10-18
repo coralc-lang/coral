@@ -1,4 +1,4 @@
-# Coral Standard Library — Complete API Reference
+<!--# Coral Standard Library — Complete API Reference
 
 > This document catalogs every `pub` export in `lib/std/`, organized by module.
 > Struct fields are listed; methods are listed with their parameters and return types.
@@ -1413,4 +1413,4 @@ Type-erased holder: wraps a raw `void*` and recovers the typed pointer at the us
 
 ```coral
 pub T cast<T>(any val)   // reinterprets the wrapped pointer as T
-```
+```-->
