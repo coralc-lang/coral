@@ -13,20 +13,103 @@ limiting factor is entirely on the compiler side.
 
 ## Where the server actually stands
 
-Verified by probing all 51 standard LSP requests plus 12 notifications against
-`coralc 0.1.0` (`python3 tools/probe-lsp-surface.py`):
+Re-verified against the current `coralc` build. Capabilities now advertised:
 
-| | |
+```json
+{"textDocumentSync": 1, "hoverProvider": true, "definitionProvider": true}
+```
+
+Hover and definition have been implemented since this doc was first written.
+Both work, with one consistent gap.
+
+### ✅ Working
+
+| Feature | Result |
 | --- | --- |
-| Methods implemented | **1** — `textDocument/hover`, which returns `null` |
-| Methods returning `-32601` | **50** |
-| Crashes / hangs / corrupt stream | **none** |
+| `textDocument/publishDiagnostics` | Works; still no empty-array clear. |
+| `textDocument/hover` | Correct types for structs, fields, locals, generics, `self`, imports and libc. |
+| `textDocument/definition` | Resolves; 32 of 64 identifier positions in `arr.crl`. |
 
-Rejecting unknown methods correctly is half the contract and it is already
-satisfied. What is missing is feature coverage.
+Verified hover output:
 
-The server also survives being sent `workspace/didChangeConfiguration`,
-`notebookDocument/documentSymbol`, and `languageStatus` without complaint.
+```
+self  ->  Arr<T, N>*
+data  ->  T
+val   ->  T val
+i     ->  usize i
+m     ->  Box<K, V> m
+E     ->  struct E
+printf -> i32 printf(const cchar* fmt, ? )
+```
+
+### ❌ The one gap, and it is consistent across hover *and* definition
+
+**Methods and constructors are not in the symbol table.** Hovering or
+go-to-definition on these returns nothing:
+
+```
+at, count, ptr, constPtr, atPtr, isEmpty, set, front, back, fill,
+copyTo, copyFrom, new
+```
+
+Every one of these is a method declared inside a struct or trait. Fields,
+locals, types and free functions all resolve. The likely cause is that member
+declarations are collected separately from top-level ones, and only the
+top-level table is registered.
+
+Also unresolved: `pub`-prefixed declarations (`pub void main()` returns nothing
+while plain `fn main()` works), module names (`onar`, `platform` — but `lib`
+resolves), and identifiers inside `C"..."` string literals.
+
+**Fixing the method table fixes hover, definition, references, documentSymbol
+and rename at once.** It is the highest-leverage single fix remaining.
+
+### ⚠️ Hover resolves by nearest-preceding-identifier
+
+A cursor resting between two symbols returns the earlier one, and hovering
+whitespace or punctuation still returns the previous symbol. So a hover can
+legitimately look wrong when the caret is not on the token you are reading.
+Always check the reported position before assuming a resolver bug.
+
+### Still unimplemented
+
+`textDocument/documentSymbol`, `textDocument/foldingRange`,
+`textDocument/semanticTokens/full`, `textDocument/inlayHint` — all
+`method not found`.
+
+---
+
+## Verifying a capability
+
+An advertised capability proves nothing: `definitionProvider: true` was
+advertised while the method still returned `null`. Verify per position.
+
+```sh
+cd /home/cerie/Documents/coral-vscode
+
+# every identifier in a file, for any position-scoped method
+node tools/lsp-probe.js FILE --method textDocument/hover
+node tools/lsp-probe.js FILE --method textDocument/definition
+
+# one position, or one whole line
+node tools/lsp-probe.js FILE --method textDocument/hover --at 8:16
+
+# document-scoped methods
+node tools/lsp-probe.js FILE --method textDocument/documentSymbol --json
+node tools/lsp-probe.js FILE --method textDocument/semanticTokens/full
+
+# which methods this tool knows how to drive
+node tools/lsp-probe.js --list
+
+# what VS Code renders in the Problems panel
+node tools/vscode-diagnostics.js FILE
+
+# raw wire payload, editor-agnostic
+python3 tools/lsp-diagnostics.py FILE
+```
+
+`lsp-probe.js` prints resolved positions, then a list of unresolved tokens —
+which is how the method gap above was found. Use it after each server change.
 
 ---
 
@@ -50,8 +133,9 @@ Also include `version` — both clients advertise `versionSupport`.
 
 ### 2. `textDocument/hover`
 
-Already advertised; always returns `null`. Return the resolved type. For a
-method this is the ideal answer:
+**Largely done** — correct for types, fields, locals, generics, `self` and
+imports. Remaining: register methods (see the gap above), then add
+documentation to the answer. For a method this is the ideal output:
 
 ```jsonc
 {"contents":[{"language":"coral","value":"fn at(usize i) -> T"},
@@ -64,6 +148,9 @@ result rather than discarding it. **Do not return `null` for a symbol you
 recognise**; return `null` only where there genuinely is nothing.
 
 ### 3. `textDocument/documentSymbol`
+
+Still `method not found`, so the outline panel is empty. Fixing the method
+symbol table is a prerequisite.
 
 `detail` is the declaration minus its body. Coral is type-first, so this is
 what makes the outline readable:
@@ -82,9 +169,10 @@ trait Rng<N>
 | fields, variant members | 8 Field |
 | constants, locals | 13 Variable |
 
-### 4. `textDocument/definition` + `textDocument/documentHighlight` + `textDocument/typeDefinition`
+### 4. `textDocument/documentHighlight` + `textDocument/typeDefinition`
 
-These share one name-resolution pass, so build them together.
+`textDocument/definition` works already. These two share its resolution pass.
+`documentHighlight` is the cheapest visible win left.
 
 Return `LocationLink[]` — both editors advertise `definition.linkSupport`, and
 it carries `originSelectionRange` so the editor highlights the declaration

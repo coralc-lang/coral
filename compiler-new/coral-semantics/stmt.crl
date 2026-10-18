@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 /* stmt.crl: statement checking and function-body setup (generic params,
  * self, params). every StmtKind has an arm; says `ok = false` rather than
  * bailing so one bad statement doesn't hide the rest. Comptime blocks bump
@@ -7,11 +8,12 @@ import ast::expr;
 import ast::id { Str, NodeId };
 import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
-import ast::decl { Decl, DeclKind, Param, GenericParam, VariantVariant };
+import ast::decl { Decl, DeclKind, Param, GenericParam, VariantVariant, Attribute };
 import ast::stmt { Stmt, StmtKind, SwitchCase };
 import ast::pat { Pat, PatKind };
 import scope { Symbol };
 import sema { Sema };
+import member { MemberInfo };
 import diag::code { ErrorCode };
 
 pub extend Sema
@@ -76,11 +78,25 @@ pub extend Sema
                         self.scopes.lastDeclFail == 1)
                         self.dupDeclDiag(stmt->kind.payload.VarDecl.name, id);
                 }
+                /* RAII: resolve the type's drop method now; the backend
+                 * emits the call at scope exit. static locals, #[[no_drop]]
+                 * and #[[no_drop_all]] opt out */
+                if (declaredType != 0 && (stmt->kind.payload.VarDecl.flags & 4) == 0 &&
+                    !self.fileNoDropAll && self.noDropDepth == 0 &&
+                    !self.stmtHasAttr(stmt, self.ctx.intern("no_drop")))
+                {
+                    MemberInfo dropInfo = self.findMethod(declaredType, self.ctx.intern("drop"));
+                    if (dropInfo.declaration.index != 0 &&
+                        self.dropMethodIsValid(dropInfo.declaration))
+                        stmt->kind.payload.VarDecl.dropMethod = dropInfo.declaration;
+                }
                 return true;
             },
             
             StmtKind::Block => {
                 // every block gets a scope; leave() frees the symbol array
+                bool noDrop = self.stmtHasAttr(stmt, self.ctx.intern("no_drop"));
+                if (noDrop) self.noDropDepth++;
                 self.scopes.enter();
                 bool ok = true;
                 u32 i = 0;
@@ -90,6 +106,7 @@ pub extend Sema
                     i++;
                 }
                 self.scopes.leave();
+                if (noDrop) self.noDropDepth--;
                 return ok;
             },
             
@@ -290,6 +307,8 @@ pub extend Sema
      * cleared on the way out; checkFunction does not nest. */
     bool checkFunction(Decl* decl, Ty selfType)
     {
+        bool prevNoDropAll = self.fileNoDropAll;
+        self.fileNoDropAll = self.declHasAttr(decl, self.ctx.intern("no_drop_all"));
         self.scopes.enter();
         bool ok = true;
         u32 genericIndex = 0;
@@ -412,7 +431,51 @@ pub extend Sema
         if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
         self.currentReturnType = 0; // no nesting; nothing to restore to
         self.scopes.leave();
+        self.fileNoDropAll = prevNoDropAll;
         return ok;
+    }
+
+    /* ── attributes ──────────────────────────────────────────────────── */
+
+    bool attrListHas(Attribute* attrs, u32 attrsLen, Str name)
+    {
+        if (attrs == null || name == 0) return false;
+        u32 i = 0;
+        while (i < attrsLen)
+        {
+            if (attrs[i].name == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    bool declHasAttr(Decl* decl, Str name)
+    {
+        if (decl == null) return false;
+        return self.attrListHas(decl->attrs, decl->attrsLen, name);
+    }
+
+    bool stmtHasAttr(Stmt* stmt, Str name)
+    {
+        if (stmt == null) return false;
+        return self.attrListHas(stmt->attrs, stmt->attrsLen, name);
+    }
+
+    /* a `drop` method is only an RAII hook when it is `void drop()`: the
+     * self receiver and nothing else. extend methods omit self from the
+     * param list (paramsLen 0); struct-body methods may spell it */
+    bool dropMethodIsValid(NodeId declId)
+    {
+        if (declId.index == 0) return false;
+        Node* n = self.ctx.nodes + declId.index;
+        if (n->kind.tag != NodeKind::Decl) return false;
+        Decl* d = &n->kind.payload.Decl.value;
+        if (d->kind.tag != DeclKind::Func) return false;
+        if (d->kind.payload.Func.paramsLen == 0) return true;
+        if (d->kind.payload.Func.paramsLen != 1) return false;
+        Node* pn = self.ctx.nodes + d->kind.payload.Func.params[0].index;
+        if (pn->kind.tag != NodeKind::Param) return false;
+        return (pn->kind.payload.Param.value.flags & 1) != 0;
     }
 
     /* declares the fields bound by a variant pattern (`Some { value }`)

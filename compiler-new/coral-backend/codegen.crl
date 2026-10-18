@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 /* backend/codegen.crl: analyzed AST → flat C.
  *
  * Output shape: labels + gotos for control flow, three-address temporaries
@@ -154,6 +155,15 @@ void stNL(Stream* s, u32 ind)
  * body currently being built (reset per function); ebuf = expression
  * text scratch; tybuf = C type text / mangled-name scratch; tdecl =
  * registered slice/tuple/fn-pointer typedefs */
+/* one live local whose type declares `drop`: unwound innermost-first at
+ * scope exit, on `return`, and on `break`/`continue` */
+struct DropEntry
+{
+    Str name;
+    Ty typeNode;
+    NodeId mdef;
+}
+
 pub struct Codegen
 {
     AstContext* ctx;
@@ -203,6 +213,18 @@ pub struct Codegen
     u32* breakLabels;
     u32 breakDepth;
     u32 switchSeq;
+
+    /* RAII unwinding: drops is a stack of live locals with a resolved
+     * drop method; fnDropMark is its base for the current function,
+     * loopDropMarks[k] / breakDropMarks[k] record the stack length at
+     * the entry of loop k / breakable construct k so `break`/`continue`
+     * unwind exactly the scopes they exit */
+    DropEntry* drops;
+    u32 dropsLen;
+    u32 dropsCap;
+    u32 fnDropMark;
+    u32* loopDropMarks;
+    u32* breakDropMarks;
 
     // small inline cache for cgFindDecl: the heaviest per-call scan
     Str* declCacheNames;
@@ -272,25 +294,107 @@ void cgPopLoop(Codegen* cg)
     if (cg.breakDepth > 0) cg.breakDepth--;
 }
 
-void cgPushLoop(Codegen* cg)
+/* mark = cg.dropsLen at the loop's entry; `continue`/`break` unwind to it */
+void cgPushLoop(Codegen* cg, u32 mark)
 {
+    if (cg.loopDepth < 64) cg.loopDropMarks[cg.loopDepth] = mark;
     cg.loopDepth++;
     if (cg.breakDepth < 64)
     {
         cg.breakKinds[cg.breakDepth] = 0;
         cg.breakLabels[cg.breakDepth] = 0;
+        cg.breakDropMarks[cg.breakDepth] = mark;
         cg.breakDepth++;
     }
 }
 
-void cgPushSwitch(Codegen* cg, u32 label)
+void cgPushSwitch(Codegen* cg, u32 label, u32 mark)
 {
     if (cg.breakDepth < 64)
     {
         cg.breakKinds[cg.breakDepth] = 1;
         cg.breakLabels[cg.breakDepth] = label;
+        cg.breakDropMarks[cg.breakDepth] = mark;
         cg.breakDepth++;
     }
+}
+
+void cgPushDrop(Codegen* cg, Str name, Ty ty, NodeId mdef)
+{
+    if (cg.dropsLen >= cg.dropsCap)
+    {
+        cgError(cg, "too many live locals with drop methods");
+        return;
+    }
+    DropEntry e;
+    e.name = name;
+    e.typeNode = ty;
+    e.mdef = mdef;
+    cg.drops[cg.dropsLen] = e;
+    cg.dropsLen++;
+}
+
+void cgEmitDropEntry(Codegen* cg, DropEntry* e)
+{
+    Ty ty = cgTyUnwrap(cg, cgSubstTy(cg, e->typeNode));
+    if (ty == 0) return;
+    Slice owner = cgOwnerName(cg, ty);
+    usize cs = cg.ebuf.len;
+    stPS(&cg.ebuf, owner);
+    stCh(&cg.ebuf, '_');
+    stPS(&cg.ebuf, cgIntern(cg, cg.ctx.intern("drop")));
+    Slice raw = stTail(&cg.ebuf, cs);
+    Slice callee = cgMangleS(cg, e->mdef, raw, 0);
+    stNL(&cg.body, cg.ind);
+    stPS(&cg.body, callee);
+    stP(&cg.body, "(&");
+    stPS(&cg.body, cgIdent(cg, e->name));
+    stP(&cg.body, ");");
+}
+
+/* emit `T_drop(&name);` for every live local above `mark`, innermost
+ * first; the stack is popped as a side effect */
+void cgEmitDropsTo(Codegen* cg, u32 mark)
+{
+    cgEmitDropsExcept(cg, mark, -1);
+}
+
+/* like cgEmitDropsTo but skips one stack slot (`skip` = moved-out local,
+ * `return s;`): the skipped local transfers ownership to the caller */
+void cgEmitDropsExcept(Codegen* cg, u32 mark, i32 skip)
+{
+    i32 i = (i32)cg.dropsLen - 1;
+    while (i >= (i32)mark)
+    {
+        if (i != skip) cgEmitDropEntry(cg, &cg.drops[i]);
+        i--;
+    }
+    cg.dropsLen = mark;
+}
+
+/* index of the innermost live local named `name`, or -1 */
+i32 cgFindDrop(Codegen* cg, Str name)
+{
+    if (name == 0) return -1;
+    i32 i = (i32)cg.dropsLen - 1;
+    while (i >= 0)
+    {
+        if (cg.drops[i].name == name) return i;
+        i--;
+    }
+    return -1;
+}
+
+void cgRemoveDropAt(Codegen* cg, u32 idx)
+{
+    if (idx >= cg.dropsLen) return;
+    u32 i = idx;
+    while (i + 1 < cg.dropsLen)
+    {
+        cg.drops[i] = cg.drops[i + 1];
+        i++;
+    }
+    cg.dropsLen--;
 }
 
 void cgPopSwitch(Codegen* cg)
@@ -3348,6 +3452,21 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 Ty tt = 0;
                 if (tn.kind.tag == NodeKind::Expr) tt = tn.kind.payload.Expr.value.resolvedType;
                 if (cgIntToPtrInit(cg, value, tt)) rv = cgWrapPtrCast(cg, tyStr(cg, tt), rv);
+                /* RAII move semantics `x = y;` on droppable locals: the
+                 * overwritten value of x drops now and y's pending drop
+                 * is cancelled (x owns the new value at its exit) */
+                Node* tgn = cgNode(cg, target);
+                Node* vgn = cgNode(cg, value);
+                bool tIsIdent = tgn.kind.tag == NodeKind::Expr &&
+                                tgn.kind.payload.Expr.value.kind.tag == ExprKind::Ident;
+                bool vIsIdent = vgn.kind.tag == NodeKind::Expr &&
+                                vgn.kind.payload.Expr.value.kind.tag == ExprKind::Ident;
+                i32 ti = tIsIdent ? cgFindDrop(cg, tgn.kind.payload.Expr.value.kind.payload.Ident.name) : -1;
+                i32 vi = vIsIdent ? cgFindDrop(cg, vgn.kind.payload.Expr.value.kind.payload.Ident.name) : -1;
+                if (ti >= 0 && vi != ti)
+                    cgEmitDropEntry(cg, &cg.drops[ti]); // old value of x
+                if (vi >= 0 && vi != ti)
+                    cgRemoveDropAt(cg, (u32)vi); // y moved into x
             }
             usize ascs = cg.ebuf.len;
             stP(&cg.ebuf, "((");
@@ -4085,7 +4204,7 @@ void cgEmitSwitch(Codegen* cg, Slice scrut, Ty scrutTy, SwitchCase* cases, u32 c
     }
     u32 swLabel = cg.switchSeq;
     cg.switchSeq++;
-    cgPushSwitch(cg, swLabel);
+    cgPushSwitch(cg, swLabel, cg.dropsLen);
 
     // pattern bindings: declared up front, assigned on case entry
     {
@@ -4206,6 +4325,7 @@ void cgStmt(Codegen* cg, NodeId id)
     switch (s.kind.tag)
     {
         StmtKind::Block => {
+            u32 dropMark = cg.dropsLen;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '{');
             cg.ind++;
@@ -4215,6 +4335,8 @@ void cgStmt(Codegen* cg, NodeId id)
                 cgStmt(cg, s.kind.payload.Block.stmts[i]);
                 i++;
             }
+            /* scope exit: unwind the block's locals, innermost first */
+            cgEmitDropsTo(cg, dropMark);
             cg.ind--;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '}');
@@ -4303,6 +4425,24 @@ void cgStmt(Codegen* cg, NodeId id)
                 }
             }
             stCh(&cg.body, ';');
+            /* RAII: register the local so its drop runs at scope exit.
+             * `T x = y;` with y a droppable local moves the value: y is
+             * unregistered and x's future drop owns the buffer */
+            if (s.kind.payload.VarDecl.dropMethod.index != 0 &&
+                (s.kind.payload.VarDecl.flags & 4) == 0 && ty != 0)
+            {
+                if (init.index != 0)
+                {
+                    Node* inn2 = cgNode(cg, init);
+                    if (inn2.kind.tag == NodeKind::Expr &&
+                        inn2.kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    {
+                        i32 si = cgFindDrop(cg, inn2.kind.payload.Expr.value.kind.payload.Ident.name);
+                        if (si >= 0) cgRemoveDropAt(cg, (u32)si);
+                    }
+                }
+                cgPushDrop(cg, name, ty, s.kind.payload.VarDecl.dropMethod);
+            }
             return;
         },
 
@@ -4319,6 +4459,21 @@ void cgStmt(Codegen* cg, NodeId id)
                 Ty tt = 0;
                 if (tn.kind.tag == NodeKind::Expr) tt = tn.kind.payload.Expr.value.resolvedType;
                 if (cgIntToPtrInit(cg, s.kind.payload.Assign.value, tt)) rv = cgWrapPtrCast(cg, tyStr(cg, tt), rv);
+                /* RAII move semantics for `x = y;` on droppable locals:
+                 * the overwritten value of x drops now, and y's pending
+                 * drop is cancelled (x's exit drop owns the new value) */
+                Node* tgn = cgNode(cg, s.kind.payload.Assign.target);
+                Node* vgn = cgNode(cg, s.kind.payload.Assign.value);
+                bool tIsIdent = tgn.kind.tag == NodeKind::Expr &&
+                                tgn.kind.payload.Expr.value.kind.tag == ExprKind::Ident;
+                bool vIsIdent = vgn.kind.tag == NodeKind::Expr &&
+                                vgn.kind.payload.Expr.value.kind.tag == ExprKind::Ident;
+                i32 ti = tIsIdent ? cgFindDrop(cg, tgn.kind.payload.Expr.value.kind.payload.Ident.name) : -1;
+                i32 vi = vIsIdent ? cgFindDrop(cg, vgn.kind.payload.Expr.value.kind.payload.Ident.name) : -1;
+                if (ti >= 0 && vi != ti)
+                    cgEmitDropEntry(cg, &cg.drops[ti]); // old value of x
+                if (vi >= 0 && vi != ti)
+                    cgRemoveDropAt(cg, (u32)vi); // y moved into x
             }
             stNL(&cg.body, cg.ind);
             stPS(&cg.body, lv);
@@ -4333,10 +4488,51 @@ void cgStmt(Codegen* cg, NodeId id)
         StmtKind::Return => {
             NodeId v = s.kind.payload.Return.value;
             if (v.index == 0) {
+                cgEmitDropsTo(cg, cg.fnDropMark);
                 cgEmitStmt(cg, "return");
                 return;
             }
             Slice t = cgExpr(cg, v);
+            if (cg.dropsLen > cg.fnDropMark)
+            {
+                /* `return s;` moves the local out: its drop must not run,
+                 * the caller owns the value now */
+                i32 moved = -1;
+                Node* vn = cgNode(cg, v);
+                if (vn.kind.tag == NodeKind::Expr &&
+                    vn.kind.payload.Expr.value.kind.tag == ExprKind::Ident)
+                    moved = cgFindDrop(cg, vn.kind.payload.Expr.value.kind.payload.Ident.name);
+                if (moved >= 0)
+                {
+                    cgEmitDropsExcept(cg, cg.fnDropMark, moved);
+                    stNL(&cg.body, cg.ind);
+                    stP(&cg.body, "return ");
+                    stPS(&cg.body, t);
+                    stCh(&cg.body, ';');
+                    return;
+                }
+                /* other returns may alias dropped locals (slices into a
+                 * local buffer): materialize the value first */
+                Slice rt = Slice::fromStr("long");
+                if (vn.kind.tag == NodeKind::Expr)
+                {
+                    Slice rtyp = cgResultTy(cg, v, &vn.kind.payload.Expr.value);
+                    if (rtyp.len > 0) rt = rtyp;
+                }
+                u32 ti = cgNewTemp(cg, rt, 0);
+                Slice tn = cgTempName(cg, ti);
+                stNL(&cg.body, cg.ind);
+                stPS(&cg.body, tn);
+                stP(&cg.body, " = ");
+                stPS(&cg.body, t);
+                stCh(&cg.body, ';');
+                cgEmitDropsTo(cg, cg.fnDropMark);
+                stNL(&cg.body, cg.ind);
+                stP(&cg.body, "return ");
+                stPS(&cg.body, tn);
+                stCh(&cg.body, ';');
+                return;
+            }
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "return ");
             stPS(&cg.body, t);
@@ -4346,6 +4542,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Break => {
             if (cg.breakDepth > 0 && cg.breakKinds[cg.breakDepth - 1] == 1) {
+                cgEmitDropsTo(cg, cg.breakDropMarks[cg.breakDepth - 1]);
                 stNL(&cg.body, cg.ind);
                 stP(&cg.body, "goto __Lsw");
                 stU64(&cg.body, (u64)cg.breakLabels[cg.breakDepth - 1]);
@@ -4353,6 +4550,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 return;
             }
             if (cg.loopDepth == 0) { cgError(cg, "break outside of loop"); return; }
+            if (cg.loopDepth > 0) cgEmitDropsTo(cg, cg.loopDropMarks[cg.loopDepth - 1]);
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "break;");
             return;
@@ -4360,6 +4558,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Continue => {
             if (cg.loopDepth == 0) { cgError(cg, "continue outside of loop"); return; }
+            cgEmitDropsTo(cg, cg.loopDropMarks[cg.loopDepth - 1]);
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "continue;");
             return;
@@ -4382,6 +4581,7 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::While => {
+            u32 loopMark = cg.dropsLen;
             usize b0 = cg.body.len;
             Slice c = cgExpr(cg, s.kind.payload.While.cond);
             bool condStmts = cg.body.len > b0;
@@ -4391,9 +4591,10 @@ void cgStmt(Codegen* cg, NodeId id)
                 stP(&cg.body, "while (");
                 stPS(&cg.body, c);
                 stCh(&cg.body, ')');
-                cgPushLoop(cg);
+                cgPushLoop(cg, loopMark);
                 cgStmtBraced(cg, s.kind.payload.While.body);
                 cgPopLoop(cg);
+                cgEmitDropsTo(cg, loopMark);
                 return;
             }
             // the condition carried statements: keep them inside the loop
@@ -4408,9 +4609,10 @@ void cgStmt(Codegen* cg, NodeId id)
             stP(&cg.body, "if (!(");
             stPS(&cg.body, c);
             stP(&cg.body, ")) break;");
-            cgPushLoop(cg);
+            cgPushLoop(cg, loopMark);
             cgStmtBraced(cg, s.kind.payload.While.body);
             cgPopLoop(cg);
+            cgEmitDropsTo(cg, loopMark);
             cg.ind--;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '}');
@@ -4418,15 +4620,18 @@ void cgStmt(Codegen* cg, NodeId id)
         },
 
         StmtKind::Loop => {
+            u32 loopMark = cg.dropsLen;
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "while (1)");
-            cgPushLoop(cg);
+            cgPushLoop(cg, loopMark);
             cgStmtBraced(cg, s.kind.payload.Loop.body);
             cgPopLoop(cg);
+            cgEmitDropsTo(cg, loopMark);
             return;
         },
 
         StmtKind::For => {
+            u32 loopMark = cg.dropsLen;
             bool hasInit = s.kind.payload.For.init.index != 0;
             bool hasCond = (s.kind.payload.For.flags & 2) != 0;
             bool hasPost = (s.kind.payload.For.flags & 4) != 0;
@@ -4453,9 +4658,11 @@ void cgStmt(Codegen* cg, NodeId id)
                 stCh(&cg.body, ';');
                 stPS(&cg.body, p);
                 stCh(&cg.body, ')');
-                cgPushLoop(cg);
+                cgPushLoop(cg, loopMark);
                 cgStmtBraced(cg, s.kind.payload.For.body);
                 cgPopLoop(cg);
+                /* the C for-init declared its locals in the loop scope */
+                cgEmitDropsTo(cg, loopMark);
                 return;
             }
             // statement-bearing cond/post: manual loop shape
@@ -4476,7 +4683,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stPS(&cg.body, c);
                 stP(&cg.body, ")) break;");
             }
-            cgPushLoop(cg);
+            cgPushLoop(cg, loopMark);
             cgStmtBraced(cg, s.kind.payload.For.body);
             cgPopLoop(cg);
             if (hasPost) {
@@ -4488,6 +4695,7 @@ void cgStmt(Codegen* cg, NodeId id)
             cg.ind--;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '}');
+            cgEmitDropsTo(cg, loopMark);
             cg.ind--;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '}');
@@ -4496,6 +4704,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::ForIn => {
             // own scope: index temp + bind name must not collide
+            u32 loopMark = cg.dropsLen;
             stNL(&cg.body, cg.ind);
             stCh(&cg.body, '{');
             cg.ind++;
@@ -4558,9 +4767,10 @@ void cgStmt(Codegen* cg, NodeId id)
             }
             stCh(&cg.body, ';');
 
-            cgPushLoop(cg);
+            cgPushLoop(cg, loopMark);
             cgStmtBraced(cg, s.kind.payload.ForIn.body);
             cgPopLoop(cg);
+            cgEmitDropsTo(cg, loopMark);
 
             cg.ind--;
             stNL(&cg.body, cg.ind);
@@ -4735,7 +4945,10 @@ bool cgTyHasParam(Codegen* cg, Ty t)
         TypeKind::Const => { return cgTyHasParam(cg, e.kind.payload.Const.base); },
         TypeKind::Comptime => { return cgTyHasParam(cg, e.kind.payload.Comptime.base); },
         TypeKind::Slice => { return cgTyHasParam(cg, e.kind.payload.Slice.base); },
-        TypeKind::Array => { return cgTyHasParam(cg, e.kind.payload.Array.base); },
+        TypeKind::Array => {
+            return cgTyHasParam(cg, e.kind.payload.Array.base) ||
+                   e.kind.payload.Array.sizeParam != 4294967295;
+        },
         TypeKind::Named => {
             u32 i = 0;
             while (i < e.kind.payload.Named.genericArgsLen) {
@@ -4935,6 +5148,8 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     cg.tempsLen = 0;
     cg.loopDepth = 0;
     cg.breakDepth = 0;
+    cg.dropsLen = 0;
+    cg.fnDropMark = 0;
     cg.ind = 1;
     /* bound names: fresh set per function; params and `self` are
      * locals (Ident refs to them stay raw) */
@@ -4982,6 +5197,8 @@ void cgEmitFuncCommon(Codegen* cg, NodeId declId, Slice cname, Ty retTy, Ty* par
     {
         cgStmt(cg, bodyId);
     }
+    /* fall-through end of the body: unwind every live local */
+    cgEmitDropsTo(cg, cg.fnDropMark);
     Slice bodyText = stTail(&cg.body, bodyStart);
 
     // header
@@ -6114,6 +6331,12 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.switchSeq = 0;
     cg.breakKinds = (u32*)arena.alloc(64 * @sizeof(u32), 8);
     cg.breakLabels = (u32*)arena.alloc(64 * @sizeof(u32), 8);
+    cg.dropsCap = 4096;
+    cg.dropsLen = 0;
+    cg.fnDropMark = 0;
+    cg.drops = (DropEntry*)arena.alloc(4096 * @sizeof(DropEntry), 8);
+    cg.loopDropMarks = (u32*)arena.alloc(64 * @sizeof(u32), 8);
+    cg.breakDropMarks = (u32*)arena.alloc(64 * @sizeof(u32), 8);
     cg.regCap = 512;
     cg.regLen = 0;
     cg.regNames = (Slice*)arena.alloc(512 * @sizeof(Slice), 8);

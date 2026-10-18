@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 // parser/type.crl: type parsing
 //
 // base type then suffixes (fn-pointer, pointer, slice, array), with the
@@ -107,6 +108,7 @@ pub extend Parser
         if (self.current.kind != TokenKind::LBracket) return base;
         self.advance();
         if (self.match(TokenKind::RBracket)) return self.makeSlice(base);
+        SourceLoc sizeLoc = self.tokenLoc(self.current);
         NodeId sizeExpr = self.parseExpr();
         self.expect(TokenKind::RBracket);
         u32 v = 0;
@@ -132,18 +134,15 @@ pub extend Parser
         }
         if (!ok)
         {
-            if (sizeName != 0 && sizeName < self.ctx.internsLen)
+            if (sizeName != 0)
             {
-                String msg = String::new();
-                msg.pushView("array size '");
-                msg.pushView(str { .ptr = self.ctx.interns[sizeName].ptr, .len = self.ctx.interns[sizeName].len });
-                msg.pushView("' does not resolve to a compile-time constant: declare it as a const int in this file, or use an integer literal");
-                self.reportCurrentError(ErrorCode::ParseExpectedExpr, msg.asView());
+                /* a bare name: possibly a generic parameter of the
+                 * enclosing struct/fn. sema rejects it when it is not
+                 * (runtime variable, unknown name) with a located error */
+                Ty inner = self.parseDeclaratorArray(base);
+                return self.makeArrayParam(inner, sizeName, sizeLoc);
             }
-            else
-            {
-                self.reportCurrentError(ErrorCode::ParseExpectedExpr, "array size must be an integer literal or a const int declared in this file");
-            }
+            self.reportCurrentError(ErrorCode::ParseExpectedExpr, "array size must be an integer literal, a const int, or a generic parameter");
             return base;
         }
         /* rightmost suffix is the innermost dimension:
@@ -393,8 +392,22 @@ pub extend Parser
     Ty makeArray(Ty base, u32 len)
     {
         TypeKind k;
-        k = TypeKind::Array{ .base = base, .len = len };
+        k = TypeKind::Array{ .base = base, .len = len, .sizeParam = 4294967295, .sizeName = 0 };
         return self.allocTypeKind(k);
+    }
+
+    /* `T data[N]`: size is a name, resolved to a generic parameter index
+     * (or rejected by sema when it is not one) once the owning decl's
+     * generic list is known */
+    Ty makeArrayParam(Ty base, Str name, SourceLoc loc)
+    {
+        TypeKind k;
+        k = TypeKind::Array{ .base = base, .len = 0, .sizeParam = 4294967295, .sizeName = name };
+        Ty t = self.allocTypeKind(k);
+        /* record where the size was spelled: sema errors point here */
+        TypeEntry* te = self.ctx.types + t;
+        te.loc = loc;
+        return t;
     }
 
     Ty makeTuple(Ty* elems, u32 len)

@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 
 /* sema.crl: the Sema state object shared by the whole semantics pass:
  * scope stack, error counters, import/alias/extends bookkeeping, and the
@@ -47,6 +48,12 @@ pub struct Sema
     Slice* modKeys;
     Slice* modVals;
     u32 modLen;
+    /* `#[[no_drop_all]]` on the function (or its file, propagated at
+     * parse time): skip resolving drop methods for locals in this body */
+    bool fileNoDropAll;
+    /* nesting depth of `#[[no_drop]]` blocks: locals inside are not
+     * auto-dropped */
+    u32 noDropDepth;
 }
 
 /* ── state ─────────────────────────────────────────────────────────── */
@@ -109,6 +116,8 @@ pub extend Sema
         self.modKeys = null;
         self.modVals = null;
         self.modLen = 0;
+        self.fileNoDropAll = false;
+        self.noDropDepth = 0;
     }
 
     void deinit()
@@ -406,11 +415,18 @@ pub extend Sema
                 self.tySpelling(k.payload.Array.base, sub, 128);
                 self.tyAppend(buf, cap, &len, self.zStr(sub));
                 self.tyAppendCh(buf, cap, &len, 91);
-                u32 n = k.payload.Array.len;
-                u32 di = 0;
-                if (n == 0) { digits[0] = 48; di = 1; } // "0"
-                while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n /= 10; di++; } // u32 → decimal, backwards
-                while (di > 0) { di--; self.tyAppendCh(buf, cap, &len, digits[di]); }
+                if (k.payload.Array.sizeName != 0 && k.payload.Array.sizeParam != 4294967295)
+                {
+                    self.tyAppend(buf, cap, &len, self.nameTextView(k.payload.Array.sizeName));
+                }
+                else
+                {
+                    u32 n = k.payload.Array.len;
+                    u32 di = 0;
+                    if (n == 0) { digits[0] = 48; di = 1; } // "0"
+                    while (n > 0 && di < 11) { digits[di] = (u8)(48 + (n % 10)); n /= 10; di++; } // u32 → decimal, backwards
+                    while (di > 0) { di--; self.tyAppendCh(buf, cap, &len, digits[di]); }
+                }
                 self.tyAppendCh(buf, cap, &len, 93);
             },
             TypeKind::FnPtr => {

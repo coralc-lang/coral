@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 /* coral-lsp/server.crl: the coralc language server (`coralc --serve`).
  *
  * JSON-RPC over stdin/stdout, Content-Length framed. One analyzed
@@ -24,7 +25,7 @@ import sem { scope { Symbol }, sema { Sema }, member { MemberInfo } };
 import diag::engine { DiagList, DiagRecord };
 import diag::error { helpFor };
 import ast::id { SourceLoc, NodeId, locFile, locLine, locCol };
-import ast::types { Ty };
+import ast::types { Ty, TypeEntry, TypeKind };
 import ast::node { Node, NodeKind };
 import ast::expr { Expr, ExprKind };
 import ast::stmt { Stmt, StmtKind };
@@ -635,6 +636,40 @@ void lspPushType(String* s, LspDoc* d, Ty ty, u8* buf, usize cap)
     s.pushView(str { .ptr = sp, .len = n });
 }
 
+/* is `ty` a function pointer? (the server explains these explicitly) */
+bool lspIsFnPtrTy(LspDoc* d, Ty ty)
+{
+    if (ty == 0 || d->unit.ctx == null || d->unit.sema == null) return false;
+    if (ty >= d->unit.ctx.typesLen) return false;
+    TypeEntry* e = d->unit.ctx.types + ty;
+    return e.kind.tag == TypeKind::FnPtr;
+}
+
+/* append the fn-pointer explanation clause:
+ * `fn_pointer: a pointer to a function taking T, … and returning R` */
+void lspPushFnPtrSentence(String* s, LspDoc* d, Ty ty, u8* buf, usize cap)
+{
+    TypeEntry* e = d->unit.ctx.types + ty;
+    s.pushView("fn_pointer: a pointer to a function taking ");
+    u32 n = e.kind.payload.FnPtr.paramsLen;
+    if (n == 0)
+    {
+        s.pushView("no arguments");
+    }
+    else
+    {
+        u32 i = 0;
+        while (i < n)
+        {
+            if (i > 0) s.pushView(", ");
+            lspPushType(s, d, e.kind.payload.FnPtr.params[i], buf, cap);
+            i++;
+        }
+    }
+    s.pushView(" and returning ");
+    lspPushType(s, d, e.kind.payload.FnPtr.returnType, buf, cap);
+}
+
 /* identifier under the cursor: text view, byte length, intern id */
 bool lspWordAt(LspDoc* d, i64 line0, i64 char0, u8** outPtr, usize* outLen, u32* outSid)
 {
@@ -954,6 +989,11 @@ String lspLocalCard(LspDoc* d, NodeId declId, u8* buf, usize cap)
             s.pushView(lspInternText(d, st.kind.payload.VarDecl.name));
             s.pushView("\nprovided by this file\nType: ");
             lspPushType(&s, d, st.kind.payload.VarDecl.typeNode, buf, cap);
+            if (lspIsFnPtrTy(d, st.kind.payload.VarDecl.typeNode))
+            {
+                s.pushView("\n");
+                lspPushFnPtrSentence(&s, d, st.kind.payload.VarDecl.typeNode, buf, cap);
+            }
             s.pushView("\n\n```coral\n");
             if ((st.kind.payload.VarDecl.flags & 1) != 0) s.pushView("const ");
             lspPushType(&s, d, st.kind.payload.VarDecl.typeNode, buf, cap);
@@ -982,6 +1022,11 @@ String lspLocalCard(LspDoc* d, NodeId declId, u8* buf, usize cap)
         else s.pushView(lspInternText(d, p.name));
         s.pushView("\nprovided by this file\nType: ");
         lspPushType(&s, d, p.typeNode, buf, cap);
+        if (lspIsFnPtrTy(d, p.typeNode))
+        {
+            s.pushView("\n");
+            lspPushFnPtrSentence(&s, d, p.typeNode, buf, cap);
+        }
         s.pushView("\n\n```coral\n");
         lspPushType(&s, d, p.typeNode, buf, cap);
         s.pushView(" ");
@@ -1028,6 +1073,11 @@ String lspFieldCard(LspDoc* d, MemberInfo mi, u8* namePtr, usize nameLen, str ro
     }
     s.pushView("\nType: ");
     lspPushType(&s, d, mi.typeNode, buf, cap);
+    if (lspIsFnPtrTy(d, mi.typeNode))
+    {
+        s.pushView("\n");
+        lspPushFnPtrSentence(&s, d, mi.typeNode, buf, cap);
+    }
     if (mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
     {
         Node* fn2 = d->unit.ctx.nodes + mi.declaration.index;
@@ -1585,7 +1635,12 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
         // expressions (and anything else): just the type
         Ty ty = lspHoverType(d, line0, char0);
         if (ty == 0) { dealloc<u8>(buf); return JsonValue::nullVal(); }
-        val.pushView("```coral\n");
+        if (lspIsFnPtrTy(d, ty))
+        {
+            lspPushFnPtrSentence(&val, d, ty, buf, 512);
+            val.pushView("\nprovided by this file");
+        }
+        val.pushView("\n\n```coral\n");
         lspPushType(&val, d, ty, buf, 512);
         val.pushView("\n```");
     }

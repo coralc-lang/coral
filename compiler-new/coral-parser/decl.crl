@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 // parser/decl.crl: declaration parsing
 //
 // one entry point (parseDecl) dispatches on the leading keyword, with
@@ -14,7 +15,7 @@ import base { Parser, ParserMark };
 import context::context { AstContext, InternEntry, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
 import ast {
     id { NodeId, Str, SourceLoc },
-    decl { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol },
+    decl { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol, Attribute },
     node { Node, NodeKind },
     types { Ty, TypeEntry, TypeKind }
 };
@@ -58,35 +59,50 @@ pub extend Parser
     }
 
     /* `#[[name(args), …]]*`: one or more attribute lists.
-     * Returns flags: bit0 = carries `const`. Shared by decl, method and
-     * struct/union member parsing so every position accepts attributes.
-     * names and args are skipped wholesale; only `const` is understood */
-    u8 parseAttrList()
+     * Returns flags: bit0 = carries `const`. When `outAttrs` is non-null
+     * every attribute's name is materialized (args are skipped for now);
+     * the caller owns the realloc'd array (process-lifetime arena is also
+     * fine — this parser never frees decls). Shared by decl, statement,
+     * method and struct/union member parsing so every position accepts
+     * attributes. */
+    u8 parseAttrListTo(Attribute** outAttrs, u32* outLen)
     {
         u8 flags = 0;
+        Attribute* list = null;
+        u32 len = 0;
+        u32 cap = 0;
         while (self.match(TokenKind::Hash))
         {
             self.expect(TokenKind::LBracket);
             self.expect(TokenKind::LBracket);
-            if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+            bool first = true;
+            while (!self.atEnd() && self.current.kind != TokenKind::RBracket)
             {
-                if (self.current.kind == TokenKind::Const) flags |= 1;
-                self.advance();
-            }
-            if (self.current.kind == TokenKind::LParen)
-            {
-                self.advance();
-                while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                    self.advance();
-                self.expect(TokenKind::RParen);
-            }
-            while (self.match(TokenKind::Comma))
-            {
-                if (!self.atEnd() && self.current.kind != TokenKind::RBracket)
+                if (!first)
                 {
-                    if (self.current.kind == TokenKind::Const) flags |= 1;
+                    if (!self.match(TokenKind::Comma)) break;
+                    if (self.current.kind == TokenKind::RBracket) break;
+                }
+                first = false;
+                Str name = 0;
+                SourceLoc loc = self.tokenLoc(self.current);
+                if (self.current.kind == TokenKind::Const)
+                {
+                    flags |= 1;
+                    name = self.ctx.intern("const");
                     self.advance();
                 }
+                else if (self.current.kind == TokenKind::Ident)
+                {
+                    name = self.ctx.intern(self.current.data.asStr());
+                    self.advance();
+                }
+                else
+                {
+                    self.advance();
+                    continue;
+                }
+                /* `name(arg, …)`: kept for later passes; skipped here */
                 if (self.current.kind == TokenKind::LParen)
                 {
                     self.advance();
@@ -94,11 +110,56 @@ pub extend Parser
                         self.advance();
                     self.expect(TokenKind::RParen);
                 }
+                if (outAttrs != null && name != 0)
+                {
+                    if (len == cap)
+                    {
+                        u32 newCap = cap == 0 ? 4 : cap * 2;
+                        Attribute* raw = realloc<Attribute>(list, (usize)newCap);
+                        if (raw == null) { self.reportAllocFailed(); break; }
+                        list = raw;
+                        cap = newCap;
+                    }
+                    Attribute a;
+                    a.name = name;
+                    a.args = null;
+                    a.argsLen = 0;
+                    a.loc = loc;
+                    list[len] = a;
+                    len++;
+                }
             }
             self.expect(TokenKind::RBracket);
             self.expect(TokenKind::RBracket);
         }
+        if (outAttrs != null) *outAttrs = list;
+        if (outLen != null) *outLen = len;
         return flags;
+    }
+
+    // wrapper for call sites that only want the const bit
+    u8 parseAttrList()
+    {
+        return self.parseAttrListTo(null, null);
+    }
+
+    /* attach parsed attributes to a Decl or Stmt node (both carry
+     * attrs/attrsLen slots); used by parseDecl/parseStmt after the node
+     * exists. no-op for zero ids and unknown node kinds */
+    void attachAttrs(NodeId id, Attribute* attrs, u32 attrsLen)
+    {
+        if (attrsLen == 0 || id.index == 0) return;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag == NodeKind::Decl)
+        {
+            n->kind.payload.Decl.value.attrs = attrs;
+            n->kind.payload.Decl.value.attrsLen = attrsLen;
+        }
+        else if (n->kind.tag == NodeKind::Stmt)
+        {
+            n->kind.payload.Stmt.value.attrs = attrs;
+            n->kind.payload.Stmt.value.attrsLen = attrsLen;
+        }
     }
 
     /* ── top-level dispatch ── */
@@ -110,7 +171,18 @@ pub extend Parser
      * diagnostics from the discarded pass */
     NodeId parseDecl()
     {
-        u8 attrFlags = self.parseAttrList();
+        Attribute* attrs = null;
+        u32 attrsLen = 0;
+        u8 attrFlags = self.parseAttrListTo(&attrs, &attrsLen);
+        NodeId id = self.parseDeclBody(attrFlags);
+        self.attachAttrs(id, attrs, attrsLen);
+        return id;
+    }
+
+    /* the body of parseDecl, after the leading attribute lists were
+     * consumed and the const bit extracted */
+    NodeId parseDeclBody(u8 attrFlags)
+    {
         bool isConst = (attrFlags & 1) != 0;
         bool isPub = self.match(TokenKind::Pub);
         bool isExtern = self.match(TokenKind::Extern);
@@ -267,8 +339,26 @@ pub extend Parser
             
             TypeKind::Array => {
                 self.rebindTypeParams(entry->kind.payload.Array.base, genericValues, genericCount);
+                Str sn = entry->kind.payload.Array.sizeName;
+                if (sn != 0)
+                {
+                    u32 g2 = 0;
+                    while (g2 < genericCount)
+                    {
+                        Node* gn2 = self.ctx.nodes + genericValues[g2].index;
+                        if (gn2->kind.tag == NodeKind::GenericParam)
+                        {
+                            if (gn2->kind.payload.GenericParam.value.name == sn)
+                            {
+                                entry->kind.payload.Array.sizeParam = g2;
+                                break;
+                            }
+                        }
+                        g2++;
+                    }
+                }
                 return;
-            }
+            },
             
             TypeKind::FnPtr => {
                 self.rebindTypeParams(entry->kind.payload.FnPtr.returnType, genericValues, genericCount);

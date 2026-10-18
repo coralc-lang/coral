@@ -1,3 +1,4 @@
+#[[no_drop_all]]
 // parser/stmt.crl: statement parsing
 
 import base { Parser, ParserMark };
@@ -40,49 +41,34 @@ pub extend Parser
 
     /* ── dispatch ── */
 
-    /* consumes any leading #[[...]] attrs, arms the condassign escape
-     * hatch, then dispatches on keyword; everything else is expr-or-decl.
-     * only the FIRST attribute in each group is checked for `condassign` */
+    /* consumes any leading #[[...]] attrs (materialized onto the produced
+     * Stmt node), arms the condassign escape hatch, then dispatches on
+     * keyword; everything else is expr-or-decl */
     NodeId parseStmt()
     {
+        Attribute* attrs = null;
+        u32 attrsLen = 0;
         self.condAssignAttr = false;
-        while (self.match(TokenKind::Hash))
+        self.parseAttrListTo(&attrs, &attrsLen);
+        u32 ai = 0;
+        while (ai < attrsLen)
         {
-            self.expect(TokenKind::LBracket);
-            self.expect(TokenKind::LBracket);
-            Token attrTok = self.expect(TokenKind::Ident);
-            Str attrName = self.ctx.intern(attrTok.data.asStr());
+            Str attrName = attrs[ai].name;
             if (attrName == self.ctx.intern("condassign")) self.condAssignAttr = true;
-            else if (attrName != self.ctx.intern("fallthrough"))
-                self.reportWarning(ErrorCode::ParseMisplacedAttr, attrTok,
+            else if (attrName != self.ctx.intern("fallthrough") && attrName != self.ctx.intern("no_drop"))
+                self.reportWarningAt(ErrorCode::ParseMisplacedAttr, attrs[ai].loc,
                     "attribute has no meaning on a statement; attach it to a declaration instead");
-            if (self.current.kind == TokenKind::LParen)
-            {
-                self.advance();
-                while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                {
-                    self.advance();
-                    if (!self.match(TokenKind::Comma)) break;
-                }
-                self.expect(TokenKind::RParen);
-            }
-            while (self.match(TokenKind::Comma))
-            {
-                self.expect(TokenKind::Ident);
-                if (self.current.kind == TokenKind::LParen)
-                {
-                    self.advance();
-                    while (self.current.kind != TokenKind::RParen && !self.atEnd())
-                    {
-                        self.advance();
-                        if (!self.match(TokenKind::Comma)) break;
-                    }
-                    self.expect(TokenKind::RParen);
-                }
-            }
-            self.expect(TokenKind::RBracket);
-            self.expect(TokenKind::RBracket);
+            ai++;
         }
+        NodeId id = self.parseStmtBody();
+        self.attachAttrs(id, attrs, attrsLen);
+        return id;
+    }
+
+    /* the dispatch half of parseStmt, after the attribute lists were
+     * consumed */
+    NodeId parseStmtBody()
+    {
         if (self.current.kind == TokenKind::Return)
             return self.parseReturnStmt();
         if (self.current.kind == TokenKind::If)
@@ -648,7 +634,7 @@ pub extend Parser
             if (init.index != 0) flags |= 2;
             if (isConst) flags |= 1;
             if (isStatic) flags |= 4;
-            return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags });
+            return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags, .dropMethod = NodeId{ .index = 0 } });
         }
 
         /* a statement starting `(` is a cast expression (`(void)ctx;`,
@@ -681,7 +667,7 @@ pub extend Parser
                 }
                 typeNode = self.inferArrayFromInit(typeNode, init);
                 self.expect(TokenKind::Semicolon);
-                return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags });
+                return self.storeStmt(StmtKind::VarDecl{ .name = nameId, .typeNode = typeNode, .init = init, .nameLoc = self.tokenLoc(name), .flags = flags, .dropMethod = NodeId{ .index = 0 } });
             }
         }
 
