@@ -22,7 +22,7 @@ import mono {
     collect,
     instantiate
 };
-import diag::engine { DiagnosticEngine };
+import diag::engine { DiagnosticEngine, DiagList };
 import(lib) std::mman { alloc, dealloc, realloc };
 import(lib) platform::libc { write };
 
@@ -1297,7 +1297,8 @@ LibSeg* segsFromPlatformFlag(AstContext* ctx, u32* outLen)
 
 CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice* flagsV,
                              u32 nFlags, usize errorLimit, bool allowIntPtr, bool noPrelude,
-                             bool silenced, Slice* modKeys, Slice* modVals, u32 modLen)
+                             bool silenced, Slice* modKeys, Slice* modVals, u32 modLen,
+                             bool keepOnError, DiagList* outDiags)
 {
     CompileUnit unit = CompileUnit {
         .ctx = null,
@@ -1364,6 +1365,7 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
         if (plen > 0) { mainPath = path; mainPathLen = plen; }
     }
     __tmpEngine.addFile(mainPath, mainPathLen, src, src + len);
+    __tmpEngine.collect = outDiags != null;
     *engine = __tmpEngine;
 
     Lexer lexer = Lexer {
@@ -1579,12 +1581,21 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
     dealloc<IdentEntry>(entries);
 
     if (unit.parseErrors > 0 || unit.semanticErrors > 0 || unit.monoErrors > 0) {
+        engine.moveRecordsTo(outDiags);
+        if (keepOnError) {
+            /* LSP callers still want symbols/ASTs for hover/definition
+             * on the parts that did analyze */
+            unit.ctx = ctx;
+            unit.file = file;
+            return unit;
+        }
         freeUnit(&unit);            // sema + mono (unit.ctx not set yet)
         ctx.deinit();
         dealloc<AstContext>(ctx);
         return unit;
     }
 
+    engine.moveRecordsTo(outDiags);
     unit.ctx = ctx;
     unit.file = file;
     return unit;

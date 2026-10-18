@@ -5,9 +5,11 @@
  * structured DiagList collector, hover resolves the expression type at a
  * position (Expr.resolvedType) or a top-level symbol's declared type.
  *
- * stdout hazard: the builder/compiler print to stdout. fd 1 is diverted
- * to /dev/null at startup and protocol frames go to a private dup of the
- * real stdout, so stray printf can never corrupt the LSP stream.
+ * stdout carries the protocol, so the serve path is silent: the builder
+ * and build-file parser run with their quiet flag set and the compiler
+ * engine analyzes with printErrors = false. Output goes through the
+ * std io API (stout), input through std ios getchar, so the server
+ * builds for every std target.
  */
 
 import common::slice { Slice };
@@ -20,19 +22,22 @@ import build {
 import sem::analyze { CompileUnit, analyzeForCompile, freeUnit };
 import sem { scope { Symbol }, sema { Sema } };
 import diag::engine { DiagList, DiagRecord };
-import ast::id { SourceLoc, locFile, locLine, locCol };
+import ast::id { SourceLoc, NodeId, locFile, locLine, locCol };
 import ast::types { Ty };
 import ast::node { Node, NodeKind };
 import ast::expr { Expr, ExprKind };
+import ast::stmt { Stmt, StmtKind };
+import ast::decl { Decl, Param, Field };
+import ast::pat { Pat, PatKind };
 
-import(lib) core::cchar { cchar };
-import(lib) std::mman { alloc, dealloc, realloc };
+import(lib) std::mman { alloc, dealloc };
 import(lib) std::result { Result };
 import(lib) std::text::string { String };
 import(lib) std::parser::json {
     JsonValue, JsonType, JsonPair, ParseError, parseJson, serialize
 };
-import(lib) platform::libc { open, close, read, write, dup2, fflush };
+import(lib) std::io::fs { readFileToString, IoError };
+import(lib) std::io::ios { print, readChar };
 
 pub struct LspDoc
 {
@@ -43,40 +48,14 @@ pub struct LspDoc
     bool analyzed;
 }
 
-/* stdout plumbing */
-
-/* divert fd 1 to /dev/null; returns a private fd holding the real
- * stdout for protocol writes (1 if /dev/null cannot be opened) */
-i32 lspSilenceStdout()
-{
-    i32 nul = open(C"/dev/null", 1, 0);
-    if (nul < 0) return 1;
-    i32 save = open(C"/dev/null", 1, 0);
-    if (save < 0) { close(nul); return 1; }
-    dup2(1, save);      // save becomes a dup of the real stdout
-    dup2(nul, 1);       // everything printed now goes to /dev/null
-    close(nul);
-    fflush(null);       // drop anything buffered from before the switch
-    return save;
-}
-
-void lspWriteAll(i32 fd, const u8* data, usize len)
-{
-    usize off = 0;
-    while (off < len)
-    {
-        i64 w = write(fd, (const cchar*)data + off, len - off);
-        if (w <= 0) return;
-        off = off + (usize)w;
-    }
-}
-
-/* one JSON-RPC frame: Content-Length header + compact body */
-void lspSend(i32 fd, JsonValue* msg)
+/* stdout carries the protocol; the quiet flags keep every other
+ * producer off it. One std print call per frame (single-buffered
+ * write), header + body concatenated first. */
+void lspSend(JsonValue* msg)
 {
     String body = serialize(msg);
-    String hdr = String::new();
-    hdr.pushView("Content-Length: ");
+    String frame = String::new();
+    frame.pushView("Content-Length: ");
     u8 digits[13];
     usize dn = 0;
     usize v = body.len;
@@ -90,36 +69,26 @@ void lspSend(i32 fd, JsonValue* msg)
     while (dn > 0)
     {
         dn--;
-        hdr.pushByte(digits[dn]);
+        frame.pushByte(digits[dn]);
     }
-    hdr.pushView("\r\n\r\n");
-    lspWriteAll(fd, hdr.asU8(), hdr.len);
-    lspWriteAll(fd, body.asU8(), body.len);
+    frame.pushView("\r\n\r\n");
+    frame.pushView(body.asView());
+    print(frame.asView());
 }
 
 /* ── transport  */
 
-bool lspReadExact(i32 fd, u8* buf, usize n)
-{
-    usize off = 0;
-    while (off < n)
-    {
-        i64 r = read(fd, buf + off, n - off);
-        if (r <= 0) return false;
-        off = off + (usize)r;
-    }
-    return true;
-}
-
 /* read header bytes up to the blank line, return Content-Length
  * (-1 = EOF, -2 = malformed header) */
-i32 lspReadContentLength(i32 fd)
+i32 lspReadContentLength()
 {
     u8 hdr[1056];
     usize n = 0;
     while (n < 1056)
     {
-        if (!lspReadExact(fd, hdr + n, 1)) return -1;
+        u8 c = readChar();
+        if (c == 0) return -1;
+        hdr[n] = c;
         n++;
         if (n >= 4 && hdr[n - 4] == 13 && hdr[n - 3] == 10 && hdr[n - 2] == 13 && hdr[n - 1] == 10) break;
     }
@@ -218,6 +187,50 @@ JsonValue lspErrResp(JsonValue* id, i64 code, str message)
     return o;
 }
 
+/* ── UTF-8 / UTF-16 ──────────────────────────────────────────────── */
+
+/* the protocol counts positions in UTF-16 code units, the compiler
+ * counts bytes; these convert one to the other */
+
+u32 lspUtf8Seq(u8 b)
+{
+    if (b < 128) return 1;
+    if (b >= 192 && b < 224) return 2;
+    if (b >= 224 && b < 240) return 3;
+    if (b >= 240) return 4;
+    return 1;
+}
+
+/* UTF-16 code units in the first byteIdx bytes of line (clamped) */
+i64 lspUtf16Col(str line, i64 byteIdx)
+{
+    if (byteIdx <= 0) return 0;
+    if ((usize)byteIdx > line.len) byteIdx = (i64)line.len;
+    i64 units = 0;
+    i64 i = 0;
+    while (i < byteIdx)
+    {
+        u32 sz = lspUtf8Seq(line.ptr[i]);
+        if (sz == 4) units = units + 2; else units = units + 1;
+        i = i + (i64)sz;
+    }
+    return units;
+}
+
+/* UTF-16 code units in a whole view */
+i64 lspUtf16Len(str s)
+{
+    i64 units = 0;
+    usize i = 0;
+    while (i < s.len)
+    {
+        u32 sz = lspUtf8Seq(s.ptr[i]);
+        if (sz == 4) units = units + 2; else units = units + 1;
+        i = i + (usize)sz;
+    }
+    return units;
+}
+
 /* ── URIs ──────────────────────────────────────────────────────────── */
 
 u8 lspHex(u8 c)
@@ -258,12 +271,60 @@ String lspUriToPath(str uri)
     return out;
 }
 
-JsonValue lspFileUri(str path)
+/* the analyzer reports paths as given (often relative to the workspace
+ * root); editors need absolute file URIs, so relative paths are anchored
+ * at the initialize request's rootUri */
+String lspMakeAbs(str path, str rootPath)
 {
+    if (path.len > 0 && path.ptr[0] == 47) return String::from(path);
+    String out = String::new();
+    if (rootPath.len > 0)
+    {
+        out.pushView(rootPath);
+        if (rootPath.ptr[rootPath.len - 1] != 47) out.pushByte(47);
+    }
+    usize i = 0;
+    while (i + 1 < path.len && path.ptr[i] == 46 && path.ptr[i + 1] == 47) i = i + 2;
+    out.pushView(str { .ptr = path.ptr + i, .len = path.len - i });
+    return out;
+}
+
+/* anchor for relative analyzer paths: the workspace root from initialize
+ * when there is one, else the document's own directory (loose files) */
+str lspDocRoot(LspDoc* d, str rootPath)
+{
+    if (rootPath.len > 0) return rootPath;
+    usize i = d->path.len;
+    while (i > 0)
+    {
+        i--;
+        if (d->path.asU8()[i] == 47)
+        {
+            if (i == 0) return str { .ptr = d->path.asU8(), .len = 1 };
+            return str { .ptr = d->path.asU8(), .len = i };
+        }
+    }
+    return rootPath;
+}
+
+JsonValue lspFileUri(str path, str rootPath)
+{
+    String abs = lspMakeAbs(path, rootPath);
     String u = String::new();
     u.pushView("file://");
-    u.pushView(path);
+    u.pushView(abs.asView());
+    abs.free();
     return JsonValue::stringVal(u);
+}
+
+bool lspPathEquals(str file, str docPath, str rootPath)
+{
+    if (file.len == docPath.len && file.equals(docPath)) return true;
+    if (docPath.len == 0) return false;
+    String a = lspMakeAbs(file, rootPath);
+    bool eq = a.asView().equals(docPath);
+    a.free();
+    return eq;
 }
 
 /* ── diagnostics ───────────────────────────────────────────────────── */
@@ -278,8 +339,17 @@ i64 lspSeverity(str level)
 JsonValue lspDiagRange(DiagRecord* r)
 {
     i64 line = r->line > 0 ? (i64)r->line - 1 : 0;
-    i64 col = r->col > 0 ? (i64)r->col - 1 : 0;
-    i64 endCol = r->endCol > 0 ? (i64)r->endCol - 1 : col;
+    i64 b0 = r->col > 0 ? (i64)r->col - 1 : 0;
+    i64 b1 = r->endCol > 0 ? (i64)r->endCol - 1 : b0;
+    i64 col = b0;
+    i64 endCol = b1;
+    str lt = r->lineText.asView();
+    if (lt.len > 0)
+    {
+        col = lspUtf16Col(lt, b0);
+        endCol = lspUtf16Col(lt, b1);
+    }
+    if (endCol < col) endCol = col;
     JsonValue range = lspObj();
     JsonValue start = lspObj();
     lspPut(&start, "line", JsonValue::i64Val(line));
@@ -292,27 +362,60 @@ JsonValue lspDiagRange(DiagRecord* r)
     return range;
 }
 
+/* markers want a short, code-free sentence: strip a "coralc: " prefix
+ * and capitalize the first letter */
+String lspMsgFriendly(String src)
+{
+    str v = src.asView();
+    if (v.len >= 8 && v.ptr[0] == 99 && v.ptr[1] == 111 && v.ptr[2] == 114 && v.ptr[3] == 97 &&
+        v.ptr[4] == 108 && v.ptr[5] == 99 && v.ptr[6] == 58 && v.ptr[7] == 32)
+    {
+        v = str { .ptr = v.ptr + 8, .len = v.len - 8 };
+    }
+    String out = String::from(v);
+    u8* p = out.asU8();
+    if (out.len > 0 && p[0] >= 97 && p[0] <= 122) p[0] = (u8)(p[0] - 32);
+    return out;
+}
+
 JsonValue lspDiagItem(DiagRecord* r)
 {
     JsonValue d = lspObj();
     lspPut(&d, "range", lspDiagRange(r));
     lspPut(&d, "severity", JsonValue::i64Val(lspSeverity(r->level.asView())));
-    lspPut(&d, "code", JsonValue::stringVal(r->code.clone()));
     lspPut(&d, "source", JsonValue::stringVal(String::from("coral")));
-    lspPut(&d, "message", JsonValue::stringVal(r->message.clone()));
+    lspPut(&d, "message", JsonValue::stringVal(lspMsgFriendly(r->message)));
     return d;
 }
 
-/* publish one notification per file that appears in the records; the
- * document's own file keeps the client's exact URI */
-void lspPublish(i32 outFd, LspDoc* doc, DiagList* diags)
+/* clear a document's markers with an empty publish (didClose) */
+void lspPublishEmpty(str uri)
 {
+    JsonValue params = lspObj();
+    lspPut(&params, "uri", JsonValue::stringVal(String::from(uri)));
+    lspPut(&params, "diagnostics", JsonValue::arrayVal());
+    JsonValue msg = lspObj();
+    lspPut(&msg, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
+    lspPut(&msg, "method", JsonValue::stringVal(String::from("textDocument/publishDiagnostics")));
+    lspPut(&msg, "params", params);
+    lspSend(&msg);
+}
+
+/* publish one notification per file that appears in the records; the
+ * document's own file keeps the client's exact URI and always gets a
+ * publish (empty when clean) so stale markers are cleared. When filesOut
+ * is non-null the absolute path of every published file is recorded so a
+ * later project-wide pass can clear files that stopped having records. */
+void lspPublish(DiagList* diags, str docPath, str docUri, str rootPath, String* filesOut, u32* filesOutCount)
+{
+    bool docPublished = false;
     u32 i = 0;
     while (i < diags->len)
     {
         DiagRecord* r = diags->items + i;
         str file = r->file.asView();
-        bool isDoc = file.equals(doc->path.asView());
+        bool isDoc = lspPathEquals(file, docPath, rootPath);
+        if (isDoc) docPublished = true;
         // skip files already published in this batch (earlier index)
         bool dup = false;
         u32 j = 0;
@@ -323,9 +426,27 @@ void lspPublish(i32 outFd, LspDoc* doc, DiagList* diags)
         }
         if (dup) { i++; continue; }
 
+        if (filesOut != null && filesOutCount[0] < 128)
+        {
+            String abs = lspMakeAbs(file, rootPath);
+            bool known = false;
+            u32 f = 0;
+            while (f < filesOutCount[0])
+            {
+                if (filesOut[f].asView().equals(abs.asView())) { known = true; break; }
+                f++;
+            }
+            if (known) abs.free();
+            else
+            {
+                filesOut[filesOutCount[0]] = abs;
+                filesOutCount[0] = filesOutCount[0] + 1;
+            }
+        }
+
         JsonValue params = lspObj();
-        if (isDoc) lspPut(&params, "uri", JsonValue::stringVal(doc->uri.clone()));
-        else lspPut(&params, "uri", lspFileUri(file));
+        if (isDoc) lspPut(&params, "uri", JsonValue::stringVal(String::from(docUri)));
+        else lspPut(&params, "uri", lspFileUri(file, rootPath));
         JsonValue arr = JsonValue::arrayVal();
         u32 k = i;
         while (k < diags->len)
@@ -343,10 +464,12 @@ void lspPublish(i32 outFd, LspDoc* doc, DiagList* diags)
         lspPut(&msg, "jsonrpc", JsonValue::stringVal(String::from("2.0")));
         lspPut(&msg, "method", JsonValue::stringVal(String::from("textDocument/publishDiagnostics")));
         lspPut(&msg, "params", params);
-        lspSend(outFd, &msg);
+        lspSend(&msg);
 
         i++;
     }
+
+    if (!docPublished && docPath.len > 0) lspPublishEmpty(docUri);
 }
 
 /* ── documents ─────────────────────────────────────────────────────── */
@@ -387,16 +510,72 @@ void lspDocFree(LspDoc* d)
 }
 
 /* run analysis over the document body and publish the diagnostics */
-void lspAnalyze(i32 outFd, LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen)
+void lspAnalyze(LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen, str rootPath)
 {
     freeUnit(&d->unit);
     DiagList diags;
     diags.init();
     d->unit = analyzeForCompile(d->text.asU8(), d->text.len, d->path.asU8(), null, null, 0,
                                 200, false, false, true,
-                                modKeys, modVals, modLen, &diags);
+                                modKeys, modVals, modLen, true, &diags);
     d->analyzed = true;
-    lspPublish(outFd, d, &diags);
+    lspPublish(&diags, d->path.asView(), d->uri.asView(), rootPath, null, null);
+    diags.dispose();
+}
+
+/* whole-project error report: analyze the build entry so its entire
+ * import closure (every project file) is typechecked and errors are
+ * published per file, not just for the open buffer. previousFiles /
+ * previousCount track what the last report published so files that were
+ * fixed elsewhere get cleared instead of keeping stale markers. */
+void lspProjectReport(str entryAbs, Slice* modKeys, Slice* modVals, u32 modLen, str rootPath,
+                      str docPath, str docUri, String* previousFiles, u32* previousCount)
+{
+    Result<String, IoError> sres = readFileToString(entryAbs);
+    if (sres.isErr()) return;
+    String text = sres.unwrap();
+
+    DiagList diags;
+    diags.init();
+    CompileUnit unit = analyzeForCompile(text.asU8(), text.len, entryAbs.asU8(), null, null, 0,
+                                         200, false, false, true,
+                                         modKeys, modVals, modLen, true, &diags);
+    freeUnit(&unit);
+
+    String next[128];
+    u32 nextCount = 0;
+    lspPublish(&diags, docPath, docUri, rootPath, next, &nextCount);
+
+    u32 i = 0;
+    while (i < previousCount[0])
+    {
+        bool still = false;
+        u32 j = 0;
+        while (j < nextCount)
+        {
+            if (previousFiles[i].asView().equals(next[j].asView())) { still = true; break; }
+            j++;
+        }
+        if (!still)
+        {
+            if (!lspPathEquals(previousFiles[i].asView(), docPath, rootPath))
+            {
+                // previousFiles[i] is an absolute path: clear its URI
+                String u = String::new();
+                u.pushView("file://");
+                u.pushView(previousFiles[i].asView());
+                lspPublishEmpty(u.asView());
+                u.free();
+            }
+        }
+        previousFiles[i].free();
+        i++;
+    }
+    i = 0;
+    while (i < nextCount) { previousFiles[i] = next[i]; i++; }
+    previousCount[0] = nextCount;
+
+    text.free();
     diags.dispose();
 }
 
@@ -442,8 +621,9 @@ Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
     i64 c = 0;
     while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
     {
-        pos++;
-        c++;
+        usize sz = (usize)lspUtf8Seq(base[pos]);
+        if (sz == 4) c = c + 2; else c = c + 1;
+        pos = pos + sz;
     }
 
     usize s = pos;
@@ -466,6 +646,9 @@ Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
         i++;
         if (nd->kind.tag != NodeKind::Expr) continue;
         Expr ex = nd->kind.payload.Expr.value;
+        /* the open buffer is always file 0; merged files share line/col
+         * coordinates and must not shadow the buffer's own exprs */
+        if (locFile(ex.loc) != 0) continue;
         if (locLine(ex.loc) != line1 || locCol(ex.loc) != col1) continue;
         if (!haveF) { fId = locFile(ex.loc); haveF = true; }
         if (ex.resolvedType == 0) continue;
@@ -515,6 +698,192 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0)
     return res;
 }
 
+/* ── definition ────────────────────────────────────────────────────── */
+
+/* 1-based byte col -> UTF-16 col on a 1-based line of a file known to
+ * the doc's engine; degrades to the byte col when the buffer is gone */
+i64 lspFileCol(LspDoc* d, u32 fileId, u32 line1, i64 byteCol0)
+{
+    if (byteCol0 <= 0) return 0;
+    u8* start = null;
+    u8* end = null;
+    if (fileId == 0)
+    {
+        start = d->text.asU8();
+        end = start + d->text.len;
+    }
+    else
+    {
+        if (d->unit.engineObj == null) return byteCol0;
+        if (fileId >= d->unit.engineObj->fileCount) return byteCol0;
+        start = d->unit.engineObj->fileBufs.at((usize)fileId);
+        end = d->unit.engineObj->fileBufEnds.at((usize)fileId);
+    }
+    if (start == null || end == null || end <= start) return byteCol0;
+    usize pos = 0;
+    u32 ln = 1;
+    while (start + pos < end && ln < line1)
+    {
+        if (start[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line1) return byteCol0;
+    usize e2 = pos;
+    while (start + e2 < end && start[e2] != 10 && start[e2] != 13) e2++;
+    return lspUtf16Col(str { .ptr = start + pos, .len = e2 - pos }, byteCol0);
+}
+
+/* nearest declaration of `sid` at or before line1 in the open buffer.
+ * analyses pop function scopes, so locals are not reachable through the
+ * scope stack after the fact; VarDecl/Param/ForIn/Pat nodes are. */
+NodeId lspLocalDecl(LspDoc* d, u32 sid, u32 line1)
+{
+    NodeId best;
+    best.index = 0;
+    u32 bestLine = 0;
+    u32 bestCol = 0;
+    u32 i = 1;
+    while (i < d->unit.ctx.nodesLen)
+    {
+        u32 id = i;
+        Node* nd = d->unit.ctx.nodes + i;
+        i++;
+        SourceLoc nl;
+        nl.data = 0;
+        if (nd->kind.tag == NodeKind::Stmt)
+        {
+            if (nd->kind.payload.Stmt.value.kind.tag == StmtKind::VarDecl)
+            {
+                if (nd->kind.payload.Stmt.value.kind.payload.VarDecl.name == sid)
+                    nl = nd->kind.payload.Stmt.value.kind.payload.VarDecl.nameLoc;
+            }
+            else if (nd->kind.payload.Stmt.value.kind.tag == StmtKind::ForIn)
+            {
+                if (nd->kind.payload.Stmt.value.kind.payload.ForIn.bindName == sid)
+                    nl = nd->kind.payload.Stmt.value.loc;
+            }
+        }
+        else if (nd->kind.tag == NodeKind::Param)
+        {
+            if (nd->kind.payload.Param.value.name == sid) nl = nd->kind.payload.Param.value.loc;
+        }
+        else if (nd->kind.tag == NodeKind::Pat)
+        {
+            if (nd->kind.payload.Pat.value.kind.tag == PatKind::Ident)
+            {
+                if (nd->kind.payload.Pat.value.kind.payload.Ident.name == sid)
+                    nl = nd->kind.payload.Pat.value.loc;
+            }
+        }
+        if (nl.data == 0) continue;
+        if (locFile(nl) != 0) continue;
+        if (locLine(nl) > line1) continue;
+        u32 ln = locLine(nl);
+        u32 cc = locCol(nl);
+        if (best.index == 0 || ln > bestLine || (ln == bestLine && cc > bestCol))
+        {
+            best.index = id;
+            bestLine = ln;
+            bestCol = cc;
+        }
+    }
+    return best;
+}
+
+/* declaration site of the symbol under (line0, char0); single Location */
+JsonValue lspDefinitionResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
+{
+    if (d->unit.ctx == null || d->unit.sema == null) return JsonValue::nullVal();
+    u8* base = d->text.asU8();
+    usize n = d->text.len;
+
+    usize pos = 0;
+    i64 ln = 0;
+    while (pos < n && ln < line0)
+    {
+        if (base[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line0) return JsonValue::nullVal();
+    usize lineStart = pos;
+    i64 c = 0;
+    while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
+    {
+        usize sz = (usize)lspUtf8Seq(base[pos]);
+        if (sz == 4) c = c + 2; else c = c + 1;
+        pos = pos + sz;
+    }
+
+    usize s = pos;
+    while (s > lineStart && lspWordByte(base[s - 1])) s--;
+    usize e = pos;
+    while (e < n && lspWordByte(base[e])) e++;
+    if (s == e) return JsonValue::nullVal();
+
+    u32 sid = d->unit.ctx.intern(str { .ptr = base + s, .len = e - s });
+    if (sid == 0) return JsonValue::nullVal();
+    NodeId declId;
+    declId.index = 0;
+    Symbol* sym = d->unit.sema.scopes.lookupFrom(sid, 0);
+    if (sym != null) declId = sym->declaration;
+    if (declId.index == 0) declId = lspLocalDecl(d, sid, (u32)line0 + 1);
+    if (declId.index == 0) return JsonValue::nullVal();
+    if (declId.index >= d->unit.ctx.nodesLen) return JsonValue::nullVal();
+    Node* dn = d->unit.ctx.nodes + declId.index;
+
+    SourceLoc nl;
+    nl.data = 0;
+    if (dn->kind.tag == NodeKind::Decl)
+    {
+        nl = dn->kind.payload.Decl.value.nameLoc;
+        if (nl.data == 0) nl = dn->kind.payload.Decl.value.loc;
+    }
+    else if (dn->kind.tag == NodeKind::Stmt)
+    {
+        if (dn->kind.payload.Stmt.value.kind.tag == StmtKind::VarDecl)
+            nl = dn->kind.payload.Stmt.value.kind.payload.VarDecl.nameLoc;
+        if (nl.data == 0) nl = dn->kind.payload.Stmt.value.loc;
+    }
+    else if (dn->kind.tag == NodeKind::Param) { nl = dn->kind.payload.Param.value.loc; }
+    else if (dn->kind.tag == NodeKind::Field) { nl = dn->kind.payload.Field.value.loc; }
+    else if (dn->kind.tag == NodeKind::Pat) { nl = dn->kind.payload.Pat.value.loc; }
+    else { nl = dn->loc; }
+    if (nl.data == 0) return JsonValue::nullVal();
+
+    u32 fileId = locFile(nl);
+    JsonValue uriV;
+    if (fileId == 0)
+    {
+        uriV = JsonValue::stringVal(String::from(d->uri.asView()));
+    }
+    else
+    {
+        if (d->unit.engineObj == null) return JsonValue::nullVal();
+        if (fileId >= d->unit.engineObj->fileCount) return JsonValue::nullVal();
+        uriV = lspFileUri(d->unit.engineObj->filePaths.at((usize)fileId), rootPath);
+    }
+
+    i64 line0t = locLine(nl) > 0 ? (i64)locLine(nl) - 1 : 0;
+    i64 col0t = locCol(nl) > 0 ? (i64)locCol(nl) - 1 : 0;
+    i64 ucol = lspFileCol(d, fileId, (u32)(line0t + 1), col0t);
+    i64 width = lspUtf16Len(str { .ptr = base + s, .len = e - s });
+
+    JsonValue range = lspObj();
+    JsonValue start = lspObj();
+    lspPut(&start, "line", JsonValue::i64Val(line0t));
+    lspPut(&start, "character", JsonValue::i64Val(ucol));
+    JsonValue end = lspObj();
+    lspPut(&end, "line", JsonValue::i64Val(line0t));
+    lspPut(&end, "character", JsonValue::i64Val(ucol + width));
+    lspPut(&range, "start", start);
+    lspPut(&range, "end", end);
+
+    JsonValue res = lspObj();
+    lspPut(&res, "uri", uriV);
+    lspPut(&res, "range", range);
+    return res;
+}
+
 /* ── server ────────────────────────────────────────────────────────── */
 
 JsonValue lspInitializeResult()
@@ -523,6 +892,7 @@ JsonValue lspInitializeResult()
     // 1 = full sync: every didChange carries the whole buffer
     lspPut(&caps, "textDocumentSync", JsonValue::i64Val(1));
     lspPut(&caps, "hoverProvider", JsonValue::boolVal(true));
+    lspPut(&caps, "definitionProvider", JsonValue::boolVal(true));
     JsonValue info = lspObj();
     lspPut(&info, "name", JsonValue::stringVal(String::from("coralc")));
     lspPut(&info, "version", JsonValue::stringVal(String::from("0.1.0")));
@@ -532,36 +902,8 @@ JsonValue lspInitializeResult()
     return res;
 }
 
-Slice lspReadFileSlice(str path, usize* outLen)
-{
-    String pz = String::from(path);
-    i32 fd = open((const cchar*)pz.asU8(), 0, 0);
-    if (fd < 0) return Slice::from(null, 0);
-    usize cap = 65536;
-    usize len = 0;
-    u8* buf = alloc<u8>(cap);
-    if (buf == null) { close(fd); return Slice::from(null, 0); }
-    while (true)
-    {
-        if (len == cap)
-        {
-            cap = cap * 2;
-            buf = realloc<u8>(buf, cap);
-            if (buf == null) { close(fd); return Slice::from(null, 0); }
-        }
-        i64 r = read(fd, buf + len, cap - len);
-        if (r <= 0) break;
-        len = len + (usize)r;
-    }
-    close(fd);
-    *outLen = len;
-    return Slice::from(buf, len);
-}
-
 pub i32 runServer(Slice buildFile, bool buildFileSet)
 {
-    i32 outFd = lspSilenceStdout();
-
     /* best-effort module table from the build file: this is what makes
      * imports resolve across files (diagnostics then cover the whole
      * project, not just the open buffer) */
@@ -570,24 +912,28 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
     Slice* modKeys = null;
     Slice* modVals = null;
     u32 modLen = 0;
+    Slice entrySlice = Slice::from(null, 0);
     {
-        Slice bf = buildFileSet ? buildFile : Slice::fromStr("coral.crlb");
-        usize blen = 0;
-        Slice bsrc = lspReadFileSlice(bf.asStr(), &blen);
-        if (bsrc.ptr != null)
+        str bfPath = Slice::fromStr("coral.crlb").asStr();
+        if (buildFileSet) bfPath = buildFile.asStr();
+        Result<String, IoError> bfres = readFileToString(bfPath);
+        if (bfres.isOk())
         {
+            String bsrc = bfres.unwrap();
             CrlbParser p;
-            p.init(&arena, bsrc);
+            p.init(&arena, Slice::from(bsrc.ptr, bsrc.len));
+            p.quiet = true;
             CrlbNode* root = p.parseFile();
             if (root != null && p.errors == 0)
             {
                 Builder b;
-                i32 errs = builderRunEx(root, &arena, false, true, true, &b);
+                i32 errs = builderRunEx(root, &arena, false, true, true, true, &b);
                 if (errs == 0 && b.modKeys != null)
                 {
                     modKeys = b.modKeys;
                     modVals = b.modVals;
                     modLen = b.modLen;
+                    entrySlice = b.entryPath;
                 }
             }
         }
@@ -601,14 +947,31 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         di++;
     }
 
+    bool initialized = false;
+    bool shutdownReceived = false;
+    /* base for relative paths in diagnostics: from initialize's rootUri */
+    String rootPath = String::new();
+    /* files the last project-wide report published records for */
+    String pubFiles[128];
+    u32 pubCount = 0;
+
     while (true)
     {
-        i32 len = lspReadContentLength(0);
+        i32 len = lspReadContentLength();
         if (len < 0) return 0;
         if (len > 16777216) return 0;
         u8* body = alloc<u8>((usize)len + 1);
         if (body == null) return 3;
-        if (!lspReadExact(0, body, (usize)len))
+        usize off = 0;
+        bool eof = false;
+        while (off < (usize)len)
+        {
+            u8 c = readChar();
+            if (c == 0) { eof = true; break; }
+            body[off] = c;
+            off++;
+        }
+        if (eof)
         {
             dealloc<u8>(body);
             return 0;
@@ -618,32 +981,96 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         Result<JsonValue, ParseError> pr = parseJson(str { .ptr = body, .len = (usize)len });
         if (pr.isErr())
         {
+            JsonValue resp = lspErrResp(null, -32700, "parse error");
+            lspSend(&resp);
             dealloc<u8>(body);
             continue;
         }
         JsonValue msg = pr.unwrap();
 
+        if (msg.type != JsonType::Object)
+        {
+            JsonValue resp = lspErrResp(null, -32600, "invalid request");
+            lspSend(&resp);
+            dealloc<u8>(body);
+            continue;
+        }
+
         str method = jStr(jGet(&msg, "method"));
         JsonValue* id = jGet(&msg, "id");
         JsonValue* params = jGet(&msg, "params");
 
+        if (method.len == 0)
+        {
+            JsonValue resp = lspErrResp(id, -32600, "invalid request");
+            lspSend(&resp);
+            dealloc<u8>(body);
+            continue;
+        }
+
+        if (!initialized)
+        {
+            if (method.equals("initialize"))
+            {
+                initialized = true;
+                str rootUri = jStr(jGet(params, "rootUri"));
+                if (rootUri.len > 0) rootPath = lspUriToPath(rootUri);
+                JsonValue resp = lspResp(id, lspInitializeResult());
+                lspSend(&resp);
+            }
+            else if (method.equals("exit"))
+            {
+                // exit before shutdown: nonzero per the spec
+                dealloc<u8>(body);
+                return 1;
+            }
+            else if (id != null)
+            {
+                JsonValue resp = lspErrResp(id, -32002, "server not initialized");
+                lspSend(&resp);
+            }
+            // every other notification is dropped until initialize
+            dealloc<u8>(body);
+            continue;
+        }
+
+        if (shutdownReceived)
+        {
+            if (method.equals("exit"))
+            {
+                dealloc<u8>(body);
+                return 0;
+            }
+            // requests after shutdown are invalid; notifications dropped
+            if (id != null)
+            {
+                JsonValue resp = lspErrResp(id, -32600, "invalid request");
+                lspSend(&resp);
+            }
+            dealloc<u8>(body);
+            continue;
+        }
+
         if (method.equals("initialize"))
         {
-            JsonValue resp = lspResp(id, lspInitializeResult());
-            lspSend(outFd, &resp);
+            // initialize may be sent only once
+            JsonValue resp = lspErrResp(id, -32600, "invalid request");
+            lspSend(&resp);
         }
         else if (method.equals("initialized"))
         {
         }
         else if (method.equals("shutdown"))
         {
+            shutdownReceived = true;
             JsonValue resp = lspResp(id, JsonValue::nullVal());
-            lspSend(outFd, &resp);
+            lspSend(&resp);
         }
         else if (method.equals("exit"))
         {
+            // without shutdown: nonzero per the spec
             dealloc<u8>(body);
-            return 0;
+            return 1;
         }
         else if (method.equals("textDocument/didOpen"))
         {
@@ -656,10 +1083,15 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                 usize fi = 0;
                 while (fi < 16)
                 {
-                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    /* nested on purpose: a method call on the right of
+                     * `&&` is hoisted before the null check today */
+                    if (docs[fi] != null)
                     {
-                        slot = fi;
-                        break;
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            slot = fi;
+                            break;
+                        }
                     }
                     fi++;
                 }
@@ -684,7 +1116,17 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                     freeUnit(&d->unit);
                     d->text.free();
                     d->text = String::from(text);
-                    lspAnalyze(outFd, d, modKeys, modVals, modLen);
+                    str docRoot = lspDocRoot(d, rootPath.asView());
+                    lspAnalyze(d, modKeys, modVals, modLen, docRoot);
+                    /* then the whole-project report, so errors in files
+                     * this buffer never imports still show up */
+                    if (entrySlice.ptr != null)
+                    {
+                        String entryAbs = lspMakeAbs(entrySlice.asStr(), docRoot);
+                        lspProjectReport(entryAbs.asView(), modKeys, modVals, modLen, docRoot,
+                                         d->path.asView(), d->uri.asView(), pubFiles, &pubCount);
+                        entryAbs.free();
+                    }
                 }
             }
         }
@@ -693,20 +1135,34 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
             JsonValue* td = jGet(params, "textDocument");
             str uri = jStr(jGet(td, "uri"));
             JsonValue* changes = jGet(params, "contentChanges");
-            if (uri.len > 0 && changes != null && changes->type == JsonType::Array && changes->arrVal.count() > 0)
+            bool hasChange = false;
+            if (uri.len > 0)
+            {
+                if (changes != null)
+                {
+                    if (changes->type == JsonType::Array)
+                    {
+                        if (changes->arrVal.count() > 0) hasChange = true;
+                    }
+                }
+            }
+            if (hasChange)
             {
                 str text = jStr(jGet(changes->arrVal.atPtr(0), "text"));
                 usize fi = 0;
                 while (fi < 16)
                 {
-                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    if (docs[fi] != null)
                     {
-                        LspDoc* d = docs[fi];
-                        freeUnit(&d->unit);
-                        d->text.free();
-                        d->text = String::from(text);
-                        lspAnalyze(outFd, d, modKeys, modVals, modLen);
-                        break;
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            LspDoc* d = docs[fi];
+                            freeUnit(&d->unit);
+                            d->text.free();
+                            d->text = String::from(text);
+                            lspAnalyze(d, modKeys, modVals, modLen, lspDocRoot(d, rootPath.asView()));
+                            break;
+                        }
                     }
                     fi++;
                 }
@@ -719,14 +1175,19 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
             usize fi = 0;
             while (fi < 16)
             {
-                if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                if (docs[fi] != null)
                 {
-                    lspDocFree(docs[fi]);
-                    docs[fi] = null;
-                    break;
+                    if (docs[fi]->uri.asView().equals(uri))
+                    {
+                        lspDocFree(docs[fi]);
+                        docs[fi] = null;
+                        break;
+                    }
                 }
                 fi++;
             }
+            // closing a document clears its markers
+            if (uri.len > 0) lspPublishEmpty(uri);
         }
         else if (method.equals("textDocument/hover"))
         {
@@ -741,16 +1202,53 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                 usize fi = 0;
                 while (fi < 16)
                 {
-                    if (docs[fi] != null && docs[fi]->uri.asView().equals(uri))
+                    if (docs[fi] != null)
                     {
-                        res = lspHoverResult(docs[fi], line0, char0);
-                        break;
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            res = lspHoverResult(docs[fi], line0, char0);
+                            break;
+                        }
                     }
                     fi++;
                 }
             }
-            JsonValue resp = lspResp(id, res);
-            lspSend(outFd, &resp);
+            if (id != null)
+            {
+                JsonValue resp = lspResp(id, res);
+                lspSend(&resp);
+            }
+        }
+        else if (method.equals("textDocument/definition"))
+        {
+            JsonValue* td = jGet(params, "textDocument");
+            str uri = jStr(jGet(td, "uri"));
+            JsonValue* posn = jGet(params, "position");
+            i64 line0 = jInt(jGet(posn, "line"), 0);
+            i64 char0 = jInt(jGet(posn, "character"), 0);
+            JsonValue res = JsonValue::nullVal();
+            if (uri.len > 0)
+            {
+                usize fi = 0;
+                while (fi < 16)
+                {
+                    if (docs[fi] != null)
+                    {
+                        if (docs[fi]->uri.asView().equals(uri))
+                        {
+                            res = lspDefinitionResult(docs[fi], line0, char0,
+                                                      lspDocRoot(docs[fi], rootPath.asView()));
+                            break;
+                        }
+                    }
+                    fi++;
+                }
+            }
+            if (id != null)
+            {
+                JsonValue resp = lspResp(id, res);
+                lspSend(&resp);
+            }
         }
         else if (method.equals("$/cancelRequest"))
         {
@@ -758,7 +1256,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         else if (id != null)
         {
             JsonValue resp = lspErrResp(id, -32601, "method not found");
-            lspSend(outFd, &resp);
+            lspSend(&resp);
         }
 
         dealloc<u8>(body);
