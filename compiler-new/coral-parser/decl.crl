@@ -327,17 +327,35 @@ pub extend Parser
             self.advance();
             NodeListBuilder params;
             self.ctx.nodeListInit(&params);
-            if (self.current.kind != TokenKind::RParen)
+            if (self.current.kind == TokenKind::LBrace || self.current.kind == TokenKind::Eof)
             {
-                NodeId param = self.parseParam();
-                if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
-                while (self.match(TokenKind::Comma))
-                {
-                    param = self.parseParam();
-                    if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
-                }
+                /* `main(` running straight into the body: name the
+                 * function and the missing ')' instead of cascading
+                 * through "expected a type" */
+                String msg = String::new();
+                msg.pushView("expected ')' to close the parameter list of '");
+                if (name != 0 && name < self.ctx.internsLen)
+                    msg.pushView(str { .ptr = self.ctx.interns[name].ptr, .len = self.ctx.interns[name].len });
+                msg.pushView("', found '");
+                if (self.current.kind == TokenKind::LBrace) msg.pushView("{");
+                else msg.pushView("<eof>");
+                msg.pushView("'");
+                self.reportError(ErrorCode::ParseExpectedToken, self.current, msg.asView());
             }
-            self.expect(TokenKind::RParen);
+            else
+            {
+                if (self.current.kind != TokenKind::RParen)
+                {
+                    NodeId param = self.parseParam();
+                    if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
+                    while (self.match(TokenKind::Comma))
+                    {
+                        param = self.parseParam();
+                        if (!self.ctx.nodeListAppend(&params, param)) self.reportAllocFailed();
+                    }
+                }
+                self.expect(TokenKind::RParen);
+            }
             // `const` qualifier after the parameter list: const method
             if (self.match(TokenKind::Const)) flags |= 16;
             u32 paramCount = params.len;

@@ -20,14 +20,15 @@ import build {
     builder { Builder, builderRunEx }
 };
 import sem::analyze { CompileUnit, analyzeForCompile, freeUnit };
-import sem { scope { Symbol }, sema { Sema } };
+import sem { scope { Symbol }, sema { Sema }, member { MemberInfo } };
 import diag::engine { DiagList, DiagRecord };
+import diag::error { helpFor };
 import ast::id { SourceLoc, NodeId, locFile, locLine, locCol };
 import ast::types { Ty };
 import ast::node { Node, NodeKind };
 import ast::expr { Expr, ExprKind };
 import ast::stmt { Stmt, StmtKind };
-import ast::decl { Decl, Param, Field };
+import ast::decl { Decl, DeclKind, Param, Field };
 import ast::pat { Pat, PatKind };
 
 import(lib) std::mman { alloc, dealloc };
@@ -383,8 +384,24 @@ JsonValue lspDiagItem(DiagRecord* r)
     JsonValue d = lspObj();
     lspPut(&d, "range", lspDiagRange(r));
     lspPut(&d, "severity", JsonValue::i64Val(lspSeverity(r->level.asView())));
+    if (r->code.len > 0)
+        lspPut(&d, "code", JsonValue::stringVal(String::from(r->code.asView())));
     lspPut(&d, "source", JsonValue::stringVal(String::from("coral")));
-    lspPut(&d, "message", JsonValue::stringVal(lspMsgFriendly(r->message)));
+    /* the help line is part of the diagnostic: editors get the full
+     * message so models can act on it, not just restate it. Records
+     * only carry help when a call site passed one; otherwise fall back
+     * to the per-code default the CLI renderer uses. */
+    String msg = lspMsgFriendly(r->message);
+    str dflt = str::empty();
+    if (r->help.len > 0) dflt = r->help.asView();
+    else dflt = helpFor(r->code.asView());
+    if (dflt.len > 0)
+    {
+        String h = lspMsgFriendly(String::from(dflt));
+        msg.pushView("\n\n");
+        msg.pushStr(&h);
+    }
+    lspPut(&d, "message", JsonValue::stringVal(msg));
     return d;
 }
 
@@ -601,6 +618,699 @@ i32 lspExprRank(ExprKind k)
     }
 }
 
+/* intern id -> text; empty when 0 or out of range */
+str lspInternText(LspDoc* d, Str id)
+{
+    if (id == 0 || id >= d->unit.ctx.internsLen) return str::empty();
+    return str { .ptr = d->unit.ctx.interns[id].ptr, .len = d->unit.ctx.interns[id].len };
+}
+
+/* append tySpelling(ty) to s; shares the caller's scratch buffer */
+void lspPushType(String* s, LspDoc* d, Ty ty, u8* buf, usize cap)
+{
+    if (ty == 0) { s.pushView("?"); return; }
+    u8* sp = d->unit.sema.tySpelling(ty, buf, cap);
+    usize n = 0;
+    while (sp[n] != 0) n++;
+    s.pushView(str { .ptr = sp, .len = n });
+}
+
+/* identifier under the cursor: text view, byte length, intern id */
+bool lspWordAt(LspDoc* d, i64 line0, i64 char0, u8** outPtr, usize* outLen, u32* outSid)
+{
+    if (d->unit.ctx == null) return false;
+    u8* base = d->text.asU8();
+    usize n = d->text.len;
+
+    usize pos = 0;
+    i64 ln = 0;
+    while (pos < n && ln < line0)
+    {
+        if (base[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line0) return false;
+    usize lineStart = pos;
+    i64 c = 0;
+    while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
+    {
+        usize sz = (usize)lspUtf8Seq(base[pos]);
+        if (sz == 4) c = c + 2; else c = c + 1;
+        pos = pos + sz;
+    }
+
+    usize s = pos;
+    while (s > lineStart && lspWordByte(base[s - 1])) s--;
+    usize e = pos;
+    while (e < n && lspWordByte(base[e])) e++;
+    if (s == e) return false;
+
+    u32 sid = d->unit.ctx.intern(str { .ptr = base + s, .len = e - s });
+    if (sid == 0) return false;
+    outPtr[0] = base + s;
+    outLen[0] = e - s;
+    outSid[0] = sid;
+    return true;
+}
+
+/* clang-style one-liner for a declaration: `i32 bogus(i32 a)`, `struct Foo`,
+ * `i32 v`; empty when the kind has nothing useful to show */
+String lspDeclDetail(LspDoc* d, Decl* decl, u8* buf, usize cap)
+{
+    String s = String::new();
+    switch (decl->kind.tag)
+    {
+        DeclKind::Func => {
+            lspPushType(&s, d, decl->kind.payload.Func.returnType, buf, cap);
+            s.pushView(" ");
+            s.pushView(lspInternText(d, decl->kind.payload.Func.name));
+            s.pushView("(");
+            u32 i = 0;
+            while (i < decl->kind.payload.Func.paramsLen)
+            {
+                if (i > 0) s.pushView(", ");
+                u32 pid = decl->kind.payload.Func.params[i].index;
+                Param p = (d->unit.ctx.nodes + pid)->kind.payload.Param.value;
+                if ((p.flags & 1) != 0) s.pushView("self");
+                else if ((p.flags & 16) != 0) s.pushView("...");
+                else
+                {
+                    lspPushType(&s, d, p.typeNode, buf, cap);
+                    if (p.name != 0)
+                    {
+                        s.pushView(" ");
+                        s.pushView(lspInternText(d, p.name));
+                    }
+                }
+                i++;
+            }
+            s.pushView(")");
+        },
+        DeclKind::Constant => {
+            lspPushType(&s, d, decl->kind.payload.Constant.typeNode, buf, cap);
+            s.pushView(" ");
+            s.pushView(lspInternText(d, decl->kind.payload.Constant.name));
+        },
+        DeclKind::Struct => { s.pushView("struct "); s.pushView(lspInternText(d, decl->kind.payload.Struct.name)); },
+        DeclKind::Enum => { s.pushView("enum "); s.pushView(lspInternText(d, decl->kind.payload.Enum.name)); },
+        DeclKind::Variant => { s.pushView("variant "); s.pushView(lspInternText(d, decl->kind.payload.Variant.name)); },
+        DeclKind::Union => { s.pushView("union "); s.pushView(lspInternText(d, decl->kind.payload.Union.name)); },
+        DeclKind::Trait => { s.pushView("trait "); s.pushView(lspInternText(d, decl->kind.payload.Trait.name)); },
+        DeclKind::TypeAlias => { s.pushView("type "); s.pushView(lspInternText(d, decl->kind.payload.TypeAlias.name)); },
+        DeclKind::Distinct => { s.pushView("distinct "); s.pushView(lspInternText(d, decl->kind.payload.Distinct.name)); },
+        else => {}
+    }
+    return s;
+}
+
+/* "what it is": one word for the hover card's first line */
+str lspDeclKindText(LspDoc* d, Decl* decl)
+{
+    switch (decl->kind.tag)
+    {
+        DeclKind::Func => {
+            if (decl->kind.payload.Func.paramsLen > 0)
+            {
+                u32 pid = decl->kind.payload.Func.params[0].index;
+                if (pid != 0 && pid < d->unit.ctx.nodesLen)
+                {
+                    Node* pn = d->unit.ctx.nodes + pid;
+                    if (pn->kind.tag == NodeKind::Param && (pn->kind.payload.Param.value.flags & 1) != 0)
+                    {
+                        if ((decl->kind.payload.Func.flags & 16) != 0) return "const method";
+                        return "method";
+                    }
+                }
+            }
+            return "function";
+        },
+        DeclKind::Constant => { return "constant"; },
+        DeclKind::Struct => { return "struct"; },
+        DeclKind::Enum => { return "enum"; },
+        DeclKind::Variant => { return "variant"; },
+        DeclKind::Union => { return "union"; },
+        DeclKind::Trait => { return "trait"; },
+        DeclKind::TypeAlias => { return "type alias"; },
+        DeclKind::Distinct => { return "distinct type"; },
+        DeclKind::Flag => { return "flag"; },
+        DeclKind::Comptime => { return "comptime block"; },
+        else => { return "item"; }
+    }
+}
+
+str lspDeclName(LspDoc* d, Decl* decl)
+{
+    switch (decl->kind.tag)
+    {
+        DeclKind::Func => { return lspInternText(d, decl->kind.payload.Func.name); },
+        DeclKind::Constant => { return lspInternText(d, decl->kind.payload.Constant.name); },
+        DeclKind::Struct => { return lspInternText(d, decl->kind.payload.Struct.name); },
+        DeclKind::Enum => { return lspInternText(d, decl->kind.payload.Enum.name); },
+        DeclKind::Variant => { return lspInternText(d, decl->kind.payload.Variant.name); },
+        DeclKind::Union => { return lspInternText(d, decl->kind.payload.Union.name); },
+        DeclKind::Trait => { return lspInternText(d, decl->kind.payload.Trait.name); },
+        DeclKind::TypeAlias => { return lspInternText(d, decl->kind.payload.TypeAlias.name); },
+        DeclKind::Distinct => { return lspInternText(d, decl->kind.payload.Distinct.name); },
+        DeclKind::Flag => { return lspInternText(d, decl->kind.payload.Flag.flagName); },
+        else => { return str::empty(); }
+    }
+}
+
+/* which module a declaration comes from: the part under /lib/ for std,
+ * otherwise the path relative to the project root */
+str lspShortPath(LspDoc* d, u32 fileId, str rootPath)
+{
+    if (d->unit.engineObj == null || fileId >= d->unit.engineObj->fileCount) return str::empty();
+    str full = d->unit.engineObj->filePaths.at((usize)fileId);
+    usize i = 0;
+    while (i + 5 <= full.len)
+    {
+        if (full.ptr[i] == 47 && full.ptr[i + 1] == 108 && full.ptr[i + 2] == 105 &&
+            full.ptr[i + 3] == 98 && full.ptr[i + 4] == 47)
+            return str { .ptr = full.ptr + i + 5, .len = full.len - (i + 5) };
+        i++;
+    }
+    if (rootPath.len > 0 && full.len > rootPath.len)
+    {
+        usize j = 0;
+        bool pref = true;
+        while (j < rootPath.len)
+        {
+            if (full.ptr[j] != rootPath.ptr[j]) { pref = false; break; }
+            j++;
+        }
+        if (pref && full.ptr[rootPath.len] == 47)
+            return str { .ptr = full.ptr + rootPath.len + 1, .len = full.len - rootPath.len - 1 };
+    }
+    return full;
+}
+
+/* clang-style card for a top-level declaration: kind + name, where it is
+ * from, its type, then the declaration echo in a coral block */
+String lspDeclCard(LspDoc* d, Decl* decl, u32 fileId, str rootPath, u8* buf, usize cap)
+{
+    String s = String::new();
+    str kind = lspDeclKindText(d, decl);
+    if (kind.len > 0) { s.pushView(kind); s.pushView(" "); }
+    s.pushView(lspDeclName(d, decl));
+    s.pushView("\nprovided by ");
+    if (fileId == 0) s.pushView("this file");
+    else
+    {
+        str sp = lspShortPath(d, fileId, rootPath);
+        if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
+    }
+    s.pushView("\nType: ");
+    if (decl->kind.tag == DeclKind::Func)
+    {
+        lspPushType(&s, d, decl->kind.payload.Func.returnType, buf, cap);
+        s.pushView("(");
+        u32 i = 0;
+        while (i < decl->kind.payload.Func.paramsLen)
+        {
+            if (i > 0) s.pushView(", ");
+            u32 pid = decl->kind.payload.Func.params[i].index;
+            Param p = (d->unit.ctx.nodes + pid)->kind.payload.Param.value;
+            if ((p.flags & 1) != 0) s.pushView("self");
+            else if ((p.flags & 16) != 0) s.pushView("...");
+            else lspPushType(&s, d, p.typeNode, buf, cap);
+            i++;
+        }
+        s.pushView(")");
+    }
+    else if (decl->kind.tag == DeclKind::Constant)
+    {
+        lspPushType(&s, d, decl->kind.payload.Constant.typeNode, buf, cap);
+    }
+    else if (decl->kind.tag == DeclKind::Struct || decl->kind.tag == DeclKind::Union)
+    {
+        NodeId* fields = decl->kind.payload.Struct.fields;
+        u32 fc = decl->kind.payload.Struct.fieldsLen;
+        if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fc = decl->kind.payload.Union.fieldsLen;
+        }
+        s.pushView(kind);
+        s.pushView(" ");
+        s.pushView(lspDeclName(d, decl));
+        if (fc > 0)
+        {
+            s.pushView("\ndeclares ");
+            d->unit.sema.pushDec(&s, (u64)fc);
+            s.pushView(fc == 1 ? " field: " : " fields: ");
+            u32 i = 0;
+            while (i < fc && i < 10)
+            {
+                if (i > 0) s.pushView(", ");
+                Node* fn2 = d->unit.ctx.nodes + fields[i].index;
+                if (fn2->kind.tag == NodeKind::Field)
+                {
+                    s.pushView(lspInternText(d, fn2->kind.payload.Field.value.name));
+                    s.pushView(": ");
+                    lspPushType(&s, d, fn2->kind.payload.Field.value.typeNode, buf, cap);
+                }
+                i++;
+            }
+            if (fc > 10) s.pushView(", ...");
+        }
+        else s.pushView("\nno fields");
+    }
+    else if (decl->kind.tag == DeclKind::Enum)
+    {
+        u32 cases = decl->kind.payload.Enum.variantsLen;
+        s.pushView("enum ");
+        s.pushView(lspDeclName(d, decl));
+        if (cases > 0)
+        {
+            s.pushView("\ndeclares ");
+            d->unit.sema.pushDec(&s, (u64)cases);
+            s.pushView(cases == 1 ? " case" : " cases");
+        }
+    }
+    else if (decl->kind.tag == DeclKind::Variant)
+    {
+        u32 cases = decl->kind.payload.Variant.variantsLen;
+        s.pushView("variant ");
+        s.pushView(lspDeclName(d, decl));
+        if (cases > 0)
+        {
+            s.pushView("\ndeclares ");
+            d->unit.sema.pushDec(&s, (u64)cases);
+            s.pushView(cases == 1 ? " case: " : " cases: ");
+            u32 i = 0;
+            while (i < cases && i < 10)
+            {
+                if (i > 0) s.pushView(", ");
+                s.pushView(lspInternText(d, decl->kind.payload.Variant.variants[i].name));
+                i++;
+            }
+            if (cases > 10) s.pushView(", ...");
+        }
+    }
+    else if (decl->kind.tag == DeclKind::Trait)
+    {
+        s.pushView("trait ");
+        s.pushView(lspDeclName(d, decl));
+    }
+    else if (decl->kind.tag == DeclKind::TypeAlias)
+    {
+        s.pushView("type ");
+        s.pushView(lspDeclName(d, decl));
+        s.pushView(" = ");
+        lspPushType(&s, d, decl->kind.payload.TypeAlias.target, buf, cap);
+    }
+    else if (decl->kind.tag == DeclKind::Distinct)
+    {
+        s.pushView("distinct ");
+        s.pushView(lspDeclName(d, decl));
+        s.pushView(" = ");
+        lspPushType(&s, d, decl->kind.payload.Distinct.baseType, buf, cap);
+    }
+    String echo = lspDeclDetail(d, decl, buf, cap);
+    if (echo.len > 0)
+    {
+        s.pushView("\n\n```coral\n");
+        s.pushView(echo.asView());
+        s.pushView("\n```");
+    }
+    return s;
+}
+
+/* card for locals/params, matched through lspLocalDecl: they are gone
+ * from the scope stack once analysis finishes */
+String lspLocalCard(LspDoc* d, NodeId declId, u8* buf, usize cap)
+{
+    String none = String::new();
+    if (declId.index == 0 || declId.index >= d->unit.ctx.nodesLen) return none;
+    Node* nd = d->unit.ctx.nodes + declId.index;
+    if (nd->kind.tag == NodeKind::Stmt)
+    {
+        Stmt st = nd->kind.payload.Stmt.value;
+        if (st.kind.tag == StmtKind::VarDecl)
+        {
+            String s = String::new();
+            s.pushView("variable ");
+            s.pushView(lspInternText(d, st.kind.payload.VarDecl.name));
+            s.pushView("\nprovided by this file\nType: ");
+            lspPushType(&s, d, st.kind.payload.VarDecl.typeNode, buf, cap);
+            s.pushView("\n\n```coral\n");
+            if ((st.kind.payload.VarDecl.flags & 1) != 0) s.pushView("const ");
+            lspPushType(&s, d, st.kind.payload.VarDecl.typeNode, buf, cap);
+            s.pushView(" ");
+            s.pushView(lspInternText(d, st.kind.payload.VarDecl.name));
+            s.pushView("\n```");
+            return s;
+        }
+        if (st.kind.tag == StmtKind::ForIn)
+        {
+            String s = String::new();
+            s.pushView("variable ");
+            s.pushView(lspInternText(d, st.kind.payload.ForIn.bindName));
+            s.pushView("\nprovided by this file\n\n```coral\n");
+            s.pushView(lspInternText(d, st.kind.payload.ForIn.bindName));
+            s.pushView("\n```");
+            return s;
+        }
+    }
+    if (nd->kind.tag == NodeKind::Param)
+    {
+        Param p = nd->kind.payload.Param.value;
+        String s = String::new();
+        s.pushView("parameter ");
+        if ((p.flags & 1) != 0) s.pushView("self");
+        else s.pushView(lspInternText(d, p.name));
+        s.pushView("\nprovided by this file\nType: ");
+        lspPushType(&s, d, p.typeNode, buf, cap);
+        s.pushView("\n\n```coral\n");
+        lspPushType(&s, d, p.typeNode, buf, cap);
+        s.pushView(" ");
+        s.pushView(lspInternText(d, p.name));
+        s.pushView("\n```");
+        return s;
+    }
+    if (nd->kind.tag == NodeKind::Pat)
+    {
+        Pat pt = nd->kind.payload.Pat.value;
+        if (pt.kind.tag == PatKind::Ident)
+        {
+            String s = String::new();
+            s.pushView("variable ");
+            s.pushView(lspInternText(d, pt.kind.payload.Ident.name));
+            s.pushView("\nprovided by this file");
+            return s;
+        }
+    }
+    return none;
+}
+
+/* card for a struct/variant field reached through `.name` */
+String lspFieldCard(LspDoc* d, MemberInfo mi, u8* namePtr, usize nameLen, str rootPath, u8* buf, usize cap)
+{
+    String s = String::new();
+    s.pushView("field ");
+    s.pushView(str { .ptr = namePtr, .len = nameLen });
+    if (mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
+    {
+        Node* fn2 = d->unit.ctx.nodes + mi.declaration.index;
+        s.pushView("\ndeclared in ");
+        u32 fid = locFile(fn2->loc);
+        if (fid == 0) s.pushView("this file");
+        else
+        {
+            str sp = lspShortPath(d, fid, rootPath);
+            if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
+        }
+    }
+    else
+    {
+        s.pushView("\nprovided by the type");
+    }
+    s.pushView("\nType: ");
+    lspPushType(&s, d, mi.typeNode, buf, cap);
+    if (mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
+    {
+        Node* fn2 = d->unit.ctx.nodes + mi.declaration.index;
+        if (fn2->kind.tag == NodeKind::Field)
+        {
+            Field fv = fn2->kind.payload.Field.value;
+            s.pushView("\n\n```coral\n");
+            lspPushType(&s, d, fv.typeNode, buf, cap);
+            s.pushView(" ");
+            s.pushView(str { .ptr = namePtr, .len = nameLen });
+            s.pushView("\n```");
+        }
+    }
+    else
+    {
+        s.pushView("\n\n```coral\n");
+        lspPushType(&s, d, mi.typeNode, buf, cap);
+        s.pushView(" ");
+        s.pushView(str { .ptr = namePtr, .len = nameLen });
+        s.pushView("\n```");
+    }
+    return s;
+}
+
+/* builtin scalar/aggregate types: what they are and how big they are */
+String lspBuiltinTypeCard(str w)
+{
+    String s = String::new();
+    if (w.equals("i8")) { s.pushView("type i8\n8-bit signed integer, 1 byte"); }
+    else if (w.equals("i16")) { s.pushView("type i16\n16-bit signed integer, 2 bytes"); }
+    else if (w.equals("i32")) { s.pushView("type i32\n32-bit signed integer, 4 bytes"); }
+    else if (w.equals("i64")) { s.pushView("type i64\n64-bit signed integer, 8 bytes"); }
+    else if (w.equals("isize")) { s.pushView("type isize\npointer-sized signed integer, 8 bytes on x86_64"); }
+    else if (w.equals("u8")) { s.pushView("type u8\n8-bit unsigned integer, 1 byte"); }
+    else if (w.equals("u16")) { s.pushView("type u16\n16-bit unsigned integer, 2 bytes"); }
+    else if (w.equals("u32")) { s.pushView("type u32\n32-bit unsigned integer, 4 bytes"); }
+    else if (w.equals("u64")) { s.pushView("type u64\n64-bit unsigned integer, 8 bytes"); }
+    else if (w.equals("usize")) { s.pushView("type usize\npointer-sized unsigned integer, 8 bytes on x86_64"); }
+    else if (w.equals("f32")) { s.pushView("type f32\n32-bit IEEE 754 floating point, 4 bytes"); }
+    else if (w.equals("f64")) { s.pushView("type f64\n64-bit IEEE 754 floating point, 8 bytes"); }
+    else if (w.equals("bool")) { s.pushView("type bool\ntrue / false, 1 byte"); }
+    else if (w.equals("cchar")) { s.pushView("type cchar\nC character, 1 byte (alias of u8)"); }
+    else if (w.equals("void")) { s.pushView("type void\nno value"); }
+    else if (w.equals("str")) { s.pushView("type str\nimmutable view of bytes: { ptr, len }, 16 bytes"); }
+    else if (w.equals("untyped")) { s.pushView("type untyped\nuntyped integer literal, inferred from context"); }
+    return s;
+}
+
+/* compiler builtins: @name(...) */
+String lspBuiltinCallCard(str w)
+{
+    String s = String::new();
+    if (w.equals("assert"))
+        s.pushView("builtin @assert\nruntime check: aborts with a message when the condition is false\n\n```coral\n@assert(cond, \"message\")\n```");
+    else if (w.equals("assertOut"))
+        s.pushView("builtin @assertOut\nlike @assert, but marks the failure path as unreachable (out-of-bounds guards)\n\n```coral\n@assertOut(cond, \"message\")\n```");
+    else if (w.equals("sizeof"))
+        s.pushView("builtin @sizeof\ntype size in bytes, evaluated at compile time\n\n```coral\n@sizeof(T)\n```");
+    else if (w.equals("typeof"))
+        s.pushView("builtin @typeof\ntype of an expression, usable in type position\n\n```coral\n@typeof(expr)\n```");
+    else if (w.equals("compileError"))
+        s.pushView("builtin @compileError\nfails the build with a message during monomorphization\n\n```coral\n@compileError(\"message\")\n```");
+    else if (w.equals("drop"))
+        s.pushView("builtin @drop\nruns a value's drop method here instead of at scope end\n\n```coral\n@drop(value)\n```");
+    else if (w.equals("toStr"))
+        s.pushView("builtin @toStr\ncompile-time stringification of an expression (debug output)");
+    else if (w.equals("isFormatLiteral"))
+        s.pushView("builtin @isFormatLiteral\ncompile-time check that an expression is a format string literal");
+    return s;
+}
+
+/* #[[attr]] channels: what each attribute means */
+String lspAttributeCard(str w)
+{
+    String s = String::new();
+    if (w.equals("no_drop_all"))
+        s.pushView("attribute no_drop_all\ndisables automatic drop-trait RAII for every value in this file\napplies to: the whole file\nstatus: parsed, not enforced yet");
+    else if (w.equals("no_drop"))
+        s.pushView("attribute no_drop\ndisables automatic drop-trait RAII for one variable or block\nstatus: parsed, not enforced yet");
+    else if (w.equals("packed"))
+        s.pushView("attribute packed\npacked struct layout: no padding between fields\nstatus: parsed, not enforced yet");
+    else if (w.equals("reorder"))
+        s.pushView("attribute reorder\nreorders struct fields for the most efficient layout\nstatus: parsed, not enforced yet");
+    else if (w.equals("inline"))
+        s.pushView("attribute inline\nhint that this function is worth inlining\nstatus: recognized by codegen");
+    else if (w.equals("const"))
+        s.pushView("attribute const\nmethod or function may not mutate self or its parameters");
+    else if (w.equals("condassign"))
+        s.pushView("attribute condassign\nallows `=` at the top level of the next condition (assignment in condition)");
+    else if (w.equals("fallthrough"))
+        s.pushView("attribute fallthrough\nswitch case continues into the next case instead of erroring");
+    else if (w.equals("generate"))
+        s.pushView("attribute generate(...)\ngenerates trait/impl boilerplate (derive); e.g. #[[generate(Drop, Eq)]]\nstatus: planned, not implemented");
+    else if (w.equals("deprecated"))
+        s.pushView("attribute deprecated\nmarks a declaration as deprecated; uses should warn");
+    return s;
+}
+
+/* `.field = value` in a struct literal has no receiver expression:
+ * find the field by name across struct/union decls */
+String lspOrphanFieldCard(LspDoc* d, u32 wsid, u8* namePtr, usize nameLen, str rootPath, u8* buf, usize cap)
+{
+    String none = String::new();
+    u32 hits = 0;
+    NodeId first;
+    first.index = 0;
+    Ty firstTy = 0;
+    u32 firstFile = 0;
+    u32 i = 1;
+    while (i < d->unit.ctx.nodesLen)
+    {
+        Node* nd = d->unit.ctx.nodes + i;
+        i++;
+        if (nd->kind.tag != NodeKind::Decl) continue;
+        Decl* decl = &nd->kind.payload.Decl.value;
+        NodeId* fields = null;
+        u32 fieldCount = 0;
+        if (decl->kind.tag == DeclKind::Struct)
+        {
+            fields = decl->kind.payload.Struct.fields;
+            fieldCount = decl->kind.payload.Struct.fieldsLen;
+        }
+        else if (decl->kind.tag == DeclKind::Union)
+        {
+            fields = decl->kind.payload.Union.fields;
+            fieldCount = decl->kind.payload.Union.fieldsLen;
+        }
+        if (fields == null) continue;
+        u32 j = 0;
+        while (j < fieldCount)
+        {
+            Node* fn2 = d->unit.ctx.nodes + fields[j].index;
+            j++;
+            if (fn2->kind.tag != NodeKind::Field) continue;
+            if (fn2->kind.payload.Field.value.name != wsid) continue;
+            hits++;
+            if (first.index == 0)
+            {
+                first = fields[j - 1];
+                firstTy = fn2->kind.payload.Field.value.typeNode;
+                firstFile = locFile(fn2->loc);
+            }
+        }
+    }
+    if (hits == 0) return none;
+    String s = String::new();
+    s.pushView("field ");
+    s.pushView(str { .ptr = namePtr, .len = nameLen });
+    s.pushView("\ndeclared in ");
+    if (firstFile == 0) s.pushView("this file");
+    else
+    {
+        str sp = lspShortPath(d, firstFile, rootPath);
+        if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
+    }
+    s.pushView("\nType: ");
+    lspPushType(&s, d, firstTy, buf, cap);
+    if (hits > 1)
+    {
+        s.pushView("\n\nmatches ");
+        d->unit.sema.pushDec(&s, (u64)hits);
+        s.pushView(" struct or union declarations");
+    }
+    return s;
+}
+
+/* literals describe themselves: value, size in bytes, character count */
+String lspLiteralCard(LspDoc* d, i64 line0, i64 char0)
+{
+    String none = String::new();
+    if (d->unit.ctx == null || d->unit.sema == null) return none;
+    u8* base = d->text.asU8();
+    usize n = d->text.len;
+    usize pos = 0;
+    i64 ln = 0;
+    while (pos < n && ln < line0)
+    {
+        if (base[pos] == 10) ln++;
+        pos++;
+    }
+    if (ln < line0) return none;
+    usize lineStart = pos;
+    i64 c = 0;
+    while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
+    {
+        usize sz = (usize)lspUtf8Seq(base[pos]);
+        if (sz == 4) c = c + 2; else c = c + 1;
+        pos = pos + sz;
+    }
+    u32 line1 = (u32)line0 + 1;
+    u32 i = 1;
+    while (i < d->unit.ctx.nodesLen)
+    {
+        Node* nd = d->unit.ctx.nodes + i;
+        i++;
+        if (nd->kind.tag != NodeKind::Expr) continue;
+        Expr ex = nd->kind.payload.Expr.value;
+        if (locFile(ex.loc) != 0 || locLine(ex.loc) != line1) continue;
+        usize byteAt = pos - lineStart;
+        u32 litCol = locCol(ex.loc);
+        if (litCol == 0) continue;
+        if (ex.kind.tag == ExprKind::StringLit)
+        {
+            /* the token may start before the hovered byte (quotes/prefix) */
+            str raw = lspInternText(d, ex.kind.payload.StringLit.value);
+            usize start = (usize)(litCol - 1);
+            if (byteAt < start || byteAt >= start + raw.len) continue;
+        }
+        else if (byteAt != (usize)(litCol - 1)) continue;
+        u8* buf = alloc<u8>(128);
+        if (buf == null) return none;
+        String s = String::new();
+        if (ex.kind.tag == ExprKind::StringLit)
+        {
+            str v = lspInternText(d, ex.kind.payload.StringLit.value);
+            bool cstyle = (ex.kind.payload.StringLit.flags & 1) != 0;
+            u8* inner = v.ptr;
+            usize innerLen = v.len;
+            if (cstyle && innerLen > 0 && inner[0] == 67) { inner++; innerLen--; }
+            if (innerLen >= 2 && inner[0] == 34 && inner[innerLen - 1] == 34) { inner++; innerLen = innerLen - 2; }
+            s.pushView(cstyle ? "C string literal\n" : "string literal\n");
+            s.pushView("Type: ");
+            if (ex.resolvedType != 0) lspPushType(&s, d, ex.resolvedType, buf, 128);
+            else s.pushView(cstyle ? "cchar*" : "str");
+            s.pushView("\nSize: ");
+            d->unit.sema.pushDec(&s, (u64)innerLen + (cstyle ? (u64)1 : (u64)0));
+            s.pushView(" bytes (");
+            d->unit.sema.pushDec(&s, (u64)innerLen);
+            s.pushView(" chars");
+            if (cstyle) s.pushView(" + NUL terminator");
+            s.pushView(")\n\n```coral\n");
+            if (cstyle) s.pushView("C\"");
+            else s.pushView("\"");
+            if (innerLen > 0) s.pushView(str { .ptr = inner, .len = innerLen });
+            s.pushView("\"");
+            s.pushView("\n```");
+        }
+        else if (ex.kind.tag == ExprKind::CharLit)
+        {
+            u32 cv = ex.kind.payload.CharLit.value;
+            s.pushView("character literal\nType: ");
+            if (ex.resolvedType != 0) lspPushType(&s, d, ex.resolvedType, buf, 128);
+            else s.pushView("cchar");
+            s.pushView("\nValue: ");
+            d->unit.sema.pushDec(&s, (u64)cv);
+            s.pushView(" (1 byte)\n\n```coral\n'");
+            if (cv >= 32 && cv < 127) s.pushByte((u8)cv);
+            else
+            {
+                s.pushView("\\x");
+                u8 hi = (u8)((cv >> 4) & 15);
+                u8 lo = (u8)(cv & 15);
+                s.pushByte(hi < 10 ? (u8)(48 + hi) : (u8)(97 + hi - 10));
+                s.pushByte(lo < 10 ? (u8)(48 + lo) : (u8)(97 + lo - 10));
+            }
+            s.pushView("'\n```");
+        }
+        else if (ex.kind.tag == ExprKind::IntLit)
+        {
+            s.pushView("integer literal\nType: ");
+            if (ex.resolvedType != 0) lspPushType(&s, d, ex.resolvedType, buf, 128);
+            else s.pushView("i32");
+            s.pushView("\nValue: ");
+            d->unit.sema.pushDec(&s, ex.kind.payload.IntLit.value);
+            s.pushView("\n");
+        }
+        else if (ex.kind.tag == ExprKind::BoolLit)
+        {
+            s.pushView("bool literal\nType: bool\nValue: ");
+            s.pushView((ex.kind.payload.BoolLit.flags & 1) != 0 ? "true" : "false");
+            s.pushView("\n");
+        }
+        else
+        {
+            dealloc<u8>(buf);
+            return none;
+        }
+        dealloc<u8>(buf);
+        return s;
+    }
+    return none;
+}
+
 /* type of the expression at (line0, char0), 0 when nothing resolves */
 Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
 {
@@ -622,7 +1332,7 @@ Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
     while (pos < n && c < char0 && base[pos] != 10 && base[pos] != 13)
     {
         usize sz = (usize)lspUtf8Seq(base[pos]);
-        if (sz == 4) c = c + 2; else c = c + 1;
+        if (sz == 4) c += 2; else c += 1;
         pos = pos + sz;
     }
 
@@ -670,24 +1380,215 @@ Ty lspHoverType(LspDoc* d, i64 line0, i64 char0)
             if (sym != null && sym->typeNode != 0) best = sym->typeNode;
         }
     }
+
+    if (best == 0)
+    {
+        /* locals are gone from the scope stack once analysis finishes:
+         * match the declaration node's name position directly */
+        u32 j = 1;
+        while (j < d->unit.ctx.nodesLen)
+        {
+            Node* nd = d->unit.ctx.nodes + j;
+            j++;
+            if (nd->kind.tag == NodeKind::Stmt)
+            {
+                Stmt st = nd->kind.payload.Stmt.value;
+                if (st.kind.tag != StmtKind::VarDecl) continue;
+                SourceLoc nl = st.kind.payload.VarDecl.nameLoc;
+                if (locFile(nl) != 0 || locLine(nl) != line1 || locCol(nl) != col1) continue;
+                NodeId initId = st.kind.payload.VarDecl.init;
+                if (initId.index != 0)
+                {
+                    Node* in = d->unit.ctx.nodes + initId.index;
+                    if (in->kind.tag == NodeKind::Expr && in->kind.payload.Expr.value.resolvedType != 0)
+                        best = in->kind.payload.Expr.value.resolvedType;
+                }
+                if (best == 0) best = st.kind.payload.VarDecl.typeNode;
+                break;
+            }
+            else if (nd->kind.tag == NodeKind::Param)
+            {
+                Param p = nd->kind.payload.Param.value;
+                if (locFile(p.loc) == 0 && locLine(p.loc) == line1 && locCol(p.loc) == col1)
+                {
+                    best = p.typeNode;
+                    break;
+                }
+            }
+        }
+    }
     return best;
 }
 
-JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0)
+JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
 {
-    Ty ty = lspHoverType(d, line0, char0);
-    if (ty == 0) return JsonValue::nullVal();
-
     u8* buf = alloc<u8>(512);
     if (buf == null) return JsonValue::nullVal();
-    u8* sp = d->unit.sema.tySpelling(ty, buf, 512);
-    usize sl = 0;
-    while (sp[sl] != 0) sl++;
 
     String val = String::new();
-    val.pushView("```coral\n");
-    val.pushView(str { .ptr = sp, .len = sl });
-    val.pushView("\n```");
+    bool have = false;
+
+    if (d->unit.ctx != null && d->unit.sema != null)
+    {
+        u8* wptr = null;
+        usize wlen = 0;
+        u32 wsid = 0;
+        if (lspWordAt(d, line0, char0, &wptr, &wlen, &wsid))
+        {
+            // named symbol (covers std lib / other merged files)
+            Symbol* sym = d->unit.sema.scopes.lookupFrom(wsid, 0);
+            if (sym != null && sym->declaration.index != 0 && sym->declaration.index < d->unit.ctx.nodesLen)
+            {
+                Node* dn = d->unit.ctx.nodes + sym->declaration.index;
+                if (dn->kind.tag == NodeKind::Decl)
+                {
+                    val = lspDeclCard(d, &dn->kind.payload.Decl.value, locFile(dn->loc), rootPath, buf, 512);
+                    if (val.len > 0) have = true;
+                }
+            }
+            if (!have)
+            {
+                // locals are gone from the scope stack: match the name
+                // against the nearest preceding VarDecl/Param/ForIn/Pat
+                NodeId lid = lspLocalDecl(d, wsid, (u32)line0 + 1);
+                if (lid.index != 0)
+                {
+                    val = lspLocalCard(d, lid, buf, 512);
+                    if (val.len > 0) have = true;
+                }
+            }
+            str wv = str { .ptr = wptr, .len = wlen };
+            if (!have && wv.equals("self"))
+            {
+                val = String::new();
+                val.pushView("parameter self\nthe receiver of the current method\nprovided by this file");
+                have = true;
+            }
+            if (!have)
+            {
+                // builtin scalar/aggregate type names describe themselves
+                String c = lspBuiltinTypeCard(wv);
+                if (c.len > 0) { val = c; have = true; }
+            }
+            if (!have)
+            {
+                /* compiler builtins (`@assert`) and attributes (`#[[...]]`) */
+                u8* base = d->text.asU8();
+                u8* q = wptr;
+                while (q > base && (q[-1] == 32 || q[-1] == 9)) q--;
+                if (q > base && q[-1] == 64)
+                {
+                    String c = lspBuiltinCallCard(wv);
+                    if (c.len > 0) { val = c; have = true; }
+                }
+                else
+                {
+                    usize back = 0;
+                    u8* r2 = q;
+                    bool inAttr = false;
+                    while (r2 > base && back < 60)
+                    {
+                        if (r2 > base + 1 && r2[-1] == 91 && r2[-2] == 91) { inAttr = true; break; }
+                        if (r2[-1] == 10 || r2[-1] == 93) break;
+                        r2--; back++;
+                    }
+                    if (inAttr)
+                    {
+                        String c = lspAttributeCard(wv);
+                        if (c.len > 0) { val = c; have = true; }
+                    }
+                }
+            }
+            if (!have)
+            {
+                /* member access `.name` / `->name`: the receiver's type
+                 * comes from re-resolving the expression before the dot */
+                u8* base = d->text.asU8();
+                u8* q = wptr;
+                while (q > base && (q[-1] == 32 || q[-1] == 9)) q--;
+                bool isMember = false;
+                if (q > base && q[-1] == 46) { isMember = true; q--; }
+                else if (q > base + 1 && q[-1] == 62 && q[-2] == 45) { isMember = true; q = q - 2; }
+                if (isMember)
+                {
+                    while (q > base && (q[-1] == 32 || q[-1] == 9)) q--;
+                    u8* rs = q;
+                    while (rs > base && lspWordByte(rs[-1])) rs--;
+                    if (rs < q)
+                    {
+                        usize lsPos = 0;
+                        i64 ln2 = 0;
+                        while (lsPos < d->text.len && ln2 < line0)
+                        {
+                            if (base[lsPos] == 10) ln2++;
+                            lsPos++;
+                        }
+                        i64 rcol = 0;
+                        u8* pp = base + lsPos;
+                        while (pp < rs)
+                        {
+                            usize sz = (usize)lspUtf8Seq(pp[0]);
+                            if (sz == 4) rcol = rcol + 2; else rcol = rcol + 1;
+                            pp = pp + sz;
+                        }
+                        Ty recvTy = lspHoverType(d, line0, rcol);
+                        if (recvTy != 0)
+                        {
+                            MemberInfo mi = d->unit.sema.findMember(recvTy, wsid);
+                            if (mi.kind == 2 && mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
+                            {
+                                Node* mn2 = d->unit.ctx.nodes + mi.declaration.index;
+                                if (mn2->kind.tag == NodeKind::Decl)
+                                {
+                                    val = lspDeclCard(d, &mn2->kind.payload.Decl.value, locFile(mn2->loc), rootPath, buf, 512);
+                                    if (val.len > 0) have = true;
+                                }
+                            }
+                            else if (mi.kind == 1)
+                            {
+                                val = lspFieldCard(d, mi, wptr, wlen, rootPath, buf, 512);
+                                have = true;
+                            }
+                            /* a variant case name (`x.payload.Case`): show
+                             * it as a case of the variant type */
+                            else if (d->unit.sema.variantHasCase(recvTy, wsid))
+                            {
+                                val = String::new();
+                                val.pushView("case ");
+                                val.pushView(str { .ptr = wptr, .len = wlen });
+                                val.pushView(" of type ");
+                                lspPushType(&val, d, recvTy, buf, 512);
+                                have = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        /* `.field = value` in a struct literal: no receiver */
+                        val = lspOrphanFieldCard(d, wsid, wptr, wlen, rootPath, buf, 512);
+                        if (val.len > 0) have = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!have)
+    {
+        // literals describe themselves
+        String lit = lspLiteralCard(d, line0, char0);
+        if (lit.len > 0) { val = lit; have = true; }
+    }
+
+    if (!have)
+    {
+        // expressions (and anything else): just the type
+        Ty ty = lspHoverType(d, line0, char0);
+        if (ty == 0) { dealloc<u8>(buf); return JsonValue::nullVal(); }
+        val.pushView("```coral\n");
+        lspPushType(&val, d, ty, buf, 512);
+        val.pushView("\n```");
+    }
 
     JsonValue contents = lspObj();
     lspPut(&contents, "kind", JsonValue::stringVal(String::from("markdown")));
@@ -1206,7 +2107,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                     {
                         if (docs[fi]->uri.asView().equals(uri))
                         {
-                            res = lspHoverResult(docs[fi], line0, char0);
+                            res = lspHoverResult(docs[fi], line0, char0, rootPath.asView());
                             break;
                         }
                     }

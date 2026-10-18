@@ -19,12 +19,82 @@ import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
+    /* intern id -> text view; empty when out of range */
+    str nameTextView(Str id)
+    {
+        if (id == 0 || id >= self.ctx.internsLen) return str::empty();
+        return str { .ptr = self.ctx.interns[id].ptr, .len = self.ctx.interns[id].len };
+    }
+
+    /* type spelling as a view over the caller's scratch buffer */
+    str typeTextView(Ty ty, u8* buf, usize cap)
+    {
+        if (ty == 0) return String::from("?").asView();
+        u8* ts = self.tySpelling(ty, buf, cap);
+        usize n = 0;
+        while (ts[n] != 0) n++;
+        return str { .ptr = ts, .len = n };
+    }
+
+    /* diagnostics name their operand: `'x'`, `field 'data'`, `this expression` */
+    void appendExprDesc(String* s, NodeId id)
+    {
+        if (id.index == 0 || id.index >= self.ctx.nodesLen)
+        {
+            s.pushView("this expression");
+            return;
+        }
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr)
+        {
+            s.pushView("this expression");
+            return;
+        }
+        Expr e = n->kind.payload.Expr.value;
+        if (e.kind.tag == ExprKind::Ident)
+        {
+            s.pushView("'");
+            s.pushView(self.nameTextView(e.kind.payload.Ident.name));
+            s.pushView("'");
+            return;
+        }
+        if (e.kind.tag == ExprKind::Field)
+        {
+            s.pushView("field '");
+            s.pushView(self.nameTextView(e.kind.payload.Field.field));
+            s.pushView("'");
+            return;
+        }
+        if (e.kind.tag == ExprKind::DerefField)
+        {
+            s.pushView("field '");
+            s.pushView(self.nameTextView(e.kind.payload.DerefField.field));
+            s.pushView("'");
+            return;
+        }
+        s.pushView("this expression");
+    }
+
+    /* decimal u64 into a String; arity messages need it */
+    void pushDec(String* s, u64 v)
+    {
+        if (v == 0) { s.pushView("0"); return; }
+        u8 tmp[24];
+        u32 n = 0;
+        while (v > 0) { tmp[n] = (u8)(48 + (v % 10)); v = v / 10; n++; }
+        while (n > 0) { n--; s.pushChar(tmp[n]); }
+    }
+
     bool checkIdent(NodeId id, Str name)
     {
         Symbol* symbol = self.lookupAt(name, id);
         if (symbol == null)
         {
-            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, "undeclared identifier");
+            String msg = String::new();
+            msg.pushView("undeclared identifier '");
+            msg.pushView(self.nameTextView(name));
+            msg.pushView("'");
+            self.semaErrorNode(ErrorCode::SemaUndeclaredIdent, id, msg.asView());
             return false;
         }
         // record the symbol's type on the ident expression: consumers
@@ -160,7 +230,12 @@ pub extend Sema
         if (te->kind.tag != TypeKind::FnPtr) return true;
         if (argsLen != te->kind.payload.FnPtr.paramsLen)
         {
-            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, "wrong number of arguments in call");
+            String msg = String::new();
+            msg.pushView("wrong number of arguments in function-pointer call: expected ");
+            self.pushDec(&msg, (u64)te->kind.payload.FnPtr.paramsLen);
+            msg.pushView(", got ");
+            self.pushDec(&msg, (u64)argsLen);
+            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, msg.asView());
             return false;
         }
         u32 i = 0;
@@ -214,7 +289,15 @@ pub extend Sema
         }
         if (argsLen < paramsLen || (!variadic && argsLen != paramsLen))
         {
-            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, "wrong number of arguments in call");
+            String msg = String::new();
+            msg.pushView("wrong number of arguments in call to '");
+            msg.pushView(self.nameTextView(decl->kind.payload.Func.name));
+            msg.pushView("': expected ");
+            self.pushDec(&msg, (u64)paramsLen);
+            if (variadic) msg.pushView(" or more");
+            msg.pushView(", got ");
+            self.pushDec(&msg, (u64)argsLen);
+            self.semaErrorNode(ErrorCode::SemaArityMismatch, callId, msg.asView());
             return false;
         }
         /* C++/clang template rule: explicit typeargs on the callee
@@ -1070,20 +1153,43 @@ pub extend Sema
                         MemberInfo m = self.findMethod(ownerTy, mn);
                         if (m.declaration.index == 0)
                         {
-                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("static method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' not found on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("'");
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                            dealloc<u8>(mbuf);
                             return false;
                         }
                         Node* methodNode = self.ctx.nodes + m.declaration.index;
                         Decl* md = &methodNode->kind.payload.Decl.value;
                         if ((md->kind.payload.Func.flags & 4) == 0)
                         {
-                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static");
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("' is not static; it needs a receiver");
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                            dealloc<u8>(mbuf);
                             return false;
                         }
                         u32 pLen = md->kind.payload.Func.paramsLen;
                         if (pLen != expr->kind.payload.Call.argsLen)
                         {
-                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                            String msg = String::new();
+                            msg.pushView("wrong number of arguments to static method '");
+                            msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                            msg.pushView("': expected ");
+                            self.pushDec(&msg, (u64)pLen);
+                            msg.pushView(", got ");
+                            self.pushDec(&msg, (u64)expr->kind.payload.Call.argsLen);
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
                             return false;
                         }
                         u32 kk = 0;
@@ -1168,20 +1274,43 @@ pub extend Sema
                         MemberInfo m = self.findMethod(ownerTy, mn);
                         if (m.declaration.index == 0)
                         {
-                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("static method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' not found on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("'");
+                            self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                            dealloc<u8>(mbuf);
                             return false;
                         }
                         Node* methodNode = self.ctx.nodes + m.declaration.index;
                         Decl* md = &methodNode->kind.payload.Decl.value;
                         if ((md->kind.payload.Func.flags & 4) == 0)
                         {
-                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static");
+                            u8* mbuf = alloc<u8>(128);
+                            String msg = String::new();
+                            msg.pushView("method '");
+                            msg.pushView(self.nameTextView(mn));
+                            msg.pushView("' on type '");
+                            if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                            msg.pushView("' is not static; it needs a receiver");
+                            self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                            dealloc<u8>(mbuf);
                             return false;
                         }
                         u32 pLen = md->kind.payload.Func.paramsLen;
                         if (pLen != expr->kind.payload.Call.argsLen)
                         {
-                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                            String msg = String::new();
+                            msg.pushView("wrong number of arguments to static method '");
+                            msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                            msg.pushView("': expected ");
+                            self.pushDec(&msg, (u64)pLen);
+                            msg.pushView(", got ");
+                            self.pushDec(&msg, (u64)expr->kind.payload.Call.argsLen);
+                            self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
                             return false;
                         }
                         u32 jj = 0;
@@ -1193,7 +1322,19 @@ pub extend Sema
                             {
                                 Param* pp = &pn->kind.payload.Param.value;
                                 if (!self.assignCompatible(expr->kind.payload.Call.args[jj], self.exprType(expr->kind.payload.Call.args[jj]), pp->typeNode))
-                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "static arg type mismatch");
+                                {
+                                    u8* mbuf = alloc<u8>(128);
+                                    String msg = String::new();
+                                    msg.pushView("type mismatch in argument ");
+                                    self.pushDec(&msg, (u64)(jj + 1));
+                                    msg.pushView(" of static call to '");
+                                    msg.pushView(self.nameTextView(md->kind.payload.Func.name));
+                                    msg.pushView("': expected '");
+                                    if (mbuf != null) msg.pushView(self.typeTextView(pp->typeNode, mbuf, 128)); else msg.pushView("?");
+                                    msg.pushView("'");
+                                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                                    dealloc<u8>(mbuf);
+                                }
                             }
                             jj++;
                         }
@@ -1237,11 +1378,25 @@ pub extend Sema
                             return self.checkFnPtrCall(id, fnField.typeNode, expr->kind.payload.MethodCall.args, expr->kind.payload.MethodCall.argsLen);
                         }
                     }
-                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "method not found on type");
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.MethodCall.method));
+                    msg.pushView("' not found on type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(self.stripType(self.exprType(expr->kind.payload.MethodCall.receiver)), tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
                     return false;
                 }
                 Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
                 Decl* methodDecl = &methodNode->kind.payload.Decl.value;
+                if (methodDecl->kind.payload.Func.name == self.ctx.intern("drop"))
+                {
+                    self.semaErrorNode(ErrorCode::SemaExplicitDrop, id,
+                        "explicit call to drop is not allowed; drop runs automatically at scope exit");
+                    return false;
+                }
                 u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
                 // `self` sits at param 0 (flag bit 1) but never appears in
                 // method-call args, so arity and substitution start past it
@@ -1258,7 +1413,14 @@ pub extend Sema
                 }
                 if (paramsLen - selfOffset != expr->kind.payload.MethodCall.argsLen)
                 {
-                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to method");
+                    String msg = String::new();
+                    msg.pushView("wrong number of arguments to method '");
+                    msg.pushView(self.nameTextView(methodDecl->kind.payload.Func.name));
+                    msg.pushView("': expected ");
+                    self.pushDec(&msg, (u64)(paramsLen - selfOffset));
+                    msg.pushView(", got ");
+                    self.pushDec(&msg, (u64)expr->kind.payload.MethodCall.argsLen);
+                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
                     return false;
                 }
                 /* the receiver carries the generic binding (`Vec<K>` binds
@@ -1327,7 +1489,15 @@ pub extend Sema
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.Field.obj), expr->kind.payload.Field.field);
                 if (member.typeNode == 0)
                 {
-                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found on type");
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("field '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.Field.field));
+                    msg.pushView("' not found on type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(self.stripType(self.exprType(expr->kind.payload.Field.obj)), tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
                     return false;
                 }
                 self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.Field.obj)));
@@ -1369,7 +1539,15 @@ pub extend Sema
                 MemberInfo member = self.findMember(self.exprType(expr->kind.payload.DerefField.obj), expr->kind.payload.DerefField.field);
                 if (member.typeNode == 0)
                 {
-                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "field not found through pointer");
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("field '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.DerefField.field));
+                    msg.pushView("' not found through pointer of type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(self.exprType(expr->kind.payload.DerefField.obj), tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
                     return false;
                 }
                 self.setExprType(id, self.substituteFieldTy(member.typeNode, self.exprType(expr->kind.payload.DerefField.obj)));
@@ -1396,7 +1574,15 @@ pub extend Sema
                 else if (objectEntry->kind.tag == TypeKind::Str) self.setExprType(id, self.charType()); // str[i] → char (the byte type)
                 else
                 {
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot dereference this type");
+                    u8* tb = alloc<u8>(256);
+                    String msg = String::new();
+                    msg.pushView("cannot index ");
+                    self.appendExprDesc(&msg, expr->kind.payload.Index.obj);
+                    msg.pushView(": value of type '");
+                    if (tb != null) { msg.pushView(self.typeTextView(objectType, tb, 256)); dealloc<u8>(tb); }
+                    else msg.pushView("?");
+                    msg.pushView("' is not indexable (expected array, slice, pointer, or str)");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
                     return false;
                 }
                 if (!self.checkExpr(expr->kind.payload.Index.index)) return false;
@@ -1441,7 +1627,18 @@ pub extend Sema
                 {
                     TypeEntry* te = self.ctx.types + inner;
                     if (te->kind.tag == TypeKind::Pointer) self.setExprType(id, te->kind.payload.Pointer.base);
-                    else self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "cannot dereference non-pointer type");
+                    else
+                    {
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        msg.pushView("cannot dereference ");
+                        self.appendExprDesc(&msg, expr->kind.payload.Deref.expr);
+                        msg.pushView(": value of type '");
+                        if (tb != null) { msg.pushView(self.typeTextView(inner, tb, 256)); dealloc<u8>(tb); }
+                        else msg.pushView("?");
+                        msg.pushView("' is not a pointer");
+                        self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                    }
                 }
                 return true;
             },
@@ -1744,20 +1941,43 @@ pub extend Sema
                 MemberInfo methodInfo = self.findMethod(ownerTy, expr->kind.payload.StaticCall.method);
                 if (methodInfo.declaration.index == 0)
                 {
-                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "static method not found on type");
+                    u8* mbuf = alloc<u8>(128);
+                    String msg = String::new();
+                    msg.pushView("static method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.StaticCall.method));
+                    msg.pushView("' not found on type '");
+                    if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                    msg.pushView("'");
+                    self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
+                    dealloc<u8>(mbuf);
                     return false;
                 }
                 Node* methodNode = self.ctx.nodes + methodInfo.declaration.index;
                 Decl* methodDecl = &methodNode->kind.payload.Decl.value;
                 if ((methodDecl->kind.payload.Func.flags & 4) == 0)
                 {
-                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "method is not static; called on the type");
+                    u8* mbuf = alloc<u8>(128);
+                    String msg = String::new();
+                    msg.pushView("method '");
+                    msg.pushView(self.nameTextView(expr->kind.payload.StaticCall.method));
+                    msg.pushView("' on type '");
+                    if (mbuf != null) msg.pushView(self.typeTextView(ownerTy, mbuf, 128)); else msg.pushView("?");
+                    msg.pushView("' is not static; it needs a receiver");
+                    self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, msg.asView());
+                    dealloc<u8>(mbuf);
                     return false;
                 }
                 u32 paramsLen = methodDecl->kind.payload.Func.paramsLen;
                 if (paramsLen != expr->kind.payload.StaticCall.argsLen)
                 {
-                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, "wrong number of arguments to static method");
+                    String msg = String::new();
+                    msg.pushView("wrong number of arguments to static method '");
+                    msg.pushView(self.nameTextView(methodDecl->kind.payload.Func.name));
+                    msg.pushView("': expected ");
+                    self.pushDec(&msg, (u64)paramsLen);
+                    msg.pushView(", got ");
+                    self.pushDec(&msg, (u64)expr->kind.payload.StaticCall.argsLen);
+                    self.semaErrorNode(ErrorCode::SemaArityMismatch, id, msg.asView());
                     return false;
                 }
                 i = 0;
