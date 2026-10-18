@@ -53,6 +53,8 @@ pub extend Sema
                 }
                 if (declaredType != 0 && actualType == 0)
                     self.coerceArrayLit(stmt->kind.payload.VarDecl.init, declaredType);
+                if (declaredType != 0 && stmt->kind.payload.VarDecl.init.index != 0)
+                    self.checkIntLitFit(stmt->kind.payload.VarDecl.init, declaredType);
                 if (declaredType == 0)
                 {
                     // `var x = expr;`: infer from the initializer
@@ -91,6 +93,8 @@ pub extend Sema
                         self.dropMethodIsValid(dropInfo.declaration))
                         stmt->kind.payload.VarDecl.dropMethod = dropInfo.declaration;
                 }
+                if ((stmt->kind.payload.VarDecl.flags & 4) == 0)
+                    self.noteLocal(stmt->kind.payload.VarDecl.name, stmt->kind.payload.VarDecl.nameLoc);
                 return true;
             },
             
@@ -321,6 +325,190 @@ pub extend Sema
 
     /* ── function bodies ─────────────────────────────────────────────── */
 
+    /* a `break` that belongs to the loop being analysed; nested loops own
+     * their own breaks, so their bodies are not scanned */
+    bool stmtHasBreak(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Stmt) return false;
+        Stmt* st = &n->kind.payload.Stmt.value;
+        if (st->kind.tag == StmtKind::Break) return true;
+        if (st->kind.tag == StmtKind::Block)
+        {
+            u32 i = 0;
+            while (i < st->kind.payload.Block.stmtsLen)
+            {
+                if (self.stmtHasBreak(st->kind.payload.Block.stmts[i])) return true;
+                i++;
+            }
+        }
+        else if (st->kind.tag == StmtKind::If)
+        {
+            if (self.stmtHasBreak(st->kind.payload.If.thenBody)) return true;
+            if (self.stmtHasBreak(st->kind.payload.If.elseBody)) return true;
+        }
+        else if (st->kind.tag == StmtKind::Switch)
+        {
+            u32 i = 0;
+            while (i < st->kind.payload.Switch.casesLen)
+            {
+                if (self.stmtHasBreak(st->kind.payload.Switch.cases[i].body)) return true;
+                i++;
+            }
+        }
+        return false;
+    }
+
+    /* `true` literal condition: `while (true)` */
+    bool exprIsTrueLiteral(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::BoolLit) return false;
+        return (e->kind.payload.BoolLit.flags & 1) != 0;
+    }
+
+    /* calls that never fall through: @assert(false), @assertOut(false, …),
+     * @panic(…), @unreachable() */
+    bool exprIsNoReturnCall(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Expr) return false;
+        Expr* e = &n->kind.payload.Expr.value;
+        if (e->kind.tag != ExprKind::BuiltinCall) return false;
+        Str nm = e->kind.payload.BuiltinCall.name;
+        if (nm == self.ctx.intern("panic") || nm == self.ctx.intern("unreachable")) return true;
+        if (nm != self.ctx.intern("assert") && nm != self.ctx.intern("assertOut")) return false;
+        if (e->kind.payload.BuiltinCall.argsLen == 0) return false;
+        NodeId a = e->kind.payload.BuiltinCall.args[0];
+        if (a.index == 0) return false;
+        Node* an = self.ctx.nodes + a.index;
+        if (an->kind.tag != NodeKind::Expr) return false;
+        Expr* ae = &an->kind.payload.Expr.value;
+        if (ae->kind.tag != ExprKind::BoolLit) return false;
+        return (ae->kind.payload.BoolLit.flags & 1) == 0;
+    }
+
+    /* T0011 support: only the obvious shapes count as "always returns" —
+     * a `return`, a block whose last statement does, an if/else with both
+     * arms doing so, a switch with a `default` whose cases all do, a
+     * break-less `loop`/`while (true)`, a trailing noreturn builtin, and
+     * a comptime block (its arms either return or fail compilation). */
+    bool stmtAlwaysReturns(NodeId id)
+    {
+        if (id.index == 0) return false;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Stmt) return false;
+        Stmt* st = &n->kind.payload.Stmt.value;
+        if (st->kind.tag == StmtKind::Return) return true;
+        if (st->kind.tag == StmtKind::ExprStmt)
+            return self.exprIsNoReturnCall(st->kind.payload.ExprStmt.expr);
+        if (st->kind.tag == StmtKind::Comptime) return true;
+        if (st->kind.tag == StmtKind::Loop)
+            return !self.stmtHasBreak(st->kind.payload.Loop.body);
+        if (st->kind.tag == StmtKind::While)
+        {
+            if (!self.exprIsTrueLiteral(st->kind.payload.While.cond)) return false;
+            return !self.stmtHasBreak(st->kind.payload.While.body);
+        }
+        if (st->kind.tag == StmtKind::Block)
+        {
+            u32 len = st->kind.payload.Block.stmtsLen;
+            if (len == 0) return false;
+            return self.stmtAlwaysReturns(st->kind.payload.Block.stmts[len - 1]);
+        }
+        if (st->kind.tag == StmtKind::If)
+        {
+            if (st->kind.payload.If.elseBody.index == 0) return false;
+            return self.stmtAlwaysReturns(st->kind.payload.If.thenBody) &&
+                   self.stmtAlwaysReturns(st->kind.payload.If.elseBody);
+        }
+        if (st->kind.tag == StmtKind::Switch)
+        {
+            if (st->kind.payload.Switch.casesLen == 0) return false;
+            bool hasDefault = false;
+            u32 i = 0;
+            while (i < st->kind.payload.Switch.casesLen)
+            {
+                SwitchCase c = st->kind.payload.Switch.cases[i];
+                if ((c.flags & 4) != 0) hasDefault = true;
+                if (!self.stmtAlwaysReturns(c.body)) return false;
+                i++;
+            }
+            return hasDefault;
+        }
+        return false;
+    }
+
+    /* T0012 support: locals are recorded when their declaration is
+     * checked and marked used when an Ident resolves to the same interned
+     * name. Shadowing shares a name, so a use of any local with that name
+     * counts (conservative: never warns spuriously). */
+    void noteLocal(Str name, SourceLoc loc)
+    {
+        if (!self.warnUnused || name == 0) return;
+        InternEntry* ie = self.ctx.interns + name;
+        if (ie->len > 0 && ie->ptr[0] == 95) return; /* `_name` opts out */
+        if (self.unusedLen == self.unusedCap)
+        {
+            u32 cap = self.unusedCap == 0 ? (u32)16 : self.unusedCap * 2;
+            Str* nn = alloc<Str>((usize)cap);
+            SourceLoc* nl = alloc<SourceLoc>((usize)cap);
+            u8* nu = alloc<u8>((usize)cap);
+            u32 i = 0;
+            while (i < self.unusedLen)
+            {
+                nn[i] = self.unusedNames[i];
+                nl[i] = self.unusedLocs[i];
+                nu[i] = self.unusedUsed[i];
+                i++;
+            }
+            if (self.unusedNames != null) dealloc<Str>(self.unusedNames);
+            if (self.unusedLocs != null) dealloc<SourceLoc>(self.unusedLocs);
+            if (self.unusedUsed != null) dealloc<u8>(self.unusedUsed);
+            self.unusedNames = nn;
+            self.unusedLocs = nl;
+            self.unusedUsed = nu;
+            self.unusedCap = cap;
+        }
+        self.unusedNames[self.unusedLen] = name;
+        self.unusedLocs[self.unusedLen] = loc;
+        self.unusedUsed[self.unusedLen] = 0;
+        self.unusedLen++;
+    }
+
+    void markLocalUsed(Str name)
+    {
+        u32 i = 0;
+        while (i < self.unusedLen)
+        {
+            if (self.unusedNames[i] == name) self.unusedUsed[i] = 1;
+            i++;
+        }
+    }
+
+    void reportUnusedLocals(u32 base)
+    {
+        u32 i = base;
+        while (i < self.unusedLen)
+        {
+            if (self.unusedUsed[i] == 0)
+            {
+                String msg = String::new();
+                msg.pushView("unused local '");
+                msg.pushView(self.nameTextView(self.unusedNames[i]));
+                msg.pushView("'");
+                self.semaWarn(ErrorCode::SemaUnusedVar, self.unusedLocs[i], msg.asView());
+            }
+            i++;
+        }
+        self.unusedLen = base;
+    }
+
     /* check one function body. scope layout, in order: generic params, the
      * implicit self pointer (when checking a method), then real params, then
      * the body. currentReturnType is parked here for Return statements and
@@ -448,7 +636,30 @@ pub extend Sema
         }
         if (!self.checkType(decl->kind.payload.Func.returnType)) ok = false;
         self.currentReturnType = decl->kind.payload.Func.returnType;
+        u32 unusedBase = self.unusedLen;
         if (!self.checkStmt(decl->kind.payload.Func.body)) ok = false;
+        if (decl->kind.payload.Func.body.index != 0) self.reportUnusedLocals(unusedBase);
+        /* T0011: a non-void function must not fall off the closing brace */
+        Ty retTy = decl->kind.payload.Func.returnType;
+        if (decl->kind.payload.Func.body.index != 0 && retTy != 0)
+        {
+            Ty probe = retTy;
+            while (probe != 0 && ((self.ctx.types + probe)->kind.tag == TypeKind::Const ||
+                                  (self.ctx.types + probe)->kind.tag == TypeKind::Comptime))
+            {
+                if ((self.ctx.types + probe)->kind.tag == TypeKind::Const)
+                    probe = (self.ctx.types + probe)->kind.payload.Const.base;
+                else probe = (self.ctx.types + probe)->kind.payload.Comptime.base;
+            }
+            if (probe != 0 && (self.ctx.types + probe)->kind.tag != TypeKind::Void &&
+                !self.stmtAlwaysReturns(decl->kind.payload.Func.body))
+            {
+                SourceLoc loc = decl->loc;
+                if (loc.data == 0) loc = decl->nameLoc;
+                self.semaError(ErrorCode::SemaMissingReturn, loc,
+                    "non-void function can reach the end without returning a value");
+            }
+        }
         self.currentReturnType = 0; // no nesting; nothing to restore to
         self.scopes.leave();
         self.fileNoDropAll = prevNoDropAll;

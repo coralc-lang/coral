@@ -445,6 +445,55 @@ pub extend Sema
         }
     }
 
+    /* T0010: a literal being stored into a narrower integer type must fit
+     * (u8 x = 300 is an error even though the generic-literal rules widen
+     * it for arithmetic). Only the plainly-written shapes are checked:
+     * `N` and `-N`. */
+    void checkIntLitFit(NodeId initId, Ty declared)
+    {
+        if (initId.index == 0 || declared == 0) return;
+        u32 w = self.intWidth(declared);
+        if (w == 0 || w >= 64) return;
+        bool signed = self.intSigned(declared);
+        Node* n = self.ctx.nodes + initId.index;
+        if (n->kind.tag != NodeKind::Expr) return;
+        Expr* e = &n->kind.payload.Expr.value;
+        u64 mag = 0;
+        bool neg = false;
+        if (e->kind.tag == ExprKind::IntLit) mag = e->kind.payload.IntLit.value;
+        else if (e->kind.tag == ExprKind::Neg)
+        {
+            neg = true;
+            NodeId inner = e->kind.payload.Neg.expr;
+            if (inner.index == 0) return;
+            Node* in = self.ctx.nodes + inner.index;
+            if (in->kind.tag != NodeKind::Expr) return;
+            Expr* ie = &in->kind.payload.Expr.value;
+            if (ie->kind.tag != ExprKind::IntLit) return;
+            mag = ie->kind.payload.IntLit.value;
+        }
+        else return;
+        bool overflow = false;
+        if (!signed)
+        {
+            if (neg) overflow = true;
+            else if (mag >= (((u64)1) << (u64)w)) overflow = true;
+        }
+        else
+        {
+            u64 limit = ((u64)1) << (u64)(w - 1);
+            if (neg) { if (mag > limit) overflow = true; }
+            else { if (mag >= limit) overflow = true; }
+        }
+        if (!overflow) return;
+        String msg = String::new();
+        if (neg) msg.pushView("integer literal '-");
+        else msg.pushView("integer literal '");
+        self.pushDec(&msg, mag);
+        msg.pushView("' does not fit in the declared integer type");
+        self.semaErrorNode(ErrorCode::SemaLiteralOverflow, initId, msg.asView());
+    }
+
     bool integerType(Ty typeNode)
     {
         if (typeNode == 0) return false;

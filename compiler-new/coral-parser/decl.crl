@@ -57,11 +57,18 @@ pub extend Parser
             u8* q = s;
             while (q < lineEnd && (q[0] == 32 || q[0] == 9)) q++;
             if (q + 2 >= lineEnd) break;
-            if (q[0] != 47 || q[1] != 47 || q[2] != 47) break;
-            if (q + 3 < lineEnd && q[3] == 47) break;
-            starts[n] = q + 3;
-            ends[n] = lineEnd;
-            n++;
+            bool isDoc = q[0] == 47 && q[1] == 47 && q[2] == 47;
+            if (isDoc && q + 3 < lineEnd && q[3] == 47) isDoc = false;
+            /* an attribute on its own line between the docs and the
+             * declaration still documents the declaration (temp.crl) */
+            bool isAttr = q[0] == 35 && q[1] == 91 && q[2] == 91;
+            if (!isDoc && !isAttr) break;
+            if (isDoc)
+            {
+                starts[n] = q + 3;
+                ends[n] = lineEnd;
+                n++;
+            }
             p = s;
             lineNo = lineNo - 1;
         }
@@ -151,8 +158,8 @@ pub extend Parser
     {
         if (a == b) return 0;
         if (a == 0 || b == 0) return 4;
-        str sa = self.ctx.interns[a];
-        str sb = self.ctx.interns[b];
+        str sa = str { .ptr = self.ctx.interns[a].ptr, .len = self.ctx.interns[a].len };
+        str sb = str { .ptr = self.ctx.interns[b].ptr, .len = self.ctx.interns[b].len };
         if (sa.len > 40) sa.len = 40;
         if (sb.len > 40) sb.len = 40;
         usize* prev = alloc<usize>(41);
@@ -262,6 +269,25 @@ pub extend Parser
                 {
                     name = self.ctx.intern(self.current.data.asStr());
                     self.advance();
+                    /* P0012: misspelled attribute names get a did-you-mean
+                     * like `.member` typos do (closestField) */
+                    if (!self.isKnownAttr(name))
+                    {
+                        String msg = String::new();
+                        msg.pushView("unknown attribute '");
+                        msg.pushView(str { .ptr = self.ctx.interns[name].ptr, .len = self.ctx.interns[name].len });
+                        msg.pushView("'");
+                        Str cand = self.closestAttrName(name);
+                        if (cand != 0)
+                        {
+                            String hint = String::new();
+                            hint.pushView("did you mean '");
+                            hint.pushView(str { .ptr = self.ctx.interns[cand].ptr, .len = self.ctx.interns[cand].len });
+                            hint.pushView("'?");
+                            self.reportErrorAtHelp(ErrorCode::ParseUnknownAttr, loc, msg.asView(), hint.asView());
+                        }
+                        else self.reportErrorAtHelp(ErrorCode::ParseUnknownAttr, loc, msg.asView(), null);
+                    }
                 }
                 else
                 {

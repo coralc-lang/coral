@@ -88,6 +88,7 @@ pub extend Sema
 
     bool checkIdent(NodeId id, Str name)
     {
+        self.markLocalUsed(name);
         Symbol* symbol = self.lookupAt(name, id);
         if (symbol == null)
         {
@@ -1618,6 +1619,33 @@ pub extend Sema
                 Ty indexTy = self.exprType(expr->kind.payload.Index.index);
                 if (indexTy != 0 && !self.integerType(indexTy))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, id, "array index must be an integer type");
+                /* T0013: a literal index against a fixed array length */
+                if (objectEntry->kind.tag == TypeKind::Array &&
+                    objectEntry->kind.payload.Array.sizeName == 0 &&
+                    objectEntry->kind.payload.Array.len > 0)
+                {
+                    NodeId idxId = expr->kind.payload.Index.index;
+                    if (idxId.index != 0)
+                    {
+                        Node* idxNode = self.ctx.nodes + idxId.index;
+                        if (idxNode->kind.tag == NodeKind::Expr)
+                        {
+                            Expr* ie = &idxNode->kind.payload.Expr.value;
+                            bool bad = false;
+                            if (ie->kind.tag == ExprKind::IntLit)
+                                bad = ie->kind.payload.IntLit.value >= (u64)objectEntry->kind.payload.Array.len;
+                            else if (ie->kind.tag == ExprKind::Neg) bad = true;
+                            if (bad)
+                            {
+                                String msg = String::new();
+                                msg.pushView("constant array index is out of bounds (array length ");
+                                self.pushDec(&msg, (u64)objectEntry->kind.payload.Array.len);
+                                msg.pushView(")");
+                                self.semaErrorNode(ErrorCode::SemaIndexOutOfBounds, idxId, msg.asView());
+                            }
+                        }
+                    }
+                }
                 return true;
             },
             ExprKind::Cast => {
