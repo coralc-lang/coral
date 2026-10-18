@@ -15,6 +15,7 @@ import scope { Symbol };
 import sema { Sema };
 import member { MemberInfo };
 import diag::code { ErrorCode };
+import(lib) std::mman { alloc, dealloc };
 
 pub extend Sema
 {
@@ -112,6 +113,25 @@ pub extend Sema
             
             StmtKind::Return => {
                 NodeId retVal = stmt->kind.payload.Return.value;
+                if (retVal.index == 0)
+                {
+                    /* bare `return;` is only valid where no value is
+                     * expected — otherwise the emitted C is `return;` in a
+                     * value-returning function and gcc rejects it */
+                    Ty rt = self.currentReturnType;
+                    if (rt != 0 && (self.ctx.types + rt)->kind.tag != TypeKind::Void)
+                    {
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        msg.pushView("return with no value in function returning '");
+                        if (tb != null) { msg.pushView(self.typeTextView(self.stripType(rt), tb, 256)); dealloc<u8>(tb); }
+                        else msg.pushView("?");
+                        msg.pushView("'");
+                        self.semaErrorNodeHelp(ErrorCode::SemaTypeMismatch, id, msg.asView(),
+                            "write `return <expr>;` or change the function's return type to void");
+                    }
+                    return true;
+                }
                 if (!self.checkExpr(retVal)) return false;
                 if (!self.checkAssign(retVal, self.exprType(retVal), self.currentReturnType))
                     self.semaErrorNode(ErrorCode::SemaTypeMismatch, retVal, "return value type does not match function return type");

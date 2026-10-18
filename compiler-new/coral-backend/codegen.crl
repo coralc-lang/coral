@@ -196,6 +196,16 @@ pub struct Codegen
     u32 subsLen;
     u32 errors;
 
+    /* file-scope `var` globals whose initializer is not a C constant:
+     * storage stays zero-initialized and coral_globals_init() — a C
+     * constructor — assigns before main runs */
+    NodeId* dynInits;
+    u32 dynInitsLen;
+    u32 dynInitsCap;
+    /* recursion budget while folding `const` refs into initializers:
+     * a self-referential const errors instead of looping */
+    u32 foldDepth;
+
     /* per-function emission state: __L<labelSeq> gotos, __t<tempsLen>
      * temporaries (all declared at the function top) */
     u32 labelSeq;
@@ -257,6 +267,22 @@ void cgError(Codegen* cg, str msg)
         loc.data = 0;
         cg.sema.semaError(ErrorCode::CodegenInternal, loc, msg);
     }
+}
+
+/* G0001 instead of G0002: the language construct itself is fine, C's
+ * file-scope rules just cannot express it as written */
+void cgErrorUnsupported(Codegen* cg, NodeId at, str msg)
+{
+    cg.errors++;
+    if (cg.sema == null) return;
+    if (at.index != 0)
+    {
+        cg.sema.semaErrorNode(ErrorCode::CodegenUnsupported, at, msg);
+        return;
+    }
+    SourceLoc loc;
+    loc.data = 0;
+    cg.sema.semaError(ErrorCode::CodegenUnsupported, loc, msg);
 }
 
 u32 cgLabel(Codegen* cg)
@@ -5691,8 +5717,54 @@ void cgEmitVariantDef(Codegen* cg, Decl* dd, Slice name)
     stP(&cg.defs, "\n};\n");
 }
 
+/* a reference to a file-scope `const` whose own initializer is
+ * constant-foldable: cgConstExpr can substitute the value, since C
+ * rejects reading another object at file scope. Returns the Constant
+ * decl's node id (0 when not foldable) */
+NodeId cgFoldableConstDecl(Codegen* cg, NodeId id)
+{
+    NodeId none;
+    none.index = 0;
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return none;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag != ExprKind::Ident) return none;
+    Str nm = e->kind.payload.Ident.name;
+    if (cgIsLocalName(cg, nm)) return none;
+    Str alias = 0;
+    NodeId rd = cgResolveRef(cg, nm, (u32)DeclKind::Constant, id, &alias);
+    if (rd.index == 0) return none;
+    Node* rn = cgNode(cg, rd);
+    if (rn.kind.tag != NodeKind::Decl) return none;
+    Decl* rdd = &rn.kind.payload.Decl.value;
+    if (rdd.kind.tag != DeclKind::Constant) return none;
+    /* flags bit 16 = `const`; a `var` global may change at runtime */
+    if ((rdd.kind.payload.Constant.flags & 16) == 0) return none;
+    if (rdd.kind.payload.Constant.value.index == 0) return none;
+    if (!cgConstAtom(cg, rdd.kind.payload.Constant.value)) return none;
+    return rd;
+}
+
+/* an ident naming a function is an address constant in C: file-scope
+ * `const A = { .alloc = f }` initializers rely on this */
+bool cgConstFuncIdent(Codegen* cg, NodeId id)
+{
+    Node* n = cgNode(cg, id);
+    if (n.kind.tag != NodeKind::Expr) return false;
+    Expr* e = &n.kind.payload.Expr.value;
+    if (e->kind.tag != ExprKind::Ident) return false;
+    Str nm = e->kind.payload.Ident.name;
+    if (cgIsLocalName(cg, nm)) return false;
+    Str alias = 0;
+    NodeId rd = cgResolveRef(cg, nm, (u32)DeclKind::Func, id, &alias);
+    if (rd.index == 0) return false;
+    Node* rn = cgNode(cg, rd);
+    return rn.kind.tag == NodeKind::Decl && rn.kind.payload.Decl.value.kind.tag == DeclKind::Func;
+}
+
 /* file-scope constant values must lower to C constant expressions:
- * literals, casts, and unary/binary operators over the same */
+ * literals, casts, and unary/binary operators over the same, plus
+ * references to other file-scope `const` decls (folded by value) */
 bool cgConstAtom(Codegen* cg, NodeId id)
 {
     if (id.index == 0) return false;
@@ -5702,6 +5774,16 @@ bool cgConstAtom(Codegen* cg, NodeId id)
     u32 k = (u32)e->kind.tag;
     if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
         k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit) return true;
+    if (k == ExprKind::Ident)
+    {
+        if (cg.foldDepth >= 32) return false;
+        cg.foldDepth++;
+        NodeId fd = cgFoldableConstDecl(cg, id);
+        bool foldable = fd.index != 0;
+        cg.foldDepth--;
+        if (foldable) return true;
+        return cgConstFuncIdent(cg, id);
+    }
     if (k == ExprKind::Neg) return cgConstAtom(cg, e->kind.payload.Neg.expr);
     if (k == ExprKind::Not) return cgConstAtom(cg, e->kind.payload.Not.expr);
     if (k == ExprKind::BitNot) return cgConstAtom(cg, e->kind.payload.BitNot.expr);
@@ -5741,8 +5823,32 @@ void cgConstExpr(Codegen* cg, NodeId id)
     u32 k = (u32)e->kind.tag;
     if (k == ExprKind::IntLit || k == ExprKind::FloatLit || k == ExprKind::BoolLit ||
         k == ExprKind::StringLit || k == ExprKind::CharLit || k == ExprKind::NullLit ||
-        k == ExprKind::Ident || k == ExprKind::Path)
+        k == ExprKind::Path)
     {
+        stPS(&cg.defs, cgExpr(cg, id));
+        return;
+    }
+    if (k == ExprKind::Ident)
+    {
+        /* fold a reference to another file-scope `const` by value: C
+         * forbids reading another object in a file-scope initializer */
+        NodeId fd = cgFoldableConstDecl(cg, id);
+        if (fd.index != 0)
+        {
+            if (cg.foldDepth >= 32)
+            {
+                cgError(cg, "constant initializer refers to itself");
+                return;
+            }
+            Node* dn = cgNode(cg, fd);
+            Decl* fdd = &dn.kind.payload.Decl.value;
+            cg.foldDepth++;
+            stCh(&cg.defs, '(');
+            cgConstExpr(cg, fdd.kind.payload.Constant.value);
+            stCh(&cg.defs, ')');
+            cg.foldDepth--;
+            return;
+        }
         stPS(&cg.defs, cgExpr(cg, id));
         return;
     }
@@ -5811,6 +5917,112 @@ void cgConstExpr(Codegen* cg, NodeId id)
     stPS(&cg.defs, cgExpr(cg, id));
 }
 
+/* would cgEmitInitValue emit this initializer without statement temps
+ * and without C runtime expressions? (mirrors its shape) */
+bool cgInitConstP(Codegen* cg, NodeId v)
+{
+    if (v.index == 0) return true;
+    Node* n = cgNode(cg, v);
+    if (n.kind.tag == NodeKind::Expr && n.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral)
+    {
+        Expr* al = &n.kind.payload.Expr.value;
+        u32 i = 0;
+        while (i < al.kind.payload.ArrayLiteral.elemsLen)
+        {
+            if (!cgInitConstP(cg, al.kind.payload.ArrayLiteral.elems[i])) return false;
+            i++;
+        }
+        return true;
+    }
+    if (n.kind.tag == NodeKind::Expr && n.kind.payload.Expr.value.kind.tag == ExprKind::StructLiteral)
+    {
+        Expr* se = &n.kind.payload.Expr.value;
+        /* variant literals lower through cgExpr already; leave that path
+         * unchanged rather than reclassifying them */
+        if (se->kind.payload.StructLiteral.variantName != 0) return true;
+        u32 i = 0;
+        while (i < se->kind.payload.StructLiteral.fieldValuesLen)
+        {
+            if (!cgInitConstP(cg, se->kind.payload.StructLiteral.fieldValues[i])) return false;
+            i++;
+        }
+        return true;
+    }
+    return cgConstAtom(cg, v);
+}
+
+void cgAddDynInit(Codegen* cg, NodeId decl)
+{
+    if (cg.dynInitsLen >= cg.dynInitsCap)
+    {
+        cgError(cg, "too many file-scope variables with runtime initializers");
+        return;
+    }
+    cg.dynInits[cg.dynInitsLen] = decl;
+    cg.dynInitsLen++;
+}
+
+/* runtime `var` globals: the assignments run from a constructor before
+ * main, so the emitted C storage stays plain zero-initialized */
+void cgEmitGlobalInit(Codegen* cg)
+{
+    if (cg.dynInitsLen == 0) return;
+    usize bodyStart = cg.body.len;
+    cg.tempsLen = 0;
+    cg.loopDepth = 0;
+    cg.breakDepth = 0;
+    cg.dropsLen = 0;
+    cg.fnDropMark = 0;
+    cg.ind = 1;
+    cg.localNamesLen = 0;
+    u32 i = 0;
+    while (i < cg.dynInitsLen)
+    {
+        Node* dn = cgNode(cg, cg.dynInits[i]);
+        Decl* dd = &dn.kind.payload.Decl.value;
+        stNL(&cg.body, cg.ind);
+        stPS(&cg.body, cgMangle(cg, cg.dynInits[i], dd.kind.payload.Constant.name, 0));
+        stP(&cg.body, " = ");
+        Slice ev = cgExpr(cg, dd.kind.payload.Constant.value);
+        stPS(&cg.body, ev);
+        stCh(&cg.body, ';');
+        i++;
+    }
+    Slice bodyText = stTail(&cg.body, bodyStart);
+    stNL(&cg.bodies, 0);
+    stP(&cg.bodies, "__attribute__((constructor)) static void coral_globals_init(void) {");
+    // temporaries declared at function top (same shape as cgEmitFuncCommon)
+    u32 t = 0;
+    while (t < cg.tempsLen)
+    {
+        stP(&cg.bodies, "\n    ");
+        Slice tty = cg.tempTys[t];
+        usize bi = 0;
+        while (bi < tty.len && tty.ptr[bi] != 91) bi++;
+        if (bi < tty.len)
+        {
+            usize j = 0;
+            while (j < bi) { stCh(&cg.bodies, tty.ptr[j]); j++; }
+            stCh(&cg.bodies, ' ');
+            stPS(&cg.bodies, cgTempName(cg, t));
+            j = bi;
+            while (j < tty.len) { stCh(&cg.bodies, tty.ptr[j]); j++; }
+            stP(&cg.bodies, ";");
+        }
+        else
+        {
+            stPS(&cg.bodies, tty);
+            stCh(&cg.bodies, ' ');
+            stPS(&cg.bodies, cgTempName(cg, t));
+            stP(&cg.bodies, ";");
+        }
+        t++;
+    }
+    stPS(&cg.bodies, bodyText);
+    stNL(&cg.bodies, 0);
+    stCh(&cg.bodies, '}');
+}
+
 /* file-scope constants and variables, emitted after the prototypes so
  * fn-pointer initializers (`const A = { .alloc = f }`) see a prior
  * declaration of f */
@@ -5849,8 +6061,29 @@ void cgEmitGlobals(Codegen* cg)
                             inn.kind.payload.Expr.value.kind.tag == ExprKind::ArrayLiteral;
                         if (isArray && !isArrLit)
                             cgError(cg, "array constant needs an array-literal initializer");
-                        stP(&cg.defs, " = ");
-                        cgEmitInitValue(cg, cval);
+                        /* C only accepts constant expressions at file scope.
+                         * a `const` decl must be one; a runtime `var`
+                         * initializer is deferred to coral_globals_init() */
+                        bool constShaped = cgInitConstP(cg, cval);
+                        if (!constShaped && (cflags & 16) != 0)
+                        {
+                            cgErrorUnsupported(cg, cg.file.decls[i],
+                                "initializer of a file-scope constant must be a constant expression");
+                        }
+                        else if (!constShaped && isArray)
+                        {
+                            cgErrorUnsupported(cg, cg.file.decls[i],
+                                "file-scope array initializer must be constant");
+                        }
+                        else if (!constShaped)
+                        {
+                            cgAddDynInit(cg, cg.file.decls[i]);
+                        }
+                        else
+                        {
+                            stP(&cg.defs, " = ");
+                            cgEmitInitValue(cg, cval);
+                        }
                     }
                     stP(&cg.defs, ";\n");
                 }
@@ -6435,8 +6668,12 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
     cg.regCap = 512;
     cg.regLen = 0;
     cg.regNames = (Slice*)arena.alloc(512 * @sizeof(Slice), 8);
+    cg.dynInitsCap = 512;
+    cg.dynInitsLen = 0;
+    cg.dynInits = (NodeId*)arena.alloc(512 * @sizeof(NodeId), 8);
+    cg.foldDepth = 0;
     cg.ind = 0;
-    if (cg.tempTys == null || cg.tempArrs == null || cg.regNames == null) {
+    if (cg.tempTys == null || cg.tempArrs == null || cg.regNames == null || cg.dynInits == null) {
         CodegenResult r;
         r.cCode = Slice::from(null, 0);
         r.errors = 1;
@@ -6457,6 +6694,7 @@ pub CodegenResult generateC(AstContext* ctx, File* file, MonoContext* mono, Aren
         cg.protos = cg.defs;
         cg.defs = defsSaved;
     }
+    cgEmitGlobalInit(&cg);
     cgEmitBodies(&cg);
 
     // assemble: preamble | fwd typedefs | alias/enum typedefs | registry typedefs | defs | protos | bodies
