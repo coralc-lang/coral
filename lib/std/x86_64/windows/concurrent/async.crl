@@ -49,6 +49,7 @@ import(lib) platform::win32 {
 import(lib) platform::libc { printf };
 import(lib) core::cchar { cchar };
 
+/// Errors reported by the async runtime.
 pub variant AsyncError
 {
     OutsideFiber { str msg; },
@@ -74,6 +75,7 @@ const i32 STEP_STUCK = 5;
 // ready and then returns its result. v1 futures are not individually
 // cancellable — the owner drops a future it no longer wants to wait on, and
 // the runtime never resumes or frees one; see the module comment.
+/// One-shot result cell awaited by fibers.
 pub struct Future
 {
     u8 state;
@@ -137,6 +139,7 @@ Fiber* _activeFiber; // fiber currently executing on the driver thread
 bool _busy; // a driver owns the scheduler (run/runOnce guard)
 
 // Heap stack size for new fibers. Set it before the first spawn.
+/// Stack size, in bytes, for newly spawned fibers.
 pub usize defaultFiberStackSize = 131072;
 
 u64 _nowMs()
@@ -161,6 +164,7 @@ void _initScheduler()
 
 // Set up the module from the calling thread before any other thread touches
 // it — the lazy path inside _lock() is not itself synchronized.
+/// Initialize the scheduler; true on success.
 pub bool init()
 {
     _initScheduler();
@@ -400,6 +404,7 @@ i32 _step(bool allowWait)
 // payload (my judgment call, null is the result).
 // Err(SpawnFailed) — null fn, or the fiber/future could not be allocated;
 // the message says which.
+/// Spawn fn(arg) on its own fiber, returning a join future or Err.
 pub Result<Future*, AsyncError> spawn(void(rawptr) fn, rawptr arg)
 {
     if (fn == null)
@@ -430,6 +435,7 @@ pub Result<Future*, AsyncError> spawn(void(rawptr) fn, rawptr arg)
 // There is nowhere to suspend to outside a fiber, so that diagnoses itself
 // (message on stdout) and returns Err; await on a null future is Err too.
 // Ok(null) is a legitimate result — join futures resolve with a null payload.
+/// Suspend the calling fiber until f resolves; Err outside a fiber.
 pub Result<rawptr, AsyncError> await(Future* f)
 {
     Fiber* cur = _activeFiber;
@@ -458,6 +464,7 @@ pub Result<rawptr, AsyncError> await(Future* f)
 // Timer awaitable — await(sleep(ms)) suspends the fiber for at least ms.
 // null — the future or timer entry could not be allocated; awaiting a null
 // future reports Err(NullFuture).
+/// Awaitable that resolves after at least ms milliseconds.
 pub Future* sleep(u64 ms)
 {
     Future* f = _newFuture();
@@ -492,6 +499,7 @@ pub Future* sleep(u64 ms)
 // receives nobody will ever send; after an external completion (or spawn)
 // makes progress, run() may simply be called again. Not re-entrant, a nested
 // or concurrent driver call returns false without driving anything.
+/// Drive fibers until all finish; false if the scheduler stalls.
 pub bool run()
 {
     if (_busy) return false;
@@ -520,6 +528,7 @@ pub bool run()
 
 // One scheduler slice that never blocks — expire due timers, then run at most
 // one ready fiber, then return (nothing to do just returns).
+/// Run at most one scheduler slice without blocking.
 pub void runOnce()
 {
     if (_busy) return;
@@ -540,6 +549,7 @@ pub void runOnce()
 // (the pool thread only completes the future under the scheduler lock).
 // null — the job could not be queued (bad args, OOM, or a stopped pool)
 // instead of an early-resolved future.
+/// Offload fn(arg) to pool, returning a future that resolves on completion.
 pub Future* poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
 {
     if (pool == null || fn == null) return null;
@@ -582,6 +592,7 @@ pub Future* poolRun(ThreadPool* pool, void(rawptr) fn, rawptr arg)
 // A pending recv future that is never awaited and never matched stays pending
 // forever (the module-level no-cancellation rule) — its value, if a send did
 // match it, goes nowhere.
+/// Buffered or rendezvous channel of rawptr values.
 pub struct AsyncChannel
 {
     rawptr* buf;
@@ -591,6 +602,7 @@ pub struct AsyncChannel
     Future* recvHead;
     Future* recvTail;
 
+    /// Initialize a channel with the given capacity (0 for rendezvous).
     bool init(usize capacity)
     {
         self.buf = null;
@@ -606,6 +618,7 @@ pub struct AsyncChannel
         return true;
     }
 
+    /// Release the channel's buffer; parked receives stay pending.
     void deinit()
     {
         if (self.buf != null) dealloc<rawptr>(self.buf);
@@ -618,6 +631,7 @@ pub struct AsyncChannel
         self.recvTail = null;
     }
 
+    /// Deliver value to a receiver or a buffer slot; true on success.
     bool send(rawptr value)
     {
         _lock();
@@ -644,6 +658,7 @@ pub struct AsyncChannel
     }
 
     // null — the receive future could not be allocated.
+    /// Return a future resolving to the next received value, or null on OOM.
     Future* recv()
     {
         _lock();
@@ -678,6 +693,7 @@ pub struct AsyncChannel
 }
 
 // @drop is the inbuilt drop trait — mirrors threadpool.crl's deinit hookup.
+/// Drops the channel by releasing its buffer.
 pub extend AsyncChannel : @drop
 {
     void drop()

@@ -5,8 +5,10 @@ import(lib) platform::win32 { CreateThread, WaitForSingleObject, GetExitCodeThre
 
 const u32 INFINITE = 0xFFFFFFFF;
 
+/// Opaque handle to a running thread.
 pub distinct Thread = rawptr;
 
+/// Condition variable used together with a Mutex.
 pub struct ConditionVar
 {
         // CONDITION_VARIABLE is 8B on x64 (a single PVOID) — FLAGGED;
@@ -14,11 +16,14 @@ pub struct ConditionVar
     rawptr impl[1];
 
     #[[inline]]
+    /// Initialize the condition variable.
     void init() { InitializeConditionVariable(self.impl); }
+    /// Destroy the condition variable.
     void destroy()
     {
         // no-op, CONDITION_VARIABLE needs no destruction.
     }
+    /// Atomically release mutex and wait for a signal or broadcast.
     void wait(Mutex* mutex)
     {
         // Releases self's critical section while blocked, like
@@ -26,8 +31,10 @@ pub struct ConditionVar
         SleepConditionVariableCS(self.impl, mutex->_cs, INFINITE);
     }
     #[[inline]]
+    /// Wake one waiter.
     void signal() { WakeConditionVariable(self.impl); }
     #[[inline]]
+    /// Wake all waiters.
     void broadcast() { WakeAllConditionVariable(self.impl); }
 }
 
@@ -48,6 +55,7 @@ u32 _threadEntry(rawptr p)
     return (usize)result;
 }
 
+/// Error returned when a thread cannot be created.
 pub variant ThreadError
 {
     CreateFailed { str msg; }
@@ -55,6 +63,7 @@ pub variant ThreadError
 
 // Err(CreateFailed) — null fn, ThreadCtx allocation failed, or CreateThread
 // failed (the message says which); Ok — the join handle for the new thread.
+/// Create a thread running fn(arg); Err(CreateFailed) on failure.
 pub Result<Thread, ThreadError> threadCreate(rawptr(rawptr) fn, rawptr arg)
 {
     if (fn == null)
@@ -75,6 +84,7 @@ pub Result<Thread, ThreadError> threadCreate(rawptr(rawptr) fn, rawptr arg)
     return Result<Thread, ThreadError>::Ok { .value = (Thread)h };
 }
 
+/// Wait for thread t to finish; true on success.
 pub bool threadJoin(Thread t, rawptr* retval)
 {
     rawptr h = (rawptr)t;
@@ -96,6 +106,7 @@ pub bool threadJoin(Thread t, rawptr* retval)
     return true;
 }
 
+/// Terminate the calling thread, returning retval to its joiner.
 pub void threadExit(rawptr retval)
 {
     // FLAG, truncated to u32; called from inside a threadCreate entry it
@@ -103,6 +114,7 @@ pub void threadExit(rawptr retval)
     ExitThread((usize)retval);
 }
 
+/// Handle for the calling thread.
 pub Thread threadCurrent()
 {
     // FLAG, a reusable u32 id, NOT the HANDLE threadCreate returns —
@@ -110,10 +122,12 @@ pub Thread threadCurrent()
     return (Thread)(rawptr)(usize)GetCurrentThreadId();
 }
 
+/// 64-bit atomic integer with sequentially consistent operations.
 pub struct AtomicU64
 {
     u64 value;
 
+    /// Atomically load the value.
     u64 load()
     {
         u64 v;
@@ -121,12 +135,14 @@ pub struct AtomicU64
         return v;
     }
 
+    /// Atomically store val.
     void store(u64 val)
     {
         asm volatile { "xchgq %0, %1\n\tmfence" : "=m"(self.value) : "r"(val) }
         return;
     }
 
+    /// Atomically add delta, returning the previous value.
     u64 fetchAdd(u64 delta)
     {
         u64 result;
@@ -134,11 +150,13 @@ pub struct AtomicU64
         return result;
     }
 
+    /// Atomically subtract delta, returning the previous value.
     u64 fetchSub(u64 delta)
     {
         return self.fetchAdd(0u - delta);
     }
 
+    /// Atomically compare with expected and store desired on match; true on match.
     bool compareExchange(u64 expected, u64 desired)
     {
         u8 ok;
@@ -147,10 +165,12 @@ pub struct AtomicU64
     }
 }
 
+/// 32-bit atomic integer with sequentially consistent operations.
 pub struct AtomicU32
 {
     u32 value;
 
+    /// Atomically load the value.
     u32 load()
     {
         u32 v;
@@ -158,12 +178,14 @@ pub struct AtomicU32
         return v;
     }
 
+    /// Atomically store val.
     void store(u32 val)
     {
         asm volatile { "xchgl %0, %1\n\tmfence" : "=m"(self.value) : "r"(val) }
         return;
     }
 
+    /// Atomically add delta, returning the previous value.
     u32 fetchAdd(u32 delta)
     {
         u32 result;
@@ -171,11 +193,13 @@ pub struct AtomicU32
         return result;
     }
 
+    /// Atomically subtract delta, returning the previous value.
     u32 fetchSub(u32 delta)
     {
         return self.fetchAdd(0u - delta);
     }
 
+    /// Atomically compare with expected and store desired on match; true on match.
     bool compareExchange(u32 expected, u32 desired)
     {
         u8 ok;

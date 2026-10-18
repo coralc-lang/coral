@@ -11,6 +11,8 @@ import(lib) std::option { Option };
 
 // Shared error type for the whole io subsystem (fs is the lowest module
 // everything else can import without a cycle).
+/// Shared error type for the whole io subsystem; an OS error, an
+/// unexpected EOF, or a caller-side usage problem.
 pub variant IoError
 {
     // errno (linux) / GetLastError (windows) from the failing call
@@ -21,37 +23,59 @@ pub variant IoError
     BadUsage { str msg; }
 }
 
+/// Constructors for IoError.
 pub extend IoError
 {
     // errno of the calling thread, captured right after a failed libc call
+/// Captures the calling thread's last OS error and tags it with `op`.
     static IoError os(str op)
     {
         return IoError::Os { .code = *__errno_location(), .op = op };
     }
 }
 
+/// open() flag: open for reading only.
 pub const i32 O_RDONLY = 0;
+/// open() flag: open for writing only.
 pub const i32 O_WRONLY = 1;
+/// open() flag: open for reading and writing.
 pub const i32 O_RDWR = 2;
+/// open() flag: create the file if it does not exist.
 pub const i32 O_CREAT = 64;
+/// open() flag: truncate the file to zero length.
 pub const i32 O_TRUNC = 512;
+/// open() flag: writes always append at end of file.
 pub const i32 O_APPEND = 1024;
+/// owner rwx mode bits (0700).
 pub const i32 S_IRWXU = 448;
+/// owner read mode bit (0400).
 pub const i32 S_IRUSR = 256;
+/// owner write mode bit (0200).
 pub const i32 S_IWUSR = 128;
+/// owner execute mode bit (0100).
 pub const i32 S_IXUSR = 64;
+/// fileSeek whence: offset is absolute.
 pub const i32 SEEK_SET = 0;
+/// fileSeek whence: offset is relative to the current position.
 pub const i32 SEEK_CUR = 1;
+/// fileSeek whence: offset is relative to end of file.
 pub const i32 SEEK_END = 2;
+/// access() mode: test only for existence.
 pub const i32 F_OK = 0;
+/// access() mode: test for read permission.
 pub const i32 R_OK = 4;
+/// access() mode: test for write permission.
 pub const i32 W_OK = 2;
+/// access() mode: test for execute permission.
 pub const i32 X_OK = 1;
 
+/// An open file, wrapping an OS file descriptor or handle.
 pub distinct File = i32;
+/// An open directory stream returned by openDir.
 pub distinct Dir = rawptr;
 
 // had to check to make sure the layout matches glibc x86-64 struct stat and the BSDs' old stat
+/// POSIX-shaped file metadata: size, mode, link count and timestamps.
 pub struct Stat
 {
     u64 st_dev;
@@ -74,6 +98,7 @@ pub struct Stat
     i64 reserved[3];
 }
 
+/// The kind of filesystem entry a Stat describes.
 pub enum FileType
 {
     Unknown,
@@ -86,6 +111,7 @@ pub enum FileType
     Socket
 }
 
+/// Opens `path` with a stdio-style `mode` ("r", "w", "a", optional "+"); returns a File or IoError.
 pub Result<File, IoError> fileOpen(str path, str mode)
 {
     u8 pbuf[4096];
@@ -111,11 +137,13 @@ pub Result<File, IoError> fileOpen(str path, str mode)
     return Result<File, IoError>::Ok { .value = (File)fd };
 }
 
+/// Closes an open File.
 pub void fileClose(File f)
 {
     close((i32)f);
 }
 
+/// Reads up to `count` bytes from `f` into `buf`; returns the byte count or IoError.
 pub Result<isize, IoError> fileRead(File f, u8* buf, usize count)
 {
     isize n = read((i32)f, buf, count);
@@ -123,6 +151,7 @@ pub Result<isize, IoError> fileRead(File f, u8* buf, usize count)
     return Result<isize, IoError>::Ok { .value = n };
 }
 
+/// Writes `count` bytes from `buf` to `f`; returns the byte count or IoError.
 pub Result<isize, IoError> fileWrite(File f, const u8* buf, usize count)
 {
     isize n = write((i32)f, buf, count);
@@ -130,6 +159,7 @@ pub Result<isize, IoError> fileWrite(File f, const u8* buf, usize count)
     return Result<isize, IoError>::Ok { .value = n };
 }
 
+/// Moves the offset of `f` by `offset` according to `whence`; returns the new offset or IoError.
 pub Result<isize, IoError> fileSeek(File f, isize offset, i32 whence)
 {
     isize n = lseek((i32)f, offset, whence);
@@ -139,6 +169,7 @@ pub Result<isize, IoError> fileSeek(File f, isize offset, i32 whence)
 
 // existence probe: false means "does not exist", the normal answer to
 // the question — no errno worth propagating.
+/// Returns true if `path` exists.
 pub bool fileExists(str path)
 {
     u8 pbuf[4096];
@@ -150,6 +181,7 @@ pub bool fileExists(str path)
 
 // None when the path does not stat — ENOENT (absence) is the common
 // answer here; `out` is filled only on Some.
+/// Stats `path`; returns Some(true) on success and None if it cannot be statted.
 pub Option<bool> statPath(str path, Stat* out)
 {
     u8 pbuf[4096];
@@ -160,6 +192,7 @@ pub Option<bool> statPath(str path, Stat* out)
     return Option<bool>::Some { .value = true };
 }
 
+/// Classifies a Stat's mode into a FileType.
 pub FileType getFileType(const Stat* s)
 {
     u32 mode = s->st_mode;
@@ -173,6 +206,7 @@ pub FileType getFileType(const Stat* s)
     return FileType::Unknown;
 }
 
+/// Creates directory `path` with permission bits `mode`.
 pub Result<bool, IoError> createDir(str path, i32 mode)
 {
     u8 pbuf[4096];
@@ -183,6 +217,7 @@ pub Result<bool, IoError> createDir(str path, i32 mode)
     return Result<bool, IoError>::Ok { .value = true };
 }
 
+/// Removes the empty directory `path`.
 pub Result<bool, IoError> removeDir(str path)
 {
     u8 pbuf[4096];
@@ -193,6 +228,7 @@ pub Result<bool, IoError> removeDir(str path)
     return Result<bool, IoError>::Ok { .value = true };
 }
 
+/// Deletes the file `path`.
 pub Result<bool, IoError> deleteFile(str path)
 {
     u8 pbuf[4096];
@@ -203,6 +239,7 @@ pub Result<bool, IoError> deleteFile(str path)
     return Result<bool, IoError>::Ok { .value = true };
 }
 
+/// Renames `oldPath` to `newPath`.
 pub Result<bool, IoError> renameFile(str oldPath, str newPath)
 {
     u8 oldBuf[4096];
@@ -218,6 +255,7 @@ pub Result<bool, IoError> renameFile(str oldPath, str newPath)
 
 // permission probe: false means "cannot access", the normal answer —
 // no error info beyond that worth propagating.
+/// Returns true if `path` is accessible with mode `mode` (F_OK/R_OK/W_OK/X_OK).
 pub bool canAccess(str path, i32 mode)
 {
     u8 pbuf[4096];
@@ -227,6 +265,7 @@ pub bool canAccess(str path, i32 mode)
     return access(pbuf, mode) == 0;
 }
 
+/// Opens directory `path` for iteration; returns a Dir or IoError.
 pub Result<Dir, IoError> openDir(str path)
 {
     u8 pbuf[4096];
@@ -238,16 +277,19 @@ pub Result<Dir, IoError> openDir(str path)
     return Result<Dir, IoError>::Ok { .value = (Dir)d };
 }
 
+/// Returns the next raw directory entry, or null at end of stream.
 pub rawptr readDir(Dir dir)
 {
     return readdir((rawptr)dir);
 }
 
+/// Closes a Dir and releases its resources.
 pub void closeDir(Dir dir)
 {
     closedir((rawptr)dir);
 }
 
+/// Reads the entire file at `path` into a String or IoError.
 pub Result<String, IoError> readFileToString(str path)
 {
     Result<File, IoError> fo = fileOpen(path, "r");
@@ -275,6 +317,7 @@ pub Result<String, IoError> readFileToString(str path)
 // glibc x86-64 struct dirent (fields we need; reclen-padded tail omitted).
 // Layout verified against bits/dirent.h, d_ino u64, d_off i64, d_reclen u16,
 // d_type u8, d_name cchar[256].
+/// A glibc-shaped directory entry, one row of a directory listing.
 pub struct Dirent
 {
     u64 d_ino;
@@ -285,6 +328,7 @@ pub struct Dirent
 }
 
 // Read the next directory entry; false at end of stream.
+/// Copies the next directory entry into `out`; false at end of stream.
 pub bool readDirEntry(Dir dir, Dirent* out)
 {
     rawptr raw = readDir(dir);
@@ -295,6 +339,7 @@ pub bool readDirEntry(Dir dir, Dirent* out)
 
 // mkdir -p behavior, create every missing component of `path`.
 // mode 0755 by convention here (pass 493u).
+/// Creates `path` and any missing parent directories (mkdir -p).
 pub Result<bool, IoError> createDirRecursive(str path, i32 mode)
 {
     if (path.len == 0) return Result<bool, IoError>::Err { .error = IoError::BadUsage { .msg = "empty path" } };
@@ -314,6 +359,7 @@ pub Result<bool, IoError> createDirRecursive(str path, i32 mode)
 }
 
 // Write an entire String to `path` (truncates).
+/// Writes the contents of `data` to `path`, truncating it first.
 pub Result<bool, IoError> writeFileFromString(str path, const String* data)
 {
     Result<File, IoError> fo = fileOpen(path, "w");

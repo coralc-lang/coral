@@ -6,12 +6,14 @@ import(lib) platform::libc;
 // Reported by user-facing inits whose initial backing allocation genuinely
 // fails (the allocator fn pointers themselves stay rawptr/null — that is
 // their contract, not an error case).
+/// Reported when a user-facing allocator init cannot allocate.
 pub variant AllocError
 {
     AllocFailed { str msg; }
 }
 
 // global default allocator
+/// Global default allocator used by alloc/dealloc.
 pub Allocator* defaultAllocator;
 
 rawptr _defaultAllocHeap;
@@ -19,6 +21,7 @@ usize _defaultAllocHeapSize;
 
 // Tear down the default allocator and return the heap to the OS.
 // Only call this when nothing allocated through it is still in use.
+/// Tear down the default allocator and return its heap to the OS.
 pub void deinitDefaultAllocator()
 {
     if (defaultAllocator == null) return;
@@ -50,6 +53,7 @@ rawptr _libcRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return libc::realloc(ptr, newSize);
 }
 
+/// Allocator backed by the C library's malloc/free/realloc.
 pub Allocator libcAllocator = Allocator {
     .ctx = null,
     .alloc = _libcAlloc,
@@ -78,6 +82,7 @@ rawptr _miStdRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return _miAllocInstance.realloc(ptr, newSize);
 }
 
+/// Allocator backed by a global mimalloc instance.
 pub Allocator miAllocator = Allocator {
     .ctx = null,
     .alloc = _miStdAlloc,
@@ -86,6 +91,7 @@ pub Allocator miAllocator = Allocator {
 };
 
 // Fallback — use mimalloc if not initialized
+/// Initialize the default allocator if it is not set.
 pub void ensureDefaultAllocator()
 {
     if (defaultAllocator == null)
@@ -94,6 +100,7 @@ pub void ensureDefaultAllocator()
 
 // Initialize default allocator with libc malloc
 // Call this once at program start (or use -flag=def)
+/// Set the default allocator to the libc-backed one.
 pub void initDefaultAllocator()
 {
     if (defaultAllocator != null) return;
@@ -306,6 +313,7 @@ rawptr _heapRealloc(rawptr ctx, rawptr ptr, usize newSize)
 
 // Coral free-list heap as the fallback allocator
 
+/// Fallback free-list heap allocator that needs no libc.
 pub Allocator cAllocator = Allocator {
     .ctx = null,
     .alloc = _heapAlloc,
@@ -313,6 +321,7 @@ pub Allocator cAllocator = Allocator {
     .realloc = _heapRealloc
 };
 
+/// Page size assumed by the page allocator.
 pub const usize pageSize = 4096u;
 
 rawptr _pageAlloc(rawptr ctx, usize size)
@@ -356,6 +365,7 @@ rawptr _pageRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return newPtr;
 }
 
+/// Allocator that maps whole pages for each allocation.
 pub Allocator pageAllocator = Allocator {
     .ctx = null,
     .alloc = _pageAlloc,
@@ -363,12 +373,14 @@ pub Allocator pageAllocator = Allocator {
     .realloc = _pageRealloc
 };
 
+/// Allocator that carves allocations from a fixed caller buffer.
 pub struct FixedBufferAllocator
 {
     u8* buffer;
     usize cap;
     usize used;
 
+    /// Set the backing buffer and its size.
     void init(u8* buffer, usize size)
     {
         self.buffer = buffer;
@@ -376,6 +388,7 @@ pub struct FixedBufferAllocator
         self.used = 0;
     }
 
+    /// Allocator vtable backed by this buffer.
     Allocator allocator()
     {
         return Allocator {
@@ -386,11 +399,13 @@ pub struct FixedBufferAllocator
         };
     }
 
+    /// Reclaim all allocations made from the buffer.
     void reset()
     {
         self.used = 0;
     }
 
+    /// Bytes still available in the buffer.
     usize remaining(const self*)
     {
         return self.cap - self.used;
@@ -427,18 +442,21 @@ rawptr _fbaRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return newPtr;
 }
 
+/// Allocator that uses a small stack buffer, falling back to another.
 pub struct StackFallbackAllocator
 {
     FixedBufferAllocator fba;
     Allocator* fallback;
     u8 stackBuf[1024];
 
+    /// Set the fallback allocator for oversized requests.
     void init(Allocator* fallback)
     {
         self.fba.init(self.stackBuf, 1024u);
         self.fallback = fallback;
     }
 
+    /// Allocator vtable backed by this allocator.
     Allocator allocator()
     {
         return Allocator {
@@ -490,6 +508,7 @@ rawptr _sfaRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return newPtr;
 }
 
+/// Bump allocator that grows its buffer through a backing allocator.
 pub struct ArenaAllocator
 {
     Allocator* backing;
@@ -500,6 +519,7 @@ pub struct ArenaAllocator
     // A failed initial buffer allocation leaves the arena empty (cap 0),
     // which still grows lazily from the backing allocator on first use, so
     // push degrades to null-returning instead of writing through a null base.
+    /// Initialize with a backing allocator and initial capacity.
     void init(Allocator* backing, usize initialCap)
     {
         self.backing = backing;
@@ -512,6 +532,7 @@ pub struct ArenaAllocator
         self.cap = initialCap;
     }
 
+    /// Release the arena's buffer back to the backing allocator.
     void deinit()
     {
         if (self.backing != null) self.backing->free(self.backing->ctx, (rawptr)self.base);
@@ -520,6 +541,7 @@ pub struct ArenaAllocator
         self.used = 0;
     }
 
+    /// Allocator vtable backed by this arena.
     Allocator allocator()
     {
         return Allocator {
@@ -531,10 +553,14 @@ pub struct ArenaAllocator
     }
 
     #[[inline]]
+    /// Bump-allocate size bytes from the arena; null on failure.
     rawptr push(usize size) { return _arenaAlloc((rawptr)self, size); }
     #[[inline]]
+    /// Bump-allocate count T objects from the arena.
     T* pushType<T>(usize count) { return (T*)self.push(@sizeof(T) * count); }
+    /// Reclaim all arena allocations without freeing the buffer.
     void reset() { self.used = 0; }
+    /// Bytes still available in the arena.
     usize remaining() { return self.cap - self.used; }
 }
 
@@ -584,6 +610,7 @@ rawptr _arenaRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return newPtr;
 }
 
+/// Allocator handing out fixed-size blocks from one backing region.
 pub struct PoolAllocator
 {
     rawptr freeList;
@@ -592,6 +619,7 @@ pub struct PoolAllocator
     u8* backing;
     Allocator* source;
 
+    /// Reserve blockCount blocks of blockSize from source.
     void init(Allocator* source, usize blockSize, usize blockCount)
     {
         self.source = source;
@@ -611,6 +639,7 @@ pub struct PoolAllocator
         }
     }
 
+    /// Release the backing region to the source allocator.
     void deinit()
     {
         if (self.source != null && self.backing != null)
@@ -621,6 +650,7 @@ pub struct PoolAllocator
         self.blockCount = 0;
     }
 
+    /// Allocator vtable backed by this pool.
     Allocator allocator()
     {
         return Allocator {
@@ -631,11 +661,13 @@ pub struct PoolAllocator
         };
     }
 
+    /// Allocate one block; null when the pool is exhausted.
     rawptr allocBlock()
     {
         return _poolAlloc((rawptr)self, self.blockSize);
     }
 
+    /// Return a block to the pool.
     void freeBlock(rawptr block)
     {
         _poolFree((rawptr)self, block);
@@ -669,6 +701,7 @@ rawptr _poolRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return ptr;
 }
 
+/// Allocator that tracks allocations so they can be freed together.
 pub struct ScopeAlloc
 {
     Allocator* backing;
@@ -677,6 +710,7 @@ pub struct ScopeAlloc
     usize len;
     usize cap;
 
+    /// Initialize with a backing allocator and initial tracking capacity.
     void init(Allocator* backing, usize cap)
     {
         self.backing = backing;
@@ -717,6 +751,7 @@ pub struct ScopeAlloc
         self.cap = newCap;
     }
 
+    /// Allocate size bytes and record them for freeAll.
     rawptr alloc(usize size)
     {
         if (self.backing == null) return null;
@@ -731,11 +766,13 @@ pub struct ScopeAlloc
         return ptr;
     }
 
+    /// Allocate count T objects and record them for freeAll.
     T* allocType<T>(usize count)
     {
         return (T*)self.alloc(@sizeof(T) * count);
     }
 
+    /// Free every allocation recorded so far.
     void freeAll()
     {
         for (usize i = 0; i < self.len; i++) {
@@ -744,6 +781,7 @@ pub struct ScopeAlloc
         self.len = 0;
     }
 
+    /// Free all recorded allocations and the tracking arrays.
     void deinit()
     {
         self.freeAll();
@@ -754,6 +792,7 @@ pub struct ScopeAlloc
         self.cap = 0;
     }
 
+    /// Total bytes currently held by recorded allocations.
     usize bytesUsed(const self*)
     {
         usize total = 0;
@@ -762,6 +801,7 @@ pub struct ScopeAlloc
     }
 }
 
+/// Allocator that wraps another and tracks allocation statistics.
 pub struct LoggingAllocator
 {
     Allocator* parent;
@@ -775,6 +815,7 @@ pub struct LoggingAllocator
     usize trackLen;
     usize trackCap;
 
+    /// Wrap parent and begin tracking its allocations.
     void init(Allocator* parent)
     {
         self.parent = parent;
@@ -841,6 +882,7 @@ pub struct LoggingAllocator
         return 0;
     }
 
+    /// Allocator vtable backed by this logging allocator.
     Allocator allocator()
     {
         return Allocator {
@@ -851,6 +893,7 @@ pub struct LoggingAllocator
         };
     }
 
+    /// Print allocation statistics.
     void printStats()
     {    // TODO!
          // platform::libc::write
@@ -907,6 +950,7 @@ rawptr _logRealloc(rawptr ctx, rawptr ptr, usize newSize)
     return newPtr;
 }
 
+/// Allocate count T objects from the default allocator.
 pub T* alloc<T>(usize count)
 {
     if (count == 0) return null;
@@ -915,6 +959,7 @@ pub T* alloc<T>(usize count)
     return (T*)defaultAllocator->alloc(defaultAllocator->ctx, @sizeof(T) * count);
 }
 
+/// Free a block previously returned by alloc.
 pub void dealloc<T>(T* ptr)
 {
     if (!ptr) return;
@@ -923,6 +968,7 @@ pub void dealloc<T>(T* ptr)
     defaultAllocator->free(defaultAllocator->ctx, (rawptr)ptr);
 }
 
+/// Resize a block to count T objects; frees when newCount is 0.
 pub T* realloc<T>(T* ptr, usize newCount)
 {
     if (newCount == 0) { dealloc<T>(ptr); return null; }
@@ -931,20 +977,24 @@ pub T* realloc<T>(T* ptr, usize newCount)
     return (T*)defaultAllocator->realloc(defaultAllocator->ctx, (rawptr)ptr, @sizeof(T) * newCount);
 }
 
+/// Copy count T objects from src to dst.
 pub void copy<T>(T* dst, T* src, usize count)
 {
     if (dst && src && count > 0) memcpy((rawptr)dst, (const rawptr)src, @sizeof(T) * count);
 }
 
 #[[inline]]
+/// Move count T objects from src to dst, allowing overlap.
 pub void move<T>(T* dst, T* src, usize count) {
     memmove((rawptr)dst, (rawptr)src, @sizeof(T) * count);
 }
 #[[inline]]
+/// Zero count T objects at ptr.
 pub void zero<T>(T* ptr, usize count) {
     memset((rawptr)ptr, 0, @sizeof(T) * count);
 }
 #[[inline]]
+/// True when count T objects at a and b are byte-equal.
 pub bool equal<T>(const T* a, const T* b, usize count) {
     return memcmp((const rawptr)a, (const rawptr)b, @sizeof(T) * count) == 0;
 }
