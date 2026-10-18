@@ -88,7 +88,7 @@ These parse, are stored by name, and do nothing:
 - `#[[hot]]`, `#[[cold]]` — branch/function weight hints. Not emitted.
 - `#[[no_mangle]]` — keep the source symbol name. Mangling is untouched.
 - `#[[generate(...)]]` — derive-style boilerplate generator; planned
-  spelling `#[[generate(Drop, Eq)]]`. Arguments are skipped by the parser.
+  spelling `#[[generate(Drop, Add)]]`. Arguments are skipped by the parser.
 - `#[[no_std]]`, `#[[extern]]` — future slots; `extern` already exists as
   a keyword form.
 - `#[[test]]`, `#[[bench]]`, `#[[cfg]]`, `#[[link]]`, `#[[simd]]` — future

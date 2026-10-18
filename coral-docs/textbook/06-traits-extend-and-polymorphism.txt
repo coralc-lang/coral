@@ -407,17 +407,19 @@ E1303, field moved out before the drop runs. If you take a field out of a struct
 
 The fix is to drop or transfer the whole value, or to replace the moved field with a valid one before the scope ends.
 
-E1304, a trait bound masked by generics. This one is about constraints and is best understood after the next two sections. In short: calling an operation that requires a capability on a value of a type parameter, without declaring that the parameter has the capability, is an error. Writing a generic function that formats `T` without requiring `T : @toStr` is the classic case:
+E1304, a capability used through a type parameter. This one is about generics and is best understood after the next two sections. In short: a generic body may call any operation on a value of type `T`, but the compiler only checks that the operation exists when it instantiates the generic for a concrete type. Ask a generic to print its `T` — which needs `@toStr` — and then call it with a type that has no `@toStr`, and the error is reported at that instantiation, naming the type:
 
-    void broken<T>(T value) {
-        println("{}", value);   // error E1304: T has no known toStr capability
+    void printer<T>(T value) {
+        println("{}", value);   // fine here; each instantiation must supply @toStr
     }
 
-    void right<T : @toStr>(T value) {
-        println("{}", value);   // fine: the bound licenses the call
-    }
+    struct Opaque { i32 id; }   // no @toStr
 
-Together, these four say something clear: every automatic drop either happens and is not called by hand (E1301), is on a type whose layout is fixed (E1302), receives every field it expects (E1303), and the capabilities a generic relies on are declared (E1304). The compiler will not let a lifetime mistake slip through quietly.
+    printer(Opaque { .id = 1 });  // error E1304: Opaque has no toStr capability
+
+Coral does not let you write the requirement on the signature — there is no `T : @toStr` bound. The requirement is a property of the body, and the compiler enforces it wherever the generic is instantiated. When you want to state or check it more directly, you inspect the type in a `comptime` block, as Chapter 7 shows.
+
+Together, these four say something clear: every automatic drop either happens and is not called by hand (E1301), is on a type whose layout is fixed (E1302), receives every field it expects (E1303), and the capabilities a generic relies on exist for the type it is instantiated with (E1304). The compiler will not let a lifetime mistake slip through quietly.
 
 6.10 Dynamic Dispatch: any Trait
 
@@ -441,11 +443,11 @@ The recommended design is to keep dynamic dispatch at the boundary where the con
 
 One practical note on spelling, since it comes up here. Coral has no `as` cast; a conversion is written with the target type in parentheses, as in `(Circle)x`. And the wildcard in a pattern is `else`, never an underscore — in a `switch` over an `any Shape`, you would write what you need explicitly and let an `else` catch the rest, exactly as in any other switch.
 
-6.11 Traits as Constraints: Static Polymorphism
+6.11 Static Polymorphism with Generics
 
-A generic function can require that its type parameter satisfies a trait. The constraint is written after the parameter, and the compiler checks it at every call site:
+A generic function can work for every type that can do what its body asks. The body is the requirement: write `sum += s.area()` and the function works for any `T` whose values have an `area` method. There is no bound to write and no constraint clause on the signature:
 
-    f64 totalArea<T : Shape>(Vec<T> shapes) {
+    f64 totalArea<T>(Vec<T> shapes) {
         f64 sum = 0.0;
         for (T s : shapes) {
             sum += s.area();
@@ -453,12 +455,12 @@ A generic function can require that its type parameter satisfies a trait. The co
         return sum;
     }
 
-Inside `totalArea`, the call `s.area()` is legal because the constraint `T : Shape` guarantees every `T` has an area. At a call site, `T` is deduced from the argument, and the compiler checks that the deduced type implements Shape. Passing a `Vec<str>` is a compile error, reported where the call is, not inside the function — which is the useful place, because that is where the mistake was made.
+Inside `totalArea`, the call `s.area()` is checked when the function is instantiated. Call it with `Vec<Circle>` and the compiler generates a `totalArea<Circle>` whose `s.area()` is a direct call to `Circle::area`. Call it with `Vec<str>` — a type with no `area` — and the error is reported naming `str` as missing the operation. The requirement is never declared up front; it is discovered and enforced at each instantiation. If you want to assert it in your own words, or branch on the type, a `comptime` block does that, as Chapter 7 develops.
 
-This is static polymorphism, and it is free. `totalArea` is monomorphised for each `T` that calls it, so a call with `T = Circle` produces a version whose `s.area()` is a direct call to `Circle::area`. No vtable, no indirection, no dispatch — the constraint buys type-checking without costing anything at runtime. A constrained generic is the preferred form when the set of types is known at compile time and performance matters; `any Trait` is the fallback when it is not. Compare the two side by side:
+This is static polymorphism, and it is free. `totalArea` is monomorphised for each `T` that calls it, so there is no vtable, no indirection, and no dispatch — the type checking costs nothing at runtime. A generic is the preferred form when the set of types is known at compile time and performance matters; `any Trait` is the fallback when it is not. Compare the two side by side:
 
     // static: monomorphised, direct calls, chosen at compile time
-    f64 totalArea<T : Shape>(Vec<T> shapes) { ... }
+    f64 totalArea<T>(Vec<T> shapes) { ... }
 
     // dynamic: one function, indirect calls, chosen at runtime
     f64 totalAreaDyn(Vec<any Shape> shapes) {
@@ -471,7 +473,7 @@ This is static polymorphism, and it is free. `totalArea` is monomorphised for ea
 
 The first cannot accept a mixed vector, because `T` must be a single type. The second can, because every element is the same `any Shape` type. That single sentence is the whole decision: homogeneous and known at compile time means a generic; heterogeneous or known only at runtime means `any`.
 
-Constraints compose. A type parameter may be constrained by several traits, and a trait may itself require another trait, so that an implementor must satisfy both — the interface hierarchy stays honest because the compiler enforces it. The standard library uses this to say, for example, that a sortable iterator requires element types that can be compared. The E1304 diagnostic from the previous section is the enforcement: if a body uses a capability it never declared, the compiler refuses.
+Because there are no bounds, a generic's requirements are exactly the operations its body names and nothing more. That has a pleasant consequence: to learn what a generic needs from its type parameter, you read the body rather than a signature. It has a cost too: the requirement is not visible to a caller until an instantiation fails, so a well-written generic documents in a comment the capabilities it expects. The E1304 diagnostic from the previous section is the enforcement — instantiate a generic with a type that cannot do what the body asks, and the compiler refuses, naming the type and the operation it was missing.
 
 6.12 A Worked Example: One Printer for a Whole Tree
 
@@ -510,7 +512,7 @@ The printing algorithm is written once, against the trait:
 
 Look at what `printTree` does not know. It does not know about files or directories. It knows the two methods TreeNode declares, and it recurses through them. Add a new node type — a symlink, a device, a network mount — and it participates in printing without a single line of `printTree` changing, provided it conforms to TreeNode. That is the open/closed property polymorphism is supposed to give: open to new types, closed to modification of the algorithm.
 
-Why `any TreeNode` here rather than a generic `printTree<T : TreeNode>`? Because the tree is heterogeneous. A directory holds files and directories together, so the children list must hold values of different concrete types, and the common dynamic type is exactly what makes that possible. A generic could print a homogeneous `Vec<T>`, but not a mixed tree, because `T` would have to be one type. The choice between generic and `any` follows from the data, not from taste.
+Why `any TreeNode` here rather than a generic `printTree<T>`? Because the tree is heterogeneous. A directory holds files and directories together, so the children list must hold values of different concrete types, and the common dynamic type is exactly what makes that possible. A generic could print a homogeneous `Vec<T>`, but not a mixed tree, because `T` would have to be one type. The choice between generic and `any` follows from the data, not from taste.
 
 Now add a second, different behaviour over the same data — counting the nodes — and notice that the shape repeats. The new operation is another recursion through the same two methods, and the node types never change:
 
@@ -579,7 +581,7 @@ The conformance to `Plugin` promises the interface; the conformance to `@drop` m
 
 2. Comprehension. Why can a const method be called on a const value but a non-const method cannot? Write a two-sentence explanation a C programmer would accept, and point at the diagnostic family that enforces it.
 
-3. Implementation. Declare a trait `Comparable` with a method `lessThan(other) bool`, implement it for `Point` (compare by distance from the origin) and for a struct of your choice. Then write `minimum<T : Comparable>(T a, T b) T`.
+3. Implementation. Declare a trait `Comparable` with a method `lessThan(other) bool`, implement it for `Point` (compare by distance from the origin) and for a struct of your choice. Then write a generic `minimum<T>(T a, T b) T` whose body calls `lessThan`, and explain where the requirement that `T` has that method is checked.
 
 4. Implementation. Add a `@toStr` conformance to a struct with three fields so that `println("{}", instance)` prints all three. Then add a wrong-way version where you print the fields in the wrong order and explain why the compiler cannot catch that.
 
@@ -591,7 +593,7 @@ The conformance to `Plugin` promises the interface; the conformance to `@drop` m
 
 8. Dispatch. Write a `Vec<any Shape>` holding a Circle, a Square, and a Triangle. Print each area. Why can the vector not have a concrete element type? Then rewrite the loop to use a generic function and explain what changes about the types accepted.
 
-9. Constraint versus dispatch. Write the same operation twice: once as `totalArea<T : Shape>` and once as `totalAreaDyn(Vec<any Shape>)`. State what each accepts, what each costs at runtime, and which you would choose when the number of shapes is fixed at compile time.
+9. Generic versus dispatch. Write the same operation twice: once as a generic `totalArea<T>` and once as `totalAreaDyn(Vec<any Shape>)`. State what each accepts, what each costs at runtime, and which you would choose when the set of shapes is fixed at compile time.
 
 10. Design. You are designing a serialisation library. Decide, with a sentence for each, what should be a trait, what should be a generic function, and what should be a plain concrete function. Then name one thing that goes wrong if you make the wrong one a trait.
 

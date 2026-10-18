@@ -46,11 +46,14 @@ The methods that read a `str` live in `core::str`, and `std::text::strutil` adds
 
     bool pre  = s.startsWith("  ");
     bool suf  = s.endsWith("  ");
-    bool dig  = s.isAsciiDigit();
+    bool dig  = s.isAsciiDigit();         // false unless every byte is a digit
     bool alp  = s.isAsciiAlpha();
     bool aln  = s.isAsciiAlnum();
+    bool none = s.isEmpty();              // true when len == 0
+    u8   b    = s.at(0);                  // bounds-checked byte (asserts idx < len)
+    const u8* bytes = s.asU8();           // the raw pointer behind the view
 
-    String owned = s.asString();          // allocates a copy
+    String alias = s.asString();          // ALIASES these bytes — see the warning below
 
 Two methods handle Unicode rather than bytes. `codepointCount` counts codepoints, not bytes, and `nextCodepoint` decodes one at a time while threading a byte cursor:
 
@@ -64,6 +67,8 @@ Two methods handle Unicode rather than bytes. `codepointCount` counts codepoints
 
 The `idx` is threaded through so each call continues where the last stopped. This is how UTF-8 is decoded forward without a separate cursor object, and it is how a `str` stays a zero-cost view while still being character-aware when you ask it to be.
 
+What the view does *not* have is any method that mutates or reallocates — there is no `toUpper`, no `replace`, no `push` here, because a view owns nothing and cannot grow. Every transform lives either on the owned `String` or as a free function in `strutil` that returns a fresh value. `equals` and `compare` are the two content comparisons (`compare` returns a negative, zero, or positive `i32` for less, equal, greater); `findView`, `findByte`, and `rfindByte` return a byte index, and they report "absent" by returning `len`, so `containsView` and `containsByte` are simply the same call tested against `len`.
+
 Two constructors matter when you are interfacing with the outside world:
 
     str a = str::fromCstr(cstr);                  // borrow a NUL-terminated C string
@@ -71,6 +76,8 @@ Two constructors matter when you are interfacing with the outside world:
     str empty = str::empty();                     // the zero-length view
 
 `fromCstr` takes the `strlen` hit once and then hands you a proper length-carrying view for everything afterwards.
+
+One trap is worth stating plainly. `str::asString` does not allocate and does not copy. It builds a `String` whose pointer and length alias the very bytes the `str` points at, leaving the capacity at zero. It exists so you can hand a borrowed view to code that insists on a `String` without paying for a copy, but the result is a borrowed view wearing a `String`'s clothes: it does not own the bytes, so you must never `free` it or bind it to a local whose end of scope runs `@drop` — either one deallocates memory that belongs to a string literal or another buffer. Pass it straight to a call (`takesString(s.asString())`) and let it vanish, or, when you genuinely need an owned copy, use `String::from(s)` (or `s.asString().clone()`, though that copies twice). Rule of thumb: `asView` to borrow a `String` as a `str`, `String::from` to own a `str` as a `String`, and `asString` only as a zero-copy bridge in argument position.
 
 17.2 String: The Owned Buffer
 
@@ -86,11 +93,13 @@ Construct one empty, with reserved capacity, from a view, or from a C string:
 
     import(lib) std::text::string { String };
 
-    String a = String::new();            // starts with a small buffer
-    String b = String::withCap(1024);    // room for 1024 bytes up front
-    String c = String::from("hello");    // copy a view
+    String a = String::new();            // 17 bytes allocated, cap 16, len 0
+    String b = String::withCap(1024);    // room for 1024 bytes up front (clamped to >= 7)
+    String c = String::from("hello");    // copy a view, sized exactly
     String d = String::fromCstr(cstr);   // copy a C string
     String e = c.clone();                // an independent copy
+
+`String::new` does not start empty-and-allocation-free; it allocates a seventeen-byte buffer (capacity sixteen plus a trailing NUL) so that the first few appends do not reallocate. `withCap` reserves at least seven bytes regardless of what you ask for, so `withCap(0)` still yields a usable buffer. `from` sizes the buffer to exactly the view's length, which is why it is the constructor to prefer when you already know the final length. Every `String` keeps a NUL byte one past `len` so that `asCstr` can hand the buffer to C without a copy, but Coral never relies on that NUL for length — `len` is always authoritative.
 
 Appending is the most common thing you do, and there is a method for each kind of source:
 
@@ -99,7 +108,7 @@ Appending is the most common thing you do, and there is a method for each kind o
     sb.pushStr(&name);             // append another String
     sb.pushCstr(cstr);             // append a C string
     sb.pushChar('!');              // append one raw byte
-    sb.pushCodepoint(u'é');        // append one Unicode scalar as UTF-8
+    sb.pushCodepoint('é');         // append one Unicode scalar as UTF-8
     sb.pushByte(0x0A);             // append one byte
     sb.appendView(" more");        // an alias for pushView
 
@@ -141,6 +150,8 @@ And transform in place or produce a new String:
     String rep   = sb.repeat(3);
     String trimmed = sb.trim();
     Vec<str> parts = sb.splitByte(',');
+
+A few of these repay a second look. `substr` takes `(start, end)` — an exclusive end index, not a length — which is the opposite convention from `strutil::substr` (which takes a length), so read the call site carefully. `splitByte` returns `Vec<str>` whose elements are *views into* `sb`; they are valid only until the next mutation that reallocates, so either consume them immediately or copy each into an owned `String`. `toUpper` and `toLower` are byte-wise ASCII folds, not Unicode-aware case mapping, and `reverse` reverses bytes, which will corrupt any multi-byte character — those three are the string methods that quietly assume ASCII, and the `ascii`, `utf8`, and `char_util` modules exist precisely for the cases where that assumption is false. `replaceAll` mutates in place and handles a self-referential argument (the needle or replacement pointing into `sb` itself) by taking a defensive copy first, so `sb.replaceAll(sb.asView(), "x")` is defined rather than undefined. Finally, `clear` resets the length to zero but keeps the buffer, and `shrinkToFit` is the explicit request to give that capacity back.
 
 Two conversions matter and are easy to confuse. `asView` borrows the buffer without copying; `clone` allocates an independent copy:
 
@@ -191,7 +202,7 @@ Note the two shapes carefully, because they answer different questions. `split` 
 
     bool ci      = equalsIgnoreCase("Hello", "hELLo");
 
-`indexOf` returns an `isize`, not a `usize`, precisely so that "-1 means not found" is expressible without a sentinel that collides with a real index. And `substr` takes a `start` and a `length` and returns a `str` — a view into the original, not a copy, so it is safe only while the source outlives it.
+`indexOf` returns an `isize`, not a `usize`, precisely so that "-1 means not found" is expressible without a sentinel that collides with a real index. And `substr` takes a `start` and a `length` and returns a `str` — a view into the original, not a copy, so it is safe only while the source outlives it. Note the deliberate mismatch with the method of the same name: `strutil::substr(sv, start, len)` takes a length, while `String::substr(start, end)` takes an exclusive end index. The two are the same idea wearing different conventions, and the compiler cannot warn you because both are just `usize`s.
 
 17.4 ASCII, UTF-8, and the Layers of Text
 
@@ -218,6 +229,7 @@ For the common case of lowercasing text known to be ASCII — identifiers, proto
     u32 wrote = utf8Encode(cp, out);                // encode one codepoint
     usize cc  = utf8CountChars(s);                  // codepoints in a str
     bool ok   = utf8IsValid(s);                     // well-formed UTF-8?
+    u32 w16   = utf16ToUtf8(0x00E9, out);           // one UTF-16 unit -> UTF-8
 
 The general-purpose module is `std::text::utf8`, and it works on `(pointer, length)` buffers and returns `String` for the operations that allocate:
 
@@ -233,7 +245,7 @@ The general-purpose module is `std::text::utf8`, and it works on `(pointer, leng
     Option<char> next = utf8::nextChar(s, len, &consumed);  // -> Some/None
     String one = utf8::encodeChar(c);                       // -> String
 
-The separation lets a caller state which level of text it is working at. A function that claims to count characters and counts bytes instead is one of the classic text bugs; naming the layer in the call — `countCodepoints`, never a byte count — is how that bug becomes visible. And there is a `core::char_util` beneath both, with the per-`char` operations `charIsDigit`, `charIsAlpha`, `charToUpper`, `charToLower`, `charEncodeUtf8`, and the decoding pair, for when you are working with `char` values rather than buffers.
+The separation lets a caller state which level of text it is working at. A function that claims to count characters and counts bytes instead is one of the classic text bugs; naming the layer in the call — `countCodepoints`, never a byte count — is how that bug becomes visible. And there is a `core::char_util` beneath both, with the per-`char` operations `charIsDigit`, `charIsAlpha`, `charIsValid`, `charIsAscii`, `charToUpper`, `charToLower`, `charEncodeUtf8(char, u8*)`, and its decoding counterpart `charDecodeUtf8(const u8*, usize, usize*)`, for when you are working with `char` values rather than buffers. The same module also carries the byte-level classics (`isDigit`, `isAlpha`, `toUpper`, `digitValue`, `encodeUtf8`, `decodeUtf8`), which is what the one-letter-named functions on the `ascii` module delegate to. One behavioural difference matters: the `ascii` module's `utf8Decode` and `utf8ByteCount` assume the bytes are well-formed and do not check, whereas `utf8::isValid` and `ascii::utf8IsValid` are the functions that answer that question — so validate once at the boundary and then trust the fast routines inside.
 
 17.5 Formatting: print, println, and the Format Language
 
@@ -290,13 +302,13 @@ For building a `String` rather than printing, the `std::fmt` module's `formatX` 
     String fl  = formatFloat(3.14159, 3);        // "3.142"
     String px  = formatHex(0xBEEF, true);        // "0xbeef"
     String bny = formatBin(0b1010, true);        // "0b1010"
-    String ch  = formatChar(u'é');               // its UTF-8 bytes
+    String ch  = formatChar('é');                // its UTF-8 bytes
     String pad = padLeft("hi", 5, ' ');          // "   hi"
     String pad2= padRight("hi", 5, '.');         // "hi..."
 
 The signatures are `formatInt(i64 val, u64 radix, bool upper)`, `formatUint(u64 val, u64 radix, bool upper)`, `formatFloat(f64 val, u64 precision)`, `formatHex(u64 val, bool prefix)`, `formatBin(u64 val, bool prefix)`, and `formatChar(char c)`. There are also `padLeft(str sv, usize width, u8 pad)`, `padRight(str sv, usize width, u8 pad)`, `repeat(str sv, usize count)`, `join(const str* parts, usize count, str sep)`, and `joinVec(const Vec<String>* parts, str sep)`. And `String` itself has `padLeft`, `padRight`, `repeat`, and a static `join` if you would rather keep the methods on the value.
 
-One honest caveat belongs in the text, in bold. The `std::fmt` module also exposes a function named `format`, declared `String format(str f, ...)`, and it is a stub: it strips `{}` pairs out of the format string and substitutes nothing. It does not interpolate. If you call `format("x = {}", 3)` expecting "x = 3", you will get "x = " and no error, because a variadic tail with no use is not a mistake the stub can see. Interpolation lives in `print`, `println`, `eprint`, and `eprintln`, which do substitute, and string-building from pieces is the job of the `formatX` family above. The chapter states this plainly because a reader who reaches for `format` expecting interpolation will be quietly wrong, and a stub that fails silently is exactly the kind of trap a textbook exists to flag.
+One honest caveat belongs in the text, in bold. The `std::fmt` module also exposes a function named `format`, declared `String format(str f, ...)`, and it is a stub: it deletes exact `{}` pairs from the format string and substitutes nothing, copying every other byte through unchanged — so a typed placeholder like `{:x}` is left in the output literally, not even removed. It does not interpolate. If you call `format("x = {}", 3)` expecting "x = 3", you will get "x = " and no error, because a variadic tail with no use is not a mistake the stub can see. Interpolation lives in `print`, `println`, `eprint`, and `eprintln`, which do substitute, and string-building from pieces is the job of the `formatX` family above. The chapter states this plainly because a reader who reaches for `format` expecting interpolation will be quietly wrong, and a stub that fails silently is exactly the kind of trap a textbook exists to flag.
 
 17.6 The Parsing Layer
 
@@ -413,16 +425,17 @@ Two more text tools deserve their own mention because they solve problems that c
         eprintln("bad pattern");
     }
 
-    if (re.matches("12-34")) { ... }                    // does it match at all?
+    if (re.matches("12-34")) { ... }                    // true only if the WHOLE input matches
 
     Vec<str> groups = Vec<str>::new();
     if (re.find("range 12-34 here", &groups)) {
         // groups[0] is the whole match, groups[1] the first capture, ...
-        println("start = {}, end = {}", groups.at(1), groups.at(2));
+        // here groups[0] == "12-34", groups[1] == "12", groups[2] == "34"
+        println("first = {}, second = {}", groups.at(1), groups.at(2));
     }
     re.free();
 
-`compile` takes the pattern and a `caseInsensitive` flag and returns whether the pattern was valid. `matches` answers yes or no; `find` fills a `Vec<str>` with the whole match followed by each capture group, all as views into the input, and returns whether it found anything. Call `free` when you are done, or let the `@drop` conformance do it.
+`compile` takes the pattern and a `caseInsensitive` flag and returns whether the pattern was valid. `matches` is an *anchored, whole-string* test: it returns true only when the pattern covers the entire input, so it is the right tool for validating a field against a strict pattern and the wrong one for "does this substring occur somewhere" — use `find` for that. `find` searches the input, fills a `Vec<str>` with the whole match in slot zero followed by each capture group, and returns whether it found anything; a group that did not participate is reported as the empty string rather than omitted, so the vector's length always matches the pattern's group count. The captured `str`s are views into the `Regex`'s own reusable scratch buffer, not into your input — they stay valid only until the next `find` or `free` on the same `Regex`, which is why you copy anything you intend to keep. Call `free` when you are done, or let the `@drop` conformance do it; `free` also releases that scratch buffer.
 
 `std::text::uri` parses a URL into its parts, which saves you from writing the split-on-scheme, split-on-authority, split-on-query dance by hand:
 
@@ -478,9 +491,17 @@ Put the layer to work. A CSV reader must split lines into fields, handle quoted 
             f64 value = csvNumber(fields.at(1).asView());
             println("{} = {}", name, value);
         }
+
+        // `fields` owns the current row's Strings; free them before we leave.
+        for (usize i = 0; i < fields.count(); i += 1) {
+            fields.atPtr(i)->free();
+        }
+        fields.dispose();
     }
 
 The reader handles the quoting rules for you, including embedded commas and doubled quotes inside a quoted field. `parseF64` converts a `str` to a number and reports success through an out-parameter — the library's lightweight alternative to a `Result` when the caller only needs a yes-or-no. This is the shape most text processing takes: scan for structure, slice out views, trim, convert, and only allocate a `String` when the text must be owned and outlive its source. If you want to see the byte-level version of the same logic, write it once by hand — walk the bytes, toggle an `inQuotes` flag, slice with `substr` — and you will understand exactly what `CsvReader` is doing on your behalf.
+
+Two ownership details make the example correct rather than merely plausible. First, `CsvReader::new(text)` stores the text's pointer and length and never copies it, so the input `str` must outlive the reader. Second, `readRow` frees the previous row's `String`s and reuses the same `Vec` each call, so `fields` always describes only the current row — which is why the loop can reuse it, and why the explicit cleanup before returning is the only place the last row's `String`s are released. `Result` handling appears twice in miniature here: `isErr` for the malformed-input channel and the `Ok(false)` value for the clean end of stream, exactly the split Chapter 15 describes between failure and an ordinary "no more."
 
 17.9 A Worked Example: Human-Readable Sizes
 
