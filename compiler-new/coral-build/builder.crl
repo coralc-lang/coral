@@ -1651,8 +1651,8 @@ pub i32 builderRunEx(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnly
     {
         if (!b.quiet)
         {
-            if (dryRunIn) printf(C"dry run: modules.map not written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
-            else printf(C"modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+            if (dryRunIn) printf(C"coral: module map (dry run): %d modules, %d aliases, not written\n", (i32)b.modulesLen, (i32)b.aliasesLen);
+            else printf(C"coral: module map: %d modules, %d aliases -> .coral/modules.map\n", (i32)b.modulesLen, (i32)b.aliasesLen);
         }
         if (out != null) out[0] = b;
         return (i32)b.errors;
@@ -1660,8 +1660,8 @@ pub i32 builderRunEx(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnly
     if (forceIn)
     {
         /* --force bypasses the fingerprint/staleness computation entirely:
-         * no source walk, no cache read: every module is forced stale. */
-        if (!b.quiet) printf(C"--force: fingerprint/staleness checks skipped (%d modules forced stale, 0 fresh)\n", (i32)b.modulesLen);
+         * no source walk, no cache read: every module is forced stale.
+         * the single plan line is printed with the staleness block below. */
     }
     else if (!bFingerprint(&b)) return (i32)b.errors;
     if (!bLoadGraph(&b)) return (i32)b.errors;
@@ -1690,22 +1690,29 @@ pub i32 builderRunEx(CrlbNode* cfgRoot, Arena* a, bool forceIn, bool emitMapOnly
 
     if (!b.quiet)
     {
-        if (dryRunIn) printf(C"dry run: modules.map not written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
-        else printf(C"modules.map written (%d modules, %d aliases)\n", (i32)b.modulesLen, (i32)b.aliasesLen);
-    }
-    if (!emitMapOnlyIn && !b.quiet)
-    {
-        i = 0;
-        while (i < b.topoLen)
+        /* one line, only what the reader acts on: how big the program is,
+         * how much of it will be rebuilt, and why (--force / dry run).
+         * The module order itself lives in .coral/modules.map for tools. */
+        u32 staleCount = 0;
+        if (forceIn) staleCount = b.modulesLen;
+        else
         {
-            u32 idx = b.topoOrder[i];
-            usize n = 0;
-            while (n < b.mods[idx].name.len) { printf(C"%c", b.mods[idx].name.ptr[n]); n++; }
-            // if (b.force) printf(C"  forced-stale\n");
-            // else if (b.mods[idx].stale) printf(C"  stale\n");
-            // else printf(C"  fresh\n");
-            i++;
+            i = 0;
+            while (i < b.topoLen)
+            {
+                if (b.mods[b.topoOrder[i]].stale) staleCount++;
+                i++;
+            }
         }
+        if (dryRunIn)
+            printf(C"coral: build plan (dry run): %d modules, %d aliases, %d stale, .coral/modules.map not written\n",
+                   (i32)b.modulesLen, (i32)b.aliasesLen, (i32)staleCount);
+        else if (forceIn)
+            printf(C"coral: build plan: %d modules, %d aliases, %d stale (--force)\n",
+                   (i32)b.modulesLen, (i32)b.aliasesLen, (i32)staleCount);
+        else
+            printf(C"coral: build plan: %d modules, %d aliases, %d stale\n",
+                   (i32)b.modulesLen, (i32)b.aliasesLen, (i32)staleCount);
     }
 
     /* the compile phase runs in coralc.crl via compileUnitTo with this

@@ -234,6 +234,8 @@ pub extend MonoContext
         switch (entry->kind.tag)
         {
             TypeKind::TypeParam => { return self.findSubstitution(typeNode, substitutions, substitutionsLen); },
+            /* a comptime value arg is already concrete */
+            TypeKind::ValueInt => { return typeNode; },
             TypeKind::Named => {
                 u32 i = 0;
                 while (i < substitutionsLen)
@@ -278,8 +280,34 @@ pub extend MonoContext
             },
 
             TypeKind::Array => {
-                TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry->kind.payload.Array.base, substitutions, substitutionsLen), .len = entry->kind.payload.Array.len,
-                                                 .sizeParam = entry->kind.payload.Array.sizeParam, .sizeName = entry->kind.payload.Array.sizeName };
+                /* symbolic size `T data[N]`: resolve N through the instance's
+                 * substitutions; a ValueInt argument pins the length and
+                 * clears the symbolic reference */
+                u32 len = entry->kind.payload.Array.len;
+                u32 sizeParam = entry->kind.payload.Array.sizeParam;
+                Str sizeName = entry->kind.payload.Array.sizeName;
+                u32 si = 0;
+                while (si < substitutionsLen)
+                {
+                    /* fields keep the written name (no parser rebind), so
+                     * match by param index or by name; funcs get index'd */
+                    bool match = (sizeParam != 4294967295 && substitutions[si].index == sizeParam) ||
+                                 (sizeParam == 4294967295 && sizeName != 0 && substitutions[si].parameter == sizeName);
+                    if (match)
+                    {
+                        TypeEntry* se = self.typeEntryAt(substitutions[si].typeNode);
+                        if (se != null && se->kind.tag == TypeKind::ValueInt)
+                        {
+                            len = (u32)se->kind.payload.ValueInt.value;
+                            sizeParam = 4294967295;
+                            sizeName = 0;
+                        }
+                        break;
+                    }
+                    si++;
+                }
+                TypeKind kind = TypeKind::Array{ .base = self.substituteType(entry->kind.payload.Array.base, substitutions, substitutionsLen), .len = len,
+                                                 .sizeParam = sizeParam, .sizeName = sizeName };
                 return self.sema.allocType(kind);
             },
 
@@ -476,6 +504,10 @@ pub extend MonoContext
                 /* still unsubstituted: tag the raw index so it can't be
                  * mistaken for a primitive's canonical index */
                 return ((u64)t << 1) | 1;
+            },
+            /* comptime value args hash by value: `Arr<i32,4>` != `Arr<i32,9>` */
+            TypeKind::ValueInt => {
+                return (te->kind.payload.ValueInt.value * 1099511628211) ^ 97;
             },
             TypeKind::Named => {
                 u64 h = 1469598103934665603 ^ (u64)te->kind.payload.Named.name;

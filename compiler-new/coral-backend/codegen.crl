@@ -369,7 +369,25 @@ void cgEmitDropsExcept(Codegen* cg, u32 mark, i32 skip)
         if (i != skip) cgEmitDropEntry(cg, &cg.drops[i]);
         i--;
     }
-    cg.dropsLen = mark;
+    /* scope end: pop the locals above `mark`. never raise: a branch that
+     * already unwound (return/break/continue) leaves dropsLen below the
+     * stale marks captured in enclosing scopes; restoring such a mark
+     * would resurrect dead entries and later scope exits would emit
+     * duplicate drops for live locals */
+    if (cg.dropsLen > mark) cg.dropsLen = mark;
+}
+
+/* branch unwind: emits the drops for a return/break/continue but leaves
+ * the live set alone. the statements after the branch still run on the
+ * other paths and keep their registrations */
+void cgEmitDropsBranch(Codegen* cg, u32 mark, i32 skip)
+{
+    i32 i = (i32)cg.dropsLen - 1;
+    while (i >= (i32)mark)
+    {
+        if (i != skip) cgEmitDropEntry(cg, &cg.drops[i]);
+        i--;
+    }
 }
 
 /* index of the innermost live local named `name`, or -1 */
@@ -395,6 +413,31 @@ void cgRemoveDropAt(Codegen* cg, u32 idx)
         i++;
     }
     cg.dropsLen--;
+}
+
+/* a bare identifier argument is passed by value: the callee takes
+ * ownership, so the caller's pending drop is cancelled (same discipline
+ * as `return s;` and `T x = y;` moves). Without this the caller would
+ * drop a buffer the callee already owns (double free). */
+void cgMoveArg(Codegen* cg, NodeId arg)
+{
+    Node* an = cgNode(cg, arg);
+    if (an.kind.tag != NodeKind::Expr) return;
+    if (an.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return;
+    i32 mv = cgFindDrop(cg, an.kind.payload.Expr.value.kind.payload.Ident.name);
+    if (mv >= 0) cgRemoveDropAt(cg, (u32)mv);
+}
+
+/* consuming methods `x.dispose()` / `x.free()` release the receiver
+ * immediately: cancel its pending drop so a later automatic drop at a
+ * scope exit cannot free the same buffer twice */
+void cgMoveDisposeRecv(Codegen* cg, Str methName, Node* recvNode)
+{
+    if (methName != cg.ctx.intern("dispose") && methName != cg.ctx.intern("free")) return;
+    if (recvNode.kind.tag != NodeKind::Expr) return;
+    if (recvNode.kind.payload.Expr.value.kind.tag != ExprKind::Ident) return;
+    i32 ci = cgFindDrop(cg, recvNode.kind.payload.Expr.value.kind.payload.Ident.name);
+    if (ci >= 0) cgRemoveDropAt(cg, (u32)ci);
 }
 
 void cgPopSwitch(Codegen* cg)
@@ -442,6 +485,31 @@ Ty cgSubstTy(Codegen* cg, Ty t)
         }
     }
     return t;
+}
+
+/* Resolve a symbolic array size (`T data[N]`) through the current
+ * instance substitutions; a ValueInt binding hands back its value,
+ * anything else keeps `fallback`. Struct fields keep the written name
+ * (the parser only rebinds funcs to a param index), so match by
+ * sizeParam index first, then by sizeName — the same by-name idiom
+ * cgSubstTy uses for a bare `T`. */
+u64 cgSubsArrayLen(Codegen* cg, u32 sizeParam, Str sizeName, u64 fallback)
+{
+    if (cg.subs == null) return fallback;
+    u32 i = 0;
+    while (i < cg.subsLen)
+    {
+        bool match = (sizeParam != 4294967295 && cg.subs[i].index == sizeParam) ||
+                     (sizeParam == 4294967295 && sizeName != 0 && cg.subs[i].parameter == sizeName);
+        if (match)
+        {
+            TypeEntry* se = cg.ctx->types + cg.subs[i].typeNode;
+            if (se->kind.tag == TypeKind::ValueInt) return se->kind.payload.ValueInt.value;
+            return fallback;
+        }
+        i++;
+    }
+    return fallback;
 }
 
 /* Sanitize a C type spelling into a mangled identifier fragment.
@@ -1708,10 +1776,15 @@ Slice tyStr(Codegen* cg, Ty t)
         TypeKind::Slice => { return cgRegName(cg, t); },
         TypeKind::FnPtr => { return cgRegName(cg, t); },
         TypeKind::Tuple => { return cgRegName(cg, t); },
+        /* comptime value mangling fragment: `Arr_int32_t_4` */
+        TypeKind::ValueInt => {
+            stU64(&cg.tybuf, k.payload.ValueInt.value);
+            return stTail(&cg.tybuf, start);
+        },
         TypeKind::Array => {
             tyStr(cg, k.payload.Array.base);
             stCh(&cg.tybuf, '[');
-            stU64(&cg.tybuf, (u64)k.payload.Array.len);
+            stU64(&cg.tybuf, cgSubsArrayLen(cg, k.payload.Array.sizeParam, k.payload.Array.sizeName, (u64)k.payload.Array.len));
             stCh(&cg.tybuf, ']');
             return stTail(&cg.tybuf, start);
         },
@@ -2450,6 +2523,19 @@ Slice cgExpr(Codegen* cg, NodeId id)
             return stTail(&cg.ebuf, es);
         },
         ExprKind::Ident => {
+            /* generic value parameter in an instance body (`N` in
+             * `Arr<T, N>`: `return N;`, `self.data[N - 1]`): sema typed the
+             * ident as the param; emit the instance's argument value */
+            Ty vt = cgSubstTy(cg, e.resolvedType);
+            if (vt != e.resolvedType && vt != 0)
+            {
+                TypeEntry* ve = cg.ctx->types + vt;
+                if (ve.kind.tag == TypeKind::ValueInt)
+                {
+                    stU64(&cg.ebuf, ve.kind.payload.ValueInt.value);
+                    return stTail(&cg.ebuf, es);
+                }
+            }
             Str nm = e.kind.payload.Ident.name;
             if (!cgIsLocalName(cg, nm))
             {
@@ -2981,6 +3067,9 @@ Slice cgExpr(Codegen* cg, NodeId id)
                     if (!skip) {
                         if (first) first = false;
                         else stP(&abuf, ", ");
+                        /* str→ptr decay borrows the buffer; a plain
+                         * by-value arg moves it */
+                        if (!dec) cgMoveArg(cg, args[i]);
                         stPS(&abuf, cgExpr(cg, args[i]));
                         if (dec) stP(&abuf, ".ptr");
                         n++;
@@ -3023,6 +3112,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 if (rawRecvTy != 0 && cgTyIsPtr(cg, rawRecvTy)) recvIsPtr = true;
             }
             Str methName = e.kind.payload.MethodCall.method;
+            cgMoveDisposeRecv(cg, methName, rn);
             bool mFound = false;
             u8 recvKind = cgMethodRecvKind(cg, rawRecvTy, methName, &mFound);
             /* `p->alloc(ctx, size)` parses as a method call but names a
@@ -3108,7 +3198,11 @@ Slice cgExpr(Codegen* cg, NodeId id)
                         }
                     }
                     if (nullStr) stP(&abuf, "(_coral_str){0}");
-                    else stPS(&abuf, cgExpr(cg, args[i]));
+                    else
+                    {
+                        cgMoveArg(cg, args[i]);
+                        stPS(&abuf, cgExpr(cg, args[i]));
+                    }
                     n++;
                     i++;
                 }
@@ -3160,6 +3254,7 @@ Slice cgExpr(Codegen* cg, NodeId id)
                 while (i < argsLen && n < 16) {
                     if (first) first = false;
                     else stP(&abuf, ", ");
+                    cgMoveArg(cg, args[i]);
                     stPS(&abuf, cgExpr(cg, args[i]));
                     n++;
                     i++;
@@ -4488,7 +4583,7 @@ void cgStmt(Codegen* cg, NodeId id)
         StmtKind::Return => {
             NodeId v = s.kind.payload.Return.value;
             if (v.index == 0) {
-                cgEmitDropsTo(cg, cg.fnDropMark);
+                cgEmitDropsBranch(cg, cg.fnDropMark, -1);
                 cgEmitStmt(cg, "return");
                 return;
             }
@@ -4504,7 +4599,7 @@ void cgStmt(Codegen* cg, NodeId id)
                     moved = cgFindDrop(cg, vn.kind.payload.Expr.value.kind.payload.Ident.name);
                 if (moved >= 0)
                 {
-                    cgEmitDropsExcept(cg, cg.fnDropMark, moved);
+                    cgEmitDropsBranch(cg, cg.fnDropMark, moved);
                     stNL(&cg.body, cg.ind);
                     stP(&cg.body, "return ");
                     stPS(&cg.body, t);
@@ -4526,7 +4621,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 stP(&cg.body, " = ");
                 stPS(&cg.body, t);
                 stCh(&cg.body, ';');
-                cgEmitDropsTo(cg, cg.fnDropMark);
+                cgEmitDropsBranch(cg, cg.fnDropMark, -1);
                 stNL(&cg.body, cg.ind);
                 stP(&cg.body, "return ");
                 stPS(&cg.body, tn);
@@ -4542,7 +4637,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Break => {
             if (cg.breakDepth > 0 && cg.breakKinds[cg.breakDepth - 1] == 1) {
-                cgEmitDropsTo(cg, cg.breakDropMarks[cg.breakDepth - 1]);
+                cgEmitDropsBranch(cg, cg.breakDropMarks[cg.breakDepth - 1], -1);
                 stNL(&cg.body, cg.ind);
                 stP(&cg.body, "goto __Lsw");
                 stU64(&cg.body, (u64)cg.breakLabels[cg.breakDepth - 1]);
@@ -4550,7 +4645,7 @@ void cgStmt(Codegen* cg, NodeId id)
                 return;
             }
             if (cg.loopDepth == 0) { cgError(cg, "break outside of loop"); return; }
-            if (cg.loopDepth > 0) cgEmitDropsTo(cg, cg.loopDropMarks[cg.loopDepth - 1]);
+            if (cg.loopDepth > 0) cgEmitDropsBranch(cg, cg.loopDropMarks[cg.loopDepth - 1], -1);
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "break;");
             return;
@@ -4558,7 +4653,7 @@ void cgStmt(Codegen* cg, NodeId id)
 
         StmtKind::Continue => {
             if (cg.loopDepth == 0) { cgError(cg, "continue outside of loop"); return; }
-            cgEmitDropsTo(cg, cg.loopDropMarks[cg.loopDepth - 1]);
+            cgEmitDropsBranch(cg, cg.loopDropMarks[cg.loopDepth - 1], -1);
             stNL(&cg.body, cg.ind);
             stP(&cg.body, "continue;");
             return;
@@ -5539,7 +5634,7 @@ void cgEmitStructFields(Codegen* cg, NodeId* fields, u32 fieldsLen, u32 indent)
                 while ((cg.ctx->types + w)->kind.tag == TypeKind::Array)
                 {
                     stCh(&cg.defs, '[');
-                    stU64(&cg.defs, (u64)(cg.ctx->types + w)->kind.payload.Array.len);
+                    stU64(&cg.defs, cgSubsArrayLen(cg, (cg.ctx->types + w)->kind.payload.Array.sizeParam, (cg.ctx->types + w)->kind.payload.Array.sizeName, (u64)(cg.ctx->types + w)->kind.payload.Array.len));
                     stCh(&cg.defs, ']');
                     w = (cg.ctx->types + w)->kind.payload.Array.base;
                 }

@@ -56,6 +56,9 @@ pub struct LspDoc
 void lspSend(JsonValue* msg)
 {
     String body = serialize(msg);
+    /* lspSend takes ownership: every call site hands over a freshly built
+     * message that is dead after the send */
+    msg->dispose();
     String frame = String::new();
     frame.pushView("Content-Length: ");
     u8 digits[13];
@@ -76,6 +79,8 @@ void lspSend(JsonValue* msg)
     frame.pushView("\r\n\r\n");
     frame.pushView(body.asView());
     print(frame.asView());
+    body.free();
+    frame.free();
 }
 
 /* ── transport  */
@@ -419,19 +424,45 @@ void lspPublishEmpty(str uri)
     lspSend(&msg);
 }
 
+/* does `file` name one of the `count` paths? (paths are the buffers the
+ * editor holds open: their URIs belong to the buffer analysis, not to a
+ * report that read the same file from disk) */
+bool lspPathInOpen(str file, str* paths, u32 count, str rootPath)
+{
+    u32 i = 0;
+    while (i < count)
+    {
+        if (lspPathEquals(file, paths[i], rootPath)) return true;
+        i++;
+    }
+    return false;
+}
+
 /* publish one notification per file that appears in the records; the
  * document's own file keeps the client's exact URI and always gets a
  * publish (empty when clean) so stale markers are cleared. When filesOut
  * is non-null the absolute path of every published file is recorded so a
- * later project-wide pass can clear files that stopped having records. */
-void lspPublish(DiagList* diags, str docPath, str docUri, str rootPath, String* filesOut, u32* filesOutCount)
+ * later project-wide pass can clear files that stopped having records.
+ * skipPaths (open buffers) are not published at all: their URI is owned
+ * by that buffer's own analysis, and publishing disk-derived records for
+ * it would overwrite (or clear) what the user's text actually says. */
+void lspPublish(DiagList* diags, str docPath, str docUri, str rootPath, String* filesOut, u32* filesOutCount, str* skipPaths, u32 skipCount)
 {
     bool docPublished = false;
+    /* an open buffer owns its URI: even the empty "cleared" publish is
+     * withheld when the doc is in the skip list (its own analysis already
+     * published the truth for this snapshot) */
+    bool docOpen = docPath.len > 0 && lspPathInOpen(docPath, skipPaths, skipCount, rootPath);
     u32 i = 0;
     while (i < diags->len)
     {
         DiagRecord* r = diags->items + i;
         str file = r->file.asView();
+        if (lspPathInOpen(file, skipPaths, skipCount, rootPath))
+        {
+            i++;
+            continue;
+        }
         bool isDoc = lspPathEquals(file, docPath, rootPath);
         if (isDoc) docPublished = true;
         // skip files already published in this batch (earlier index)
@@ -487,7 +518,9 @@ void lspPublish(DiagList* diags, str docPath, str docUri, str rootPath, String* 
         i++;
     }
 
-    if (!docPublished && docPath.len > 0) lspPublishEmpty(docUri);
+    /* clear stale markers for the doc's URI, unless the doc is an open
+     * buffer the report deliberately skipped (it owns its own URI) */
+    if (!docPublished && !docOpen && docPath.len > 0) lspPublishEmpty(docUri);
 }
 
 /* ── documents ─────────────────────────────────────────────────────── */
@@ -533,11 +566,12 @@ void lspAnalyze(LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen, str rootP
     freeUnit(&d->unit);
     DiagList diags;
     diags.init();
+    /* errorLimit 0: the editor never gets a truncated error list */
     d->unit = analyzeForCompile(d->text.asU8(), d->text.len, d->path.asU8(), null, null, 0,
-                                200, false, false, true,
+                                0, false, false, true,
                                 modKeys, modVals, modLen, true, &diags);
     d->analyzed = true;
-    lspPublish(&diags, d->path.asView(), d->uri.asView(), rootPath, null, null);
+    lspPublish(&diags, d->path.asView(), d->uri.asView(), rootPath, null, null, null, 0);
     diags.dispose();
 }
 
@@ -547,7 +581,8 @@ void lspAnalyze(LspDoc* d, Slice* modKeys, Slice* modVals, u32 modLen, str rootP
  * previousCount track what the last report published so files that were
  * fixed elsewhere get cleared instead of keeping stale markers. */
 void lspProjectReport(str entryAbs, Slice* modKeys, Slice* modVals, u32 modLen, str rootPath,
-                      str docPath, str docUri, String* previousFiles, u32* previousCount)
+                      str docPath, str docUri, String* previousFiles, u32* previousCount,
+                      str* openPaths, u32 openCount)
 {
     Result<String, IoError> sres = readFileToString(entryAbs);
     if (sres.isErr()) return;
@@ -556,13 +591,13 @@ void lspProjectReport(str entryAbs, Slice* modKeys, Slice* modVals, u32 modLen, 
     DiagList diags;
     diags.init();
     CompileUnit unit = analyzeForCompile(text.asU8(), text.len, entryAbs.asU8(), null, null, 0,
-                                         200, false, false, true,
+                                         0, false, false, true,
                                          modKeys, modVals, modLen, true, &diags);
     freeUnit(&unit);
 
     String next[128];
     u32 nextCount = 0;
-    lspPublish(&diags, docPath, docUri, rootPath, next, &nextCount);
+    lspPublish(&diags, docPath, docUri, rootPath, next, &nextCount, openPaths, openCount);
 
     u32 i = 0;
     while (i < previousCount[0])
@@ -576,7 +611,9 @@ void lspProjectReport(str entryAbs, Slice* modKeys, Slice* modVals, u32 modLen, 
         }
         if (!still)
         {
-            if (!lspPathEquals(previousFiles[i].asView(), docPath, rootPath))
+            /* never clear an open buffer's URI: its own analysis owns it */
+            bool open = lspPathInOpen(previousFiles[i].asView(), openPaths, openCount, rootPath);
+            if (!open && !lspPathEquals(previousFiles[i].asView(), docPath, rootPath))
             {
                 // previousFiles[i] is an absolute path: clear its URI
                 String u = String::new();
@@ -1948,6 +1985,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         {
             JsonValue resp = lspErrResp(null, -32600, "invalid request");
             lspSend(&resp);
+            msg.dispose();
             dealloc<u8>(body);
             continue;
         }
@@ -1960,6 +1998,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         {
             JsonValue resp = lspErrResp(id, -32600, "invalid request");
             lspSend(&resp);
+            msg.dispose();
             dealloc<u8>(body);
             continue;
         }
@@ -1977,6 +2016,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
             else if (method.equals("exit"))
             {
                 // exit before shutdown: nonzero per the spec
+                msg.dispose();
                 dealloc<u8>(body);
                 return 1;
             }
@@ -1986,6 +2026,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                 lspSend(&resp);
             }
             // every other notification is dropped until initialize
+            msg.dispose();
             dealloc<u8>(body);
             continue;
         }
@@ -1994,6 +2035,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         {
             if (method.equals("exit"))
             {
+                msg.dispose();
                 dealloc<u8>(body);
                 return 0;
             }
@@ -2003,6 +2045,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                 JsonValue resp = lspErrResp(id, -32600, "invalid request");
                 lspSend(&resp);
             }
+            msg.dispose();
             dealloc<u8>(body);
             continue;
         }
@@ -2025,6 +2068,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
         else if (method.equals("exit"))
         {
             // without shutdown: nonzero per the spec
+            msg.dispose();
             dealloc<u8>(body);
             return 1;
         }
@@ -2075,12 +2119,27 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
                     str docRoot = lspDocRoot(d, rootPath.asView());
                     lspAnalyze(d, modKeys, modVals, modLen, docRoot);
                     /* then the whole-project report, so errors in files
-                     * this buffer never imports still show up */
+                     * this buffer never imports still show up. The report
+                     * runs on disk content, so every open buffer's path is
+                     * skipped: those URIs stay owned by the buffers. */
                     if (entrySlice.ptr != null)
                     {
+                        str openPaths[16];
+                        u32 openCount = 0;
+                        usize oi = 0;
+                        while (oi < 16)
+                        {
+                            if (docs[oi] != null)
+                            {
+                                openPaths[openCount] = docs[oi]->path.asView();
+                                openCount++;
+                            }
+                            oi++;
+                        }
                         String entryAbs = lspMakeAbs(entrySlice.asStr(), docRoot);
                         lspProjectReport(entryAbs.asView(), modKeys, modVals, modLen, docRoot,
-                                         d->path.asView(), d->uri.asView(), pubFiles, &pubCount);
+                                         d->path.asView(), d->uri.asView(), pubFiles, &pubCount,
+                                         openPaths, openCount);
                         entryAbs.free();
                     }
                 }
@@ -2215,6 +2274,7 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
             lspSend(&resp);
         }
 
+        msg.dispose();
         dealloc<u8>(body);
     }
 }

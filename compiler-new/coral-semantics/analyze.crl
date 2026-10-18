@@ -69,7 +69,7 @@ pub void freeUnit(CompileUnit* unit)
         dealloc<u8*>(unit.bufs);
         unit.bufs = null;
     }
-    if (unit.engineObj != null) { dealloc<DiagnosticEngine>(unit.engineObj); unit.engineObj = null; }
+    if (unit.engineObj != null) { unit.engineObj.deinit(); dealloc<DiagnosticEngine>(unit.engineObj); unit.engineObj = null; }
     if (unit.mono != null) {
         unit.mono.deinit();
         dealloc<MonoContext>(unit.mono);
@@ -336,6 +336,17 @@ u8* libResolveSegs(LibLoader* L, LibSeg* segs, u32 n, u8* dir, usize dirLen, u32
         u8* mbuf = libRead(mpath, &mlen);
         if (mbuf != null)
         {
+            /* keep the buffer alive until freeUnit: parsed nodes and the
+             * engine's file ranges point into it (leaked ~65KB per file
+             * per analyze otherwise) */
+            if (L->bufsLen >= L->bufsCap)
+            {
+                u32 newCap = L->bufsCap == 0 ? 8 : L->bufsCap * 2;
+                rawptr raw = realloc<u8*>(L->bufs, (usize)newCap);
+                if (raw != null) { L->bufs = (u8**)raw; L->bufsCap = newCap; }
+            }
+            if (L->bufsLen < L->bufsCap) L->bufs[L->bufsLen] = mbuf;
+            L->bufsLen++;
             u32 mfid = 0;
             DiagnosticEngine* dg = L->diag;
             if (dg != null) mfid = dg.addFile(mpath, libLen(mpath), mbuf, mbuf + mlen);
@@ -1517,15 +1528,13 @@ CompileUnit analyzeForCompile(u8* src, usize len, u8* path, Slice* flagsN, Slice
                 libLoadModulePath(&loader, "core::str");
                 libLoadModulePath(&loader, "std::io::ios");
                 libLoadModulePath(&loader, "std::text::string");
-                libLoadModulePath(&loader, "std::option"); // Todo! Stub!
-            //   libLoadModulePath(&loader, "std::Result");
+                libLoadModulePath(&loader, "std::option");
+                libLoadModulePath(&loader, "std::result");
                 libLoadModulePath(&loader, "std::vec");
-            //   libLoadModulePath(&loader, "std::arr"); // Todo! stub!
-                // /* std::result skipped: result.crl:94 `Ok { error }` field bug + isErr/isOk resolve fail (never loaded in default builds) */
-                // /* std::collections::arr NOT preloaded: Arr<T, N> uses a
-                //  * generic param as array size, which the parser rejects
-                //  * (type.crl:140 resolves sizes to u32 at parse time) */ // fuck you!, because the parser rejects it, you'd secrestly hide it from me and undo mu work??
-                // is fixing it not your purpose? if it does'nt work, fix it, don't hide it from me.
+                /* std::arr resolves to the platform aggregator, which has no
+                 * `arr` alias yet; the explicit path hits collections/lib.crl
+                 * and its `pub mod arr` re-export */
+                libLoadModulePath(&loader, "std::collections::arr");
             }
             libLoadImports(&loader, file);
             libLoadSiblingImports(&loader, file);
