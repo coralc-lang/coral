@@ -166,3 +166,29 @@ AsmObject dynamic ELF/COFF shdrs; `.section` arbitrary, `.comm/.lcomm/
   policy (ask owner before editing PORTING_RULES).
 - Verify stale `.probe/io*.crl` against Result-based fs API (read-only note;
   .probe is off-limits).
+
+### 10. coralc language-server session — open items (added 2026-10-18)
+- **Tuple syntax decision (final)**: the only tuple spelling is
+  `struct(type, type)`. Parenthesized tuple types `(A, B)` are stripped
+  with parse error P0003 pointing at `struct(A, B)`; `var (name, name)`
+  destructuring is *not* planned. Tuple members stay **1-based** (`p.1`).
+- **File-scope initializers**: any non-literal global initializer is
+  emitted verbatim and fails in gcc (`initializer element is not
+  constant`). Repro: `print.crl` at repo root (`var _b =
+  _a.isAsciiAlpha();`), `/tmp/opencode/gv2.crl` (`var h = g + 1;`),
+  `/tmp/opencode/gv3.crl` (`const B = A + 1;`). Plan: constant-fold `const`
+  inits over earlier constants; dynamic-init constructor for runtime `var`
+  globals.
+- **Bare `return ;` in a non-void function**: passes analysis, gcc rejects
+  the emitted C (codegen gap; `print.crl` also hits this).
+- **`print.crl` line 22-26** contains pasted compiler output (not Coral)
+  and `println("{}, {}", _a)` has 2 placeholders / 1 arg (E0901) — file
+  cannot compile as written even after the two gaps above.
+- **Router/log fragment in `coral-semantics/analyze.crl`**: `errWrite`
+  lives here (`void errWrite(str s) { write(2, …) }`) — use it for the
+  pending LSP server-loop `-2` malformed-frame stderr message + exit 1
+  (clean EOF stays silent).
+- **Textbook scan (deferred, user wants later)**: read
+  `coral-docs/textbook/` (39 files) against the compiler; missing features
+  → todos, invalid syntax → report to user. Verify every candidate against
+  a probe before recording (agents' claims unreliable).

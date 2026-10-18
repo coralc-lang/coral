@@ -1495,9 +1495,20 @@ pub extend Sema
                     msg.pushView("field '");
                     msg.pushView(self.nameTextView(expr->kind.payload.Field.field));
                     msg.pushView("' not found on type '");
-                    if (tb != null) { msg.pushView(self.typeTextView(self.stripType(self.exprType(expr->kind.payload.Field.obj)), tb, 256)); dealloc<u8>(tb); }
+                    Ty recvTy = self.stripType(self.exprType(expr->kind.payload.Field.obj));
+                    if (tb != null) { msg.pushView(self.typeTextView(recvTy, tb, 256)); dealloc<u8>(tb); }
                     else msg.pushView("?");
                     msg.pushView("'");
+                    /* rustc-style follow-ups: a likely spelling first, then
+                     * the full field list so the fix is a copy away */
+                    Str close = self.closestField(recvTy, expr->kind.payload.Field.field);
+                    if (close != 0)
+                    {
+                        msg.pushView("\n\ndid you mean '");
+                        msg.pushView(self.nameTextView(close));
+                        msg.pushView("'?");
+                    }
+                    self.pushAvailableFields(&msg, recvTy);
                     self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
                     return false;
                 }
@@ -1899,8 +1910,34 @@ pub extend Sema
                     else member = self.findMemberByIndex(expr->kind.payload.StructLiteral.typeNode, i);
                     if (member.typeNode == 0)
                     {
-                        if (litNames != 0) self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "unknown field in struct literal");
-                        else self.semaErrorNode(ErrorCode::SemaUnknownMember, id, "too many positional fields in struct literal");
+                        u8* tb = alloc<u8>(256);
+                        String msg = String::new();
+                        Ty litTy = self.stripType(expr->kind.payload.StructLiteral.typeNode);
+                        if (litNames != 0)
+                        {
+                            msg.pushView("unknown field '");
+                            msg.pushView(self.nameTextView(litNames[i]));
+                            msg.pushView("' in struct literal of type '");
+                            if (tb != null) { msg.pushView(self.typeTextView(litTy, tb, 256)); dealloc<u8>(tb); }
+                            else msg.pushView("?");
+                            msg.pushView("'");
+                            Str close = self.closestField(litTy, litNames[i]);
+                            if (close != 0)
+                            {
+                                msg.pushView("\n\ndid you mean '");
+                                msg.pushView(self.nameTextView(close));
+                                msg.pushView("'?");
+                            }
+                        }
+                        else
+                        {
+                            msg.pushView("too many positional fields in struct literal of type '");
+                            if (tb != null) { msg.pushView(self.typeTextView(litTy, tb, 256)); dealloc<u8>(tb); }
+                            else msg.pushView("?");
+                            msg.pushView("'");
+                        }
+                        self.pushAvailableFields(&msg, litTy);
+                        self.semaErrorNode(ErrorCode::SemaUnknownMember, id, msg.asView());
                         return false;
                     }
                     NodeId valueId = expr->kind.payload.StructLiteral.fieldValues[i];

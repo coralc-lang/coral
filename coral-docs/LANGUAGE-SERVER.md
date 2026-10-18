@@ -34,10 +34,12 @@ compiler costs diagnostics and navigation, never colour.**
 It speaks correct LSP base-protocol framing and handles the lifecycle, document
 sync, and diagnostics — opening any file also triggers a **whole-project error
 report**: the build entry is analyzed and every file in the import closure gets
-its diagnostics, not just the open buffer. `hover` returns the resolved type
-under the cursor; `documentSymbol`, `definition`, `references`, and `completion`
-still answer `-32601`. Full verified breakdown is the **Current state** section
-of `PROTOCOL.md`.
+its diagnostics, not just the open buffer. `hover` returns clangd/rust-analyzer-
+shaped cards (declaration block, then `Type:` and `Declared in <file>:<line>`),
+and unknown-field diagnostics suggest near misses and list the available fields;
+`documentSymbol`, `references`, `completion`, and `semanticTokens` still answer
+`-32601`. Full verified breakdown is the **Current state** section of
+`PROTOCOL.md`.
 
 ---
 

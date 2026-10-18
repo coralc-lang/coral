@@ -643,9 +643,15 @@ live handshake (`tools/test-live-server.js`, 9/9) and the compiler-side suite
   closure, so errors in files the open buffer never imports appear too. Files
   that stop having records are cleared on the next report.
 - `textDocument/hover` returns the markdown-typed declaration of the
-  expression or symbol under the cursor. Verified for structs, fields,
-  locals, generics, `self`, imports and libc — e.g. `self` → `Arr<T, N>*`,
-  `data` → `T`, `val` → `T val`, `printf` → `i32 printf(const cchar* fmt, ? )`.
+  expression or symbol under the cursor, laid out like clangd/rust-analyzer
+  cards: a `coral` code block with the declaration, then `Type:` and — for
+  fields — `Declared in <file>:<line>`. Struct-field cards name the owner
+  inside the block (`// In Point`), both for `p.x` and for `.x` in literals.
+  Verified for structs, fields, locals, generics, `self`, `pub` functions,
+  imports and libc — e.g. `self` → `Arr<T, N>*`, `data` → `T`,
+  `val` → `T val`, `printf` → `i32 printf(const cchar* fmt, ? )`.
+  Unknown-field diagnostics append follow-ups: `did you mean 'x'?` then
+  `available fields: a, b`.
 - `textDocument/definition` resolves; 32 of 64 identifier positions in
   `arr.crl`.
 - `-32601` for unimplemented methods; `$/cancelRequest` accepted.
@@ -655,7 +661,6 @@ live handshake (`tools/test-live-server.js`, 9/9) and the compiler-side suite
 | Gap | Detail |
 | --- | --- |
 | **Methods absent from the symbol table** | Hover **and** definition return nothing for every member declaration — `at`, `count`, `ptr`, `constPtr`, `atPtr`, `isEmpty`, `set`, `front`, `back`, `fill`, `copyTo`, `copyFrom`, `new`. Fields, locals, types and free functions all resolve, so member declarations are evidently collected separately and never registered. **Highest-leverage fix remaining:** one table unblocks hover, definition, references, documentSymbol and rename. |
-| `pub` declarations unresolved | `pub void main()` returns nothing from hover; plain `fn main()` works. |
 | No `documentSymbol` | `method not found`. Outline is empty. |
 | No `references`, `completion`, `signatureHelp` | `method not found`. |
 | No `semanticTokens`, `inlayHint`, `foldingRange` | `method not found`. Type info is hover-only, not visible in the buffer. |

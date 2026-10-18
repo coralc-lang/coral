@@ -2,6 +2,141 @@
 
 Repo: coralc @ HEAD `5dc32ad` + uncommitted frontend/build changes (below).
 
+## Update — 2026-10-18e: struct-field hover cards + field suggestions; tuple strip; docs
+
+- **Field hover cards redesigned** (clangd / rust-analyzer shape, user ask):
+  declaration block first — ```` ```coral ```` with `// In <Owner>` and the
+  `Type name` line — then `Type:` and `Declared in <file>:<line>`, then the
+  fn-ptr sentence when applicable. `MemberInfo` gained `owner` (interned
+  type name; set in `findMember`/`findMemberByIndex`/`findMethod`,
+  `member.crl`); `lspFieldCard` and `lspOrphanFieldCard` (`server.crl`) both
+  emit the new shape. Verified via LSP: `p.x` → `// In Box / i32 v`, and
+  `.x` in a literal → `// In Point / i32 x` + `Declared in …:3`.
+- **Unknown-field diagnostics carry follow-ups** (`member.crl` helpers +
+  `expr.crl` sites ~1501 and ~1902): `did you mean 'x'?` (edit distance;
+  threshold 1, or 2 from four bytes up) and `available fields: a, b, c…`
+  (≤ 8, structs/unions). Verified CLI on a `Circle` fixture:
+  `field 'raduis' not found on type 'Circle'` + both follow-ups, same for
+  struct-literal misses.
+- **Tuple syntax strip** (`coral-parser/type.crl`): only `struct(A, B)` is
+  supported; a parenthesized `(A, B)` type now reports P0003
+  "tuple types are written 'struct(A, B)'" and recovers. `var (a, b)`
+  destructuring is not planned (user decision — recorded in
+  `SESSION_TODOS.md` §10). Note tuple members are **1-based** (`p.1`).
+- **Docs** (extensions consume these): `PROTOCOL.md` hover bullet now
+  describes the card layout + field follow-ups; stale `pub`-unresolved gap
+  row removed (verified `pub i32 area` hovers fine); `LSP-SERVER-TODO.md`
+  gets the field-card sample and empty-array-clear note; `LANGUAGE-SERVER.md`
+  corrected (definition/index implemented; `documentSymbol`, `references`,
+  `completion`, `semanticTokens` still `-32601`).
+- **Method hover is still a gap**: hovering `get` (decl or `b.get()`) with
+  an `extend Box { i32 get() }` returns `null`; field cards work through
+  the same receiver path, so this is member-decl collection, not dispatch.
+  Recorded as the remaining "one gap" (PROTOCOL.md §12 / LSP-SERVER-TODO).
+- **check_crl.py is parse/sema-lite**: it PASSed the new `member.crl` while
+  the build failed 4× T0002 (`u32`/`usize` loop vars); the build is the
+  real gate. (Fixed by moving `nameDistance` DP rows to `usize`.)
+- **Verification**: build green (`build_fh2.log`), SELFHOST_IDENTICAL
+  `828b7e853589…` (`build_self3.log`); `lsp_all.py` **48 PASS / 0 fail**
+  (expectations updated for the new cards + new `p.x` check); stress 150
+  changes: no crash, growth 7.7 MB, rc 0; single-file CLI probe
+  `/tmp/opencode/fieldtest.crl` shows both suggestion messages. Installed
+  via `./mv` → `~/.coral/bin/coralc` sha `f645875f635f…`.
+- **print.crl report for the user**: if-expressions **work** (5 forms
+  verified, incl. else-if chains and globals); the real blocker is the
+  non-constant file-scope initializer (`initializer element is not
+  constant`; see §"File-scope initializers" below — now also in
+  `SESSION_TODOS.md` §10). The file also contains pasted compiler output at
+  lines 22-26 and `println("{}, {}", _a)` (E0901), so it cannot compile as
+  written regardless; bare `return ;` (T/analysis OK, gcc rejects) is the
+  §10 codegen gap.
+- **Deferred**: textbook scan (user: later in the session; delegation
+  attempt was cancelled); server-loop `-2`-malformed stderr hardening
+  (still open from 2026-10-18d follow-ups); commit of value-generics +
+  LSP/leak/beautify/tuple/hover work (user-only).
+
+## Update — 2026-10-18d: open-buffer diagnostics owned by the buffer; quiet build output
+
+- **Bug (external report, VS Code tool)**: with a project build file, the
+  open buffer's diagnostics were clobbered at didOpen. Sequence reproduced:
+  `lspAnalyze` publishes the buffer's real records (e.g. `T0001 zz`), then
+  `lspProjectReport` re-analyses the project **from disk** and publishes for
+  the same URI — empty when disk is clean (stale-error clear/steal) or
+  stale disk records when disk differs. Editors keep the last publish, so
+  the panel showed "no diagnostics" for text that has errors. The same
+  pattern could wipe markers for any other open buffer.
+- **Fix** (`coral-lsp/server.crl`): `lspPublish` gained
+  `skipPaths/skipCount` (helper `lspPathInOpen`); the didOpen report is
+  given every open doc's path, so an open buffer's URI is published only by
+  that buffer's own analysis — records, the empty "cleared" publish, and
+  the stale-file clearing pass in `lspProjectReport` all skip open paths.
+  `lspAnalyze` passes `null, 0` (unchanged behaviour). Verified: disk-clean
+  + buffer-broken at didOpen → last publish = `T0001 zz` (was `[]`);
+  didChange updates (`qq`) and clears on clean; disk-broken + buffer-clean
+  → `[]` stays. Note: `tools/lsp-didchange-check.js`'s "clean" text
+  `fn ok() {}` is *not* valid Coral (`fn` → T0001), so its clean case shows
+  1 real diagnostic — the broken-case assertions are what gate.
+- **Build output (user request)**: `coralc build` now prints a quiet,
+  phase-labelled summary per the project's own textbook
+  (`22-diagnostics-and-the-error-catalogue.txt:52` — no reader, no print).
+  `builder.crl`: one `coral: build plan: N modules, M aliases, S stale`
+  (with `(dry run)` / `(--force)` variants); the glued module-name dump and
+  the `modules.map written…` line are gone (file still written, silently).
+  `compile.crl`: `coral: emit <path> (<n> bytes)`, `coral: built <in> -> <out>`,
+  `coral: dry run: would link <out>`; failures now `error: cannot read ‹f›`,
+  `error: compile failed (N errors)`, `error: codegen failed (N errors)`,
+  `error: cannot write ‹f›`, `error: gcc failed (status N); rerun with
+  --show-gcc for details`.
+- **Verification**: two consecutive builds `cmp` **IDENTICAL** (`bc1ed03356cf…`);
+  `lsp_all.py` **47/47**; `coral-vscode` `test-live-server.js` **9/9** and
+  `lsp-didchange-check.js` "didChange re-analyses correctly (2 diagnostics)";
+  stress 60 changes: no crash, growth 3.2 MB, rc 0; installed via `./mv`
+  (`bc1ed03356cf…`, = `compiler-new/build/coralc`).
+- **Still open**: `i32 bad() { return ; }` passes analysis but gcc rejects
+  the emitted C (`coral: gcc failed`) — bare `return;` codegen gap (next).
+
+## Update — 2026-10-18c: project-scenario double-free + per-change LSP leaks fixed
+
+- **Symptom**: after the 2026-10-18b install, `--serve` in a *project*
+  (`rootUri` with `coral.crlb`) aborted with `free(): invalid pointer`
+  (SIGABRT, rc -6) on didOpen+didChange+hover; plain single-file hover was
+  fine. Stress RSS grew ~190 KB per didChange (51 MB over 150 changes).
+- **Root cause 1 — drop pass ignored call-argument moves**
+  (`coral-backend/codegen.crl`): a bare-identifier argument passed by value
+  (`arr.arrVal.push(elem)`) kept its caller-side pending drop while the callee
+  took ownership. `parseArray` dropped `elem` after moving it into the Vec;
+  the Vec/serialize path freed it again → double free on every didChange
+  (which parses a `contentChanges` array). Fix: new `cgMoveArg` cancels the
+  caller's drop for bare-Ident args in Call/MethodCall/StaticCall (skipped
+  when the arg decays str→ptr, which borrows).
+- **Root cause 2 — explicit dispose kept the auto-drop**: error paths like
+  `elem.dispose(); return nullVal();` were followed by a pass-emitted
+  `drop(&elem)` → second double-free on malformed input. Fix:
+  `cgMoveDisposeRecv` treats `x.dispose()` / `x.free()` receivers as
+  consuming (removes `x` from the live drop set at the call site).
+- **Root cause 3 — per-analyze buffer leak**: `libResolveSegs`
+  (`coral-semantics/analyze.crl`) probe-reads module `lib.crl` manifests
+  (`mbuf`) for re-export resolution but never tracked them in `L->bufs`;
+  every `lspAnalyze` leaked ~190 KB (14×64 KB for a 2-change session).
+  Fix: the probe buffer is now tracked in `L->bufs` and released by
+  `freeUnit()` with the rest.
+- **Verification**: project session now answers hover (markdown `i32 ok()`),
+  rc 0, stderr empty; `valgrind` on a didOpen+2×didChange session: **0
+  invalid frees/reads/writes** (`ERROR SUMMARY` errors are leak records
+  only), definitely-lost 13.2 MB → **85 KB**; stress 150 changes: no crash,
+  hover@0/50/100 OK, RSS growth 51 MB → **7.5 MB** (400 changes: 15.5 MB,
+  sublinear); `lsp_all.py` **47/47**; selfhost `cmp` **IDENTICAL** (two
+  consecutive emissions); installed `~/.coral/bin/coralc`
+  (`106c5b245df0…`) + smoke test (P0001 publish, clean exit).
+- **Harness fix**: `/tmp/opencode/lsp_stress.py` build file now carries the
+  required `;` on the last field (build-file fields are `;`-terminated,
+  none after `}` — a missing one silently disabled the project report);
+  hover drain reads up to 60 messages; `STRESS_N` env var.
+- **Known residual leaks** (down from 51 MB): exit-state only — `LspDoc`
+  15.4 MB + `runServer` arena 4.19 MB not freed on exit; plus ~28 KB per
+  analyze of tiny parser records (`parseAttrListTo` attribute arrays,
+  `libCandidate` paths) — next leak targets if long sessions grow.
+
 ## Update — 2026-10-18: language server milestone (`coralc --serve`)
 
 - `compiler-new/coral-lsp/server.crl` speaks real LSP on the **std API only**
@@ -29,6 +164,47 @@ Repo: coralc @ HEAD `5dc32ad` + uncommitted frontend/build changes (below).
   `-x c -` (stdin pipe, no `.c` on disk), rc=0.
 - Docs synced across coralc/coral-vscode/coral-zed: `PROTOCOL.md` §12 current
   state, `LANGUAGE-SERVER.md` compiler section.
+
+## Update — 2026-10-18b: LSP zero-diagnostics root cause + fix
+
+- **Symptom**: `--serve` published empty diagnostics + null hover for every
+  file (incl. `/tmp/only.crl`, `/tmp/sem.crl`), while the CLI reported the
+  same errors; server stderr silent. Reproduction was deterministic once a
+  self-emitted binary was in the loop.
+- **Root cause** (`coral-backend/codegen.crl`, RAII drop pass): the branch
+  exits (return/break/continue) truncated the compile-time live set via
+  `cgEmitDropsExcept`'s unconditional `cg.dropsLen = mark`, while enclosing
+  scopes still held marks captured *before* the truncation. The next scope
+  end (`cgEmitDropsTo(staleMark)`) **resurrected** the popped entries, and a
+  later exit emitted drops for live locals. Concretely, in
+  `lib/std/x86_64/linux/parser/json.crl` `ParseCtx_parseString` a
+  `String_drop(&s)` got emitted on the while-loop exit path after the early
+  `return s;` paths → returned String freed → the LSP's didOpen text (parsed
+  through that function) came back empty → parseErrors=0/semanticErrors=0/
+  monoErrors=0/diags=0 → empty publish + hover null. CLI unaffected (it does
+  not parse JSON). Instrumented traces showed `dropsLen` stuck at 1 across
+  five exits of one function — the resurrection signature.
+- **Fix (working tree)**: new `cgEmitDropsBranch` — branch unwinds
+  (Return ×3 call sites, Break switch+loop, Continue) emit exit drops but do
+  not touch the live set; true scope ends keep `cgEmitDropsTo` and the reset
+  is now guarded (`if (cg.dropsLen > mark) cg.dropsLen = mark`) so a stale
+  mark can never re-raise the stack. All debug prints removed. Also:
+  `lspAnalyze` errorLimit restored to **0**, temp `lspDbg` stderr dump
+  removed from `server.crl`.
+- **Known cosmetic leftover**: scope-end drops after an unconditional
+  `return` are emitted as unreachable C (`return s; drop(&s); }`) — harmless
+  at runtime; a later reachability cleanup can skip them.
+- **Verification** (stage0 → stage1 → stage2 lineage): stage1 emits C
+  2727247 B; gcc of it → server publishes P0001 on `/tmp/only.crl` + hover
+  `function ok`, T0001 on `/tmp/sem.crl`; `lsp_all.py` **47/47** on both the
+  gcc'd emission and the built stage2 binary (was 44/47); selfhost emission
+  `cmp` stage1 vs stage2 **IDENTICAL**; stage2 = 859792 B.
+- **Artifacts**: `/tmp/opencode/FIX2bin` (gcc of fixed emission),
+  `/tmp/opencode/s1_emit.c`, `lsp_fix2.log`, `lsp_s2.log`, `dbg1-6.log`
+  (traces), `s_vs_e.diff` (206-line bogus-drop inventory), `D0bin`/`D2bin`
+  (deterministic broken / -O2-hanging gcc's of the pre-fix debug emission).
+- **Old install**: `~/.coral/bin/coralc` (3d197f41e04c60be) still carries the
+  bug; refresh with the fixed stage2 binary before re-testing the editor.
 
 ## Milestone: self-hosting achieved
 

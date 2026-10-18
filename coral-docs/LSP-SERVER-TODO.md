@@ -26,7 +26,7 @@ Both work, with one consistent gap.
 
 | Feature | Result |
 | --- | --- |
-| `textDocument/publishDiagnostics` | Works; still no empty-array clear. |
+| `textDocument/publishDiagnostics` | Works, including empty-array clears (open buffers own their own diagnostics). |
 | `textDocument/hover` | Correct types for structs, fields, locals, generics, `self`, imports and libc. |
 | `textDocument/definition` | Resolves; 32 of 64 identifier positions in `arr.crl`. |
 
@@ -40,6 +40,32 @@ i     ->  usize i
 m     ->  Box<K, V> m
 E     ->  struct E
 printf -> i32 printf(const cchar* fmt, ? )
+```
+
+Field cards follow the clangd / rust-analyzer shape — declaration block
+first, then type and declaration site:
+
+```
+```coral
+// In Point
+i32 x
+```
+
+Type: i32
+Declared in src/misc.crl:3
+```
+
+The same card appears for `.x` in a struct literal (no receiver) and for
+`p.x` on a typed receiver (methods still get the function card). Unknown
+fields append follow-ups to the diagnostic: a likely spelling and the
+field list, rustc-style:
+
+```
+[T0006]: field 'raduis' not found on type 'Circle'
+
+did you mean 'radius'?
+
+available fields: radius, cx
 ```
 
 ### ❌ The one gap, and it is consistent across hover *and* definition
@@ -112,6 +138,35 @@ python3 tools/lsp-diagnostics.py FILE
 which is how the method gap above was found. Use it after each server change.
 
 ---
+
+## ✅ Resolved: `didChange` now re-analyses
+
+**Fixed as of the 17:07 build.** Diagnostics update live as you type; no restart
+needed.
+
+```
+didOpen (broken text)     -> 2 diagnostics
+didChange -> clean        -> 1 diagnostic   (matches the CLI)
+didChange -> broken again -> 2 diagnostics
+didChange -> broken again -> 2 diagnostics
+```
+
+Both editors benefit — they only ever send `didChange` for edits, so this was
+the single change that made diagnostics feel live.
+
+The earlier failure was that a second `analyzeForCompile` call for a path that
+had already been analysed returned no records, so every edit published an empty
+set. Only the first `didOpen` ever reported anything.
+
+Regression check:
+
+```sh
+cd /home/cerie/Documents/coral-vscode
+node tools/lsp-didchange-check.js
+```
+
+It exits 0 either way and prints which way it went, so it is safe to run by
+hand without gating a build on a compiler that is a separate workstream.
 
 ## Phase 1 — without these the editor feels dead
 

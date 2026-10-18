@@ -1086,55 +1086,52 @@ String lspLocalCard(LspDoc* d, NodeId declId, u8* buf, usize cap)
     return none;
 }
 
-/* card for a struct/variant field reached through `.name` */
+/* card for a struct/variant field reached through `.name`; laid out like
+ * clangd / rust-analyzer cards: the declaration in a code block with its
+ * owner (`// In Circle`), then the type and the declaration site */
 String lspFieldCard(LspDoc* d, MemberInfo mi, u8* namePtr, usize nameLen, str rootPath, u8* buf, usize cap)
 {
     String s = String::new();
-    s.pushView("field ");
-    s.pushView(str { .ptr = namePtr, .len = nameLen });
-    if (mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
+    s.pushView("```coral\n");
+    if (mi.owner != 0)
     {
-        Node* fn2 = d->unit.ctx.nodes + mi.declaration.index;
-        s.pushView("\ndeclared in ");
-        u32 fid = locFile(fn2->loc);
-        if (fid == 0) s.pushView("this file");
-        else
-        {
-            str sp = lspShortPath(d, fid, rootPath);
-            if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
-        }
-    }
-    else
-    {
-        s.pushView("\nprovided by the type");
-    }
-    s.pushView("\nType: ");
-    lspPushType(&s, d, mi.typeNode, buf, cap);
-    if (lspIsFnPtrTy(d, mi.typeNode))
-    {
+        s.pushView("// In ");
+        s.pushView(lspInternText(d, mi.owner));
         s.pushView("\n");
-        lspPushFnPtrSentence(&s, d, mi.typeNode, buf, cap);
     }
+    lspPushType(&s, d, mi.typeNode, buf, cap);
+    s.pushView(" ");
+    s.pushView(str { .ptr = namePtr, .len = nameLen });
+    s.pushView("\n```");
+    s.pushView("\n\nType: ");
+    lspPushType(&s, d, mi.typeNode, buf, cap);
     if (mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
     {
         Node* fn2 = d->unit.ctx.nodes + mi.declaration.index;
         if (fn2->kind.tag == NodeKind::Field)
         {
-            Field fv = fn2->kind.payload.Field.value;
-            s.pushView("\n\n```coral\n");
-            lspPushType(&s, d, fv.typeNode, buf, cap);
-            s.pushView(" ");
-            s.pushView(str { .ptr = namePtr, .len = nameLen });
-            s.pushView("\n```");
+            s.pushView("\nDeclared in ");
+            u32 fid = locFile(fn2->loc);
+            if (fid == 0) s.pushView("this file");
+            else
+            {
+                str sp = lspShortPath(d, fid, rootPath);
+                if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
+            }
+            u32 line = locLine(fn2->loc);
+            if (line > 0)
+            {
+                s.pushView(":");
+                d->unit.sema.pushDec(&s, (u64)line);
+            }
         }
+        else s.pushView("\nprovided by the type");
     }
-    else
+    else s.pushView("\nprovided by the type");
+    if (lspIsFnPtrTy(d, mi.typeNode))
     {
-        s.pushView("\n\n```coral\n");
-        lspPushType(&s, d, mi.typeNode, buf, cap);
-        s.pushView(" ");
-        s.pushView(str { .ptr = namePtr, .len = nameLen });
-        s.pushView("\n```");
+        s.pushView("\n");
+        lspPushFnPtrSentence(&s, d, mi.typeNode, buf, cap);
     }
     return s;
 }
@@ -1223,6 +1220,8 @@ String lspOrphanFieldCard(LspDoc* d, u32 wsid, u8* namePtr, usize nameLen, str r
     first.index = 0;
     Ty firstTy = 0;
     u32 firstFile = 0;
+    Str firstOwner = 0;
+    u32 firstLine = 0;
     u32 i = 1;
     while (i < d->unit.ctx.nodesLen)
     {
@@ -1256,22 +1255,39 @@ String lspOrphanFieldCard(LspDoc* d, u32 wsid, u8* namePtr, usize nameLen, str r
                 first = fields[j - 1];
                 firstTy = fn2->kind.payload.Field.value.typeNode;
                 firstFile = locFile(fn2->loc);
+                firstLine = locLine(fn2->loc);
+                if (decl->kind.tag == DeclKind::Struct) firstOwner = decl->kind.payload.Struct.name;
+                else firstOwner = decl->kind.payload.Union.name;
             }
         }
     }
     if (hits == 0) return none;
     String s = String::new();
-    s.pushView("field ");
+    s.pushView("```coral\n");
+    if (firstOwner != 0)
+    {
+        s.pushView("// In ");
+        s.pushView(lspInternText(d, firstOwner));
+        s.pushView("\n");
+    }
+    lspPushType(&s, d, firstTy, buf, cap);
+    s.pushView(" ");
     s.pushView(str { .ptr = namePtr, .len = nameLen });
-    s.pushView("\ndeclared in ");
+    s.pushView("\n```");
+    s.pushView("\n\nType: ");
+    lspPushType(&s, d, firstTy, buf, cap);
+    s.pushView("\nDeclared in ");
     if (firstFile == 0) s.pushView("this file");
     else
     {
         str sp = lspShortPath(d, firstFile, rootPath);
         if (sp.len == 0) s.pushView("another file"); else s.pushView(sp);
     }
-    s.pushView("\nType: ");
-    lspPushType(&s, d, firstTy, buf, cap);
+    if (firstLine > 0)
+    {
+        s.pushView(":");
+        d->unit.sema.pushDec(&s, (u64)firstLine);
+    }
     if (hits > 1)
     {
         s.pushView("\n\nmatches ");
