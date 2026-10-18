@@ -1,0 +1,441 @@
+Chapter 31
+
+Live Examples: Mathematics and Number Theory
+
+The Arithmetic Nobody Hands You
+
+Open the standard library and look for a `primes` module. It is not there. Look for `gcd`, for a fast power, for a binomial coefficient. Not there either. Coral's `std::math` is honest about what it is: a binding to the C math library. It gives you `sqrt`, `pow`, `exp`, `log`, `sin`, `cos`, the constants `pi` and `e`, some clamping and interpolation helpers, and the `random` generators. What it does not do is think about integers. It has no idea what a prime is, it does not know Euclid's algorithm, and it will happily compute `pow(x, y)` on doubles for you but has nothing to say about `x` to the `y` modulo `m`.
+
+That is not a gap in the library. It is the normal state of affairs, and it is where a great deal of real programming begins. Number theory is the part of mathematics that shows up in code you can hold: hashing, checksums, cryptography, the way a hash map picks a table size, the way a load balancer spreads requests, the way an identifier is validated, the way a game seeds randomness. None of it is an API call. All of it is a handful of algorithms, each a dozen lines, each with a cost and a range where it is correct and a range where it quietly lies.
+
+This chapter works through nine of them, in Coral, starting from the slow obvious method and improving it where the improvement is worth the ink. Every example follows the same shape: the problem in plain terms, the intuition of why the obvious thing is slow, the approach, a complete implementation, the cost, the edge cases that bite, and a variation to try on your own. None of it is exotic. All of it is the difference between arithmetic that works and arithmetic that overflows at the worst moment.
+
+A note on types before we begin, because it comes up in every example. Machine integers wrap around. A `u64` holds zero through 18,446,744,073,709,551,615 and then, if you add one, becomes zero again without complaint. A `i64` goes to about 9.2 quintillion on either side of zero and then wraps to the other end. The machines perform this modulo arithmetic by design; the language does not stop you, because checking every addition would be ruinous and because sometimes the wraparound is exactly what you want (as in hashing). The burden is on you, the author, to know the range of your inputs and to prove the arithmetic stays inside it. That burden is the hidden subject of this whole chapter. Every "edge cases" paragraph is, at heart, a sentence about overflow.
+
+31.1 Is This Number Prime?
+
+The problem. Given a whole number, decide whether it is prime — that is, whether its only divisors are one and itself.
+
+The intuition. A number `n` is prime if nothing smaller than it divides it evenly. The obvious program tries every candidate: does two divide `n`? Does three? Does four? Down to `n - 1`. It is correct, and it is hopeless for large `n`, because for a number with a hundred digits you would try more candidates than there are atoms in the room. The first real insight is smaller and older than computers: you only need to test candidates up to the square root of `n`. Here is why, in one sentence you can hold in your head. If `n` is not prime, then `n = a * b` for two numbers each greater than one; the two factors cannot both be larger than the square root, because their product would exceed `n`. So at least one factor is at most the square root, and if any factor exists, a factor no larger than the root exists. You find it or you conclude there is none.
+
+The approach. Brute force first, for honesty, then the square-root bound, then the wheel. The wheel is a small refinement: after handling two and three by hand, every prime candidate is of the form `6k - 1` or `6k + 1`, so the loop can step six at a time and test two offsets. That cuts the work by a further factor of three, and it is the version worth keeping.
+
+The implementation.
+
+    pub bool isPrimeBrute(u64 n) {
+        if (n < 2) return false;
+        u64 d = 2;
+        while (d < n) {
+            if (n % d == 0) return false;
+            d += 1;
+        }
+        return true;
+    }
+
+    pub bool isPrime(u64 n) {
+        if (n < 2) return false;
+        if (n < 4) return true;            // 2 and 3 are prime
+        if (n % 2 == 0) return false;
+        if (n % 3 == 0) return false;
+
+        u64 i = 5;
+        while (i <= n / i) {               // i*i avoids overflow
+            if (n % i == 0) return false;
+            if (n % (i + 2) == 0) return false;
+            i += 6;
+        }
+        return true;
+    }
+
+Read the loop bound carefully. The natural spelling is `while (i * i <= n)`, and it is wrong near the top of the range: when `n` is close to the maximum `u64`, `i * i` itself wraps around to a small number, the comparison succeeds when it should fail, and the function either loops forever or examines nonsense. The form `i <= n / i` says the same thing without ever computing a product that might overflow — division cannot overflow the way multiplication can. This is the single most common integer bug in this kind of code, and the fix is always the same: compare against the quotient, not the square.
+
+Cost and notes. The brute-force version is O(n) divisions. The square-root version is O(sqrt n). The wheel is still O(sqrt n) but with a smaller constant — roughly n over three tests rather than n over one. None of these scales to cryptographic sizes, and that is fine; the slow-by-design nature of factoring small numbers is exactly why public-key cryptography exists. If you ever need to test hundred-digit primes, you do not improve this loop, you change the algorithm entirely (Miller-Rabin), and that is a different chapter of mathematics.
+
+Edge cases. Zero and one are not prime; the guard at the top handles both. Negative numbers have no meaning as primes here; `isPrime` takes `u64`, so the type system makes a negative input impossible rather than making it a wrong answer. Two and three are prime and are handled before the even check, which would otherwise reject two. And the overflow-safe bound matters for any `n` above about four billion, which is well inside the range a `u64` invites.
+
+Variation. Rewrite `isPrime` to return not just a yes or no but the smallest divisor it found, as an `Option<u64>` — `None` for prime, `Some(d)` for composite. This is the shape the factorisation example (31.8) needs, and writing it now gets the two to share a structure.
+
+31.2 The Sieve of Eratosthenes
+
+The problem. Produce every prime below a limit, not just decide one number. If you need the primes below a million — to test many numbers, to build a table, to seed a hash — testing each with `isPrime` is the wrong tool for the job.
+
+The intuition. Instead of asking about each number separately, mark the composites once, all at once. Write down every number from two to the limit. Two is prime; cross out every multiple of two (4, 6, 8, ...). The first number not crossed out after two is three, and it is prime; cross out every multiple of three. The first survivor after three is five; cross out its multiples. When you have crossed out the multiples of every prime up to the square root of the limit, every number still standing is prime. The work is not per number; it is per multiple, and most numbers are a multiple of very few small primes.
+
+The approach. Two versions. The first uses a vector of bytes, one byte per candidate, to make the marking obvious. The second uses `std::collections::bitset`, which is the honest data structure for a dense range of yes-or-no answers, and which the library already provides.
+
+The implementation, byte version.
+
+    import(lib) std::vec { Vec };
+
+    pub Vec<u64> sieve(u64 limit) {
+        Vec<u64> primes = Vec<u64>::new();
+        if (limit < 2) return primes;
+
+        Vec<u8> composite = Vec<u8>::withCap((usize)(limit + 1));
+        for (u64 i = 0; i <= limit; i += 1) composite.push(0);
+
+        for (u64 p = 2; p <= limit / p; p += 1) {
+            if (composite.at((usize)p) != 0) continue;
+            for (u64 multiple = p * p; multiple <= limit; multiple += p)
+                composite.set((usize)multiple, 1);
+        }
+
+        for (u64 i = 2; i <= limit; i += 1)
+            if (composite.at((usize)i) == 0) primes.push(i);
+        return primes;
+    }
+
+The inner loop starts at `p * p`, not at `2 * p`, and that is the whole reason the sieve is fast. By the time the sieve reaches a prime `p`, every multiple of `p` smaller than `p * p` has already been crossed out by a smaller prime — a multiple `k * p` with `k < p` has a factor `k` whose smallest prime is less than `p`, and that prime already did the crossing. Starting at the square is not an optimisation you add later; it is part of the algorithm.
+
+The implementation, bitset version.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::bitset { Bitset };
+
+    pub Vec<u64> sieveBits(u64 limit) {
+        Vec<u64> primes = Vec<u64>::new();
+        if (limit < 2) return primes;
+
+        Bitset composite = Bitset::new(limit + 1);   // one bit per number
+        for (u64 p = 2; p <= limit / p; p += 1) {
+            if (composite.test(p)) continue;
+            for (u64 multiple = p * p; multiple <= limit; multiple += p)
+                composite.set(multiple);
+        }
+
+        for (u64 i = 2; i <= limit; i += 1)
+            if (!composite.test(i)) primes.push(i);
+        return primes;
+    }
+
+The bitset holds one bit per number instead of one byte, an eight-fold saving, and the bit operations are single machine instructions. For a million numbers that is 125 kilobytes of state instead of a megabyte, which is the difference between fitting in cache and streaming through it.
+
+Cost and notes. The number of marking operations is the sum over primes `p` below the root of the limit of (limit / p), which works out to O(n log log n) — famously close to linear, and the reason the sieve embarrasses per-number tests. The space is O(n) bytes, or O(n/8) with the bitset. The constant in the log-log is tiny; for a million the whole thing finishes in the time a single `isPrime` does for one stubborn composite.
+
+Edge cases. A limit below two produces an empty list. `limit + 1` allocates one more slot than strictly needed so that index `limit` is valid; forgetting the plus-one is an off-by-one out-of-bounds trap. The bitset constructor rounds the bit count up to whole 64-bit words and its `set`, `test`, and friends assert that the index is inside the declared universe, so a stray index is a diagnostic, not silent corruption.
+
+Variation. Build the smallest-prime-factor table instead: a `Vec<u64>` where entry `i` holds the smallest prime dividing `i`. It is the same sieve with one extra assignment inside the marking loop, and it is the engine of the fast factorisation in 31.8.
+
+31.3 Greatest Common Divisor, and the Trap in Least Common Multiple
+
+The problem. Given two integers, find their greatest common divisor (the largest number dividing both) and their least common multiple (the smallest number both divide).
+
+The intuition. The naive method is to factor both numbers and intersect the prime sets. It works, and it is slow, and it needs a factoriser. Euclid found something far better more than two thousand years ago, and the idea is almost embarrassing in its simplicity. If a number divides both `a` and `b`, then it divides their difference — and indeed it divides `a - k*b` for any whole `k`. So the common divisors of `a` and `b` are exactly the common divisors of `b` and `a mod b`. Repeatedly replace the larger pair with `(b, a mod b)` until the remainder is zero; the last nonzero remainder is the answer. You have not factored anything, and you have thrown away enormous amounts of magnitude at each step.
+
+The approach. The iterative Euclid for the GCD. Then the LCM, whose implementation hides a trap that is worth a paragraph: `lcm(a, b) = a * b / gcd(a, b)` is the formula you learn, and computing it in that order overflows for values whose product exceeds the type even when the answer comfortably fits. Divide before you multiply.
+
+The implementation.
+
+    pub u64 gcd(u64 a, u64 b) {
+        while (b != 0) {
+            u64 t = a % b;
+            a = b;
+            b = t;
+        }
+        return a;
+    }
+
+    pub u64 lcm(u64 a, u64 b) {
+        if (a == 0 || b == 0) return 0;
+        return (a / gcd(a, b)) * b;      // divide first, then multiply
+    }
+
+    pub i64 gcdSigned(i64 a, i64 b) {
+        if (a < 0) a = -a;
+        if (b < 0) b = -b;
+        return (i64)gcd((u64)a, (u64)b);
+    }
+
+Cost and notes. Euclid runs in O(log(min(a, b))) remainder steps, and the number of steps is bounded by roughly five times the number of decimal digits — for numbers that fit in a `u64` it is at most a couple of dozen iterations. That is Fibonacci's quiet contribution: the worst case for Euclid is two consecutive Fibonacci numbers, because each step shaves off proportionally the least. The `gcdSigned` version takes the absolute values first, since the algorithm is about divisibility and sign is irrelevant; care is needed because negating the most negative `i64` overflows, which is why the unsigned path is the safe one to build on.
+
+Edge cases. `gcd(0, 0)` is zero by the loop, which is the conventional answer. `gcd(0, n)` is `n`, again handled. The LCM returns zero if either input is zero, because there is no least common multiple of zero and anything. And the divide-before-multiply order is not a style preference: with `a = 2^32` and `b = 2^32 - 2`, the product overflows a `u64` while the true LCM fits, so the textbook order gives a wrong answer in silence.
+
+Variation. Extend Euclid to the extended form, which returns not just the GCD `g` but also the coefficients `x` and `y` with `a*x + b*y = g`. That pair is exactly the modular inverse when `g` is one, and it is the honest way to compute an inverse without invoking Fermat's little theorem, which only works when the modulus is prime.
+
+31.4 Modular Arithmetic and Fast Exponentiation
+
+The problem. Compute `base` raised to `exp`, modulo `m`, without ever forming the enormous full power. This is the core operation of every public-key cryptosystem and of a surprising amount of ordinary code: hashing with a rolling polynomial, generating pseudorandom sequences, checking divisibility tricks.
+
+The intuition. Raising to a power naively means multiplying `base` by itself `exp` times, and for a large exponent that is a number with millions of digits before you ever take the modulus. The modulus is what saves you — `(a * b) mod m = ((a mod m) * (b mod m)) mod m` — so you can reduce after every multiplication and never work with a value larger than `m`. But you can do better still. Exponentiation by squaring says: to compute `x^8`, square three times (`x^2`, `x^4`, `x^8`) rather than multiplying seven times. The exponent's binary representation tells you which powers to include: read the bits of the exponent, square at every step, and multiply into the result when the current bit is one. A `exp`-step loop becomes a log-`exp` loop.
+
+The approach. Reduce the base first, then walk the exponent's bits from the bottom. Use `u64` and note the multiplication caveat honestly.
+
+The implementation.
+
+    pub u64 modPow(u64 base, u64 exp, u64 m) {
+        if (m == 1) return 0;
+        u64 result = 1;
+        base %= m;
+        while (exp > 0) {
+            if ((exp & 1u) == 1u)
+                result = (result * base) % m;
+            exp >>= 1;
+            base = (base * base) % m;
+        }
+        return result;
+    }
+
+The `(result * base) % m` line is correct only while the product fits the type, which means `m` must be at most about four billion (the square root of the `u64` maximum). When the modulus can be larger, you need multiplication that does not overflow, and the standard trick is to multiply by doubling and repeated addition, reducing at each step:
+
+    pub u64 mulMod(u64 a, u64 b, u64 m) {
+        u64 result = 0;
+        a %= m;
+        while (b > 0) {
+            if ((b & 1u) == 1u) {
+                result = (result + a) % m;
+            }
+            a = (a * 2u) % m;
+            b >>= 1;
+        }
+        return result;
+    }
+
+With `mulMod` in hand, every `result * base` and `base * base` in `modPow` becomes a `mulMod` call, and the algorithm is correct for the full `u64` range, at the cost of a factor of about sixty-four in speed.
+
+Cost and notes. `modPow` does one or two modular multiplications per bit of the exponent: O(log exp) steps, each O(1) while the modulus is small enough. `mulMod` turns each of those into O(log m) additions, so the full-range version is O(log exp * log m). The small-modulus version is the common case by far, and it is the one to reach for.
+
+Edge cases. Modulus one means every value is congruent to zero; returning zero early avoids a degenerate loop. A base larger than the modulus is reduced first. An exponent of zero returns one, which is correct for every nonzero base and is the conventional value even for base zero (the argument is a matter of convention; the code picks the common one). The overflow in the naive modulus is the sharp edge, and the reason `mulMod` earns its place in a real cryptographic routine.
+
+Variation. Write `modInverse` using the extended Euclid from 31.3, returning an `Option<u64>` that is `None` exactly when the base shares a factor with the modulus (so no inverse exists). Test it by checking that `(a * aInv) % m == 1` for a range of inputs.
+
+31.5 Factorials, and Where Machine Integers Surrender
+
+The problem. Compute `n!` — the product of every whole number from one to `n`. It appears in combinatorics, in series expansions, and as the canonical example of a function that outgrows any fixed-width type almost immediately.
+
+The intuition. The multiplication is trivial; the range is not. Twenty factorial already exceeds what a `u64` can hold — `20!` is about 2.4 quintillion, just inside the `u64` ceiling — and `21!` wraps silently to a wrong, plausible number. So the interesting part of this example is not how to multiply but how to be honest about when you cannot. There are three honest answers: detect the overflow and report it; compute the value as a floating-point approximation, accepting that it is approximate; or, for the logarithm, compute `log(n!)` as a sum, which is how a probability code avoids the overflow entirely.
+
+The approach. Start with the checked integer version that reports overflow as a `bool` and writes through a pointer. Then the logarithm version, which is what you actually want when the factorial is an intermediate quantity in a larger expression.
+
+The implementation.
+
+    import(lib) std::math::math { log, exp, pi };
+
+    pub bool factorial(u64 n, u64* out) {
+        u64 result = 1;
+        for (u64 i = 2; i <= n; i += 1) {
+            if (result > 0xFFFFFFFFFFFFFFFFu / i) return false;   // would overflow
+            result *= i;
+        }
+        *out = result;
+        return true;
+    }
+
+    pub f64 logFactorial(u64 n) {
+        f64 sum = 0.0;
+        for (u64 i = 2; i <= n; i += 1) sum += log((f64)i);
+        return sum;
+    }
+
+    // Stirling's approximation: n! ~ sqrt(2*pi*n) * (n/e)^n
+    pub f64 logFactorialStirling(u64 n) {
+        if (n < 2) return 0.0;
+        f64 fn = (f64)n;
+        return 0.5 * log(2.0 * pi * fn) + fn * (log(fn) - 1.0);
+    }
+
+The overflow test is the pattern to memorise: before multiplying, compare the running result against the largest value divided by the factor. If `result` already exceeds `MAX / i`, then `result * i` would exceed `MAX`, so stop. Testing after the multiplication is useless, because the product has already wrapped and no comparison can detect it.
+
+Cost and notes. The checked version is O(n) multiplications and never lies. The sum-of-logs version is O(n) calls to `log`, which is slower but produces a usable magnitude where the integer version would have failed; for large `n` the sum form is accurate and the Stirling form is a cheap constant-time approximation good to within a fraction of a percent for moderate `n`. Use the exact integer form when `n` is small and the answer is an exact count; use the logarithm when `n` is large and the answer is a probability or a ratio, where the absolute scale matters less than the exponent.
+
+Edge cases. `0!` is one, and the loop starts at two so the result stays one. The checked version rejects `21!` and beyond on the machine as written. The logarithm version is accurate because summing logs of moderate numbers accumulates error slowly, but it is still a floating-point computation and should never be compared for exact equality. Stirling is an approximation; do not use it to decide an equality.
+
+Variation. Write `binomialProbability(n, k, p)` using `logFactorial` to compute the binomial coefficient in log space and the powers of `p` and `1 - p` in log space, then exponentiate the sum once at the end. It computes a probability for `n` in the thousands without ever forming a factorial.
+
+31.6 Fibonacci: Naive, Linear, and Fast
+
+The problem. Compute the `n`th Fibonacci number, where each is the sum of the two before it, starting one and one.
+
+The intuition. The textbook recursive definition translates directly into code — `fib(n) = fib(n-1) + fib(n-2)` — and that code is a disaster. It recomputes the same subproblems over and over; `fib(40)` makes on the order of a billion calls to compute a value well under a hundred million. The fix is not a clever formula at first; it is simply to remember the two values you already have and march upward. That is the iterative version, linear in `n` and constant in space. The fast version notices that a whole step of the recurrence is a two-by-two matrix multiplication, and that repeated multiplication can be done by squaring, yielding the answer in log `n` steps. The same idea is often written as "fast doubling," which uses two identities to jump ahead by halves.
+
+The approach. Show all three, in order, because the progression is the lesson: from the definition, through the obvious repair, to the insight that the recurrence is a linear map and linear maps can be exponentiated.
+
+The implementation.
+
+    pub u64 fibNaive(u64 n) {
+        if (n < 2) return n;
+        return fibNaive(n - 1) + fibNaive(n - 2);
+    }
+
+    pub u64 fibIterative(u64 n) {
+        u64 a = 0;
+        u64 b = 1;
+        for (u64 i = 0; i < n; i += 1) {
+            u64 next = a + b;
+            a = b;
+            b = next;
+        }
+        return a;
+    }
+
+    // fast doubling: fib(2k) = fib(k) * (2*fib(k+1) - fib(k))
+    //                fib(2k+1) = fib(k)^2 + fib(k+1)^2
+    struct Pair { u64 first; u64 second; }
+
+    Pair fibPair(u64 n) {
+        if (n == 0) return Pair { .first = 0, .second = 1 };
+        Pair half = fibPair(n / 2);
+        u64 a = half.first;
+        u64 b = half.second;
+        u64 c = a * (2 * b - a);      // fib(2k)
+        u64 d = a * a + b * b;        // fib(2k+1)
+        if (n % 2 == 0) return Pair { .first = c, .second = d };
+        return Pair { .first = d, .second = c + d };
+    }
+
+    pub u64 fibFast(u64 n) {
+        return fibPair(n).first;
+    }
+
+Cost and notes. `fibNaive` is O(phi^n) time — exponential in `n`, with `phi` the golden ratio — and O(n) stack depth. `fibIterative` is O(n) time and O(1) space, and it is what you should almost always write; for `n` up to the point where the numbers overflow (a bit past ninety), it is instant. `fibFast` is O(log n) time and O(log n) stack depth, and it is the right shape when `n` is astronomically large and you are working modulo something, as in a hashing or a contest problem.
+
+Edge cases. The two conventions for the start of the sequence (`0, 1` versus `1, 1`) differ by an index; the code above uses the `0, 1` convention where `fib(0) = 0` and `fib(10) = 55`. All three overflow past `fib(93)` on a `u64`; the fast version overflows just as readily, because it is the values that are too large, not the algorithm that is too slow. In practice the fast version is used modulo a prime, where nothing overflows because everything is reduced.
+
+Variation. Rewrite `fibFast` to take a modulus and reduce after every multiplication, returning `fib(n) mod m`. Check it against `fibIterative` for small `n` to convince yourself they agree.
+
+31.7 Combinations: Choosing Without Overcounting
+
+The problem. Compute "n choose k," the number of ways to pick `k` items from `n` without regard to order.
+
+The intuition. The formula is a ratio of factorials, `n! / (k! * (n - k)!)`, and computing it that way overflows almost immediately even when the answer is small — you form two huge factorials and then cancel them. But the cancellation is the point: almost all the factors in the numerator also appear in the denominator. Writing the ratio as a product, `(n - k + 1)/1 * (n - k + 2)/2 * ... * n/k`, keeps every intermediate value equal to a smaller binomial coefficient, which is always a whole number. Multiply one factor at a time and divide immediately, and the running product is an exact integer at every step.
+
+The approach. Reduce the loop length using the symmetry `C(n, k) = C(n, n - k)` so you multiply the smaller number of terms. Combine the multiply and divide in the right order.
+
+The implementation.
+
+    pub u64 choose(u64 n, u64 k) {
+        if (k > n) return 0;
+        if (k > n - k) k = n - k;          // symmetry: fewer factors
+
+        u64 result = 1;
+        for (u64 i = 1; i <= k; i += 1) {
+            result = result * (n - k + i) / i;   // exact at each step
+        }
+        return result;
+    }
+
+Why is each step exact? After `i` steps the running value equals `C(n - k + i, i)`, a binomial coefficient, hence a whole number. The multiplication and division are therefore both within the integers, and the division leaves no remainder. This is not an accident you should rely on blindly in every formula — it is a specific property of this one, and a comment defending it is worth more than the code.
+
+Cost and notes. O(min(k, n - k)) multiplications and divisions, all on `u64`. For large `n` and `k` near `n / 2` the answer overflows a `u64` long before the loop finishes — `C(67, 33)` is already bigger than a `u64` — so the version above is for genuinely small counts. For combinatorial work at scale you want `chooseMod`, the same loop with a modular reduction and a modular inverse for the division, or a Pascal's-triangle table when you need a whole row.
+
+Edge cases. `k > n` returns zero, the conventional answer (there are no ways to choose more items than exist). `k == 0` and `k == n` both return one, handled by the loop running zero times. The symmetry line must run before the loop, not inside it, and it must use `n - k` after the guard so it never underflows. The exactness of the division is the thing to test: run it against a Pascal's-triangle table for all `n` below twenty and every `k` from zero to `n`.
+
+Variation. Implement `pascalRow(n)` returning a `Vec<u64>` of the `n`th row, built by successive addition, and use it to check `choose(n, k)` for every valid `k`. Seeing the triangle emerge makes the exactness argument obvious.
+
+31.8 Prime Factorisation
+
+The problem. Given a number, write it as a product of primes: `360 = 2^3 * 3^2 * 5`. This is the inverse of the primality question and it underpins simplifying fractions, computing GCDs by hand, and an enormous amount of competitive and recreational mathematics.
+
+The intuition. Divide out the smallest prime that fits, then the next smallest, and keep going. The trick that makes the naive approach acceptable is a restatement of the prime-testing insight: once you have divided out every prime up to the square root of the remaining number, whatever remains is itself prime. So you never need a primality test, and you never need to test divisors beyond the root of what is left. A further speed-up precomputes the smallest prime factor of every number up to a bound, so factoring any number within the bound is a matter of reading the table.
+
+The approach. A direct trial-division factoriser that needs no setup, then the smallest-prime-factor table for repeated factorisation.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub Vec<u64> factorise(u64 n) {
+        Vec<u64> factors = Vec<u64>::new();
+        if (n < 2) return factors;
+
+        while (n % 2 == 0) { factors.push(2); n /= 2; }
+        u64 f = 3;
+        while (f <= n / f) {
+            while (n % f == 0) { factors.push(f); n /= f; }
+            f += 2;
+        }
+        if (n > 1) factors.push(n);       // what remains is prime
+        return factors;
+    }
+
+    // smallest prime factor table, built like the sieve
+    pub Vec<u64> smallestPrimeFactors(u64 limit) {
+        Vec<u64> spf = Vec<u64>::withCap((usize)(limit + 1));
+        for (u64 i = 0; i <= limit; i += 1) spf.push(0);
+        for (u64 i = 2; i <= limit; i += 1) {
+            if (spf.at((usize)i) != 0) continue;
+            for (u64 j = i; j <= limit; j += i)
+                if (spf.at((usize)j) == 0) spf.set((usize)j, i);
+        }
+        return spf;
+    }
+
+    pub void factoriseUsing(const Vec<u64>* spf, u64 n) {
+        while (n > 1) {
+            u64 p = spf->at((usize)n);
+            println("{}", p);
+            n /= p;
+        }
+    }
+
+Cost and notes. The direct factoriser is O(sqrt n) divisions in the worst case (when `n` is prime), and much less when `n` has small factors. The table costs O(n log log n) to build, once, and then factors any number up to the limit in O(log n) steps. The choice is the same as the sieve versus `isPrime`: pay once to build a table if you will factor many numbers, otherwise trial-divide.
+
+Edge cases. Numbers below two factor into an empty list, which is the honest answer (one has no prime factors). The division loop must handle repeated factors — the inner `while` keeps dividing while `f` still fits, so `8` produces three twos rather than stopping after the first. The `f += 2` loop skips even divisors, which is safe because two was handled before the loop. And the final `if (n > 1)` is what catches the large prime left over, which can be far above the square root of the original number after the small factors are gone.
+
+Variation. Return the factors grouped with their exponents — a `Vec` of pairs `(prime, power)` — so `360` prints as `2^3 * 3^2 * 5`. The grouping is a short pass over the flat list, and the paired form is what a fraction-simplifying routine actually consumes.
+
+31.9 Floating-Point Pitfalls
+
+The problem. Arithmetic on `f64` does not behave like arithmetic on the reals, and the differences are not exotic corner cases; they are on the first line of the first program anyone writes. `0.1 + 0.2` is not `0.3`. Many additions do not give the same sum as the same additions in a different order. `x != x` is true when `x` is not-a-number. This example is less an algorithm than a set of habits for not being surprised.
+
+The intuition. A `f64` is a fixed number of binary digits — fifty-three bits of mantissa — storing a value as a sign, an exponent, and a fraction. Most decimal fractions have no exact binary representation, exactly as one third has no exact decimal representation. So a stored `0.1` is the nearest binary value, slightly off; adding two of them accumulates the error. The errors are tiny, but tiny errors compared for exact equality are just wrong answers waiting to happen. The habits are: never compare floating-point values for exact equality unless you mean bit-for-bit; compare with a tolerance; be aware that operations are not associative; and treat NaN as a special value that poisons every comparison.
+
+The approach. Provide the two comparison helpers you will use constantly — absolute tolerance and relative tolerance — and demonstrate the traps with small functions that make the failure visible rather than mystifying.
+
+The implementation.
+
+    import(lib) std::math::math { fabs, maxF64, isNan, isFinite };
+
+    pub bool nearlyEqualAbs(f64 a, f64 b, f64 eps) {
+        return fabs(a - b) <= eps;
+    }
+
+    pub bool nearlyEqualRel(f64 a, f64 b, f64 eps) {
+        return fabs(a - b) <= eps * maxF64(fabs(a), fabs(b));
+    }
+
+    // Absolute tolerance fails for large magnitudes; relative fails near zero.
+    // The combined test uses relative when the values are large and absolute
+    // when they are near zero.
+    pub bool nearlyEqual(f64 a, f64 b, f64 eps) {
+        f64 diff = fabs(a - b);
+        if (diff <= eps) return true;
+        f64 scale = maxF64(fabs(a), fabs(b));
+        return diff <= eps * scale;
+    }
+
+    pub void demonstrate() {
+        f64 a = 0.1 + 0.2;
+        println("{}", a);                        // 0.30000000000000004
+        println("{}", a == 0.3);                 // false
+        println("{}", nearlyEqual(a, 0.3, 1e-9)); // true
+
+        f64 nan = 0.0 / 0.0;
+        println("{}", isNan(nan));               // true
+        println("{}", nan == nan);               // false — the only value not equal to itself
+        println("{}", nan < 1.0);                // false
+        println("{}", nan > 1.0);                // false
+    }
+
+Cost and notes. Comparison helpers are a few floating-point operations and cost essentially nothing. The important costs are conceptual. Floating-point addition and multiplication are not associative: `(a + b) + c` need not equal `a + (b + c)`, which is why a sum should be accumulated in a consistent order and why numerically careful code uses techniques like Kahan summation when the precision matters. Catastrophic cancellation happens when you subtract two nearly equal large numbers and the leading digits cancel, leaving the error exposed; the fix is to rearrange the formula algebraically, not to add more digits. And `pow` and `exp` are approximations, not exact functions, so even mathematically equal expressions can differ in the last bits.
+
+Edge cases. NaN is not equal to anything, including itself, and every comparison involving it is false; check with `isNan`, never with `==`. Infinity is a real value in the type, and `isFinite` tells you whether a value is an ordinary number. Negative zero exists and compares equal to positive zero, which occasionally surprises a bit-level routine (the bit patterns differ). The relative-tolerance helper divides by a magnitude that can be zero, which is why the combined version checks the absolute tolerance first.
+
+Variation. Write `sumStable(const Vec<f64>* xs)` using Kahan (compensated) summation and compare its result against the naive loop on a list that mixes very large and very small values. The naive sum loses the small values entirely once the accumulator is large; the compensated sum keeps a running correction that recovers them.
+
+31.10 Exercises
+
+1. Comprehension. Explain in your own words why testing divisors only up to the square root is correct. Then explain why the loop bound is written `i <= n / i` rather than `i * i <= n`, and what specifically goes wrong with the latter near the top of the `u64` range.
+
+2. Implementation. Write `countPrimesBelow(limit)` using the bitset sieve, and check that the count for a million is 78,498. Then time the byte-vector sieve against the bitset sieve and explain the gap in one sentence.
+
+3. Implementation. Implement the extended Euclid and use it to write `modInverse`. Choose a base and modulus that are coprime and one pair that are not, and confirm the `Option` distinguishes them. Which of the two returned coefficients is the inverse, and why does the sign need normalising into `[0, m)`?
+
+4. Overflow. For each of these, say whether the natural implementation overflows for some input in range, and if so give a concrete offending input: `lcm` computed as `a * b / gcd`; `choose` computed via three factorials; `modPow` with a modulus above two billion; `fibFast` for `n` in the hundreds. Explain the fix for each.
+
+5. Combinatorics. Write a routine that returns the `n`th row of Pascal's triangle, then use it to check `choose` for all `n` from zero to twenty. What is the largest `n` for which the full row still fits in a `u64`?
+
+6. Factorisation. Use `smallestPrimeFactors` to implement `phi(n)`, Euler's totient — the count of numbers below `n` that are coprime to it — from the factorisation. Verify that `phi(p) = p - 1` for every prime `p` in a range.
+
+7. Floating point. Construct a list of a million values that are each `0.1`, and compare the result of summing them with a naive loop against summing them in reverse order. Are the two results equal? Now add a single value of `1.0` at the start and repeat. Explain what changed.
+
+8. Design. The chapter's theme is that machine integers wrap. Write a short `checkedMul`, `checkedAdd`, and `checkedSub` for `u64`, each returning a `bool` and writing through a pointer, and then rewrite `factorial` using them. Argue in two sentences for when a `Result` would be better than a `bool` here.

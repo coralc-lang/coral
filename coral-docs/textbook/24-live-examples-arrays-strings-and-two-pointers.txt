@@ -1,0 +1,505 @@
+Chapter 24
+
+Live Examples: Arrays, Strings, and Two Pointers
+
+Two Fingers on the Same List
+
+If Chapter 23 was about single-pass bookkeeping, this chapter is about a pattern that solves a surprising number of array and string problems with a single idea: keep two positions in the data and move them according to a rule. The pattern is called two pointers, and it is less a technique than a way of seeing. Most of the time, a problem that a beginner solves with a double loop is a problem where the double loop is redundant — one of the two loops is rediscovering information the other already has — and replacing the nested loop with two coordinated pointers removes the redundancy. The brute force costs n²; the two-pointer version costs n.
+
+Hold on — let me make that concrete before we use it, because "two pointers" is the kind of phrase that sounds like jargon until it clicks. Imagine you are looking for your friend in a single-file queue. The naive method is: stand at the front, and for each person, walk the whole queue behind them comparing faces. That is the nested loop. The two-pointer method is: put one finger at the front and one at the back, and move a finger based on what you see. You never revisit a position you already left behind, so the total number of steps is the length of the queue. The art is choosing the rule for which finger moves, and that rule is always justified by a property of the data — sortedness, or a target, or symmetry. In each problem below I will point at the property that licenses the move, because that is the part that transfers.
+
+The other theme is the difference between a `str` and a `String`, and between a value you may overwrite and one you may only read. Reversing a string in place needs a mutable buffer, which in Coral is a `String`; a `str` is a borrowed, read-only view by design (Chapter 17). Several problems below also use a "write pointer" and a "read pointer" inside one array — a cousin of the two-pointer idea where one index writes the values that survive and the other scans. Once you see it, you will see it everywhere: filtering, deduplicating, and compacting are all the same three lines.
+
+24.1 Reverse a String In Place
+
+The problem
+
+Given a mutable string, reverse its characters without allocating a second string.
+
+Picture this
+
+Two people standing at opposite ends of a row of boxes, each holding one item, walk toward the center swapping as they meet. When they pass each other, every box has changed places exactly once. Nobody copies the whole row; only one swap is in flight at a time.
+
+Brute force
+
+Build a new string by walking the original backwards and appending each character. That is correct and linear, but it needs a second buffer the size of the first. The problem says "in place" precisely to forbid that.
+
+The better approach
+
+Two pointers, one at the left end and one at the right, swap the two characters they point at, then step inward. Stop when the pointers meet or cross. Every position is touched once, and the only extra storage is the one character being swapped.
+
+The implementation
+
+    import(lib) std::text::string { String };
+    import(lib) std::io::ios { println };
+
+    void reverseString(String* s) {
+        isize i = 0;
+        isize j = (isize)s->len - 1;
+        while (i < j) {
+            u8 t = s->at((usize)i);
+            s->atApply((usize)i, s->at((usize)j));
+            s->atApply((usize)j, t);
+            i++;
+            j--;
+        }
+    }
+
+    i32 main() {
+        String text = String::from("hello");
+        reverseString(&text);
+        println("{}", text.asView());
+        return 0;
+    }
+
+The two details that matter are the types and the mutability. The loop counters are `isize`, signed, because `j--` must be able to reach zero and stop; an unsigned counter would wrap around to a huge value on the final decrement and crash. And the operations go through `String`, whose `at` and `atApply` give read and overwrite access. A `str` would not compile here, and that is not an inconvenience — it is the type system telling you that reversing needs ownership of the bytes, not a view of them.
+
+The cost
+
+Time is linear: the loop runs about half the length, and each iteration does a constant amount of work (two reads, two writes). Space is constant, no matter how long the string. Compare that with the build-a-new-string approach, which is also linear in time but linear in extra space. This is the first problem where the two-pointer pattern buys you a space improvement, not a time one, and both are real.
+
+Edge cases and a variation
+
+The empty string and the single-character string exit the loop immediately, which is correct. A string of even length ends with `j < i`; a string of odd length ends with `i == j` on the middle character, which has nothing to swap with, and the loop stops. The variation: reverse the words in a sentence rather than the characters — "the sky is blue" becomes "blue is sky the". The classic trick is elegant: first reverse the whole string, then reverse each word back. Two applications of the primitive above, and you have solved the word problem without a second buffer.
+
+24.2 Valid Palindrome
+
+The problem
+
+Given a string, decide whether it reads the same forwards and backwards, considering only letters and digits and ignoring case. So `"A man, a plan, a canal: Panama"` is a palindrome.
+
+Picture this
+
+Two readers, one at each end of a sentence, both ignoring punctuation and paying no attention to uppercase. Each reads a character; if the two characters differ, the answer is no. If they meet in the middle having agreed on everything, the answer is yes. The punctuation between them is simply skipped.
+
+Brute force
+
+First strip the string of everything that is not a letter or digit and lowercase the rest, producing a cleaned copy; then compare the cleaned copy to its own reverse. Two passes and an allocation. It works, and the cleaning step is error-prone (did you remember all the punctuation?). The "reverse the cleaned copy" also doubles the space for no reason.
+
+The better approach
+
+Two pointers, one from each end, advancing past anything that is not alphanumeric and comparing the survivors with case folded. No copy is made; the punctuation is skipped as the pointers travel. This is the same skeleton as 24.1 with two changes: skip non-alphanumeric characters before comparing, and compare lowercase forms instead of swapping.
+
+The implementation
+
+    import(lib) std::text::ascii { isAsciiAlnum, toAsciiLower };
+    import(lib) std::io::ios { println };
+
+    bool isPalindrome(str s) {
+        isize i = 0;
+        isize j = (isize)s.len - 1;
+        while (i < j) {
+            while (i < j && !isAsciiAlnum(s.at((usize)i))) i++;
+            while (i < j && !isAsciiAlnum(s.at((usize)j))) j--;
+            if (toAsciiLower(s.at((usize)i)) != toAsciiLower(s.at((usize)j))) {
+                return false;
+            }
+            i++;
+            j--;
+        }
+        return true;
+    }
+
+The inner `while` loops are the new idea, and they are worth reading slowly. Each one advances a pointer past characters that should not be compared. The condition `i < j` appears inside them too, so a string that is all punctuation — no alphanumeric character at all — cannot run the pointers past each other and off the end. This guard-inside-the-guard is the detail most first attempts get wrong, and it only fails on inputs like `"..."` or `"   "`.
+
+The cost
+
+Time is linear: each pointer moves inward and never retreats, so the total movements are bounded by the length of the string, even though there are nested loops. Space is constant: two indices and no allocation. This is a recurring surprise about the two-pointer pattern — loops nested in the source do not necessarily mean a nested cost, if the inner loop consumes a shared budget.
+
+Edge cases and a variation
+
+The empty string and a single character are palindromes; the loop handles both. `"0P"` is not a palindrome, because `0` and `P` are different after folding (they are not the same character, and neither is punctuation to skip). The Unicode caveat belongs here in bold: this code compares bytes, so it is correct for ASCII and wrong for text with accented letters or emoji, whose UTF-8 encodings are multiple bytes. Chapter 17 explains the fix — decode with `nextCodepoint` and compare codepoints — and the reason it matters is that a byte-by-byte comparison will split a multi-byte character and compare its halves, which is meaningless. The variation: allow the deletion of at most one character to make the string a palindrome, a classic follow-up solved by trying both skips when the two pointers disagree.
+
+24.3 Two Sum in a Sorted Array
+
+The problem
+
+Given an array sorted in ascending order and a target value, find the two positions whose values add up to the target. Assume exactly one such pair exists.
+
+Picture this
+
+Two people stand at the two ends of a number line, each holding a number, and they want their two numbers to sum to a target. If their sum is too small, the only way to increase it is to move the left person rightward to a bigger number. If the sum is too big, move the right person leftward to a smaller number. Because the line is sorted, each move is the unique sensible one, and the pair converges on the answer.
+
+Brute force
+
+Try every pair: for each i, scan every j after it and check the sum. That is about n² / 2 additions. It ignores the one piece of information the problem gave you — that the array is sorted — and that is the tell that the intended solution uses ordering.
+
+The better approach
+
+Two pointers, left and right. Compute the sum of the two values. If it equals the target, return the positions. If it is too small, no pair involving the smallest value and any value at or below the right pointer can reach the target except by advancing the left pointer, so advance `i`. If it is too big, advance `j` leftward. Each step eliminates one candidate entirely, so the pointers cross after at most n steps.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    Vec<i32> twoSumSorted(const Vec<i32>* v, i32 target) {
+        Vec<i32> out = Vec<i32>::new();
+        isize i = 0;
+        isize j = (isize)v->count() - 1;
+        while (i < j) {
+            i64 sum = (i64)v->at((usize)i) + (i64)v->at((usize)j);
+            if (sum == (i64)target) {
+                out.push((i32)i);
+                out.push((i32)j);
+                return out;
+            }
+            if (sum < (i64)target) {
+                i++;
+            } else {
+                j--;
+            }
+        }
+        return out;
+    }
+
+The comparison widens the sum to `i64` before checking it. If both values are large `i32`s, their sum can overflow a 32-bit integer and wrap to a small number, which would make the "too small" branch fire when the true sum was actually "too big." Widening the arithmetic is the smallest, cheapest guard against a whole class of silent bug.
+
+The cost
+
+Time is linear: each iteration moves one pointer one step inward, so there are at most n iterations. Space is constant. The brute force was quadratic; the improvement comes entirely from using the sortedness to decide which pointer must move, so that each comparison rules out an entire row or column of the hypothetical table of pairs.
+
+Edge cases and a variation
+
+Fewer than two elements cannot contain a pair; the loop returns an empty vector, which the caller can treat as "none found." The problem guarantees a pair exists, but a robust version should not assume it. Equal values are fine: `[3, 3]` with target 6 returns positions 0 and 1, since `i < j`. The variation that connects this chapter to the next: the same problem on an *unsorted* array cannot use two pointers, because there is no ordering to justify a move. Instead you keep a hash map from value to the position where you saw it and, for each number, ask whether its complement is already in the map. That is Chapter 25's opening problem, and the contrast — sorted permits two pointers, unsorted demands hashing — is the lesson.
+
+24.4 Remove Duplicates from a Sorted Array
+
+The problem
+
+Given a sorted array, remove the duplicates in place so each value appears once, and return the new length. The elements beyond the new length do not matter.
+
+Picture this
+
+You are packing a shelf from left to right, and the items arrive already sorted, so all copies of any item are adjacent. You keep a "write hand" that always points at the next empty slot and a "read eye" that scans every item. Whenever the read eye finds an item different from the last one you kept, you place it under the write hand and advance the hand. The read eye passes over the duplicates and never places them.
+
+The better approach
+
+Two indices, one reading and one writing, both starting after the first element. The read index visits every element; the write index only advances when the current element differs from the last one written. Because the array is sorted, the last written value is exactly the value to compare against — no set, no memory, just one comparison. At the end, the write index is the count of distinct values, and everything from it onward can be discarded.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    usize removeDuplicates(Vec<i32>* v) {
+        if (v->count() == 0) return 0;
+        usize k = 1;
+        for (usize i = 1; i < v->count(); i++) {
+            if (v->at(i) != v->at(k - 1)) {
+                v->set(k, v->at(i));
+                k++;
+            }
+        }
+        while (v->count() > k) {
+            v->pop();
+        }
+        return k;
+    }
+
+Vegetarians, note the comparison: we compare the current read value against `v->at(k - 1)`, the last value we kept, not against the previous read position `v->at(i - 1)`. They are usually the same, but not always — after a write, the two positions diverge — and comparing against the last kept value is the correct invariant. The final `pop` loop trims the vector down to the distinct count. A `Vec` has no `truncate` method, so shrinking to a length is an explicit sequence of pops; the loop does the job in constant time per removed element.
+
+The cost
+
+Time is linear: one pass, one comparison and occasionally one write per element. Space is constant: two indices and no allocation at all, which is the entire point of an in-place problem. Note that the pop loop is also linear in the number of duplicates removed, so the total remains linear.
+
+Edge cases and a variation
+
+An empty array returns zero; a single-element array returns one. All-equal input leaves one element and returns one. The variation: allow each value to appear at most twice, keeping the second occurrence but not the third. The write-pointer pattern is unchanged; only the count compared against changes, from "differs from the last kept" to "differs from the value two positions back in the kept prefix." Problems like this are all the same skeleton with a different predicate, which is why recognizing the skeleton is worth more than memorizing the solution.
+
+24.5 Move Zeroes
+
+The problem
+
+Given an array, move every zero to the end while keeping the relative order of the nonzero elements, in place.
+
+Picture this
+
+A conveyor belt carries items past a worker whose job is to slide all the empty boxes to the far end without disturbing the order of the full ones. The worker keeps a hand on the next open slot on the left; each time a full box comes by, it goes under that hand and the hand moves on. When the belt ends, every slot to the right of the hand is filled with empty boxes.
+
+Brute force
+
+Collect the nonzero elements into a second list in order, then write them back into the original followed by the right number of zeroes. Linear, but it allocates a second array the size of the first.
+
+The better approach
+
+The write-pointer pattern again, with the predicate "is nonzero." Walk the array with a read index; whenever the value is nonzero, write it at the write index and advance the write index. When the scan ends, the first `k` positions hold all the nonzero values in their original order, and every position from `k` onward is set to zero. One pass to move the values, one pass to fill the tail.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    void moveZeroes(Vec<i32>* v) {
+        usize k = 0;
+        for (usize i = 0; i < v->count(); i++) {
+            if (v->at(i) != 0) {
+                v->set(k, v->at(i));
+                k++;
+            }
+        }
+        for (usize i = k; i < v->count(); i++) {
+            v->set(i, 0);
+        }
+    }
+
+There is a subtle property this version has for free and a common interview follow-up asks about explicitly: the relative order of the nonzero elements is preserved, because the read pointer visits them in order and the write pointer accepts them in the same order. If order did not matter, a faster swap-based version exists that touches each element once, but it is not required here.
+
+The cost
+
+Time is linear: one full scan plus a second scan of the tail, so at most twice the length in the worst case, which is still linear. Space is constant. The second pass is the honest price of using overwrite-and-fill rather than swap: you visit the tail once to zero it. The swap-based alternative avoids that second pass when order is not required, but it needs a branch that the order-preserving version does not.
+
+Edge cases and a variation
+
+An array with no zeroes does one pass and then sets an empty tail, which is correct. An array that is all zeroes keeps `k` at zero and zeroes the whole array, which is also correct. The variation: move all instances of a given value to the end, or move the even numbers to the front. Each is the same skeleton with a different predicate; the only line that changes is the `if`. A harder variant, "sort the array by parity while preserving the relative order within each group," needs a two-pass version because the write pointer must first count the odds to know where one group ends and the other begins.
+
+24.6 Merge Two Sorted Arrays
+
+The problem
+
+Given two sorted arrays, merge them into the first, which has enough empty space at its end to hold both. Do not allocate.
+
+Picture this
+
+Two stacks of numbered cards, each already in order, and one empty table to the right. If you fill from the left, you would overwrite cards you have not read yet. But there is empty space at the *right*, so work backwards: look at the largest remaining card in each stack and place the larger one in the rightmost empty slot. The biggest card of all must end up at the far right, so placing it there is safe, and everything else shifts into place behind it.
+
+Brute force
+
+Copy both arrays into a fresh buffer and sort it. That is O((m+n) log(m+n)) and allocates, squandering the fact that both inputs are already sorted.
+
+The better approach
+
+Three pointers, all walking backwards. One index `i` at the last real element of the first array, one `j` at the last element of the second, and one `k` at the last slot of the combined region. At each step, take the larger of `a[i]` and `b[j]`, write it at `k`, and step that source pointer back. When the second array is exhausted, the first array's remaining elements are already in place — a small optimization that avoids a redundant copy of the first array's front.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    void merge(Vec<i32>* a, i32 m, const Vec<i32>* b, i32 n) {
+        isize i = (isize)m - 1;
+        isize j = (isize)n - 1;
+        isize k = (isize)(m + n) - 1;
+        while (j >= 0) {
+            if (i >= 0 && a->at((usize)i) > b->at((usize)j)) {
+                a->set((usize)k, a->at((usize)i));
+                i--;
+            } else {
+                a->set((usize)k, b->at((usize)j));
+                j--;
+            }
+            k--;
+        }
+    }
+
+The loop condition is `j >= 0`, not `i >= 0 && j >= 0`, and that asymmetry is deliberate. Once the second array is exhausted, the leftovers of the first array are already at the front of `a` in the correct order, so there is nothing left to do. If instead you looped until both ran out, you would be copying values onto themselves, which is harmless but pointless. The `i >= 0` guard inside the condition is what protects the read of `a[i]` when the first array runs out before the second — a case that happens when the first array is empty.
+
+The cost
+
+Time is linear in the combined length: each iteration places exactly one element, and there are `m + n` elements. Space is constant. The backwards direction is what lets us avoid allocation, and the reason it works is that the destination is larger than the source and the source is consumed from the same end that the destination is filled from.
+
+Edge cases and a variation
+
+Merging with an empty second array leaves the first untouched; merging with an empty first array copies the second into place. The variation that shows the pattern's breadth: merge k sorted arrays. Pairwise merging is O(k · N · log k) in the worst case, but a min-heap that always yields the smallest front element does it in O(N log k), which is what Chapter 16's `PriorityQueue` is for. That is the bridge from this chapter to the data-structure chapters.
+
+24.7 Sort Colors (the Dutch National Flag)
+
+The problem
+
+Given an array containing only 0s, 1s, and 2s, sort it in place in a single pass.
+
+Picture this
+
+The name comes from the three bands of the Dutch flag. Imagine a row of buckets and three hands: a "left" hand that owns everything that should be 0, a "right" hand that owns everything that should be 2, and a "middle" eye that has not yet decided about the element it is looking at. When the eye sees a 0, it throws it to the left region and grows it. When it sees a 2, it throws it to the right region. When it sees a 1, that element is already home and the eye simply moves on. The regions grow toward each other until they meet, and the whole row is sorted.
+
+Brute force
+
+Count how many 0s, 1s, and 2s there are in one pass, then overwrite the array with that many of each. Two passes, linear, and honestly fine. It is not one pass as required, and it does not generalize to a large number of distinct values.
+
+The better approach
+
+Three pointers: `low` is the boundary after the region of 0s, `high` is the boundary before the region of 2s, and `mid` is the scanning eye moving between them. At each step, look at `v[mid]`:
+
+    - if it is 0, swap it with the element at `low`, advance both `low` and `mid`;
+    - if it is 1, it is in its final region, advance only `mid`;
+    - if it is 2, swap it with the element at `high`, retreat `high`, and do
+      not advance `mid`.
+
+The last line is the one to understand. After swapping with `high`, the element now at `mid` is one we have never examined — it came from the unprocessed right end — so we must look at it again rather than stepping over it.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    void swapAt(Vec<i32>* v, usize a, usize b) {
+        i32 t = v->at(a);
+        v->set(a, v->at(b));
+        v->set(b, t);
+    }
+
+    void sortColors(Vec<i32>* v) {
+        isize low = 0;
+        isize mid = 0;
+        isize high = (isize)v->count() - 1;
+        while (mid <= high) {
+            i32 x = v->at((usize)mid);
+            if (x == 0) {
+                swapAt(v, (usize)low, (usize)mid);
+                low++;
+                mid++;
+            } else if (x == 1) {
+                mid++;
+            } else {
+                swapAt(v, (usize)mid, (usize)high);
+                high--;
+            }
+        }
+    }
+
+The `mid <= high` condition, with `high` inclusive, is the workhorse. The region between `mid` and `high` is exactly the part not yet processed; when `mid` passes `high`, nothing is left. Every iteration either shrinks that region or advances `mid` into territory whose status is already known, so the loop terminates in a single pass.
+
+The cost
+
+Time is linear, and not just asymptotically: this is a true single pass, so each element is examined a constant number of times and swapped at most once. Space is constant, three indices. Compare that with counting sort's two passes and the improvement is a factor of two in the number of array traversals — small, but the single-pass property is what the problem asks for and what makes the pattern reusable.
+
+Edge cases and a variation
+
+An array with only one distinct value leaves all pointers in place and does nothing. All 0s advance `low` and `mid` together to the end. The subtle bug to avoid is advancing `mid` after a 2-swap; test it on `[2, 0, 1]` and you will see the unprocessed element arrive at `mid`. The variation: sort four or five distinct small values. The Dutch flag does not extend trivially to more colors — the number of boundary pointers grows awkwardly — and for more than a handful of values, the honest answer is the counting approach of the brute force. Knowing where a technique stops scaling is as valuable as knowing it.
+
+24.8 Container With Most Water
+
+The problem
+
+Given wall heights at positions along a line, choose two walls that together with the line form a container holding the most water. The container's area is the distance between the walls times the height of the shorter wall.
+
+Picture this
+
+You are looking at a skyline. Pick two buildings; the water you can hold between them is limited by the shorter of the two, and the width is how far apart they are. Moving a building inward always reduces the width, so the only way to possibly gain is to find a taller shorter-wall — which means the shorter wall is the one worth abandoning.
+
+Brute force
+
+Check every pair of walls, compute the area, keep the maximum. That is n² / 2 area computations, each constant work. It is correct and it is the baseline.
+
+The better approach
+
+Two pointers at the ends, which is the widest possible container. Compute its area. Now move inward the pointer at the *shorter* wall. Why that one? Because the current width is the maximum achievable for this pair, and the height is capped by the shorter wall; keeping the shorter wall and moving the taller one inward can only reduce the width while the cap stays the same, so it cannot beat what we already have. Moving the shorter wall inward is the only move that has any chance of finding a taller cap. Repeat until the pointers meet.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 maxArea(const Vec<i32>* h) {
+        isize i = 0;
+        isize j = (isize)h->count() - 1;
+        i64 best = 0;
+        while (i < j) {
+            i64 width = (i64)(j - i);
+            i64 hi = (i64)h->at((usize)i);
+            i64 hj = (i64)h->at((usize)j);
+            i64 shorter = hi < hj ? hi : hj;
+            i64 area = width * shorter;
+            if (area > best) best = area;
+            if (hi < hj) {
+                i++;
+            } else {
+                j--;
+            }
+        }
+        return best;
+    }
+
+All the arithmetic is `i64`, so even the largest possible area — a width near a billion times a height near a billion — cannot overflow. The move rule is the heart of the proof, and it is worth restating: when we discard the shorter wall, we discard every container that could have used it, and none of those could have beaten the best we already recorded. That is why the algorithm is allowed to be greedy.
+
+The cost
+
+Time is linear: each iteration moves one pointer inward, so exactly `n - 1` iterations. Space is constant. The quadratic brute force collapses to linear because the move rule lets us throw away a whole family of candidate pairs without checking them.
+
+Edge cases and a variation
+
+Fewer than two walls yields an area of zero, which the loop returns naturally. Equal-height walls let us move either pointer; moving one is correct because the other can be the shorter wall for the next candidate. The variation: return which two walls achieved the maximum, not just the area. Keep the indices whenever the best is updated. A second variation: the "trapping rain water" problem just below looks similar — two walls and water — but asks for the total water trapped across all the gaps, not the best single container, and the two-pointer rule is subtly different.
+
+24.9 Trapping Rain Water
+
+The problem
+
+Given an elevation map as an array of wall heights, compute how much rainwater is trapped in the valleys after a rainstorm.
+
+Picture this
+
+After a storm, water collects in every dip of a skyline, each basin filled to the level of the lower of its two bounding walls. Picture a cross-section of a mountain range; the water sits in the valleys up to the height of the shorter wall that encloses each valley. The amount above any one hill is the water level at that hill minus the hill's own height, and the water level at a point is the smaller of the tallest wall to its left and the tallest wall to its right.
+
+Brute force
+
+For each position, scan left to find the maximum height and scan right to find the maximum; the water above that position is the smaller of the two maxima minus the position's height, when positive. Three nested-ish scans give O(n²). It is the most direct translation of the definition and the easiest place to start.
+
+The better approach
+
+Two pointers with two running maxima, one maximum maintained from the left and one from the right. Here is the key insight: if the tallest wall seen so far on the left is shorter than the tallest seen so far on the right, then the water level at the left pointer is governed entirely by the left maximum — the right side is known to have a wall at least as tall, so it will never be the binding constraint. So we can add `leftMax - height[i]` at the left pointer with confidence, and move it inward. Mirror the logic on the right. One pass, no per-position scanning.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 trap(const Vec<i32>* h) {
+        if (h->count() == 0) return 0;
+        isize i = 0;
+        isize j = (isize)h->count() - 1;
+        i64 leftMax = 0;
+        i64 rightMax = 0;
+        i64 water = 0;
+        while (i < j) {
+            i64 hi = (i64)h->at((usize)i);
+            i64 hj = (i64)h->at((usize)j);
+            if (hi < hj) {
+                if (hi >= leftMax) {
+                    leftMax = hi;
+                } else {
+                    water += leftMax - hi;
+                }
+                i++;
+            } else {
+                if (hj >= rightMax) {
+                    rightMax = hj;
+                } else {
+                    water += rightMax - hj;
+                }
+                j--;
+            }
+        }
+        return water;
+    }
+
+The condition `hi < hj` chooses which side to process, and the choice is exactly the insight above: the side with the smaller wall is the side whose water level is settled, because the other side already offers a taller wall. The `if (hi >= leftMax)` branch distinguishes a new high wall (which traps nothing above itself) from a valley position (which traps the difference).
+
+The cost
+
+Time is linear: the pointers move toward each other and each position is processed once. Space is constant: two maxima and an accumulator. The O(n²) brute force becomes O(n) by precomputing the running maxima on the fly instead of rescanning for them, which is the same "carry it forward" idea as the running sum of Chapter 23.
+
+Edge cases and a variation
+
+An empty array or a single position traps nothing. A monotonically increasing or decreasing skyline traps nothing, because there is no valley; the code handles this because every position either sets a new maximum or its difference is zero. The variation: the two-pointer rule here and the one in 24.8 look alike but answer different questions, and mixing them up is a common mistake. In 24.8 we move the shorter wall because we are optimizing one container; here we move the side with the smaller maximum because we are accumulating water everywhere. Write both and compare the move rules side by side; the difference in the problem statement is exactly the difference in the rule.
+
+24.10 Exercises
+
+1. Comprehension. In 24.1, why must the loop indices be signed (`isize`) rather than unsigned? Construct the exact failure on a three-character string if they were `usize`.
+
+2. Comprehension. In 24.4, explain why the comparison is against `v->at(k - 1)` and not `v->at(i - 1)`. Give an input where the two differ.
+
+3. Implementation. Write `void rotateRight(Vec<i32>* v, usize k)` that rotates the array right by k positions in place, using the "reverse the whole array, then reverse each part" trick. What is the time and space, and how many swaps does it do?
+
+4. Implementation. Write `bool isSubsequence(str a, str b)`: does `a` appear as a subsequence of `b`? Use two pointers and explain why a greedy advance is correct.
+
+5. Implementation. Write `usize longestMountain(const Vec<i32>*)` returning the length of the longest bitonic (up-then-down) subarray, in one pass. Which pointers or state do you maintain?
+
+6. Implementation. Solve "two sum" on an unsorted array *without* hashing, by sorting a copy first, then recovering the original indices. What extra steps does the sortedness buy you, and what does sorting cost that hash-keeping would not?
+
+7. Analysis. In 24.7, trace the array `[2, 0, 1, 2, 0]` by hand through the Dutch-flag algorithm, writing the array and the three indices after every iteration. Then explain in one sentence why `mid` is not advanced after a 2-swap.
+
+8. Design. In 24.8, write the proof that the greedy move rule never discards the optimal pair. Then find an input where moving the *taller* wall instead gives the wrong answer, to see the proof's necessity.
+
+9. Strings. Adapt 24.2 to be correct for Unicode by decoding codepoints with `str::nextCodepoint` (Chapter 17) instead of comparing bytes. Which cases does the byte version get wrong, and does the codepoint version change the complexity?
+
+10. Meta. Every problem in this chapter used at most constant extra space. Pick two where the brute force did *not* allocate either, and state precisely what the two-pointer version saved — because for those, the win was time, not memory, and saying which is which is the habit this chapter is training.

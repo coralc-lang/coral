@@ -1,0 +1,456 @@
+Chapter 29
+
+Live Examples: Dynamic Programming and Greedy
+
+Two Ways to Be Shortsighted, and Two Ways to Fix It
+
+Chapter 27 ended on a problem it called dynamic programming in disguise: the memoized Fibonacci. That is a good place to start, because dynamic programming (DP) is nothing more than recursion plus a memory. The recursion breaks a big problem into smaller ones; the memory stops you from solving the same smaller problem twice. Strip away the intimidating name and that is the whole technique: a problem that contains the same subproblem many times is solved by solving each once and remembering it.
+
+Greedy algorithms look like the opposite approach and are often confused with DP. A greedy algorithm does not look ahead and does not remember. It makes the choice that looks best right now and never reconsiders. Take the biggest coin that fits, take the earliest-ending meeting, take the shortest edge. Sometimes this local rule produces the global optimum, and when it does the algorithm is gloriously simple and fast. Sometimes it does not, and you get a plausible-looking answer that is quietly wrong. The skill is knowing which situation you are in, and the most instructive part of that skill is a case where greedy fails, because a failure teaches you what property the greedy rule needs.
+
+This chapter is the two techniques side by side. The DP problems build tables of remembered answers; the greedy problems make irreversible choices; and the last DP-versus-greedy problem shows the same problem solved the wrong way and then the right way. By the end you should be able to look at a new problem and ask the two diagnostic questions: does the same subproblem come up repeatedly (then remember), and is there a choice that is safe to make now and never revisit (then be greedy)?
+
+A note on the imports these examples use. The growable list is `import(lib) std::vec { Vec };`, the min-heap behind Huffman coding is `import(lib) std::collections::priorityqueue { PriorityQueue };`, tree nodes are allocated with `import(lib) std::mman { alloc, dealloc };`, and sorting uses `sortI32` from `import(lib) std::collections::sort { sortI32 };`. The string type `str` is built in. Each code block assumes those imports are present and is otherwise complete.
+
+29.1 The Two Ingredients of Dynamic Programming
+
+Before any code, name the two things a problem must have for DP to apply.
+
+The first is overlapping subproblems. If the recursion solves each subproblem at most once — as in factorial, where n! calls (n−1)! which calls (n−2)! and no subproblem is ever needed twice — then there is nothing to remember, and DP adds only overhead. If the recursion asks the same question over and over — as Fibonacci did, computing F(3) many times — then remembering pays.
+
+The second is optimal substructure: the best answer to the whole problem can be assembled from the best answers to its parts. This is subtle and worth a concrete statement. In shortest-path problems, the shortest route from A to C through B is the shortest route from A to B plus the shortest route from B to C; the pieces do not have to be compromised to make the whole better. When that is true, you can build large answers out of optimal small ones. When it is false — a problem where a locally great choice makes the overall answer worse — DP does not apply directly.
+
+There are two ways to drive a DP, and they are the same computation written in opposite directions. Top-down, or memoization, is Chapter 27's approach: write the natural recursion and add a table that caches results, so a repeated call returns a stored answer. Bottom-up, or tabulation, fills a table in order from the smallest subproblems up, so that when a bigger entry needs a smaller one, it is already computed. The top-down version is easier to derive from the recursion; the bottom-up version usually has a smaller constant factor and no recursion stack. Most of this chapter shows the bottom-up form, because its table is a picture of the subproblem structure you can read off the code.
+
+29.2 Climbing Stairs: The Smallest Useful DP
+
+The problem. You are climbing a staircase with n steps. Each move you may climb either 1 step or 2. In how many distinct ways can you reach the top?
+
+Picture this. You are at the bottom of the stairs. To reach step n, your very last move landed you there from step n−1 (one step) or from step n−2 (two steps). So the number of ways to reach step n is the number of ways to reach n−1 plus the number of ways to reach n−2. That is exactly the Fibonacci recurrence wearing a different hat, and there is one way to be at the bottom (do nothing).
+
+Brute force, then better. The brute force is the same double recursion that made Fibonacci explode: each call forks into two smaller calls, and the same step is recomputed by many paths. The fix is the same too, but here we write it as a small bottom-up table, which makes the DP structure visible:
+
+    u64 climbStairs(u64 n) {
+        if (n <= 1) return 1;
+        Vec<u64> ways = Vec<u64>::withCap((usize)n + 1);
+        ways.push(1);    // ways[0] = 1: one way to stand at the bottom
+        ways.push(1);    // ways[1] = 1: one way to reach step 1
+        for (u64 i = 2; i <= n; i += 1) {
+            u64 prev1 = ways.at((usize)(i - 1));
+            u64 prev2 = ways.at((usize)(i - 2));
+            ways.push(prev1 + prev2);
+        }
+        return ways.at((usize)n);
+    }
+
+The table `ways` holds one entry per step, and each entry is the sum of the two before it. The first two entries are the base cases read directly off the problem; every later entry is computed from entries that already exist, which is what "bottom-up" means. Read backwards from the top, this table is a proof: the number of ways to reach step i is the sum of the ways to reach the two steps you could have come from.
+
+Time and space. The loop runs n−1 times, doing constant work per step, so it is Θ(n) time. The table is n+1 entries, so it is Θ(n) space — but note that each entry uses only the two before it, so we could keep just two variables and drop to O(1) space, exactly as the iterative Fibonacci did in 27.2. The full table is shown because most DP problems genuinely need it, and seeing the general form before optimising the special case is the right order of learning.
+
+Edge cases. n = 0 returns 1 (one way to already be there — do nothing). n = 1 returns 1. n = 2 returns 2 (1+1 or 2). The values grow like Fibonacci, so u64 overflows at the same place, around n = 93.
+
+A variation. If the allowed moves are 1, 2, or 3 steps at a time, the recurrence becomes ways[i] = ways[i−1] + ways[i−2] + ways[i−3] and the base cases are ways[0] = 1, ways[1] = 1, ways[2] = 2. The shape of the DP does not change at all; only the number of predecessors summed changes. Recognising "the last move could have come from here" is the general trick for reaching-a-target counting problems.
+
+29.3 Coin Change: The Minimum Number of Coins
+
+The problem. Given a list of coin denominations and a target amount, find the fewest coins that sum exactly to the target, or report that it is impossible.
+
+Picture this. You are paying an exact amount from a till, and you want the smallest handful of coins. For any amount a, your last coin was some denomination c, and before that coin you had to make a−c optimally. So the fewest coins for a is one plus the fewest coins for a−c, minimised over every coin c that fits. That sentence is the recurrence, and it is the smallest possible statement of optimal substructure.
+
+Brute force, then better. The brute-force recursion tries every coin as the "last" coin and recurses, which explodes because the same amount is re-solved through many orderings. The bottom-up table fills amounts from 0 upward, so each is solved once:
+
+    i64 coinChange(Vec<i32>* coins, i32 amount) {
+        i64 impossible = 1000000000;
+        Vec<i64> dp = Vec<i64>::withCap((usize)amount + 1);
+        dp.push(0);                                  // 0 coins make amount 0
+        for (i32 a = 1; a <= amount; a += 1) {
+            dp.push(impossible);                     // start assuming unreachable
+        }
+        for (i32 a = 1; a <= amount; a += 1) {
+            for (usize c = 0; c < coins->count(); c += 1) {
+                i32 coin = coins->at(c);
+                if (coin <= a) {
+                    i64 before = dp.at((usize)(a - coin));
+                    if (before + 1 < dp.at((usize)a)) {
+                        dp.set((usize)a, before + 1);
+                    }
+                }
+            }
+        }
+        i64 answer = dp.at((usize)amount);
+        if (answer >= impossible) return -1;
+        return answer;
+    }
+
+`dp[a]` is the fewest coins for amount a; `impossible` is a stand-in for "no way yet found." The nested loops consider, for each amount, every coin as the last coin and keep the smallest result. The `coin <= a` guard prevents asking for a negative amount. When the final entry is still `impossible`, no combination exists and we return −1.
+
+Time and space. The outer loop runs amount times and the inner loop runs once per coin, so the time is Θ(amount × number_of_coins). The table is amount+1 entries, so the space is Θ(amount). This is the classic DP trade written plainly: we spend memory proportional to the target to turn an exponential recursion into a polynomial loop.
+
+Edge cases. amount = 0 returns 0 (no coins needed), which the initial `dp.push(0)` handles. If no coin is ≤ amount, every entry stays impossible and the answer is −1. Denominations must be positive; a zero or negative coin would break the `a - coin` index. And note this computes the minimum count, not the combination itself; to recover which coins were used you would also store, per amount, which coin produced the best value, then walk that back from amount to 0.
+
+A variation. If you want the number of distinct combinations rather than the minimum count — "how many ways to make this amount" — change the DP from "minimise" to "sum": `dp[a] += dp[a - coin]`, and iterate the coins in the outer loop and the amounts in the inner loop. The direction of the loops is what distinguishes counting combinations (order of coins does not matter) from counting sequences (order matters), a distinction that trips up almost everyone the first time.
+
+29.4 0/1 Knapsack: Take It or Leave It, Once
+
+The problem. Given n items, each with a weight and a value, and a knapsack with a maximum weight capacity, choose a subset of items to maximise total value without exceeding the capacity. Each item may be taken at most once.
+
+Picture this. You are robbing a museum with a single duffel bag of fixed capacity. Each loot has a weight and a value. You walk past the exhibits one by one; for each, you either take it (if it fits in what is left) or leave it. Unlike the coin problem, you cannot take a copy of an item later — there is only one of each — and that "once" is what makes this problem different from coin change.
+
+Brute force, then better. The brute force enumerates all 2^n subsets and checks each for weight, which is exponential. DP processes the items one at a time, maintaining a table of the best value achievable at every capacity using only the items seen so far:
+
+    i32 knapsack(Vec<i32>* weights, Vec<i32>* values, i32 capacity) {
+        usize n = weights->count();
+        Vec<i32> dp = Vec<i32>::withCap((usize)capacity + 1);
+        for (i32 c = 0; c <= capacity; c += 1) {
+            dp.push(0);
+        }
+        for (usize i = 0; i < n; i += 1) {
+            i32 w = weights->at(i);
+            i32 val = values->at(i);
+            for (i32 c = capacity; c >= w; c -= 1) {
+                i32 withItem = dp.at((usize)(c - w)) + val;
+                if (withItem > dp.at((usize)c)) {
+                    dp.set((usize)c, withItem);
+                }
+            }
+        }
+        return dp.at((usize)capacity);
+    }
+
+The single `dp` vector is reused as the items stream past: after processing item i, `dp[c]` is the best value possible with capacity c using items 0 through i. The inner loop runs downward from `capacity` to `w`. That downward direction is the whole trick for the "at most once" rule: when we read `dp[c - w]`, we must read a value from the previous item's row, not one already updated with the current item, and going downward guarantees that entry has not been touched yet this pass. If you iterate upward instead, an item can be taken multiple times — which is a different problem (unbounded knapsack) and a bug in this one.
+
+Time and space. There are n items and capacity+1 capacities, so the time is Θ(n × capacity). The space is Θ(capacity), because the second dimension is collapsed — we keep only the current row, not all n of them. This collapsing is a real optimisation over the textbook (n+1) × (capacity+1) table; the downward loop is the price of it.
+
+Edge cases. No items or zero capacity yields 0. An item heavier than the whole capacity is skipped by the loop bound `c >= w`. All weights and values should be non-negative; negative values would make the problem weird (you would not take them, but the recurrence would still add them). Fractional knapsack, where you may take part of an item (a handful of gold dust rather than a whole statue), is a different problem and is solved greedily by value density — see 29.10.
+
+A variation. To recover which items were chosen, keep a second boolean table `taken[i][c]` recording whether item i was included at capacity c, then walk from `taken[n][capacity]` backwards. The recovery step is where many DP solutions live or die in interviews: the value is only half the answer if the question was "which items."
+
+29.5 Longest Common Subsequence
+
+The problem. Given two strings, find the length of their longest common subsequence — the longest sequence of characters that appears in both, in the same order, but not necessarily consecutively. For "ABCBDAB" and "BDCABA" the length is 4.
+
+Picture this. Two editors have versions of the same document, and you want to know how much text they share in order. You line the two up and walk them together. If the current characters match, that character is part of the common subsequence and you advance both. If they do not match, one of the two characters must be skipped, so the answer is the better of skipping one or skipping the other. That decision — match, or skip one side — is the recurrence.
+
+Brute force, then better. The brute force generates every subsequence of the first string and checks membership in the second, which is exponential. DP builds a table indexed by (i, j), the prefixes of the two strings, where each cell is the LCS length of those prefixes:
+
+    i32 lcs(str a, str b) {
+        usize m = a.len;
+        usize n = b.len;
+        usize width = n + 1;
+        Vec<i32> dp = Vec<i32>::withCap((m + 1) * width);
+        for (usize i = 0; i < (m + 1) * width; i += 1) {
+            dp.push(0);
+        }
+        for (usize i = 1; i <= m; i += 1) {
+            for (usize j = 1; j <= n; j += 1) {
+                if (a.at(i - 1) == b.at(j - 1)) {
+                    dp.set(i * width + j, dp.at((i - 1) * width + (j - 1)) + 1);
+                } else {
+                    i32 up = dp.at((i - 1) * width + j);
+                    i32 left = dp.at(i * width + (j - 1));
+                    dp.set(i * width + j, up > left ? up : left);
+                }
+            }
+        }
+        return dp.at(m * width + n);
+    }
+
+The table is two-dimensional but stored in one flat vector: the cell for (i, j) lives at index `i * width + j` where `width = n + 1`. When the characters at the current positions match, the answer is one plus the best answer for the two prefixes with that character removed (`i−1, j−1`). When they do not, the answer is the larger of dropping a character from either string. The first row and first column are all zeros — an empty prefix has no common subsequence — which the initial fill establishes.
+
+Time and space. Both loops run over the two lengths, so the time is Θ(m × n). The flat table has (m+1)(n+1) entries, so the space is Θ(m × n). The full table is not always necessary — only the previous row is needed to compute the next, so a two-row version reduces the space to Θ(min(m, n)) — but the full table is kept when you also want to reconstruct the actual subsequence by walking backward through it.
+
+Edge cases. If either string is empty, the answer is 0 and the loops simply do not execute. Identical strings return their common length. Duplicate characters are handled naturally because the recurrence looks only at positions, not at values elsewhere. The distinction between a subsequence (characters in order, gaps allowed) and a substring (characters contiguous) matters: the longest common substring is a different, also-DP problem with a different recurrence.
+
+A variation. The edit distance of the next section is a near cousin: same table layout, same two-pointer walk, but the cells add a cost instead of a length. Learn LCS and you have learned half of edit distance, and both are half of diff, the algorithm behind every "compare two versions" tool you have used.
+
+29.6 Edit Distance: How Different Are Two Strings
+
+The problem. Given two strings, find the minimum number of single-character insertions, deletions, and substitutions needed to turn the first into the second. This is the Levenshtein distance.
+
+Picture this. You are fixing a typo, and each fix is one of three actions: delete a character, insert a character, or replace a character. You want the fewest fixes. Walking the two strings from the left, if the current characters match, no fix is needed and the answer is the same as for the prefixes without them. If they differ, you must spend exactly one fix, and you choose whichever of the three actions (delete from the first, insert into the first, substitute) leaves you the cheapest remainder.
+
+Brute force, then better. The brute-force recursion branches into three at every mismatch, giving roughly 3^(m+n) work. DP collapses the branching into a table where each cell holds the distance between two prefixes:
+
+    i32 editDistance(str a, str b) {
+        usize m = a.len;
+        usize n = b.len;
+        usize width = n + 1;
+        Vec<i32> dp = Vec<i32>::withCap((m + 1) * width);
+        for (usize i = 0; i < (m + 1) * width; i += 1) {
+            dp.push(0);
+        }
+        for (usize i = 0; i <= m; i += 1) {
+            dp.set(i * width, (i32)i);          // turning a prefix into empty: i deletions
+        }
+        for (usize j = 0; j <= n; j += 1) {
+            dp.set(j, (i32)j);                   // turning empty into a prefix: j insertions
+        }
+        for (usize i = 1; i <= m; i += 1) {
+            for (usize j = 1; j <= n; j += 1) {
+                if (a.at(i - 1) == b.at(j - 1)) {
+                    dp.set(i * width + j, dp.at((i - 1) * width + (j - 1)));
+                } else {
+                    i32 del = dp.at((i - 1) * width + j);
+                    i32 ins = dp.at(i * width + (j - 1));
+                    i32 sub = dp.at((i - 1) * width + (j - 1));
+                    i32 best = del < ins ? del : ins;
+                    if (sub < best) best = sub;
+                    dp.set(i * width + j, best + 1);
+                }
+            }
+        }
+        return dp.at(m * width + n);
+    }
+
+The base cases are the border of the table: turning the empty string into a prefix of length j costs j insertions, and turning a prefix of length i into empty costs i deletions. Those borders are the first row and first column. Every interior cell either copies the diagonal (a match, free) or adds one to the cheapest of the three neighbours: up (delete), left (insert), or diagonal (substitute). This is the recurrence written as a picture, and the picture is the most important part; the code is just the picture made concrete.
+
+Time and space. The table is (m+1)(n+1), so both are Θ(m × n), exactly like LCS. The reconstruction of the actual edit script is a walk backward from the bottom-right corner, mirroring the choices that produced each cell. As with LCS, only the previous row is needed for the distance alone.
+
+Edge cases. Distance from "" to "abc" is 3 (three insertions), set by the first-row border. Identical strings give 0. This version treats every operation as cost 1; real spell checkers weight substitutions that are cheap on a keyboard (typing 'h' instead of 'j') lower than unrelated ones, which is the weighted edit distance. Transpositions ("hte" vs "the") cost 2 here but 1 under the Damerau–Levenshtein variant.
+
+A variation. The same table underlies dynamic time warping for comparing sequences that can stretch (audio, motion capture, gene sequences with insertions). The only change is that the "cost" between two aligned elements is a distance function you choose. Once you understand the edit-distance table, a whole family of sequence-alignment algorithms is the same picture with a different ruler.
+
+29.7 Longest Increasing Subsequence
+
+The problem. Given a list of integers, find the length of the longest strictly increasing subsequence. For [10, 9, 2, 5, 3, 7, 101, 18] the answer is 4 (for example 2, 3, 7, 101).
+
+Picture this. You are picking moments in a stock chart to buy at the lowest price and sell higher, but only moving forward in time and only ever buying at a higher price than before, staying strictly ascending. The longest chain of increasing values is your answer. Think of each element as the possible last link of a chain; the longest chain ending at element i is one plus the longest chain ending at an earlier element whose value is smaller.
+
+Brute force, then better. The brute force tries all 2^n subsequences, exponential. The DP is O(n^2): a table `dp[i]` holds the length of the longest increasing subsequence that ends exactly at position i.
+
+    i32 lis(Vec<i32>* nums) {
+        usize n = nums->count();
+        if (n == 0) return 0;
+        Vec<i32> dp = Vec<i32>::withCap(n);
+        for (usize i = 0; i < n; i += 1) {
+            dp.push(1);                         // any single element is a chain of one
+        }
+        i32 best = 1;
+        for (usize i = 1; i < n; i += 1) {
+            for (usize j = 0; j < i; j += 1) {
+                if (nums->at(j) < nums->at(i)) {
+                    i32 candidate = dp.at(j) + 1;
+                    if (candidate > dp.at(i)) {
+                        dp.set(i, candidate);
+                    }
+                }
+            }
+            if (dp.at(i) > best) best = dp.at(i);
+        }
+        return best;
+    }
+
+Every position starts as a chain of length 1 (the element alone). For each position i, we look back at every earlier position j with a smaller value and extend that chain; `dp[i]` becomes the best such extension. The answer is the largest value anywhere in the table, not necessarily the last entry, because the longest chain can end anywhere. That "the answer is the table's maximum" is the detail people miss.
+
+Time and space. The two nested loops are Θ(n^2) time, and the table is Θ(n) space. That is fine for thousands of elements but too slow for millions, and there is a famous O(n log n) version: maintain a `tails` array where `tails[k]` is the smallest possible tail of an increasing subsequence of length k+1, and use binary search to place each new element. If you have just read 28.7 on binary search, that improvement is a beautiful application of it — the DP's inner scan is exactly what the binary search replaces.
+
+Edge cases. An empty list returns 0, and a single element returns 1, both before the loop. Strictly increasing means duplicates do not extend a chain; if you want non-decreasing, change `<` to `<=`, and the problem changes subtly. Negative numbers are fine; only relative order matters.
+
+A variation. The longest decreasing subsequence is the same algorithm with the comparison flipped. The longest bitonic subsequence (up then down) computes the increasing length ending at each position and the decreasing length starting at each position, then finds the maximum sum, a classic pairing of two DP passes.
+
+29.8 Minimum Path Sum: Walking a Grid
+
+The problem. Given a grid of non-negative numbers, find the minimum sum of a path from the top-left cell to the bottom-right cell, moving only right or down at each step.
+
+Picture this. You are walking through a city laid out as a grid, and each cell charges a toll. You start at the top-left corner and may only move right or down, so you can never go back. The cheapest cost to reach any cell is the cell's own toll plus the cheaper of the costs to reach the cell above it and the cell to its left. That sentence is the recurrence, and it is the two-dimensional cousin of climbing stairs.
+
+Brute force, then better. The brute force tries all paths, which number C(rows+cols, rows) — exponential. DP fills a table of cheapest costs cell by cell:
+
+    i32 minPathSum(Vec<Vec<i32>>* grid) {
+        usize rows = grid->count();
+        if (rows == 0) return 0;
+        Vec<i32>* firstRow = grid->atPtr(0);
+        usize cols = firstRow->count();
+        if (cols == 0) return 0;
+        Vec<i32> dp = Vec<i32>::withCap(cols);
+        for (usize j = 0; j < cols; j += 1) {
+            dp.push(0);
+        }
+        for (usize i = 0; i < rows; i += 1) {
+            Vec<i32>* row = grid->atPtr(i);
+            for (usize j = 0; j < cols; j += 1) {
+                i32 cell = row->at(j);
+                if (i == 0 && j == 0) {
+                    dp.set(j, cell);
+                } else if (i == 0) {
+                    dp.set(j, dp.at(j - 1) + cell);
+                } else if (j == 0) {
+                    dp.set(j, dp.at(j) + cell);
+                } else {
+                    i32 fromLeft = dp.at(j - 1);
+                    i32 fromUp = dp.at(j);
+                    dp.set(j, (fromLeft < fromUp ? fromLeft : fromUp) + cell);
+                }
+            }
+        }
+        return dp.at(cols - 1);
+    }
+
+Notice that the table is one-dimensional even though the grid is two-dimensional, and the loop nests are exactly the grid loops. This works because the only cells ever needed are the current row's left neighbour (already updated this row) and the cell above (still in the array from the previous row). `grid->atPtr(i)` returns a pointer to row i so we can read it without copying the row, which matters both for speed and, in Coral, for correctness: copying an owning `Vec` and letting the copy be freed would free memory the grid still points at. The three boundary branches handle the top row (no up), the left column (no left), and the interior (both).
+
+Time and space. Every cell is computed once, so the time is Θ(rows × cols). The space is Θ(cols) because only one row of the table is kept, not the whole grid of DP values. As with knapsack, the row-collapsing is a genuine optimisation; the naive DP would use the full grid.
+
+Edge cases. A 1×1 grid returns the single cell's cost. A single row or single column has exactly one path, and the boundary branches walk it. All-zero weights return 0. Negative weights are not handled by this greedy-looking "min of the two predecessors" reasoning in general — if negative values were allowed, the optimal path could loop to exploit them, and the problem would need a different algorithm. The non-negativity is a real precondition, not a formality.
+
+A variation. If the question is the number of distinct paths rather than the cheapest one, `dp[j]` becomes a count and the recurrence is `dp[j] = dp[j] (from above) + dp[j-1] (from left)`, with the whole first row and column set to 1. This is the "unique paths" problem, and it is the same grid walk with addition instead of minimisation — the same table, a different operation.
+
+29.9 Greedy: Interval Scheduling
+
+The problem. Given a set of intervals, each with a start and an end, select the largest possible subset of intervals that do not overlap. This is the classic activity-selection problem: one room, many meetings, schedule as many as possible.
+
+Picture this. You have one conference room and a stack of booking requests. You want to accept as many as possible. The tempting rule is to accept the earliest-starting request first, but that can lock you into a long meeting that blocks several short ones. The rule that works is counterintuitive at first: always accept the request that ends earliest. Because a meeting that ends early frees the room soonest, and no other choice can leave the room free before it does.
+
+Brute force, then better. The brute force tries every subset to find the largest non-overlapping one, exponential. The greedy algorithm sorts by end time and sweeps once, accepting any interval that starts at or after the last accepted one's end:
+
+    struct Interval {
+        i32 start;
+        i32 end;
+    }
+
+    bool byEnd(Interval a, Interval b) {
+        return a.end < b.end;
+    }
+
+    i32 maxNonOverlapping(Vec<Interval>* intervals) {
+        intervals->sortBy(byEnd);
+        i32 count = 0;
+        bool haveLast = false;
+        i64 lastEnd = 0;
+        for (usize i = 0; i < intervals->count(); i += 1) {
+            Interval cur = intervals->at(i);
+            if (!haveLast || (i64)cur.start >= lastEnd) {
+                count += 1;
+                lastEnd = cur.end;
+                haveLast = true;
+            }
+        }
+        return count;
+    }
+
+The sort by end time is the whole algorithm; everything after it is a linear sweep. An interval is accepted exactly when it begins no earlier than the last accepted interval ended, so accepted intervals are automatically disjoint and in increasing order of end. `haveLast` handles the first accepted interval without needing a magic sentinel endpoint. The `(i64)cur.start` cast keeps the comparison in a signed type so the initial `lastEnd` sentinel can never collide with a real, non-negative time.
+
+Time and space. Sorting dominates: Θ(n log n). The sweep is Θ(n). The space is O(1) beyond the sorted list. That final complexity is the point of greedy: a problem that looked like it needed exponential search is solved in n log n, and the reason is that the exchange argument (below) proves the local choice is globally safe.
+
+Why greedy works here. The proof is an exchange argument, and every correct greedy algorithm has one. Take any optimal solution. Look at its first meeting; if it is not the one that ends earliest, swap it for the one that does. The earliest-ending meeting finishes no later than the one it replaced, so nothing after it becomes invalid; the swapped solution is still valid and has the same size. Repeating this exchange shows there is an optimal solution that makes the greedy first choice, and by induction the whole greedy solution is optimal. When you cannot write such an argument, the greedy rule is a guess, and 29.11 shows what guesses cost.
+
+Edge cases. An empty list returns 0. Meetings that touch end-to-start are allowed by the `>=` comparison (a meeting ending at 10 and one starting at 10 do not conflict); use `>` instead if touching is forbidden. Intervals of zero length are accepted and count. Intervals with start greater than end are malformed input and are not handled here.
+
+A variation. If each interval has a weight (profit) and you want the maximum total weight of non-overlapping intervals, greedy by end time fails, and you need DP: sort by end and binary-search the latest compatible prior interval for each. That problem — weighted interval scheduling — is the standard bridge between the greedy and DP halves of this chapter, and it is worth working as an exercise.
+
+29.10 Greedy: Huffman Coding, with a Priority Queue
+
+The problem. Given the frequencies of symbols in a text, build an optimal prefix code — a way to encode each symbol as a bit string so that no code is a prefix of another, and the total encoded length is minimised.
+
+Picture this. Some letters in English are common (e, t, a) and some are rare (z, q). You want the common ones to have short codes and the rare ones long codes, so the total text is shorter. Huffman's insight is to build a tree from the bottom up: repeatedly take the two least frequent symbols and merge them into a new symbol whose frequency is their sum, until everything is one tree. The rarer a symbol is, the deeper it ends up, and the deeper it is, the longer its code. No prefix of a code is another code, because every symbol is a leaf and no leaf is on the path to another.
+
+Brute force, then better. The brute force searches all binary trees over the symbols, exponential. Huffman's greedy merge is optimal and needs only a priority queue: at every step it takes the two lightest nodes, and that local rule provably yields the minimal weighted path length. The priority queue from Chapter 16 (a min-heap) is exactly the tool.
+
+    struct HuffNode {
+        i32 freq;
+        i32 symbol;          // 0..symbols-1 for leaves, -1 for internal
+        HuffNode* left;
+        HuffNode* right;
+    }
+
+    bool lighterFirst(HuffNode* a, HuffNode* b) {
+        return a->freq < b->freq;
+    }
+
+    HuffNode* buildHuffman(Vec<i32>* freqs, usize symbols) {
+        PriorityQueue<HuffNode*> pq = PriorityQueue<HuffNode*>::new(lighterFirst);
+        for (usize s = 0; s < symbols; s += 1) {
+            if (freqs->at(s) > 0) {
+                HuffNode* leaf = alloc<HuffNode>(1);
+                leaf->freq = freqs->at(s);
+                leaf->symbol = (i32)s;
+                leaf->left = null;
+                leaf->right = null;
+                pq.push(leaf);
+            }
+        }
+        while (pq.count() > 1) {
+            HuffNode* a = pq.pop();
+            HuffNode* b = pq.pop();
+            HuffNode* parent = alloc<HuffNode>(1);
+            parent->freq = a->freq + b->freq;
+            parent->symbol = -1;
+            parent->left = a;
+            parent->right = b;
+            pq.push(parent);
+        }
+        if (pq.count() == 0) return null;
+        return pq.pop();
+    }
+
+    void codeLengths(HuffNode* root, i32 depth, Vec<i32>* lengths) {
+        if (root == null) return;
+        if (root->left == null && root->right == null) {
+            lengths->set((usize)root->symbol, depth);
+            return;
+        }
+        codeLengths(root->left, depth + 1, lengths);
+        codeLengths(root->right, depth + 1, lengths);
+    }
+
+The queue starts holding one leaf per symbol, ordered by frequency. Each pass pops the two lightest nodes and pushes a new internal node that is their parent, with their combined frequency. When one node remains, it is the root of the code tree. The distance from the root to a leaf is that symbol's code length, which `codeLengths` records by walking the tree and incrementing a depth counter. The total weighted path length — the objective being minimised — is the sum of `freq[s] * lengths[s]` over all symbols.
+
+Time and space. There are at most n pushes plus n−1 merges, and every heap operation is O(log n), so the time is Θ(n log n), where n is the number of distinct symbols. The tree has at most 2n−1 nodes, so the space is Θ(n). A full sort would also be O(n log n); the heap is used because the merges keep creating new frequencies that must be re-ordered, which a one-time sort cannot anticipate.
+
+Why greedy works here. The exchange argument: in an optimal tree, the two least frequent symbols must be siblings at the deepest level. If they are not, swap them with a deepest-level pair — this does not increase the weighted path length — so there is an optimal tree in which the greedy first merge is valid. Removing that sibling pair and treating their parent as a new symbol reduces the problem by one, and induction finishes it. The two-lightest-siblings property is the invariant the algorithm relies on.
+
+Edge cases. One distinct symbol produces a single-node tree with code length 0 (the symbol needs no bits if it is the only thing ever encoded; some conventions give it length 1, which is what most encoders do because a zero-bit code cannot be represented). Zero distinct symbols returns null. Ties in frequency may produce different trees with the same optimal total length, because Huffman codes are not unique. Negative frequencies are nonsense and are not guarded against.
+
+A variation. Real compressors use adaptive Huffman or arithmetic coding, which update the frequencies as the data streams past instead of assuming a fixed distribution known in advance. Arithmetic coding pushes the idea further by encoding messages as a single fraction rather than a tree of bits, and it gets closer to the theoretical entropy limit at the cost of more arithmetic. Huffman remains the classic because it is optimal among prefix codes and it fits in your head.
+
+29.11 When Greedy Fails: Coin Change, Revisited
+
+The problem. Take the coin-change problem of 29.3 — fewest coins to make an amount — and solve it greedily, always taking the largest coin that fits. Sometimes that works. When it does not, understand exactly why.
+
+Picture this. Your denominations are 1, 5, 10, and 25 cents — the US coins. Greedy gives the right answer for every amount, which is why cashiers make change in their heads. Now your denominations are 1, 3, and 4, and the amount is 6. Greedy grabs 4, then 1, then 1: three coins. But 3 + 3 is two coins. Greedy is wrong, and it is wrong because taking the largest coin now forecloses the better combination later.
+
+Brute force, then better. The greedy version is short and tempting:
+
+    i32 coinChangeGreedy(Vec<i32>* coins, i32 amount) {
+        sortI32(coins);
+        i32 count = 0;
+        i32 remaining = amount;
+        for (i64 i = (i64)coins->count() - 1; i >= 0; i -= 1) {
+            i32 coin = coins->at((usize)i);
+            while (coin <= remaining) {
+                remaining -= coin;
+                count += 1;
+            }
+        }
+        if (remaining != 0) return -1;
+        return count;
+    }
+
+Sort ascending, walk from the largest, take as many of each as fit. For coins {1, 5, 10, 25} it is correct for all amounts, and that is a genuine property of the US system (and of any system where each coin is a multiple of the next, called a canonical system). For coins {1, 3, 4} and amount 6 it returns 3 when the true answer is 2. The DP of 29.3 returns the correct 2, in Θ(amount × coins) time. This is the trade: greedy is polynomial and fast, DP is polynomial and correct; greedy is correct only when the denominations have the special structure, and DP is correct always.
+
+Why greedy fails here. The greedy choice (largest coin) is locally optimal in the sense that it leaves the smallest remainder for that one coin, but it is not "safe": there is no exchange argument showing an optimal solution contains the greedy first coin. Amount 6 with coins {1, 3, 4} is the concrete counterexample: the optimal solution does not contain a 4 at all. Without a proof of safety, greedy is a heuristic, and heuristics return wrong answers on the inputs that matter.
+
+Time and space. Greedy is Θ(coins × (amount / min-coin)) in the worst case for the `while` loops, which for typical coin sizes is effectively linear, and it is O(1) space beyond the sort. DP is Θ(amount × coins) time and Θ(amount) space. For large amounts and non-canonical systems, the right answer is DP, and the memory is the price of correctness.
+
+Edge cases and the diagnostic. Before trusting a greedy rule, either prove it with an exchange argument or test it exhaustively against a DP on small inputs. For coin change, "is this denomination system canonical" is a real theorem with a known test (Pearson's), which is a lovely example of turning "is greedy safe here" into a decidable question. The general lesson of the chapter is stated by this example: DP is correct when the problem has optimal substructure and overlapping subproblems, and greedy is correct only when, in addition, some local choice can be proven safe for every input.
+
+29.12 Exercises
+
+1. Comprehension. State the two ingredients a problem needs for dynamic programming, and give one problem from this chapter that has each, and one everyday problem that has neither.
+
+2. Comprehension. What is the difference between top-down memoization and bottom-up tabulation? For the coin-change problem, write out in words what the table's rows and columns mean.
+
+3. Trace. For climbing stairs, write the contents of the `ways` table for n = 6 by hand, one entry per line. At which point do the numbers exceed the number of ways to shuffle a deck?
+
+4. Implementation. Solve the "house robber" problem: given a row of house values, choose a set of non-adjacent houses to maximise the loot. Write the recurrence, then the DP, then say why the answer is the maximum of the table's last two entries.
+
+5. Knapsack. Modify 29.4 to also return which items were chosen. What extra storage do you need, and where do you walk to recover the answer?
+
+6. Strings. Explain, with the LCS table, why the answer is in the bottom-right cell while the LIS answer is the maximum anywhere in its table. What does that difference tell you about the two recurrences?
+
+7. Complexity. The naive edit-distance recursion is exponential and the DP is Θ(m × n). Compute both for m = n = 20 and compare, assuming one operation per nanosecond. Which is usable and which is not?
+
+8. Greedy. Solve weighted interval scheduling (see the variation in 29.9) with DP and with a greedy-by-profit rule, and find an input where the greedy rule gives a smaller total profit than the DP.
+
+9. Greedy. Prove, with an exchange argument, that always taking the earliest-ending interval is optimal for unweighted interval scheduling. Where exactly does the proof use the fact that intervals are unweighted?
+
+10. Meta. Huffman coding, interval scheduling, and coin change with canonical denominations are all correct greedy algorithms. Pick two and write a paragraph each on what structural property of the problem makes the greedy choice safe. Then write one sentence explaining what single test would have caught the coin-change failure before writing any code.
