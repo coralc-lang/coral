@@ -4,7 +4,7 @@ Live Examples: Systems and Concurrency
 
 The Machinery You Can See
 
-Chapter 18 told the story of concurrency: what a thread is, why a data race is undefined behaviour, what happens-before means, and how a mutex and a condition variable turn a collection of independently running threads into a correct exchange. This chapter is the workshop. It takes those primitives and builds the six structures that every real system is assembled from: a race that a counter loses, a producer and a consumer passing work across a queue, a thread pool draining a task list, a parallel map over a vector, an async pipeline that suspends and resumes, and a semaphore that caps how many things happen at once. Each one is short. Each one is a pattern you will meet again, often under a different name.
+Chapter 18 told the story of concurrency: what a thread is, why a data race is undefined behaviour, what happens-before means, and how a mutex and a condition variable turn a collection of independently running threads into a correct exchange. This chapter is the workshop. It takes those primitives and builds the eleven structures that every real system is assembled from: a race that a counter loses, a producer and a consumer passing work across a queue, a thread pool draining a task list, a parallel map over a vector, an async pipeline that suspends and resumes, and a semaphore that caps how many things happen at once, followed by a reader–writer lock that admits many readers or one writer, a barrier that holds a group of threads together, a divide-and-conquer parallel sum, the dining philosophers and the lock-ordering rule that saves them, and a token-bucket rate limiter. Each one is short. Each one is a pattern you will meet again, often under a different name.
 
 The promise of this chapter is that the machinery is visible. Coral does not hide the thread behind a keyword, the queue behind a runtime, or the scheduler behind magic. `threadCreate` returns a real operating system thread and a `Result` that says whether it worked. A mutex is a struct you `init` and `lock`. A condition variable is a nap with an alarm. When you read a function in this chapter, you can point at the exact line that establishes the happens-before edge, and that is the point: correctness in concurrent code is not a property you hope for, it is a property you can audit, lock by lock and signal by signal.
 
@@ -41,7 +41,7 @@ The implementation.
         return null;
     }
 
-    pub i32 main() {
+    pub void main() {
         PlainCounter plain = PlainCounter { .value = 0 };
         Result<Thread, ThreadError> a = threadCreate(bumpPlain, (rawptr)&plain);
         Result<Thread, ThreadError> b = threadCreate(bumpPlain, (rawptr)&plain);
@@ -55,7 +55,6 @@ The implementation.
         if (c.isOk()) threadJoin(c.unwrap(), null);
         if (d.isOk()) threadJoin(d.unwrap(), null);
         println("atomic {}", atomic.value.load());  // always 2000000
-        return 0;
     }
 
 Cost and notes. `fetchAdd` is a single locked instruction on x86-64 (`lock xadd`), a few tens of cycles, serialising and indivisible. The plain increment is faster in isolation and wrong. The rule of thumb from Chapter 18 is exact: use an atomic when the shared state is one integer (a counter, a flag, a ticket), and use a mutex the moment the state is anything larger. An atomic guards one cell; a mutex guards a region.
@@ -473,7 +472,411 @@ Edge cases. A `post` without a matching `wait` raises the count above its initia
 
 Variation. Replace the join-one-at-a-time structure with the MiniPool from 34.3: submit all the tasks, have each do `wait`, work, `post`, and use an `AtomicU64` for the completed count. It combines three of this chapter's patterns — a pool, a semaphore, an atomic — into the shape of a real rate-limited service, and watching them fit together is the point of the whole chapter.
 
-34.7 Exercises
+34.7 A Reader-Writer Lock
+
+The problem. Many threads read a piece of shared data and only a few ever write it. A plain mutex makes every reader wait for every other reader, needlessly serialising the common case. You want a lock that lets any number of readers in at once but gives a writer the room to itself.
+
+The intuition. The rule is a one-line contract: readers may share, a writer must be alone. Track how many readers are inside and whether a writer is active. A reader waits while a writer is active; a writer waits while any reader is active. That much is obvious. The subtlety is starvation: if readers keep arriving, a waiting writer never gets in. The fix used here is to make new readers wait whenever a writer is already waiting, so the backlog of readers cannot grow without bound. It costs a little reader latency to guarantee that writers eventually run.
+
+The approach. One mutex for the bookkeeping, two condition variables for the two waiting groups, a reader count, a writer-active flag, and a count of writers waiting for the priority rule.
+
+The implementation.
+
+    import(lib) std::concurrent::mutex { Mutex };
+    import(lib) std::concurrent::thread { ConditionVar };
+
+    pub struct RwLock {
+        Mutex mutex;
+        ConditionVar canRead;
+        ConditionVar canWrite;
+        u32 readers;
+        bool writerActive;
+        u32 writersWaiting;
+
+        void init() {
+            self.mutex.init();
+            self.canRead.init();
+            self.canWrite.init();
+            self.readers = 0;
+            self.writerActive = false;
+            self.writersWaiting = 0;
+        }
+
+        void destroy() {
+            self.mutex.destroy();
+            self.canRead.destroy();
+            self.canWrite.destroy();
+        }
+
+        void readLock() {
+            self.mutex.lock();
+            while (self.writerActive || self.writersWaiting > 0)
+                self.canRead.wait(&self.mutex);
+            self.readers += 1;
+            self.mutex.unlock();
+        }
+
+        void readUnlock() {
+            self.mutex.lock();
+            self.readers -= 1;
+            if (self.readers == 0) self.canWrite.broadcast();
+            self.mutex.unlock();
+        }
+
+        void writeLock() {
+            self.mutex.lock();
+            self.writersWaiting += 1;
+            while (self.writerActive || self.readers > 0)
+                self.canWrite.wait(&self.mutex);
+            self.writersWaiting -= 1;
+            self.writerActive = true;
+            self.mutex.unlock();
+        }
+
+        void writeUnlock() {
+            self.mutex.lock();
+            self.writerActive = false;
+            self.canWrite.broadcast();      // a waiting writer goes next
+            self.canRead.broadcast();       // otherwise the readers may enter
+            self.mutex.unlock();
+        }
+    }
+
+The `writersWaiting > 0` term in `readLock` is the whole anti-starvation policy; remove it and readers can barge past writers forever. The two broadcasts on release are deliberate: waking both groups and letting them recheck the predicates under the mutex is simpler and safer than computing which group should go next, and the priority rule sorts it out. Every wait is inside a loop, as the chapter's opening promise requires.
+
+Cost and notes. The lock is O(1) per operation, but read performance is the point: `readLock` and `readUnlock` touch the count and take the mutex, and any number of readers run their critical sections at once. The mutex is still held during the bookkeeping, so this is not lock-free; it is a way to shrink contention from "every access" to "every transition." Prefer the built-in `std::concurrent::rwlock` in production and read this version to understand what it does.
+
+Edge cases. A reader that takes the read lock twice on the same thread can deadlock if a writer arrives between the two: the second `readLock` blocks, the writer is stuck behind the first read lock, and the cycle never resolves. This is the price of writer priority, and it is why the API offers no recursive read lock. A writer must not call `readLock` while holding the write lock, or vice versa, for the same reason. If a reader crashes without releasing, `readers` never returns to zero and every writer waits forever; the lock cannot clean up after a thread, which is the discipline the caller owes it. And a lock released by a thread that never acquired it corrupts the counts silently.
+
+Variation. Remove the `writersWaiting` term to get a reader-preference lock, then run a stream of readers and one writer and observe that the writer is starved. Put the term back and watch the writer get a turn. The difference in behaviour is the whole argument for one policy over the other, and neither is universally right.
+
+34.8 A Barrier (Rendezvous)
+
+The problem. A group of threads computes in phases, and no thread may begin phase two until every thread has finished phase one. You need a meeting point that holds all of them until the last one arrives, and that can be reused for the next phase.
+
+The intuition. Count the arrivals. The first threads to reach the barrier wait; the last one to arrive releases everyone and resets the count for the next round. The one hazard is the reuse. A thread that leaves one barrier may reach the barrier again and, if it is fast, be woken by the previous release. The fix is a generation number: each release increments it, and a waiting thread remembers the generation it arrived in and sleeps until the generation changes. It cannot be fooled by the previous round's wake-up because that would have changed the generation it is not yet waiting on.
+
+The approach. A mutex, one condition variable, the number of parties, the count currently waiting, and a generation counter.
+
+The implementation.
+
+    import(lib) std::concurrent::mutex { Mutex };
+    import(lib) std::concurrent::thread { ConditionVar };
+
+    pub struct Barrier {
+        Mutex mutex;
+        ConditionVar cond;
+        u32 parties;
+        u32 waiting;
+        u64 generation;
+
+        bool init(u32 count) {
+            if (count == 0) return false;
+            self.mutex.init();
+            self.cond.init();
+            self.parties = count;
+            self.waiting = 0;
+            self.generation = 0;
+            return true;
+        }
+
+        void destroy() {
+            self.mutex.destroy();
+            self.cond.destroy();
+        }
+
+        void waitAt() {
+            self.mutex.lock();
+            u64 myGen = self.generation;
+            self.waiting += 1;
+            if (self.waiting == self.parties) {
+                self.waiting = 0;
+                self.generation += 1;         // releases everyone waiting on myGen
+                self.cond.broadcast();
+            } else {
+                while (self.generation == myGen)
+                    self.cond.wait(&self.mutex);
+            }
+            self.mutex.unlock();
+        }
+    }
+
+The last arrival skips the wait entirely: it has no reason to sleep, so it resets the count and wakes the others on its way out. The generation test `while (self.generation == myGen)` is what makes the barrier reusable; without it, a fast thread could fall through the next barrier using the previous round's signal.
+
+Cost and notes. Each `waitAt` is O(1): one lock, one comparison, and a broadcast by the last arriver. The cost of the broadcast is O(parties) wakeups, which is exactly what a rendezvous is. A barrier is how a parallel algorithm separates its phases when each phase must see the full result of the last, and it is the primitive behind `parallel_for` implementations with dependencies.
+
+Edge cases. `count` of zero is meaningless and refused. Every party must call `waitAt` the same number of times; if one thread calls it an extra time it will block at the next phase waiting for parties that are not coming, which is the correct rendezvous behaviour but easy to mistake for a hang. The condition is broadcast, not signalled, because every waiter must be released, not just one. And a barrier gives no ordering between the release and the next phase's writes, so if phase two reads what phase one wrote, each thread's writes must be visible after the barrier: the mutex used inside the barrier provides that ordering, because each thread unlocks and re-locks, which is a happens-before edge.
+
+Variation. Add a `phase()` method that returns the current generation so a worker can tell which round it is in, and use it to run a three-phase pipeline where each phase prints a different message. Then write a sense-reversing barrier, which uses a boolean "sense" flag instead of a generation counter, and argue that the two are the same idea with different counters.
+
+34.9 Parallel Sum by Divide and Conquer
+
+The problem. Sum a large array across several threads, but with a recursive division that mirrors how you would state the algorithm mathematically, rather than the fixed chunking of 34.4. The reduction — combining partial answers — is the pattern this example adds.
+
+The intuition. To sum a range, split it in half, sum each half, and add the two results. Do each half in parallel by giving one to a new thread and doing the other on the current thread. Stop splitting when the range is small enough that the cost of a thread exceeds the cost of just adding the remaining numbers; that cutoff is the only tuning knob. The data is read-only and the two halves are disjoint, so nothing is shared and no lock is needed. The partial sums are combined only after both sides have joined, which is the happens-before edge that makes the result valid.
+
+The approach. A job struct carries the data, the range, the cutoff, and an output slot for the partial sum. A recursive function fills the output; a thin thread entry calls it. The parent spawns the right half and computes the left half itself, then joins and adds.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::mman { alloc, dealloc };
+    import(lib) std::concurrent::thread {
+        threadCreate, threadJoin, Thread, ThreadError
+    };
+
+    struct SumJob {
+        const Vec<f64>* data;
+        usize start;
+        usize end;
+        usize cutoff;
+        f64 result;
+    }
+
+    void sumRange(SumJob* job) {
+        if (job->end - job->start <= job->cutoff) {
+            f64 s = 0.0;
+            for (usize i = job->start; i < job->end; i += 1) s += job->data->at(i);
+            job->result = s;
+            return;
+        }
+
+        usize mid = job->start + (job->end - job->start) / 2;
+        SumJob* left = alloc<SumJob>(1);
+        SumJob* right = alloc<SumJob>(1);
+        if (left == null || right == null) {
+            if (left != null) dealloc<SumJob>(left);
+            if (right != null) dealloc<SumJob>(right);
+            f64 s = 0.0;
+            for (usize i = job->start; i < job->end; i += 1) s += job->data->at(i);
+            job->result = s;
+            return;
+        }
+
+        left->data = job->data;
+        left->start = job->start;
+        left->end = mid;
+        left->cutoff = job->cutoff;
+        left->result = 0.0;
+
+        right->data = job->data;
+        right->start = mid;
+        right->end = job->end;
+        right->cutoff = job->cutoff;
+        right->result = 0.0;
+
+        Result<Thread, ThreadError> t = threadCreate(sumEntry, (rawptr)right);
+        sumRange(left);                                // the current thread takes the left half
+        if (t.isOk()) threadJoin(t.unwrap(), null);
+
+        job->result = left->result + right->result;
+        dealloc<SumJob>(left);
+        dealloc<SumJob>(right);
+    }
+
+    rawptr sumEntry(rawptr arg) {
+        sumRange((SumJob*)arg);
+        return null;
+    }
+
+    pub f64 parallelSum(const Vec<f64>* data, usize cutoff) {
+        @assertOut(cutoff >= 1, "a cutoff of zero never terminates");
+        SumJob root = SumJob {
+            .data = data, .start = 0, .end = data->count(),
+            .cutoff = cutoff, .result = 0.0
+        };
+        sumRange(&root);
+        return root.result;
+    }
+
+Each internal node spawns exactly one thread — for the right half — and uses the current thread for the left, so the number of live threads is bounded by the depth of the recursion rather than by the number of leaves. The `right` job outlives the `threadJoin`, so freeing it afterward is safe; freeing it before the join would be the use-after-free the chapter's opening warns about.
+
+Cost and notes. The arithmetic is O(n), the same as a sequential loop, and the parallelism comes from running disjoint halves at once. The overhead is one thread creation per internal node, which is why the cutoff exists: below a few thousand elements, thread creation dominates and the sequential loop wins. This recursive shape is what you would feed into `std::concurrent::threadpool` or a work-stealing scheduler in production, so that a fixed set of workers runs all the tasks instead of creating a fresh thread at every fork.
+
+Edge cases. A cutoff of zero recurses without end, because a one-element range would keep splitting into an empty half and itself; the assertion refuses it. An empty input has `end - start == 0`, which is at most the cutoff, so the sequential branch handles it and returns zero. Allocation failure falls back to a sequential sum rather than dropping the work, which is the honest response when the answer matters more than the parallelism. And the two adds `left->result + right->result` happen after the join, which is the only synchronisation this pattern needs.
+
+Variation. Replace the `threadCreate` with the `ThreadPool` from 34.3 so the thread count is fixed and the fork becomes a queue push, then time both versions on an array of ten million and find the cutoff where the recursive version stops paying for itself.
+
+34.10 The Dining Philosophers, and How to Avoid Deadlock
+
+The problem. Five philosophers sit around a table with one fork between each pair. To eat, a philosopher needs both the fork on the left and the fork on the right. Each spends the time alternating between thinking and eating. If every philosopher picks up the left fork first and then waits for the right, all five can hold one fork and wait forever. That is deadlock, and it is the smallest picture of the problem that any real locking code faces.
+
+The intuition. Deadlock is a cycle of waiting: each thread holds one resource and waits for the next, until the waiting wraps around to the start. Break the cycle and the deadlock cannot form. The simplest way is to impose a global order on the resources and always acquire them in that order. Number the forks zero through four; every philosopher takes the lower-numbered fork first, then the higher-numbered one. Now the philosopher between fork four and fork zero takes fork zero first, so nobody holds fork four while waiting for fork zero, and the circle is broken. The rule generalises to every program: give your locks a total order, and acquire them in that order, everywhere.
+
+The approach. A table of five mutexes. Each philosopher knows its seat, computes the two fork indices, and locks the smaller index before the larger. A fixed menu of meals keeps the run finite.
+
+The implementation.
+
+    import(lib) std::mman { alloc, dealloc };
+    import(lib) std::concurrent::mutex { Mutex };
+    import(lib) std::concurrent::thread {
+        threadCreate, threadJoin, Thread, ThreadError
+    };
+
+    const u32 PHILOSOPHERS = 5;
+    const u64 MEALS = 3;
+
+    pub struct Table {
+        Mutex forks[PHILOSOPHERS];
+
+        void init() {
+            for (u32 i = 0; i < PHILOSOPHERS; i += 1) self.forks[i].init();
+        }
+
+        void destroy() {
+            for (u32 i = 0; i < PHILOSOPHERS; i += 1) self.forks[i].destroy();
+        }
+    }
+
+    struct Seat {
+        Table* table;
+        u32 index;
+    }
+
+    rawptr dine(rawptr arg) {
+        Seat* seat = (Seat*)arg;
+        Table* table = seat->table;
+        u32 i = seat->index;
+
+        u32 left = (i + PHILOSOPHERS - 1) % PHILOSOPHERS;
+        u32 right = (i + 1) % PHILOSOPHERS;
+        u32 first = left < right ? left : right;
+        u32 second = left < right ? right : left;
+
+        for (u64 meal = 0; meal < MEALS; meal += 1) {
+            table->forks[first].lock();
+            table->forks[second].lock();
+            // eat, holding both forks
+            table->forks[second].unlock();
+            table->forks[first].unlock();
+            // think
+        }
+        return null;
+    }
+
+    pub bool dinner() {
+        Table table;
+        table.init();
+
+        Seat* seats = alloc<Seat>((usize)PHILOSOPHERS);
+        Thread* threads = alloc<Thread>((usize)PHILOSOPHERS);
+        bool* created = alloc<bool>((usize)PHILOSOPHERS);
+        if (seats == null || threads == null || created == null) {
+            if (seats != null) dealloc<Seat>(seats);
+            if (threads != null) dealloc<Thread>(threads);
+            if (created != null) dealloc<bool>(created);
+            table.destroy();
+            return false;
+        }
+
+        for (u32 i = 0; i < PHILOSOPHERS; i += 1) {
+            seats[i].table = &table;
+            seats[i].index = i;
+            created[i] = false;
+            Result<Thread, ThreadError> t = threadCreate(dine, (rawptr)&seats[i]);
+            if (t.isOk()) {
+                threads[i] = t.unwrap();
+                created[i] = true;
+            }
+        }
+
+        for (u32 i = 0; i < PHILOSOPHERS; i += 1)
+            if (created[i]) threadJoin(threads[i], null);
+
+        dealloc<bool>(created);
+        dealloc<Thread>(threads);
+        dealloc<Seat>(seats);
+        table.destroy();
+        return true;
+    }
+
+The two lines that prevent the disaster are `first = left < right ? left : right` and `second = left < right ? right : left`. Swap them back to "left then right" and the program can hang; the ordering is not a stylistic choice, it is the correctness proof. The `created` array is there because a thread creation that fails must not be joined, and the seat array is grown on the heap rather than the stack precisely so its lifetime is obvious.
+
+Cost and notes. The lock and unlock are the same O(1) mutex operations as everywhere else; the ordering adds nothing but a comparison. What it buys is the absence of a class of bug that is invisible in testing and shows up under load on a customer's machine. The alternative fixes are a waiter who grants both forks only when both are free, or seating only four of the five philosophers so at least one can always make progress; both work, and both are more machinery than sorting two integers.
+
+Edge cases. The ordering rule must be used by every code path that takes both forks, or the cycle can reappear through the path that forgot. A philosopher that releases the second fork before the first is fine here because there is no contention deadlock in release, but releasing in reverse of acquisition is the general habit to keep. This solution removes deadlock but not starvation: one philosopher could, in principle, be unlucky for a long time, and a fair implementation adds a queue. If the number of philosophers changes, `PHILOSOPHERS` must change with the array size in the struct, and the modulo arithmetic adapts automatically. And a thread that dies while holding a fork leaves it locked forever; there is no automatic cleanup, which is why production code pairs locks with a scoped release.
+
+Variation. Implement the waiter solution: a single mutex guarding a bitmask of free forks, with each philosopher becoming "hungry" and the waiter granting both forks only when both are free, signalling the philosopher to eat. It removes the starvation problem and replaces the lock-ordering argument with a single serialisation point, and comparing the two is the best way to see what each buys.
+
+34.11 A Token-Bucket Rate Limiter
+
+The problem. Allow at most a fixed rate of operations — say four database queries per second — while still permitting a short burst when the work arrives in a clump. How do you enforce a rate without a background timer thread burning cycles?
+
+The intuition. Picture a bucket that holds tokens. Tokens drip in at a constant rate up to a maximum, and every operation takes one token; an operation that finds the bucket empty waits until a token drips in. The bucket's capacity is the largest burst you allow, and the drip rate is the sustained rate. The trick that removes the timer is to compute the tokens lazily: store the time of the last refill and, whenever someone touches the bucket, add the tokens that have accrued since then based on elapsed time. No thread sits in the background; the accounting happens on demand.
+
+The approach. A mutex protecting the token count and the last-refill timestamp, a monotonic clock for the elapsed time, and a wait loop that sleeps for exactly as long as the next token needs. `tryAcquire` is the non-blocking form for callers that would rather be rejected than delayed.
+
+The implementation.
+
+    import(lib) std::concurrent::mutex { Mutex };
+    import(lib) std::time {
+        Timespec, nowMonotonic, subTimespec, timespecToF64, sleepMs
+    };
+
+    pub struct TokenBucket {
+        Mutex mutex;
+        f64 rate;          // tokens added per second
+        f64 capacity;      // maximum burst
+        f64 tokens;
+        Timespec last;
+
+        void init(f64 ratePerSecond, f64 burst) {
+            @assertOut(ratePerSecond > 0.0, "rate must be positive");
+            self.mutex.init();
+            self.rate = ratePerSecond;
+            self.capacity = burst;
+            self.tokens = burst;              // start full, so the first burst is allowed
+            self.last = nowMonotonic();
+        }
+
+        void destroy() {
+            self.mutex.destroy();
+        }
+
+        // caller must hold the mutex; adds accrued tokens, capped at capacity
+        void refill() {
+            Timespec now = nowMonotonic();
+            f64 elapsed = timespecToF64(subTimespec(now, self.last));
+            self.last = now;
+            self.tokens += elapsed * self.rate;
+            if (self.tokens > self.capacity) self.tokens = self.capacity;
+        }
+
+        bool tryAcquire() {
+            self.mutex.lock();
+            self.refill();
+            bool ok = self.tokens >= 1.0;
+            if (ok) self.tokens -= 1.0;
+            self.mutex.unlock();
+            return ok;
+        }
+
+        void acquire() {
+            while (true) {
+                self.mutex.lock();
+                self.refill();
+                if (self.tokens >= 1.0) {
+                    self.tokens -= 1.0;
+                    self.mutex.unlock();
+                    return;
+                }
+                f64 deficit = (1.0 - self.tokens) / self.rate;   // seconds until a token
+                self.mutex.unlock();
+                u64 waitMs = (u64)(deficit * 1000.0) + 1u;       // round up a millisecond
+                sleepMs(waitMs);
+            }
+        }
+    }
+
+`refill` reads and writes only under the lock; it is deliberately a separate method so that both `tryAcquire` and `acquire` share the exact same accounting. The clock is monotonic, so a system clock adjustment cannot make tokens appear or vanish. And the wait is a sleep for the computed deficit rather than a wait on a condition variable, because the API's condition variable has no timed wait: nobody will signal the callback when time passes, so the only honest way to wake on the clock is to sleep until the clock says a token is due.
+
+Cost and notes. Each call is O(1) arithmetic plus, in the blocking case, one sleep whose length is exactly the time until the next token. There is no polling loop spinning on the CPU and no timer thread; the laziness is the entire design. The capacity controls burstiness, and the rate controls the average, so the two numbers are independent dials: a large bucket with a small rate is a burst-tolerant limiter, a bucket of one is a strict metronome.
+
+Edge cases. A non-positive rate divides by zero in the deficit computation; the assertion at construction refuses it. Several waiters can wake at once and find only one token; the losers sleep again, which is a small thundering herd but never a correctness problem, because the check and the decrement happen under the lock. Starting full means the first callers get their burst immediately; starting empty would make the limiter stall for a full interval before the first operation, which is rarely what you want. If the process is suspended for a long time, the accumulated tokens are capped at the capacity, so a long pause does not bank an unbounded burst. And `sleepMs` sleeps at least the requested duration but may oversleep, so the limiter is approximate and always errs on the side of being slow, never fast.
+
+Variation. Add a `tryAcquireN(u64 n)` for operations that cost more than one token, and a fairness counter so callers are served in arrival order rather than competing. Then move the sleeping into a background refiller thread that wakes every few milliseconds and signals a condition variable, and compare the two designs on CPU wake-ups and on the accuracy of the rate under load.
+
+34.12 Exercises
 
 1. Comprehension. Explain why `count += 1` in two threads can lose an increment, and why `fetchAdd` cannot. Then explain why the rule is "atomic for one cell, mutex for a region," and give an example that tempts you to break it.
 

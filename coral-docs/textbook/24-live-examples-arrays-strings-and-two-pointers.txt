@@ -45,11 +45,10 @@ The implementation
         }
     }
 
-    i32 main() {
+    void main() {
         String text = String::from("hello");
         reverseString(&text);
         println("{}", text.asView());
-        return 0;
     }
 
 Two details matter here: the types and the mutability. The loop counters are `isize`, signed, because `j--` must reach zero and stop. An unsigned counter would wrap to a huge value on the final decrement and crash. The operations go through `String`, whose `at` and `atApply` give read and overwrite access. A `str` would not compile here, and that is no inconvenience. It is the type system telling you that reversing needs ownership of the bytes, not a view of them.
@@ -482,7 +481,371 @@ Edge cases and a variation
 
 An empty array or a single position traps nothing. A monotonically increasing or decreasing skyline traps nothing, because there is no valley; the code handles this because every position either sets a new maximum or contributes a zero difference. The variation: the two-pointer rule here and the one in 24.8 look alike but answer different questions, and mixing them up is a common mistake. In 24.8 we move the shorter wall because we are optimizing one container. Here we move the side with the smaller maximum because we are accumulating water everywhere. Write both and compare the move rules side by side; the difference in the problem statement is exactly the difference in the rule.
 
-24.10 Exercises
+24.10 Longest Common Prefix
+
+The problem
+
+Given a list of strings, find the longest prefix shared by every one of them. For `["flower", "flow", "flight"]` the answer is `"fl"`; for `["dog", "racecar", "car"]` it is the empty string.
+
+Picture this
+
+Lay the words out in a column, top to bottom, and read down the first character of each, then the second, then the third. As long as every word agrees on a column, that column belongs to the answer. The first column where any two words disagree ends the prefix. You never need to compare whole words; you compare one column at a time.
+
+Brute force
+
+Take every pair of words, find their shared prefix, and repeatedly shorten a running answer to the smallest one seen. It is `O(n · L)` in the worst case, but it rebuilds strings along the way and compares words that do not need comparing. It also duplicates work: two words that agree with the first word already agree with each other.
+
+The better approach
+
+Use the first word as the candidate prefix and shrink it. For each later word, compare it character by character against the candidate and cut the candidate down to the matching length. Once the candidate is empty, nothing more can be added and the scan can stop. This is the *vertical scan*, and it makes at most one pass over each word up to the current prefix length.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    str longestCommonPrefix(const Vec<str>* words) {
+        if (words->count() == 0) return str::empty();
+        str first = words->at(0);
+        usize limit = first.len;
+        for (usize i = 1; i < words->count(); i++) {
+            str w = words->at(i);
+            usize j = 0;
+            while (j < limit && j < w.len && w.at(j) == first.at(j)) {
+                j++;
+            }
+            limit = j;
+            if (limit == 0) break;
+        }
+        return first.slice(0, limit);
+    }
+
+`limit` is the only state, and it only ever shrinks, which is why the total work is bounded by the length of the shortest word times the number of words at the very worst, and usually far less. The returned `str` is a view into the first word's bytes, so no new memory is allocated at all; the caller's list must outlive the result, which the borrowed `str` type makes explicit.
+
+The cost
+
+Time is `O(n · L)` in the worst case, where `L` is the answer length: each word is scanned only up to the current prefix, and the prefix shrinks. Space is constant, one index and one length, because the answer is a view rather than a copy. A binary-search refinement halves the number of comparisons, but only pays off with truly enormous strings.
+
+Edge cases and a variation
+
+An empty list returns the empty string, and a single-word list returns that word in full. If any word is empty, the empty string is the shared prefix and the loop stops immediately. This compares bytes, so Unicode text with accented letters or emoji is compared as its UTF-8 encoding, which is correct for prefix purposes but treats a partial multibyte sequence as a character; Chapter 17's codepoint decoding is the fix. The variation: longest common *suffix*, by scanning each word from the back with a `limit` that counts from the end. The skeleton is identical; only the direction of the index and the meaning of `limit` change.
+
+24.11 Rotate an Array by k
+
+The problem
+
+Rotate an array to the right by `k` places, in place. So `[1, 2, 3, 4, 5, 6, 7]` rotated right by 3 becomes `[5, 6, 7, 1, 2, 3, 4]`.
+
+Picture this
+
+Cut a deck of cards and move the bottom `k` cards to the top. The obvious way is to repeatedly take the last card and move it to the front, `k` times, but that shuffles the whole deck `k` times over. The neat way is to flip the whole deck upside down, then flip each of the two piles back the right way up. Reversal plus reversal gives rotation, and it touches every card exactly twice.
+
+Brute force
+
+Rotate one position at a time, `k` times. Each rotation moves every element, so the cost is `O(n · k)`, and for `k` near `n` that is quadratic. It is simple and it is in place, and it is the baseline.
+
+The better approach
+
+Three reversals. Reverse the whole array, reverse the first `k` elements, then reverse the remaining `n - k`. After the first reversal the two groups are in the wrong internal order but on the correct sides; the second and third reversals restore the order inside each group. Every element is moved a constant number of times, so the work is linear. Reduce `k` modulo `n` first so that `k = n` (or `0`) is handled without special cases.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    void reverseRange(Vec<i32>* v, usize lo, usize hi) {
+        while (lo < hi) {
+            i32 t = v->at(lo);
+            v->set(lo, v->at(hi));
+            v->set(hi, t);
+            lo++;
+            hi--;
+        }
+    }
+
+    void rotateRight(Vec<i32>* v, usize k) {
+        usize n = v->count();
+        if (n == 0) return;
+        k = k % n;
+        if (k == 0) return;
+        reverseRange(v, 0, n - 1);
+        reverseRange(v, 0, k - 1);
+        reverseRange(v, k, n - 1);
+    }
+
+The two guards at the top are not decoration. An empty array would make `n - 1` wrap around when it is unsigned, and `k % n` would divide by zero; returning early avoids both. The `k % n` line also means a rotation by more than the length behaves correctly instead of reading out of bounds. `reverseRange` is the same two-pointer swap as 24.1, generalized to an arbitrary interval.
+
+The cost
+
+Time is linear: three passes, each moving each element at most once, so at most six writes per element. Space is constant, two indices and one temporary value. Compare the one-step-at-a-time version, which is also in place but `k` times slower.
+
+Edge cases and a variation
+
+An empty array and a `k` that is a multiple of `n` both do nothing. A single-element array is left alone even for large `k`. The variation: rotate to the *left* by `k` is the same routine applied to `n - k`, or equivalently the three reversals done with the two parts swapped. A second, genuinely different method is the "juggling" algorithm, which moves elements in cycles and does exactly `n` writes for the whole rotation rather than touching some elements twice. It is trickier to get right and worth reading once, if only to see the constant-factor trade.
+
+24.12 String Compression (Run-Length Encoding)
+
+The problem
+
+Compress a string by replacing each run of repeated characters with the character followed by the run length, omitting the length when it is one. So `"aabccc"` becomes `"a2bc3"` and `"abc"` stays `"abc"`.
+
+Picture this
+
+Walk the string and keep one finger at the start of the current run and another moving forward while the characters match. When the second finger finds a different character, the run is over: write the character, write the count if there was more than one, and move the start finger up to where the second one stopped. Every character is visited once by the moving finger and the runs are written in order.
+
+Brute force
+
+There is no meaningfully different slow version; a run-length compressor is naturally linear. The naive implementation instead rebuilds substrings and counts duplicates with an inner search for each position, which is quadratic and obscures the two-pointer skeleton that is the whole idea.
+
+The better approach
+
+One pass with a start index and a scan index. For each run, push the character into the output `String` and append the count when the run is longer than one. The only piece of machinery that is not obvious is turning a multi-digit count into its decimal characters, because Coral's formatting helpers are not the right tool for building a string one byte at a time.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::text::string { String };
+    import(lib) std::io::ios { println };
+
+    void pushUint(String* out, usize n) {
+        if (n == 0) {
+            out->pushChar(48);
+            return;
+        }
+        Vec<u8> digits = Vec<u8>::new();
+        while (n > 0) {
+            digits.push((u8)(48 + (n % 10)));
+            n = n / 10;
+        }
+        isize i = (isize)digits.count() - 1;
+        while (i >= 0) {
+            out->pushChar(digits.at((usize)i));
+            i--;
+        }
+    }
+
+    String compress(str s) {
+        String out = String::new();
+        usize i = 0;
+        while (i < s.len) {
+            u8 c = s.at(i);
+            usize j = i;
+            while (j < s.len && s.at(j) == c) {
+                j++;
+            }
+            out.pushChar(c);
+            usize run = j - i;
+            if (run > 1) pushUint(&out, run);
+            i = j;
+        }
+        return out;
+    }
+
+`pushUint` peels the decimal digits into a vector in reverse, then emits them in order; it is the integer-reversal idea of 23.3, used here to *write* a number rather than read one. The byte constant `48` is `'0'`, and adding a digit value to it produces the character. The compression loop itself is only six lines, which is the payoff for extracting the number-writing helper.
+
+The cost
+
+Time is linear in the input length: the scan index advances across each character once, and the digit work for the counts adds only a logarithm per run. Space is proportional to the length of the output, which for a highly repetitive string is far smaller than the input but in the worst case (no repeats) is the same size.
+
+Edge cases and a variation
+
+The empty string produces an empty string; the loop never runs. A string with no repeats returns a copy of itself with every count omitted. A run longer than nine exercises `pushUint`'s multi-digit path, which a `'0' + run` shortcut would get wrong. The variation from the interview version: if the compressed result is not shorter than the original, return the original. Keep the original `str` and the built `String`, then compare their lengths before returning. A second variation: decode, or *decompress*, a run-length string, which is the same two-pointer walk in reverse and is a good check that you understand the format you invented.
+
+24.13 Product of Array Except Self
+
+The problem
+
+Given an array, produce a second array where position `i` holds the product of every element except `v[i]`. Do it without using division, so zeros and negative numbers cause no trouble, and in linear time.
+
+Picture this
+
+The product of everything except position `i` is (the product of everything to its left) times (the product of everything to its right). So make two sweeps. On the way right, record at each position the product of everything before it. On the way back, multiply that by the product of everything after it, accumulated as you go. Neither sweep needs to know the whole array's product, so division never enters.
+
+Brute force
+
+For each position, loop over every other position and multiply. That is `O(n²)` and it recomputes the same partial products from every starting point.
+
+The better approach
+
+Two passes and one output array. The first pass fills `out[i]` with the running prefix product before `i`. The second pass walks backward maintaining a running suffix product and multiplies it into `out[i]`. The output array itself is the only extra storage, so beyond the answer the space is constant. Widen the accumulator to `i64`: a product of many `i32` values overflows a 32-bit integer almost immediately.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    Vec<i64> productExceptSelf(const Vec<i32>* v) {
+        usize n = v->count();
+        Vec<i64> out = Vec<i64>::withCap(n);
+        for (usize i = 0; i < n; i++) out.push(1);
+
+        i64 prefix = 1;
+        for (usize i = 0; i < n; i++) {
+            out.set(i, prefix);
+            prefix = prefix * (i64)v->at(i);
+        }
+
+        i64 suffix = 1;
+        isize i = (isize)n - 1;
+        while (i >= 0) {
+            out.set((usize)i, out.at((usize)i) * suffix);
+            suffix = suffix * (i64)v->at((usize)i);
+            i--;
+        }
+        return out;
+    }
+
+The forward pass stores the product of the elements strictly before `i`; the backward pass multiplies in the product strictly after `i`. They never overlap, which is why no division is needed and zeros are harmless: a zero simply makes every prefix after it zero and every suffix before it zero, and each answer ends up correct. The signed `isize` backward index is the same choice as 24.1, so the `i--` can reach zero and stop without wrapping.
+
+The cost
+
+Time is linear: two passes, constant work per element. Space is linear only because the answer is the same length as the input; the working state is a single running product. This is the discipline that distinguishes "extra space" from "output space," and the problem is usually asked precisely to test that distinction.
+
+Edge cases and a variation
+
+An empty array returns an empty result. A single element returns a single one, since the product of nothing is one. A zero in the input is handled by the two-pass structure, unlike a divide-by-total approach which would break. The variation: allow division and solve it in one pass by taking the total product and dividing each element out, then handle zeros as a special case. It is shorter and it fails on the cases that matter, which is exactly the lesson of the problem.
+
+24.14 3Sum
+
+The problem
+
+Given an array of integers, return every unique triple of *values* (not positions) that sums to zero. So from `[-1, 0, 1, 2, -1, -4]` the answer is `[-1, -1, 2]` and `[-1, 0, 1]`.
+
+Picture this
+
+Sort the array first, so equal values sit together and we can skip repeats by hand. Fix the smallest value of the triple with an outer loop, then find the other two with the converging two-pointer walk of 24.3. Because the array is sorted, when the sum is too small we can move the left pointer right and know we have not missed a candidate, exactly as in the sorted two-sum.
+
+Brute force
+
+Three nested loops over all triples, checking each sum and then deduplicating the results. That is `O(n³)` and the deduplication is a fiddly second problem on top. It ignores the sortedness that a single sort would provide.
+
+The better approach
+
+Sort once, then fix the first element with an outer index `i`. For the remaining window `(i, end]`, run the two-pointer two-sum against the target `-v[i]`. The sortedness licenses the pointer movement, and it also makes duplicate-skipping trivial: skip an `i` equal to the previous one, and after recording a triple, skip equal values on both ends of the window.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::sort { sortI32 };
+    import(lib) std::io::ios { println };
+
+    Vec<Vec<i32>> threeSum(Vec<i32>* nums) {
+        sortI32(nums);
+        Vec<Vec<i32>> out = Vec<Vec<i32>>::new();
+        usize n = nums->count();
+        if (n < 3) return out;
+
+        for (usize i = 0; i + 2 < n; i++) {
+            if (i > 0 && nums->at(i) == nums->at(i - 1)) continue;
+            isize lo = (isize)i + 1;
+            isize hi = (isize)n - 1;
+            while (lo < hi) {
+                i64 sum = (i64)nums->at((usize)lo)
+                        + (i64)nums->at((usize)hi)
+                        + (i64)nums->at(i);
+                if (sum == 0) {
+                    Vec<i32> triple = Vec<i32>::new();
+                    triple.push(nums->at(i));
+                    triple.push(nums->at((usize)lo));
+                    triple.push(nums->at((usize)hi));
+                    out.push(triple);
+                    lo++;
+                    hi--;
+                    while (lo < hi && nums->at((usize)lo) == nums->at((usize)lo - 1)) lo++;
+                    while (lo < hi && nums->at((usize)hi) == nums->at((usize)hi + 1)) hi--;
+                } else if (sum < 0) {
+                    lo++;
+                } else {
+                    hi--;
+                }
+            }
+        }
+        return out;
+    }
+
+There are three places duplicates could sneak in, and each is guarded once. The outer skip handles repeated first elements; the two inner skips handle repeated second and third values after a hit. The sum is widened to `i64` so three large `i32`s cannot overflow and flip the sign of the comparison. The returned triples come out in the order the sorted array produces, one per distinct value combination.
+
+The cost
+
+Sorting is `O(n log n)`, and the outer loop with its inner two-pointer walk adds `O(n²)`, so the total is `O(n²)`, which beats the cubic brute force by a full factor of `n`. Space is constant beyond the sort and the output. The sorting cost is negligible next to the quadratic scan for any interesting input.
+
+Edge cases and a variation
+
+Fewer than three elements returns nothing. All-zero input yields exactly one triple `[0, 0, 0]`, because the two inner skips collapse the repeats. The variation: *k*-sum generalizes this by fixing the first `k - 2` elements with nested loops and running the two-pointer walk for the last two; for fixed `k` that is `O(n^{k-1})`, and the pattern of "sort, fix, then converge" is identical all the way down. The 3Sum *closest* variant replaces the equality test with a running best distance, and is often the easier interview version because it does not need the duplicate guards.
+
+24.15 Find All Anagrams in a String
+
+The problem
+
+Given a string `s` and a shorter pattern `p`, return the starting indices of every substring of `s` that is an anagram of `p`. So for `s = "cbaebabacd"` and `p = "abc"`, the answer is `0` and `6` (`"cba"` and `"bac"`).
+
+Picture this
+
+An anagram is fully described by how many of each letter it contains, not by their order. So slide a window exactly as wide as `p` across `s`, and at each position ask whether the window's letter counts match `p`'s. When the window moves one step, only two letters change: one enters on the right and one leaves on the left. Update two counts instead of recounting the whole window.
+
+Brute force
+
+At every start position, copy the next `m` characters, sort them, and compare to the sorted pattern. There are `n - m + 1` windows, and each costs `O(m log m)`, for `O(n · m log m)` overall. It re-sorts windows that differ from their neighbours by a single letter.
+
+The better approach
+
+A *fixed-size sliding window* with two frequency arrays, one for the pattern and one for the current window, each of 26 counters. Seed both from the first window, then compare. On each step, add the entering character to the window count and subtract the leaving one. Since the alphabet is tiny and fixed, comparing the two arrays is a constant 26 operations, and the total is linear in `n`.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    Vec<i32> findAnagrams(str s, str p) {
+        Vec<i32> out = Vec<i32>::new();
+        usize n = s.len;
+        usize m = p.len;
+        if (m == 0 || n < m) return out;
+
+        Vec<i32> need = Vec<i32>::withCap(26);
+        Vec<i32> win = Vec<i32>::withCap(26);
+        for (usize i = 0; i < 26; i++) {
+            need.push(0);
+            win.push(0);
+        }
+
+        for (usize i = 0; i < m; i++) {
+            usize k = (usize)((i32)p.at(i) - 97);
+            need.set(k, need.at(k) + 1);
+        }
+
+        for (usize i = 0; i < n; i++) {
+            usize enter = (usize)((i32)s.at(i) - 97);
+            win.set(enter, win.at(enter) + 1);
+            if (i >= m) {
+                usize gone = (usize)((i32)s.at(i - m) - 97);
+                win.set(gone, win.at(gone) - 1);
+            }
+            if (i >= m - 1) {
+                bool same = true;
+                for (usize c = 0; c < 26; c++) {
+                    if (win.at(c) != need.at(c)) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) out.push((i32)(i - m + 1));
+            }
+        }
+        return out;
+    }
+
+The subtraction `(i32)s.at(i) - 97` maps `'a'` to index 0 and `'z'` to 25; the constant `97` is `'a'`. The two conditions delimit the window: remove the leaving character only once `i >= m`, and test only once the window is full at `i >= m - 1`. The comparison loop breaks on the first mismatch, which makes the common (non-matching) case cheap.
+
+The cost
+
+Time is `O(26 · n)`, which is `O(n)` because the alphabet size is a constant. Space is constant: two arrays of 26 integers, regardless of how long `s` and `p` are. This is the fixed-alphabet cousin of 25.6's sliding window, where the map grows with the number of distinct characters instead.
+
+Edge cases and a variation
+
+An empty pattern is not a valid anagram and returns no indices; a pattern longer than `s` cannot fit and also returns none. This assumes lowercase `a` to `z`; an uppercase letter or a space would compute an out-of-range index and must be rejected first, or the counters must be widened to cover the full byte range. The variation: at most `k` distinct characters, or "find all anagrams of any permutation of a list of patterns," both loosen the fixed-size comparison into a count of how many letters are satisfied and how many distinct letters are present. Fixed size becomes sliding maximum, but the two-array diffing idea stays.
+
+24.16 Exercises
 
 1. Comprehension. In 24.1, why must the loop indices be signed (`isize`) rather than unsigned? Construct the exact failure on a three-character string if they were `usize`.
 

@@ -10,6 +10,11 @@ docs win for *intended* semantics.
 ## 1. Lexical categories
 
 - Whitespace, `// line`, `/* block */` (block comments are not nested).
+- Doc comments: `///` lines. A contiguous run (no blank lines between) directly
+  above a declaration is one doc block; `////` is a plain comment and ends the
+  block. The parser stores the block against the declaration's name line and
+  the LSP renders it in hover; nothing else consumes docs yet. (`//!` module
+  docs are future work.)
 - Tokens: keywords, identifiers, numbers, string/char literals, operators/delimiters.
 - Identifiers: XID_Start / XID_Continue (ASCII reduced form is optimized; many
   Unicode ranges are hardcoded — a correctness smell, not full UAX31).

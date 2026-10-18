@@ -45,14 +45,13 @@ The implementation
         return out;
     }
 
-    i32 main() {
+    void main() {
         Vec<i32> nums = Vec<i32>::new();
         nums.push(1); nums.push(2); nums.push(3); nums.push(4);
         Vec<i32> out = runningSum(&nums);
         for (i32 x : out) {
             println("{}", x);
         }
-        return 0;
     }
 
 Notice three small courtesies. `withCap` reserves exactly the room we need, so the vector never reallocates while we fill it. The loop condition reads `nums->count()` on each pass, the checked, honest way to walk a `Vec` by index (Chapter 16 covers the pointer-versus-index distinction). And `sum` is a plain local: no allocation, no bookkeeping beyond one integer.
@@ -432,7 +431,225 @@ Edge cases and a variation
 
 An exponent of zero returns one, including for `base = 0` by the common convention (some call 0 to the 0th undefined; choose and document). Negative exponents are excluded by the `u32` type, a design decision made visible in the signature: you cannot call this function with a negative exponent, so the question never arises. Overflow is the real risk, since the intermediate squares grow quickly. For modular exponentiation, the variation that matters in cryptography, you take a remainder after every multiply and the algorithm is unchanged. That is the version inside every RSA implementation and inside Chapter 25's hashing discussion. Worth writing once by hand.
 
-23.9 Exercises
+23.9 Armstrong (Narcissistic) Numbers
+
+The problem
+
+A number is *Armstrong* (also called *narcissistic*) when it equals the sum of its own digits, each raised to the power of how many digits the number has. `153` has three digits, and `1³ + 5³ + 3³ = 1 + 125 + 27 = 153`, so it is Armstrong. Given a bound `n`, list every Armstrong number up to and including `n`. As a companion, decide whether a single number is Armstrong.
+
+Picture this
+
+Each digit of a number carries a weight: itself, raised to the count of digits. To test the number you peel off the digits one at a time, weigh each, and add the weights. The only mild surprise is that the exponent depends on the number you are testing, not on the digit, so you must count the digits before you weigh anything.
+
+Brute force
+
+The literal reading: for a candidate, peel each digit, and raise it by multiplying it by itself `d` times, where `d` is the digit count. That is `d` multiplications per digit, so about `d²` work per number. It is correct, and it recomputes the same tiny powers over and over: `5³` does not depend on which number is being tested.
+
+The better approach
+
+Count the digits once, then reuse 23.8's squaring `power` helper so each `digit^d` costs a handful of multiplications instead of `d`. The digit loop does not change at all. Fast exponentiation earns its keep here even for tiny exponents, because it collapses the "multiply d times" idea into one reusable helper and removes a nested loop from the middle of the test.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 ipow(i64 base, i64 exp) {
+        i64 result = 1;
+        i64 factor = base;
+        i64 e = exp;
+        while (e > 0) {
+            if ((e & 1) != 0) {
+                result = result * factor;
+            }
+            factor = factor * factor;
+            e = e >> 1;
+        }
+        return result;
+    }
+
+    i32 digitCount(i32 n) {
+        if (n == 0) return 1;
+        i32 d = 0;
+        while (n > 0) {
+            d++;
+            n = n / 10;
+        }
+        return d;
+    }
+
+    bool isArmstrong(i32 n) {
+        if (n < 0) return false;
+        i32 digits = digitCount(n);
+        i32 m = n;
+        i64 sum = 0;
+        while (m > 0) {
+            i64 d = m % 10;
+            sum = sum + ipow(d, (i64)digits);
+            m = m / 10;
+        }
+        return (i64)n == sum;
+    }
+
+    Vec<i32> armstrongUpTo(i32 n) {
+        Vec<i32> out = Vec<i32>::new();
+        for (i32 x = 1; x <= n; x++) {
+            if (isArmstrong(x)) out.push(x);
+        }
+        return out;
+    }
+
+The `ipow` helper is the 23.8 loop verbatim with the exponent type widened to `i64`, so it can serve any caller. `sum` is an `i64` because a ten-digit number can raise a digit to the tenth power many times, and the running total is not guaranteed to fit a 32-bit integer even when the final answer would.
+
+The cost
+
+Testing one number costs about `d` digit steps times `log d` squarings, so `O(d log d)`, effectively constant for a 32-bit value. Listing every Armstrong number up to `n` therefore costs `O(n log n)` in the digit counts. Space is constant apart from the returned vector. The numbers are rare, so the output is tiny no matter how large `n` gets.
+
+Edge cases and a variation
+
+Zero is Armstrong by the usual convention (`0` has one digit and `0¹ = 0`), which is why the listing starts at one only to keep the warm-up honest about what "positive" means. Single digits 1 through 9 are all Armstrong trivially, since `9 = 9¹`. Negative numbers are rejected because the minus sign is not a digit. The variation worth trying: precompute a table `power[d][digit]` for `d` up to ten and `digit` from 0 to 9, then each test is a table lookup inside the digit loop. It is more code and more memory, and it trades a few multiplications for an array index; that trade is the same one Chapter 16 draws between computing and caching.
+
+23.10 The Collatz Sequence
+
+The problem
+
+Start with a positive integer `n`. If it is even, halve it; if it is odd, replace it with `3n + 1`. Repeat until you reach 1. Return how many steps that took. As a companion, among all starting values up to a limit, find the one whose chain is longest.
+
+Picture this
+
+The sequence is nicknamed the hailstone sequence because the numbers rise and fall unpredictably before they settle at 1: `7, 22, 11, 34, 17, 52, 26, 13, 40, 20, 10, 5, 16, 8, 4, 2, 1`. Nobody has proved every chain reaches 1, but for every number anyone has tried it does. For our purposes the interesting part is that different starting numbers share the same tails: once two chains meet, the rest is identical.
+
+Brute force
+
+Simulate each starting value independently and count. That is fast per number, but across a range of starts it recomputes shared tails again and again. Every chain that passes through 16 pays for the walk from 16 down to 1, and many chains pass through 16.
+
+The better approach
+
+Remember the chain length of every value you compute, in a table indexed by the value. Before stepping, check the table; if the answer is known, add it and stop. This is the memoized recursion of 23.6, applied to a problem where the tail is shared rather than the head. Values larger than the limit are computed but not stored, because the table only has room for the starts.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 collatzSteps(i64 n, Vec<i32>* memo) {
+        if (n == 1) return 0;
+        if (n > 0 && n < (i64)memo->count()) {
+            i32 cached = memo->at((usize)n);
+            if (cached >= 0) return (i64)cached;
+        }
+        i64 next = 0;
+        if (n % 2 == 0) {
+            next = n / 2;
+        } else {
+            next = 3 * n + 1;
+        }
+        i64 steps = 1 + collatzSteps(next, memo);
+        if (n > 0 && n < (i64)memo->count()) {
+            memo->set((usize)n, (i32)steps);
+        }
+        return steps;
+    }
+
+    i32 longestCollatz(i32 limit) {
+        if (limit < 1) return 0;
+        Vec<i32> memo = Vec<i32>::withCap((usize)limit + 1);
+        for (i32 i = 0; i <= limit; i++) memo.push(-1);
+        memo.set(1, 0);
+
+        i32 bestStart = 1;
+        i64 bestLen = 0;
+        for (i32 i = 1; i <= limit; i++) {
+            i64 len = collatzSteps((i64)i, &memo);
+            if (len > bestLen) {
+                bestLen = len;
+                bestStart = i;
+            }
+        }
+        return bestStart;
+    }
+
+The sentinel `-1` means "not computed yet," exactly as in `fibMemo` from 23.6, and it is safe here for the same reason: a chain length is never negative. The arithmetic runs in `i64` because the odd step triples a value that has already grown, and a large `n` can push `3n + 1` past what a 32-bit integer holds even though the start fits one.
+
+The cost
+
+With memoization the work is close to linear in the limit: each value in the table is computed once, and values above the limit appear only as transient links. Without it, the cost is the sum of all chain lengths, far larger. Space is linear in the limit, one integer per starting value. The recursion depth is at most the longest chain, which for values in the millions stays in the hundreds.
+
+Edge cases and a variation
+
+`n = 0` is not a legal start and `limit < 1` returns zero before any work. `n = 1` takes no steps, which the table records directly. The real numerical trap is overflow on the odd branch, which is why the whole computation is `i64`; a 32-bit `3n + 1` wraps and can bounce forever without reaching 1. The variation: record not just the length but the *peak* value each chain reaches, and find the start whose chain climbs highest. Same loop, one more running maximum threaded through the recursion's return value or carried in an extra table.
+
+23.11 Perfect Numbers and Amicable Pairs
+
+The problem
+
+A *perfect* number equals the sum of its proper divisors, the divisors strictly smaller than itself: the divisors of `28` are `1, 2, 4, 7, 14`, and `1 + 2 + 4 + 7 + 14 = 28`. Two numbers are an *amicable pair* when each equals the sum of the other's proper divisors: `220` and `284` are the classic example. Given a bound `n`, list the perfect numbers up to `n` and the amicable pairs below it.
+
+Picture this
+
+Divisor sums are a friendship ledger. Every number writes down the sum of its proper divisors; a perfect number finds its own name, and two amicable numbers find each other's. The only real work is computing a divisor sum, and the trick is that divisors come in factor pairs: if `d` divides `n`, so does `n / d`. So you only search up to the square root and add both members of each pair, being careful not to double-count the square root when `n` is a perfect square.
+
+Brute force
+
+For a single number, test every integer from 1 to `n - 1` and add the ones that divide. That is linear per number, so listing perfect numbers up to `n` costs about `n²`, and the amicable scan does that work twice per candidate. Slow enough that it stalls in the tens of thousands.
+
+The better approach
+
+Compute the divisor sum in `O(sqrt n)` by walking `d` from 2 while `d * d <= n`. Each time `d` divides `n`, add both `d` and `n / d`, skipping the second when the two are equal. Seed the sum at 1 because 1 divides everything. Then a perfect test is one comparison, and an amicable test is two divisor sums.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 divisorSum(i64 n) {
+        if (n < 2) return 0;
+        i64 sum = 1;
+        for (i64 d = 2; d * d <= n; d++) {
+            if (n % d == 0) {
+                sum = sum + d;
+                i64 other = n / d;
+                if (other != d) sum = sum + other;
+            }
+        }
+        return sum;
+    }
+
+    bool isPerfect(i64 n) {
+        return n > 1 && divisorSum(n) == n;
+    }
+
+    Vec<i64> perfectUpTo(i64 n) {
+        Vec<i64> out = Vec<i64>::new();
+        for (i64 x = 2; x <= n; x++) {
+            if (isPerfect(x)) out.push(x);
+        }
+        return out;
+    }
+
+    Vec<i64> amicableFlat(i64 n) {
+        Vec<i64> out = Vec<i64>::new();
+        for (i64 a = 2; a <= n; a++) {
+            i64 b = divisorSum(a);
+            if (b > a && b <= n && divisorSum(b) == a) {
+                out.push(a);
+                out.push(b);
+            }
+        }
+        return out;
+    }
+
+The `other != d` guard is the square-root subtlety in action: for `n = 16`, `d = 4` divides it, but `16 / 4` is also `4`, and adding it twice would overcount the divisor 4. The `b > a` test in `amicableFlat` keeps each pair once and lets `a < b` handle the second half of the reciprocity, so `(220, 284)` is emitted once and never as `(284, 220)`.
+
+The cost
+
+One divisor sum is `O(sqrt n)`; listing the perfect numbers up to `n` is `O(n sqrt n)`; the amicable scan is `O(n sqrt n)` as well, since it calls the sum a small constant number of times per candidate. Space is constant beyond the returned vector. For bounds in the millions you would build a divisor-sum sieve instead, filling every value's sum in `O(n log n)` total, the same inversion the prime sieve of 23.7 uses.
+
+Edge cases and a variation
+
+One is not perfect, because its only proper divisor sum is zero, and `n < 2` returns zero from the helper. Prime numbers have divisor sum one, so they never satisfy `isPerfect` and never form a pair with anything but one, which `b > a` filters out. The variation: build the divisor sums for the whole range with a sieve, then both problems become a single linear scan. Adding `d` to every multiple of `d` for `d` from 1 to `n` costs `O(n log n)` total and turns the amicable scan from `O(n sqrt n)` into `O(n)`, a foreshadowing of the sieve-versus-trial-division trade that opened 23.7.
+
+23.12 Exercises
 
 1. Comprehension. In 23.1, why is the brute-force running-sum quadratic while the accumulator version is linear? State in one sentence what the accumulator "carries forward" that the brute force recomputes.
 

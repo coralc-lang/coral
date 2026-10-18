@@ -69,6 +69,16 @@ The class-versus-struct distinction in many languages is a distinction between r
 
 A variable of a struct type holds the struct's fields. Assigning the struct to another variable copies those fields; passing it to a function passes the fields; returning it moves them out. There is no hidden address underneath, no identity the language manages, and no aliasing you did not write. Two `Point` values with the same x and y are the same point in every way that matters, because a point is its coordinates and nothing else.
 
+In plain words, a struct variable is like a box of pieces, not a pointer to a shared box. Hand a friend a copy of the pieces and the two boxes are separate: changing your pieces does not change theirs. A pointer (`T*`) is the opposite — it is an address two people can share — and Coral makes you write the pointer when you want that sharing.
+
+    struct Point { f64 x; f64 y; }
+    Point a = Point { .x = 1.0, .y = 2.0 };
+    Point b = a;          // b gets its own copy of the two fields
+    b.x = 9.0;
+    println("{} {}", a.x, b.x);   // 1.0 9.0 — a is untouched
+
+Two `Point` variables, two independent boxes of coordinates. Nothing in that snippet can make `a` change when `b` does, and that is the whole promise of value semantics.
+
 That simple story has one refinement, and it is the modern ownership model from Chapter 11 poking its head in. When a struct owns a resource — a heap buffer, a file handle, a lock — the copy of its fields would leave two variables pointing at one resource, and if both released it, the resource would be freed twice. Coral's rule for those types is that assignment moves rather than duplicates. `Vec<u32> a = ...; Vec<u32> b = a;` copies the three fields, and the compiler cancels `a`'s automatic cleanup, so exactly one variable is left responsible for the buffer. The move is what the fields look like they should be; the difference is that the compiler knows the source has given its resource away.
 
 So value semantics and moves are the same idea seen from two sides: a struct is its fields, and when the fields include ownership, the assignment hands that ownership over rather than sharing it. To share on purpose, you write the sharing down — with a pointer, or with a counted smart pointer:
@@ -85,9 +95,13 @@ So value semantics and moves are the same idea seen from two sides: a struct is 
 
 The difference between the class model and Coral here is not that Coral lacks references. It is that the reference is a type you write (`T*`, `SharedPtr<T>`) instead of a default you inherit. A value parameter is a copy or a move, a pointer parameter is a reference, and the signature says which is which. The value-versus-reference question is answered at each parameter, and the answer is visible in the type.
 
+Simply put, a struct value is a box you own, and a pointer is a shared address you chose to write down. When you pass a struct by value, you hand over a copy (or, for an owning type, the original itself); when you pass a pointer, you hand over the address and both sides see the same data. In a language where objects are references by default, this sharing happens invisibly; in Coral it happens only when a `*` appears in the type.
+
 10.4 Methods and the Receiver
 
 A method is a function bound to a type: a function whose receiver is a value of that type. You met methods in Chapter 6, so this section only fixes the object-oriented vocabulary and the two spellings.
+
+If the word "receiver" is unfamiliar, it simply means the value the method was called on. When you write `c.bump()`, the value `c` is the receiver, and inside `bump` it is available under the name `self`. Calling a method is the same as calling a function with the receiver as its first argument, just written in the order you read naturally.
 
 The receiver of a method is the value the method was called on, and it is available inside the body under the name `self`. You do not write it in the parameter list; Coral supplies it, and the call site names it with a dot:
 
@@ -112,6 +126,8 @@ A method that belongs to the type rather than to any particular value is `static
     }
 
 Statics are called on the type with the double colon, `Counter::start()`; instance methods are called on a value with the dot, `c.bump()`. The `::` versus `.` distinction is the distinction between a type and a value, and it is visible at every call site, which is the whole point.
+
+A common beginner stumble is mixing these up. If the thing on the left is a type name, use `::`; if it is a value you declared, use `.`. `Counter::start()` makes a new counter; `c.bump()` changes the one you already have.
 
 There is one more spelling you will meet in the standard library: the explicit receiver, written as a first parameter instead of implied by `self`. `T get(const self*)` and `void bump(self*)` mean the same thing as the trailing-`const` and mutating forms above, with the receiver's pointer spelled out. The implicit form is the dominant one in application code because the bodies read more naturally; the explicit form appears where a method must hand the receiver onward or store it. Both describe the same method.
 
@@ -166,6 +182,8 @@ The first form is the ordinary cleanup method, and the standard library's owning
 
 The release happens when `dispose` is called and not before, which is the determinism the manual model buys: the memory is freed at a line you can point at.
 
+If cleanup-on-exit is new, think of `defer` as promising the janitor a job before you leave the room. Whichever door you exit through — the normal end of the block, or an early return — the cleanup runs on the way out. Writing the cleanup next to the acquisition, in the same place, is what makes it easy to see that the pair is complete.
+
 The second form is `defer`, the statement that binds a cleanup to a block and guarantees it on every exit. Where a destructor is tied to a scope by the language, `defer` ties it by writing the tie down:
 
     void process(File f) {
@@ -185,6 +203,8 @@ The third form is the one that most resembles a destructor, and it is the compil
 With this conformance, every `SmartPtr<T>` local is released at its closing brace, and the program writes no release at all. That is the destructor, opt-in and named.
 
 One honest note, and it returns in full in the memory chapter. The standard library's own files mostly free by hand rather than relying on `@drop`, and they say so at the top of the file with `#[[no_drop_all]]`, which turns automatic cleanup off for the whole file. Library code lays out and frees its bytes deliberately, and skipping the auto-RAII work keeps the library's compile times down, since the library is compiled by every program that imports it. Your application file, which has no such attribute, gets the automatic release. You never call `drop()` yourself — E1301 forbids it, because a value's scope will end and the automatic call will run too. If you need to release something early, you call its ordinary cleanup method, or you scope the value so the boundary you want is the one you wrote.
+
+A common mistake here is to call the cleanup yourself when the compiler is already going to. If a value conforms to `@drop`, the scope fires its `drop` on exit; a hand-written `drop()` call is E1301 precisely because it would run the release twice. The rule of thumb: call the ordinary method (`dispose`) if you want to release early, and otherwise let the scope finish and do it for you once.
 
 10.8 Inheritance and Its Absence
 
@@ -219,6 +239,8 @@ Delegation is composition in action: a type contains another and forwards its op
 
 Every operation forwards. `enqueue` is `pushBack` under another name, `dequeue` is `popFront`, and the queue's behaviour is the deque's behaviour with fewer doors. The virtue is that the queue does not copy the deque's logic; it reuses it. When the deque's `pushBack` gets faster or its `popFront` gets a fix, the queue inherits the improvement for free, because it forwards. The reuse that inheritance promises — the subclass sharing the base's implementation — is delivered here without a subclass relationship.
 
+Simply put, inheritance says "a queue is a kind of deque"; composition says "a queue has a deque." The second is often the truer statement, because a queue is not really interchangeable with a general deque — it is a deque with a narrower promise. By holding one as a field rather than claiming to be one, the queue keeps its own identity and its own interface, and the deque stays free to change underneath it.
+
 A decorator is a delegation with behaviour added at the seam. A logging queue wraps a queue, forwards the core operations, and contributes an extra:
 
     pub struct LoggingQueue<T> {
@@ -243,6 +265,8 @@ A decorator is a delegation with behaviour added at the seam. A logging queue wr
 10.10 Traits as Interfaces
 
 The interface — the named set of operations a piece of shared code is written against — is the trait, and Chapter 6 covers it completely. What belongs in this chapter is the object-oriented framing, because the trait is what replaces the interface and a large part of inheritance at once.
+
+In plain words, a trait is a job description. It lists the things a type must be able to do — `area`, `perimeter`, `name` — without saying how. Each type that applies for the job writes its own answers in an extend block, and the compiler checks that every listed duty was actually filled. A function written against the job description then works with any type that holds the job.
 
 Picture a drawing program that holds a list of shapes and must report the largest area. Written with no interface machinery, it inspects each shape's kind and switches: the circle branch, the rectangle branch. Every new kind of shape means editing the code that measures shapes, and every place that code lives is a place to miss. The trait fixes this. It declares the operations once, each type supplies its own bodies in an extend block, and the measuring code is written against the operations rather than against any one kind.
 
@@ -333,6 +357,8 @@ A switch over a variant dispatches on the shape of a value, and the compiler che
 
 The pattern `Shape::Circle { radius }` both checks that this is a circle and binds its radius to a local name the arm's body can use. A switch over a variant or an enum must be exhaustive or carry an `else`; forget a case and the compiler reports it (E0608), naming what is missing. That is why adding a case to a variant is safe — every switch that handles it refuses to compile until it handles the new case too.
 
+If pattern matching is new, it helps to walk one example slowly. Give the `Shape` variant the value `Shape::Circle { .radius = 2.0 }`. The switch asks each arm in turn: is this a `Circle`? Yes. So it makes a local `radius` holding `2.0` and runs that arm's body, computing `3.14159 * 2.0 * 2.0`. The other arms are never tried.
+
 The same dispatch happens on types inside a generic, using a `comptime` block. Because the type parameter is known during the build, a switch over it resolves to a single arm, and only that arm is generated:
 
     void render<T>(T value) {
@@ -400,6 +426,10 @@ A client that reports on a collection uses the trait object, because the collect
     }
 
 `report` is written once, against Shape, and it runs for a vector of circles, a vector of squares, or a vector of any shape the library adds later. Adding a shape is a new struct and a new conformance; `report`, the trait, and every existing shape stay unchanged. That is the open-closed idea — open to new types, closed to modification of the code that uses them — and it is achieved by the trait and the dispatch through it. Notice the choice of `any Shape` rather than a generic: the vector mixes concrete types, so the common dynamic type is exactly what makes the collection possible. A generic could report a homogeneous `Vec<T>`, but not a mixed one, because `T` would have to be a single type. The choice between a generic and `any` follows from the data, not from taste.
+
+Why this matters in a real program: this is the shape behind a plugin system, a renderer that draws many kinds of object, or a payment handler that supports many providers. You write the walking, reporting, or drawing code once against the trait, and every new kind of thing is a new type plus a conformance — no existing function is edited. The one cost is the runtime indirection of `any Shape`, which is exactly the trade the class world pays for a virtual call, made visible instead of hidden.
+
+A common mistake is to reach for `any Shape` when every element is the same type. If your vector holds only circles, `Vec<Circle>` plus a generic `report<T>` is faster and is checked at compile time; `any` earns its keep only when the elements genuinely differ at runtime.
 
 10.17 The Encapsulation Tradeoff
 

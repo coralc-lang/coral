@@ -39,6 +39,8 @@ Code that does not appear in `lib.crl` is not part of the module's surface; it i
 
 Hold on — how is it that `string.crl` can be reached by an outsider at all, if it is just a file? Through the `pub mod` line, and only through it. The mechanism is worth stating plainly because it explains the whole chapter: a sibling file is not automatically part of the module. It becomes part of the module when the surface exports it. Until then it is a book in the back office. This is the opposite of how many languages work, where putting a file in a folder is itself a kind of export, and it is deliberate. In Coral, being reachable is a decision someone wrote down, not a side effect of where a file was saved.
 
+If you are new to modules, the plain version is this: creating a file does not show it to the world. Only the catalogue — `lib.crl` — shows anything. It is like a shop's window display: the shop may hold hundreds of items in the back, but only the ones placed in the window are visible from the street.
+
 14.2 The Four Import Forms
 
 A file brings names into scope with `import`. Four forms exist, and each answers a different question. Learn the question each one answers and you will never have to memorise the syntax.
@@ -50,6 +52,10 @@ The first form imports a sibling file by bare name. No quotes, no extension; the
 This is the form you use inside a module, where files sit next to each other. Because the name is a bare identifier, it is greppable: searching for `import lexer` finds every file that depends on `lexer.crl`, and a bare name cannot accidentally contain a path that escapes upward. The braces name the symbols you want from that file. If a dependency is not a sibling, it is not a sibling import; it is one of the following forms.
 
 Read the braces carefully, because they are the "allow-list." `import lexer { Lexer, Token };` does not bring in the whole of `lexer.crl`; it brings in exactly two names. If someone later adds a `Parser` to `lexer.crl`, your file does not silently gain a `Parser` in scope. The list is the contract at the file level in the same way that `lib.crl` is the contract at the module level. This is the same philosophy applied twice: depend on names you chose, not on names that happened to appear.
+
+A common mistake is to import a file and assume every name inside it arrived. It did not: only the names in the braces came. If you then use a name that was never imported, the compiler reports it as unknown, and the fix is to add it to the list — which is the list quietly doing its job as the file-level contract.
+
+In plain words, an import is like ordering from a menu rather than raiding the kitchen. You name exactly the dishes you want, and if the kitchen adds a new one tomorrow, your order does not change. The braces are your order; what you leave out simply never reaches your table.
 
 The second form imports a name from another module through the module table. A double-colon path names the module and the exported item:
 
@@ -132,6 +138,10 @@ Privacy applies at the item level, not only the module level. In the surface fil
 
 Outside code can hold a `TcpSocket`, pass it to `tcpSend`, and never touch the descriptor. If the representation changes from an fd to a pointer, no caller notices. That is the whole point of a private field: it makes the type's representation free to change.
 
+In plain words, a private field is a locked drawer inside a machine the user is allowed to operate. The user can press the buttons you expose, but they cannot reach into the drawer and rearrange its contents. That is the freedom that lets you change what is in the drawer later without breaking anyone who only ever pressed the buttons.
+
+Simply put, privacy is a promise about what will not change. A `pub` name is a promise that you will keep it working; a private name is one you are free to rewrite tomorrow. That is why starting a new public type with private fields is the safer habit: every field you expose is a small contract you now have to honour.
+
 Think about what an opaque handle buys you with a concrete story. Suppose you are writing an audio library, and a `Decoder` is exposed to users. If the users can see the fields, then every field is a promise: you cannot remove one, rename one, or change its type without breaking them. If the fields are private and the users only ever call `decode`, `reset`, and `close`, then your internal buffer, your sample cursor, and your platform handle are all yours to rearrange. The users hold a `Decoder`; they do not know or care what is inside it. That is the difference between a type you can evolve for ten years and a type that is frozen the week you ship it.
 
 There is a useful habit that goes with this: when you design a public struct, start with every field private and add accessors only for the ones a caller genuinely needs. It is much easier to make a private field public later than to make a public field private later, because the latter breaks every caller who was reading it. Starting closed and opening deliberately keeps the contract small, and a small contract is one you can keep.
@@ -167,6 +177,17 @@ Here is a small example that puts qualification to work in a realistic function:
 
 Every type in the signature is a bare name, because the imports brought them into scope. Every *use* of an associated item is qualified, because `None` and `Some` belong to `Option` and could not be reached without saying which type they belong to. That is the whole rule: import the type's name, qualify its members.
 
+A tiny example shows the pattern in the smallest possible form:
+
+    import(lib) std::collections.vec { Vec };
+    import(lib) std::io::ios { println };
+
+    Vec<u64> counts = Vec<u64>::new();
+    counts.push(3);
+    println("{} item", counts.count());
+
+`Vec` is a bare name because the import brought it in; `Vec<u64>::new()` stays qualified because `new` is a member of the type. Read every colon as "belongs to": `std::collections::vec` is the vec module inside collections inside std, and `Vec::new` is new inside Vec.
+
 When two imports bring in the same name, the compiler rejects the collision rather than silently picking one. That is another small stand against surprise. If you genuinely need both — say two different `Config` types from two modules — you use an alias:
 
     import app::server { Config as ServerConfig };
@@ -193,11 +214,15 @@ One special case is worth remembering: a module whose surface is a single file c
 
 Let me tie the two halves together with a small story. Suppose you are building a game and you have a `math` module full of vector and matrix helpers. Internally, `math` has files for vectors, matrices, and the scalar utilities they share. To the rest of the game, `math` is a catalogue with two submodules, `vec` and `mat`. The game never sees the scalar file, never learns its name, and never has a reason to. If you later split the scalar file in two, or merge it into the vector file, the game is untouched, because the game only ever depended on the catalogue. That is the payoff, in one scenario: the freedom to change your mind about the internals without changing the world outside.
 
+Simply put, a re-export is a pointer, not a copy. `pub mod shapes = import shapes;` makes the name `shapes` point at the same module the rest of the world uses; it does not duplicate the code or outlive a change. If the underlying module changes, the re-export follows, because there is only one module and the re-export is one of its names.
+
 14.6 Cycles, Resolution, and the Module Map
 
 Two files that import each other would, naively, require each to be compiled before the other. Coral resolves this by separating declaration from definition. The compiler reads every file's top-level declarations before it reads any function body, so a function may call a function declared later in the same module, and two modules may refer to each other's types as long as neither needs the other to be fully defined to compute a type's size. This is the same "declare all, then define" prescan that lets array sizes be order-independent within a file, lifted to the module level.
 
 Let me unpack that, because "declaration versus definition" is the kind of phrase that slides off the eye. A declaration is the shape of a thing: a function's name, parameter types, and return type; a type's name and fields. A definition is the thing itself: the body of the function, the actual storage of the struct. To compile a call, the compiler needs the declaration — it needs to know what the function takes and returns. It does not need the body. So it makes a first pass over every file collecting declarations, and only then, with the whole map in hand, does it read bodies. That is why a function can call one written below it, and why two modules can name each other's types: by the time either body is read, both declarations are known.
+
+In plain words, the compiler first walks the whole neighbourhood writing down who lives where, and only later delivers the mail. Because the address book is finished before any letter is sent, a house can send a letter to a house that is not built yet, as long as its address is already in the book.
 
 The one case that does not compose is a cyclic layout, which is Chapter 13's territory: a struct cannot contain itself by value, because the compiler needs the size of the inner value to compute the size of the outer one, and the cycle never bottoms out. You break it with a pointer. But naming each other's types, and calling each other's functions, is fine, because neither requires the other's body or its finished size.
 
@@ -229,7 +254,11 @@ When the compiler resolves an import, it searches, in order, the project's own l
 
 The order is "most specific wins," which is the same principle as local variables shadowing globals. Your project's own definition is the most specific, so it wins; the current directory is next; the installed library is the fallback. The escape hatch exists because sometimes you genuinely must replace a standard module — to patch a bug, to target an unusual platform, to instrument calls for debugging. But a shadowed module is invisible at every import site that uses it, so leave a comment in the shadowing file explaining why it exists, or the next person will spend an hour assuming `std` is doing the standard thing.
 
+A common beginner mistake is to give a project module the same name as a library module the project also uses. Because the most specific definition wins, the local one may be chosen where you expected the library's, and the compiler's complaint will point at a name that looks correct. When a name resolves somewhere surprising, first check whether two modules are sharing it.
+
 Here is a small illustration of how the roots divide. If you need `println`, you reach it through `std::io::ios`. If you need the integer limits, you reach them through `core::limits`. If you need to call `mmap`, you reach it through a platform binding, because `mmap` is not portable and pretending otherwise would be a lie. The three roots are the three honest answers to "is this portable, language-fundamental, or tied to my machine?"
+
+Why this matters: knowing which root a name lives under tells you how far it will travel. A `std` import works on every platform the library supports; a `core` import is part of the language's own floor; a `platform` import is a conscious bet on one machine. When you review a dependency, the root is the first clue about whether the code is portable.
 
 14.8 A Worked Example: A log Module
 

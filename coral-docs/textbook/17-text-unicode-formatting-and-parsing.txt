@@ -26,6 +26,8 @@ A string literal is a `str`. A substring taken with `slice` is a `str` that poin
 
 This is why `str` is the default type for a parameter. A function that only reads a string should take a `str`, because a `str` accepts a literal, a slice of a `String`, and a window into a larger buffer, all without copying. It is the borrow of Chapter 11: a `str` never owns its bytes, so its lifetime is bounded by whatever does own them. A `str` stored beyond the call that produced it is a dangling view unless the source buffer outlives it, and the type system will not stop you — which is why `str` is for parameters and short-lived locals, not for struct fields that outlive their source.
 
+An analogy makes the two types easy to keep apart. A `str` is a window into a book someone else is holding: you can read the pages, but you do not own the book, and if the holder puts it down (frees the buffer) your window looks at empty air. A `String` is a notebook you bought yourself: you can add pages, cross things out, and it stays yours until you throw it away. Simply put, `str` is for reading and `String` is for building.
+
 The methods that read a `str` live in `core::str`, and `std::text::strutil` adds free-function versions for the cases you would rather call with functional syntax. The `str` methods themselves are:
 
     str s = "  Coral Text  ";
@@ -100,6 +102,8 @@ Construct one empty, with reserved capacity, from a view, or from a C string:
     String e = c.clone();                // an independent copy
 
 `String::new` does not start empty-and-allocation-free; it allocates a seventeen-byte buffer (capacity sixteen plus a trailing NUL) so that the first few appends do not reallocate. `withCap` reserves at least seven bytes regardless of what you ask for, so `withCap(0)` still yields a usable buffer. `from` sizes the buffer to exactly the view's length, which is why it is the constructor to prefer when you already know the final length. Every `String` keeps a NUL byte one past `len` so that `asCstr` can hand the buffer to C without a copy, but Coral never relies on that NUL for length — `len` is always authoritative.
+
+Simply put, `String::new` is like renting a small locker in advance so that your first few items do not each trigger a trip to the rental office. You start with an empty string (`len` is zero) but a little room already reserved, so the first appends are cheap. The trailing NUL is a courtesy for C, which reads until it hits a zero byte; Coral itself always trusts `len`.
 
 Appending is the most common thing you do, and there is a method for each kind of source:
 
@@ -204,9 +208,13 @@ Note the two shapes carefully, because they answer different questions. `split` 
 
 `indexOf` returns an `isize`, not a `usize`, precisely so that "-1 means not found" is expressible without a sentinel that collides with a real index. And `substr` takes a `start` and a `length` and returns a `str` — a view into the original, not a copy, so it is safe only while the source outlives it. Note the deliberate mismatch with the method of the same name: `strutil::substr(sv, start, len)` takes a length, while `String::substr(start, end)` takes an exclusive end index. The two are the same idea wearing different conventions, and the compiler cannot warn you because both are just `usize`s.
 
+Simply put, whenever you see `substr`, check where the second number is counted from: `end` means an index one past the last byte you want, while `len` means how many bytes you want. Off-by-one text bugs live exactly here, so slow down at every `substr` call.
+
 17.4 ASCII, UTF-8, and the Layers of Text
 
 Text has layers, and Coral names them, which is how you avoid the classic bug of counting the wrong unit. A byte is a `u8`. An ASCII character is a byte with ASCII meaning. A codepoint is a Unicode scalar value, up to 21 bits, stored as `char`. An encoded character is one to four bytes of UTF-8. Reach for the layer that matches what you mean.
+
+A useful analogy is mail. A byte is a single envelope. A codepoint is the idea of a letter — one address in Unicode's worldwide postal system. A UTF-8 encoded character is however many envelopes it takes to mail that letter, sometimes one and sometimes up to four. Counting envelopes and counting letters give different answers, and only one of them is what you meant.
 
 The `std::text::ascii` module classifies and converts bytes, and every function is O(1):
 
@@ -287,6 +295,17 @@ The format specifiers are deliberately few, and everything they do not cover is 
     println("{}", fixed(3.14159, 2));            // 3.14
 
 The exact signatures are `spaces(u64 count)`, `repeat(u8 ch, u64 count)`, `hex(u64 value)`, `bin(u64 value)`, and `fixed(f64 value, u64 precision)`. Note that `ios::repeat` takes a `u8` character and a count, while `fmt::repeat` (below) takes a `str` and a count — two different tools with the same name in two different modules, so import carefully.
+
+Here is a three-line program that puts the format language to work in context:
+
+    import(lib) std::io::ios { println };
+
+    void main() {
+        i64 n = 255;
+        println("dec {:d} hex {:x} bin {:b}", n, n, n);
+    }
+
+Why this matters: nearly every command-line tool, log line, and report prints a number in more than one base at some point, and knowing that `{}` consumes the next argument while `{{` prints a literal brace saves a confusing afternoon.
 
 For building a `String` rather than printing, the `std::fmt` module's `formatX` family converts a single value and returns an owned `String`:
 

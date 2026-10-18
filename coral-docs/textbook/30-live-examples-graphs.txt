@@ -528,7 +528,307 @@ Edge cases. An empty grid returns 0. A grid that is all water returns 0, and the
 
 A variation. The same flood fill answers "maximum island area" (count the cells the flood consumes and track the maximum), "perimeter of an island" (count exposed cell edges), and "number of closed islands" (an island not touching the border). The graph is identical; only what you do during the flood changes. That is the signature of a well-chosen model: the hard part, the traversal, is shared, and the different questions are small variations on what the traversal records.
 
-30.11 Exercises
+30.11 Bipartite Check (Two-Colouring)
+
+The problem. Given an undirected graph, decide whether its vertices can be coloured with two colours so that every edge joins opposite colours. Such a graph is called bipartite.
+
+Picture this. You want to split a group of people into two teams so that no two people who dislike each other share a team. You put one person on team A, then everyone they dislike must go to team B, then everyone each of those dislikes must go back to A, and so on, alternating. If you ever meet someone who would have to be on both teams at once, no such split exists.
+
+Brute force, then better. The brute force tries all 2^V colourings, which is exponential. A single BFS does it in linear time: colour a starting vertex, then flood outward, giving every neighbour the opposite of its parent's colour. The first contradictory edge — one joining two vertices of the same colour — proves the graph is not bipartite.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::queue { Queue };
+
+    bool isBipartite(Vec<Vec<i32>>* adj) {
+        usize n = adj->count();
+        Vec<i32> color = Vec<i32>::new();
+        for (usize i = 0; i < n; i += 1) {
+            color.push(-1);                  // -1 means "not coloured yet"
+        }
+        for (usize start = 0; start < n; start += 1) {
+            if (color.at(start) != -1) continue;
+            color.set(start, 0);
+            Queue<i32> q = Queue<i32>::new();
+            q.enqueue((i32)start);
+            while (!q.isEmpty()) {
+                i32 u = q.dequeue();
+                Vec<i32>* neighbors = adj->atPtr((usize)u);
+                for (usize i = 0; i < neighbors->count(); i += 1) {
+                    i32 v = neighbors->at(i);
+                    if (color.at((usize)v) == -1) {
+                        color.set((usize)v, 1 - color.at((usize)u));
+                        q.enqueue(v);
+                    } else if (color.at((usize)v) == color.at((usize)u)) {
+                        return false;        // an edge inside one colour: not bipartite
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+The `color` vector holds 0, 1, or the −1 sentinel for "uncoloured". The outer loop restarts the flood from every vertex not yet coloured, and that is what makes the check correct on a disconnected graph: each component is coloured independently and all of them must pass. Inside the flood, an uncoloured neighbour receives the opposite colour and is enqueued; a neighbour that is already coloured must be the opposite, and if it is not, an edge joins two equal colours and the answer is false. The expression `1 - color` flips neatly between 0 and 1.
+
+Time and space. Every vertex is enqueued once and every edge is examined once from each endpoint, so O(V + E) time, with the colour array and queue at O(V). This is BFS with one extra check, so the cost is exactly BFS's.
+
+Edge cases. An empty graph is bipartite, since there is nothing to colour. A self-loop makes the graph not bipartite, because a loop joins a vertex to itself and its two ends would need opposite colours; the same-colour test catches it. Any graph containing an odd-length cycle is not bipartite, and the colouring discovers that exactly when it reaches the edge that closes the odd cycle. A graph with no edges is bipartite: each component is a lone vertex.
+
+A variation. The two colours are exactly the two sides of a partition, so the same code produces the split when the answer is true: collect the vertices by colour. Checking bipartiteness is equivalent to checking for no odd cycle, and one useful special case is that every tree is bipartite, which is a handy fact when a problem's graph turns out to be a tree.
+
+30.12 Multi-Source BFS
+
+The problem. In a grid, some cells start "rotten" and the rest "fresh". Every minute, each rotten cell infects its fresh horizontal and vertical neighbours. Report the number of minutes until no fresh cell remains, or −1 if some fresh cell can never be reached.
+
+Picture this. Several fires break out at once in different parts of a field, and each minute the fire spreads one step in every direction. Because there is no single source, all the rotten cells are sources from the first minute and their fronts advance together. The time a cell catches fire is the smallest of its distances to any source, which is precisely what a BFS started from all the sources at once computes.
+
+Brute force, then better. Running BFS once from every rotten cell and taking the per-cell minimum is O(V × (V + E)), quadratic and wasteful. The better method seeds the queue with every rotten cell before the main loop begins. BFS processes cells in non-decreasing distance order, so the first time a fresh cell is reached it is by the nearest source, and one pass does the whole job.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::queue { Queue };
+
+    void rotCell(Vec<Vec<i32>>* grid, Queue<i64>* q, i32* fresh, i64 nr, i64 nc, usize rows, usize cols) {
+        if (nr < 0 || nc < 0) return;
+        if ((usize)nr >= rows || (usize)nc >= cols) return;
+        if (grid->atPtr((usize)nr)->at((usize)nc) != 1) return;   // not fresh
+        grid->atPtr((usize)nr)->set((usize)nc, 2);                // rot it
+        *fresh -= 1;
+        q->enqueue(nr * (i64)cols + nc);
+    }
+
+    i32 orangesRotting(Vec<Vec<i32>>* grid) {
+        usize rows = grid->count();
+        if (rows == 0) return 0;
+        usize cols = grid->atPtr(0)->count();
+        Queue<i64> q = Queue<i64>::new();
+        i32 fresh = 0;
+        for (usize r = 0; r < rows; r += 1) {
+            for (usize c = 0; c < cols; c += 1) {
+                i32 cell = grid->atPtr(r)->at(c);
+                if (cell == 2) {
+                    q.enqueue((i64)(r * cols + c));               // every source at once
+                } else if (cell == 1) {
+                    fresh += 1;
+                }
+            }
+        }
+        i32 minutes = 0;
+        while (!q.isEmpty() && fresh > 0) {
+            usize levelSize = q.count();
+            for (usize k = 0; k < levelSize; k += 1) {
+                i64 flat = q.dequeue();
+                i64 r = flat / (i64)cols;
+                i64 c = flat % (i64)cols;
+                rotCell(grid, &q, &fresh, r - 1, c, rows, cols);
+                rotCell(grid, &q, &fresh, r + 1, c, rows, cols);
+                rotCell(grid, &q, &fresh, r, c - 1, rows, cols);
+                rotCell(grid, &q, &fresh, r, c + 1, rows, cols);
+            }
+            minutes += 1;
+        }
+        if (fresh > 0) return -1;
+        return minutes;
+    }
+
+All rotten cells enter the queue before anything is processed, and that seeding is the entire difference from ordinary BFS. The `fresh` counter lets the loop stop as soon as the last fresh cell rots and also detects the impossible case. The inner loop drains one whole BFS level, and `minutes` is incremented once per level, so it counts rounds of simultaneous spread rather than individual cell steps. `rotCell` mirrors the four-neighbour flood of 30.10: it bounds-checks, ignores anything that is not fresh, and otherwise rots the cell, decrements the counter, and enqueues it.
+
+Time and space. Each cell enters the queue at most once and is examined by at most four neighbour checks, so O(rows × cols) time. The queue and counters are O(rows × cols) in the worst case, and `minutes` is at most that. The rot is written into the grid itself, which doubles as the visited marker.
+
+Edge cases. A grid with no fresh cells returns 0 at once, because the loop condition `fresh > 0` is false from the start. A grid with no rotten cells returns −1 whenever any fresh cell exists, since the empty queue spreads nothing. Fresh cells walled off by empty cells stay fresh, and the final check reports −1. An empty grid returns 0. If the original grid must be preserved, keep a separate visited array instead of rotting in place.
+
+A variation. Multi-source BFS answers every "nearest source" question: distance to the nearest hospital, the time for a flood to cover a map, the number of rounds for an infection with several index cases. The whole trick is to seed every source before the loop, which turns a search per source into a single pass.
+
+30.13 Bellman-Ford: Negative Edge Weights
+
+The problem. Given a directed weighted graph and a source, find the shortest distance to every vertex while allowing negative edge weights, and report whether a negative cycle is reachable from the source.
+
+Picture this. Dijkstra finalises a vertex the moment it is popped, trusting that no later path can be shorter — and that trust needs every edge to be non-negative. Bellman-Ford assumes nothing about the signs. It simply relaxes every edge again and again: if the path to u is known and the edge u→v shortens the path to v, update v. Each full pass extends the reach of known-shortest paths by one more edge, so after V−1 passes every simple path has been considered.
+
+Brute force, then better. The brute force considers all paths, exponential. Bellman-Ford is the systematic version: V−1 rounds of relaxing every edge, which is O(V × E). It is slower than Dijkstra on non-negative graphs but strictly more general, and it is the tool that detects negative cycles.
+
+    struct WEdge {
+        i32 u;
+        i32 v;
+        i32 weight;
+    }
+
+    bool bellmanFord(i32 n, Vec<WEdge>* edges, i32 source, Vec<i64>* dist) {
+        i64 infinity = 1000000000000000000;
+        for (i32 i = 0; i < n; i += 1) {
+            dist->push(infinity);
+        }
+        dist->set((usize)source, 0);
+        for (i32 round = 0; round < n - 1; round += 1) {
+            bool changed = false;
+            for (usize e = 0; e < edges->count(); e += 1) {
+                WEdge edge = edges->at(e);
+                i64 du = dist->at((usize)edge.u);
+                if (du == infinity) continue;             // u is not reachable yet
+                i64 candidate = du + (i64)edge.weight;
+                if (candidate < dist->at((usize)edge.v)) {
+                    dist->set((usize)edge.v, candidate);
+                    changed = true;
+                }
+            }
+            if (!changed) break;                          // no improvement: finish early
+        }
+        for (usize e = 0; e < edges->count(); e += 1) {
+            WEdge edge = edges->at(e);
+            i64 du = dist->at((usize)edge.u);
+            if (du == infinity) continue;
+            if (du + (i64)edge.weight < dist->at((usize)edge.v)) {
+                return false;                             // still improvable: negative cycle
+            }
+        }
+        return true;
+    }
+
+After k passes the distances are correct for every path that uses at most k edges, so V−1 passes cover every simple path — and a shortest path never needs to repeat a vertex unless a negative cycle exists. The `changed` flag ends the run early once a pass improves nothing. The final loop is the negative-cycle test: if any edge can still be relaxed after all the passes, a cycle of negative total weight is reachable from the source, and the shortest distances are undefined (they would be unbounded below).
+
+Time and space. O(V × E) time in the worst case, and O(V) space for the distance array. The `du == infinity` guard matters on graphs with unreachable vertices, because adding a negative weight to the sentinel would otherwise manufacture a bogus reachable distance; the sentinel is chosen large enough that no real distance collides with it.
+
+Edge cases. A single-vertex graph needs no relaxations and reports no negative cycle. An unreachable vertex keeps the sentinel. A negative cycle reachable from the source makes the function return false; a negative cycle the source cannot reach is irrelevant and is skipped by the reachability guard. Weights may be negative, zero, or positive.
+
+A variation. When the graph is known to have no negative edges, Dijkstra is the better choice, with its heap and its O((V + E) log V). Bellman-Ford's other life is in distributed routing: a router can run it knowing only its own links and the estimates its neighbours send, which is essentially the distance-vector protocol.
+
+30.14 Floyd-Warshall: All-Pairs Shortest Paths
+
+The problem. Given a weighted directed graph, find the shortest distance between every pair of vertices at once, allowing negative edge weights but assuming no negative cycles.
+
+Picture this. You have a road atlas and want the shortest route between every pair of cities, not merely from one city. The insight is to admit intermediate cities one at a time. First consider only direct roads; then allow city 0 as a possible stop; then allow city 1 as well; and so on. When every city has been allowed as an intermediate, every shortest route has been found, because the stops on any shortest route are some subset of the cities.
+
+Brute force, then better. Running Dijkstra from every vertex is one option, but it cannot tolerate negative edges. Running Bellman-Ford from every vertex is O(V^2 × E), which is O(V^4) on a dense graph. Floyd-Warshall fills a single V × V table in O(V^3), and its three nested loops are the entire algorithm.
+
+    import(lib) std::vec { Vec };
+
+    void floydWarshall(Vec<Vec<i64>>* dist) {
+        usize n = dist->count();
+        for (usize k = 0; k < n; k += 1) {
+            for (usize i = 0; i < n; i += 1) {
+                i64 throughK = dist->atPtr(i)->at(k);
+                if (throughK == 1000000000000000000) continue;   // no path i..k yet
+                for (usize j = 0; j < n; j += 1) {
+                    i64 candidate = throughK + dist->atPtr(k)->at(j);
+                    if (candidate < dist->atPtr(i)->at(j)) {
+                        dist->atPtr(i)->set(j, candidate);
+                    }
+                }
+            }
+        }
+    }
+
+The table begins as the adjacency matrix: `dist[i][j]` is the direct edge weight, zero on the diagonal, and the large sentinel where no edge exists. The outer loop `k` is the set of vertices allowed as intermediates. For each pair `(i, j)` the code asks whether going through `k` beats the best route found so far, and updates if it does. The ordering is not incidental: `k` must be outermost, so that when `k` is processed the table already accounts for every lower-numbered intermediate, making `dist[i][k]` and `dist[k][j]` optimal over that smaller allowed set.
+
+Time and space. Three nested loops over the vertices give Θ(V^3) time, and the table is V × V, so Θ(V^2) space. The cubic cost is fine up to a few hundred vertices and painful beyond; Dijkstra from each vertex is faster on sparse graphs, while Floyd-Warshall is the choice for dense graphs and for graphs that may have negative edges.
+
+Edge cases. Vertices with no path between them keep the sentinel, and the `throughK == sentinel` check keeps two sentinels from being added into an overshoot. A negative cycle shows up as a negative entry on the diagonal after the run: if any `dist[i][i] < 0`, a negative cycle passes through i. Initialise the diagonal to 0 and non-edges to the sentinel, and guard the sentinel as shown, because it is a finite number and adding it carelessly can overflow.
+
+A variation. The same triple loop computes transitive closure: swap the arithmetic for boolean reachability (`reach[i][j] = reach[i][j] || (reach[i][k] && reach[k][j])`) and it answers "is j reachable from i?". Swap `+` for `max` and `<` for `>` and it finds the minimax path. Recognising the triple-loop shape as a reusable engine is worth more than memorising any one application.
+
+30.15 Word Ladder
+
+The problem. Given a begin word, an end word, and a dictionary, transform the begin word into the end word one letter at a time, where every intermediate word must be in the dictionary and must differ from its predecessor by exactly one letter. Return the number of words in the shortest transformation, or 0 if none exists.
+
+Picture this. Each word is a vertex, and two words are adjacent when they differ in exactly one letter. The shortest transformation is then a shortest path in an unweighted graph, which is BFS. Start from the begin word, expand to every dictionary word one letter away, and stop the moment the end word appears. The number of layers you passed through is the length of the shortest ladder.
+
+Brute force, then better. The brute force builds the whole graph by comparing every pair of words for the one-letter difference, which is O(N^2 × L) just to build it, and then runs BFS. Since a word's neighbours can be generated on demand by scoring each unused dictionary word, the graph need not be built at all: BFS generates neighbours as it goes, and a visited flag stops a word from being enqueued twice.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::queue { Queue };
+
+    bool oneLetterApart(str a, str b) {
+        if (a.len != b.len) return false;
+        usize diff = 0;
+        for (usize i = 0; i < a.len; i += 1) {
+            if (a.at(i) != b.at(i)) diff += 1;
+            if (diff > 1) return false;
+        }
+        return diff == 1;
+    }
+
+    i32 wordLadder(str begin, str end, Vec<str>* words) {
+        usize n = words->count();
+        Vec<bool> used = Vec<bool>::new();
+        for (usize i = 0; i < n; i += 1) {
+            used.push(false);
+        }
+        Queue<str> q = Queue<str>::new();
+        q.enqueue(begin);
+        i32 steps = 1;
+        while (!q.isEmpty()) {
+            usize levelSize = q.count();
+            for (usize k = 0; k < levelSize; k += 1) {
+                str cur = q.dequeue();
+                if (cur.equals(end)) return steps;
+                for (usize i = 0; i < n; i += 1) {
+                    if (used.at(i)) continue;
+                    str w = words->at(i);
+                    if (oneLetterApart(cur, w)) {
+                        used.set(i, true);
+                        q.enqueue(w);
+                    }
+                }
+            }
+            steps += 1;
+        }
+        return 0;
+    }
+
+The queue holds words and the `used` flags mark dictionary words already enqueued, so each word enters at most once. Rather than precomputing the graph, the inner loop scores every unused dictionary word against the current one with `oneLetterApart`, comparing byte by byte. The `levelSize` snapshot makes BFS finish a whole layer of the ladder before `steps` is increased, so `steps` counts words in the ladder rather than expansions. Checking for the end word on dequeue, rather than on enqueue, also handles the case where the begin word already equals the end word.
+
+Time and space. Every dictionary word is dequeued once, and each dequeue scans the whole dictionary, so the time is O(N^2 × L) for N words of length L — the same asymptotic order as building the graph, but with far less memory and much simpler code. The queue and visited array are O(N).
+
+Edge cases. If the begin word equals the end word, the first dequeue returns 1. If the end word is not in the dictionary it can never be enqueued, so the queue drains and the function returns 0. Words of different lengths cannot be one letter apart, which `oneLetterApart` reports at once. The dictionary need not contain the begin word, because the search starts from it regardless. All words are assumed to be the same length, as the problem guarantees.
+
+A variation. For large dictionaries, generating a word's neighbours by changing each position through 'a'..'z' and looking up each result in a hash set is much faster than scanning the list, at the cost of a hash set and its key functions. Reconstructing the actual ladder rather than measuring it uses the parent-pointer trick of 30.2. Searching forward from the begin word and backward from the end word at the same time — bidirectional BFS — shrinks the explored set sharply and is the usual high-performance answer.
+
+30.16 Clone a Graph
+
+The problem. Given a connected undirected graph whose vertices are nodes holding a value and a list of neighbour pointers, produce a deep copy: new nodes with the same values and the same connectivity, sharing no node with the original.
+
+Picture this. You are duplicating a web of friendships. You cannot simply copy one person's list of friends, because each friend must also be a fresh person whose own list points at the fresh versions. The trick is to keep a map from each original node to its copy: the first time you meet a node you make its copy and record it, and every later reference resolves to the recorded copy. That map is what stops the recursion from chasing a cycle forever.
+
+Brute force, then better. Without a map, a recursive copy would follow an edge and then follow it back, looping forever on any cycle. The map breaks the cycle: each node is cloned once, the clone is recorded before its neighbours are visited, and any later visit returns the recorded clone. This is memoization applied to a graph traversal.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections.hashmap { HashMap };
+    import(lib) std::mman { alloc };
+
+    struct GNode {
+        i32 val;
+        Vec<GNode*> neighbors;
+    }
+
+    usize hashI32(i32 k) { return (usize)k; }
+    bool eqI32(i32 a, i32 b) { return a == b; }
+
+    GNode* cloneNode(GNode* node, HashMap<i32, GNode*>* seen) {
+        Option<GNode*> found = seen->get(node->val);
+        if (found.isSome()) return found.unwrap();      // already cloned
+        GNode* copy = alloc<GNode>(1);
+        copy->val = node->val;
+        copy->neighbors = Vec<GNode*>::new();
+        seen->insert(node->val, copy);                  // record before recursing
+        for (usize i = 0; i < node->neighbors.count(); i += 1) {
+            copy->neighbors.push(cloneNode(node->neighbors.at(i), seen));
+        }
+        return copy;
+    }
+
+    GNode* cloneGraph(GNode* start) {
+        if (start == null) return null;
+        HashMap<i32, GNode*> seen = HashMap<i32, GNode*>::new(hashI32, eqI32);
+        return cloneNode(start, &seen);
+    }
+
+The map ties each original value to its copy. The order of the two middle lines is the whole trick: the copy goes into the map *before* the loop that visits the neighbours. Insert it afterward and a cycle would recurse back to the original node, fail to find a copy, and clone it again — forever. Inserting first means that when a neighbour's neighbour leads back to this node, the lookup returns the copy already under construction. `node->neighbors` is a `Vec<GNode*>` field reached through the pointer, and the same auto-dereferencing lets the count and the indexed read work.
+
+Time and space. Every node is cloned once and every edge is crossed once in each direction, so O(V + E) time. The map holds one entry per vertex and each clone owns its neighbour list, so O(V + E) space, with recursion depth up to O(V) for a long path.
+
+Edge cases. A null start returns null. A single node with no neighbours clones to a node with an empty neighbour list. Self-loops and repeated edges are copied as they are, because the algorithm duplicates each neighbour list faithfully rather than deduplicating. Keying the map by value assumes values are unique, which is the usual contract; if values could repeat, key by node identity (a pointer) instead.
+
+A variation. The same clone-with-memo pattern copies any pointer-linked structure that contains cycles: linked lists with loops, doubly linked structures, persistent trees. An iterative version uses a queue: clone the start, put it in the map and the queue, then repeatedly dequeue, clone each not-yet-seen neighbour, and append the clone — recorded or fresh — to the current copy's list. Recursion and the explicit queue are the same traversal, with the bookkeeping moved from the call stack into a container.
+
+30.17 Exercises
 
 1. Comprehension. Explain the difference between an adjacency list and an adjacency matrix in terms of both memory and the cost of the two most common operations: iterating a vertex's neighbours, and testing whether two vertices are adjacent. When is each the better choice?
 

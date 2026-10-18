@@ -61,6 +61,8 @@ Here is its actual declaration, quoted from `std::collections::vec`, fields and 
 
 The three fields tell the entire story. `data` points at a heap allocation of `cap` slots. `len` is how many of those slots currently hold live elements. `cap` is how many slots the allocation has room for. The elements occupy `data[0]` through `data[len - 1]`; the slots from `len` to `cap` exist but are not part of the vector's value yet. Every operation Vec supports is bookkeeping on those three numbers, and because the fields are public — which is a deliberate design choice, not an accident — a Vec is a documented data structure rather than an opaque box. You can always ask what it costs in memory, because the numbers that say so are right there.
 
+Simply put, a Vec is a stretchy shelf. Imagine a bookshelf that came with a fixed number of slots (`cap`), some of which you have filled with books (`len`), and a little note on the side saying how many slots the shelf can currently hold. When you add a book to a full shelf, the owner does not nudge every book along; instead they buy a bigger shelf, carry every book across, and throw the old one away. That carrying is why `push` is usually instant but occasionally does real work. A common beginner mistake is to treat `count()` and the `cap` field as the same number: `count()` is how many books you have, and `cap` is how much shelf you have. Only `count()` changes when you add one.
+
 You create one in one of two ways. `new` makes an empty one with no allocation at all, and `withCap` allocates room for a known number of elements up front:
 
     import(lib) std::vec { Vec };
@@ -145,6 +147,24 @@ Iterate a Vec either by index or by range-for:
     }
 
 The range-for form is the idiomatic read: it visits each element once, in order, and hides the index. Reach for the indexed form only when you need the index itself.
+
+Here is a complete little program that builds a Vec and adds up its contents, so the whole shape is visible at once:
+
+    import(lib) std::io::ios { println };
+    import(lib) std::vec { Vec };
+
+    void main() {
+        Vec<i32> scores = Vec<i32>::new();
+        scores.push(90);
+        scores.push(85);
+        i32 total = 0;
+        for (i32 s : scores) {
+            total += s;
+        }
+        println("total = {}", total);
+    }
+
+Why this matters: almost every real program keeps a list of things whose number it does not know in advance — the lines of a file, the players in a game, the results of a query — and the Vec is the container that grows to hold them.
 
 16.2 Arr<T, N>: Fixed Size, Inline Storage
 
@@ -264,6 +284,8 @@ The API is close to Map's: `insert` (returning a `Result`), `get` and `getPtr` (
 
 The table starts at capacity 16 and doubles whenever `len * 2 >= cap`, re-homing every occupied entry into the larger array. Collisions use linear probing with a step of one, and `get`, `contains`, and `getPtr` stop their probe at the first unoccupied slot (with a wrap guard so a table that somehow fills completely still terminates). Nothing about the layout is exposed as order: the `entries` array is scanned start to finish, so `each`, `keys`, and `values` return entries in slot order, which is a function of the hash values, not of insertion.
 
+An analogy helps here. Think of a coat check with numbered hooks. No attendant tells you which hook to use; instead a rule computes a hook number from the ticket in your hand — say, the number of letters in your name. Two guests can compute the same hook number, which is a collision, so the rule adds "if that hook is taken, try the next one." To find your coat again you run the same rule and walk the same short chain. A HashMap is exactly this: the hook number is the hash, "try the next one" is linear probing, and lookup is fast because a good hash spreads names evenly across hooks. A common mistake is to write a hash function that returns the same value for many different keys (for example, always the key's first letter). The table still works, but every lookup degenerates into a linear scan, and the O(1) promise quietly becomes O(n).
+
 `each` walks the occupied entries in slot order; `eachEntry` hands you a pointer to the live `HashMapEntry` instead of a copy of the key and value:
 
     void report(str key, i32 value) { println("{}: {}", key, value); }
@@ -346,6 +368,10 @@ Order matters as much as membership, and different orders call for different str
     usize n = q.count();
     bool empty = q.isEmpty();
     q.clear();
+
+Simply put, a Queue is the checkout line at a shop: the first person to join is the first served, and you only ever add at the back and take from the front. `Deque<T>` is the same line with a second door at the front, so you can join or leave at either end. `RingBuf<T>` is a circular conveyor that holds a fixed number of items and, once it is full, knocks the oldest one off to make room for the newest — the shape you want for "the last N readings."
+
+A common beginner mistake is to use a `Vec` as a queue by calling `removeAt(0)`. That works, but each removal slides every remaining element down one slot, so it is O(n) where a Queue is O(1). Reaching for the container whose name says "queue" is the fix.
 
 `Deque<T>` is a double-ended queue: a growable ring that supports both ends. It is the structure for a work list that grows at both ends and for a sliding window:
 
@@ -574,6 +600,8 @@ For any other element type, `sortBy` takes the "less than" predicate, and `binar
 
 The pipeline reads in the order the operations happen, which is the property a loop with a temporary variable loses. Note the names precisely: the folder is `reduce`, not `fold`; the typed sorts are `sortI32` and friends rather than a bare `sort`; and every adaptor wants a pointer, so you call `map(&v, f)` and not `map(v, f)`.
 
+Simply put, these adaptors turn a loop into a sentence. `map` means "do this to every element and collect the results," `filter` means "keep only the elements this test approves of," and `reduce` means "boil the whole list down to one value." Reading `map(&v, double)` aloud gives the meaning without any index variable to track.
+
 The fine print of `iter` is where correct programs are won, so here it is, function by function. `map`, `filter`, `take`, `skip`, `slice`, `zip`, `unique`, `flatten`, and `enumerate` *allocate and return new Vecs*; the caller owns them and must let them drop. `reduce`, `forEach`, `find`, `findIndex`, `hasAny`, `all`, `countIf`, `minBy`, `maxBy`, `sum`, and `average` return a scalar and allocate nothing. `find` is the trap: it returns the element if found and `T()` — the zero/default value of `T` — if not, so `find` on `Vec<i32>` returning `0` is ambiguous between "found a zero" and "found nothing". Use `findIndex`, which returns an `isize` index or `-1`, when you need to distinguish. `minBy`, `maxBy`, and `sum` assert that the vector is non-empty; `average` returns `0.0` for an empty vector instead. `slice(v, start, end)` is half-open and clamps `end` to `count()`; if `start >= end` or `start >= count()` it returns an empty Vec. `zip` stops at the shorter input and yields `Vec<Pair<T, U>>`, where `Pair` has the fields `first` and `second`. `enumerate` is not what its name suggests if you are used to other languages: it returns a `Vec<usize>` of the indices `0..count()`, and you pair those with values yourself (conventionally via `zip`). `unique` is O(n^2) because it scans the result for each element; it is a convenience, not a set, and it takes an equality function rather than hashing. `flatten` is the one adaptor whose parameter type is `Vec<Vec<T>>*`.
 
 `sort` is a quicksort with a median-of-three pivot, exactly as the earlier `Vec::sortBy` uses internally, and the typed entry points call the corresponding partition routine. `sortI32`, `sortusize`, `sortF64`, `sortBy`, and `reverse` mutate the vector in place and take a non-const `Vec<T>*`; `isSortedI32`, `isSortedusize`, `isSortedBy`, `binarySearchI32`, `binarySearchusize`, and `binarySearchBy` only read and take `const Vec<T>*`. The typed sorts compare with `<` directly, so `sortF64` inherits whatever floats do with `NaN`; the generic `sortBy` uses the `less` predicate you supply. `binarySearchBy` takes a three-way comparator `i32(T, T) cmp`, *not* a `less` predicate, and all three binary searches return an `isize` index or `-1` when the key is absent, so they are not stable-two-way and cannot tell you an insertion point.
@@ -660,7 +688,7 @@ Put the collections to work on a task that needs several at once: count how ofte
 
     void freeEntry(HashMapEntry<String, i32>* e) { e->key.free(); }
 
-    i32 main() {
+    void main() {
         HashMap<String, i32> counts = HashMap<String, i32>::new(hashString, eqString);
 
         String line = String::new();
@@ -699,7 +727,6 @@ Put the collections to work on a task that needs several at once: count how ofte
         counts.dispose();              // ... then the hash table's storage
         words.dispose();
         top.dispose();
-        return 0;
     }
 
 Five moving parts, each doing what it is for. The HashMap accumulates counts by key, and it owns each key because the program copied the borrowed word into a `String` before inserting it. Its `keys` method produces a Vec of the distinct words to fan out over, and the `WordCount` views are safe because the map's key buffers outlive the ranking loop. The PriorityQueue orders the entries by a comparator so the top ten are simply the first ten pops. A small struct packages the pair. Then, because the map does not free its keys for you, `eachEntry(freeEntry)` releases every key buffer before `dispose` releases the table — the same pattern `std::parser::ini` uses. No container does another's job, and the whole program is a page. That is the shape a good standard library enables: the data structures are right, so the algorithm is short, and the cleanup is three lines rather than a mystery.

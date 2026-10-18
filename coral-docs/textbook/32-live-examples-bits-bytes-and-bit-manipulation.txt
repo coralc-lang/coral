@@ -371,7 +371,194 @@ Edge cases. `grayEncode` and `grayDecode` are exact inverses for every `u64`, in
 
 Variation. Generate the Gray sequence directly by the reflected construction: start with `[0]`, and to extend, take a copy of the current list in reverse, set the new high bit on each, and append. It produces the same sequence with different mechanics, and seeing both makes it clear why it is called binary-reflected.
 
-32.9 Exercises
+32.9 The Single Number (XOR)
+
+The problem. An array holds a large number of integers in which every value appears exactly twice except one, which appears exactly once. Find the loner. You may not use a set, a sort, or any extra memory proportional to the input.
+
+The intuition. Reach for the three properties of XOR and the answer is immediate. A value XORed with itself is zero; a value XORed with zero is itself; and XOR is commutative and associative, so the order does not matter. XOR the whole array together and every value that appears twice annihilates its twin, leaving only the singleton. There is no bookkeeping because the operation itself is the bookkeeping.
+
+The approach. Fold the array with XOR. One accumulator, one pass, constant memory.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub u64 singleNumber(const Vec<u64>* xs) {
+        u64 acc = 0;
+        for (usize i = 0; i < xs->count(); i += 1) acc ^= xs->at(i);
+        return acc;
+    }
+
+    // every value appears three times except one, which appears once:
+    // track bits seen once and bits seen twice; a third sighting clears both
+    pub u64 singleNumberTriple(const Vec<u64>* xs) {
+        u64 ones = 0;
+        u64 twos = 0;
+        for (usize i = 0; i < xs->count(); i += 1) {
+            u64 x = xs->at(i);
+            ones = (ones ^ x) & ~twos;      // add x to the once-seen bits
+            twos = (twos ^ x) & ~ones;      // add x to the twice-seen bits
+        }
+        return ones;
+    }
+
+In the three-times version the pair of accumulators counts each bit modulo three: `ones` holds the bits seen one more time than a multiple of three, `twos` the bits seen twice, and the masks move a bit between them on each sighting. The lesson of the first function is that XOR is a parity machine, and parity is exactly what "everything cancels except one" means.
+
+Cost and notes. `singleNumber` is O(n) time and O(1) space: a single pass with no allocation, and each step is one register XOR. Compare that to the obvious approach of a hash set, which is also O(n) time but O(n) space and a hash per element. This is the clearest example in the chapter of choosing the operation that already does the work.
+
+Edge cases. An empty array returns zero, which is the identity but not a real answer; the caller is responsible for the precondition that a singleton exists. If the data contains more than one singleton, the result is the XOR of all of them, which is meaningful only if you know the rest pair off. The function is defined on unsigned values; XOR is a bit operation, so thinking of the elements as signed numbers is a category error even though the bits are the same.
+
+Variation. Find two singletons instead of one. XOR everything to get `a ^ b`, isolate any set bit of that result, and partition the array by that bit; each part then has a single singleton, recovered with the same function. Two passes, still constant memory.
+
+32.10 Enumerating Subsets with a Bitmask
+
+The problem. Given `n` items, visit every one of the `2^n` subsets — for a brute-force search, a knapsack, a subset-sum, or any problem small enough to solve by trying all the options.
+
+The intuition. A subset of `n` items is exactly a bitmask of `n` bits: bit `i` is on when item `i` is in the subset. So the subsets are just the numbers zero through `2^n - 1`, each visited once and never repeated. Testing membership is a shift and an AND, the same primitive as everywhere else in the chapter, and walking the subset's own elements is a matter of testing each bit or peeling set bits with `x & (x - 1)`.
+
+The approach. Loop the mask from zero to `2^n - 1`, and for each mask walk its `n` bits. Wrap it in a small brute-force maximum for concreteness.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub u64 subsetSum(const Vec<u64>* items, u32 n, u64 mask) {
+        u64 sum = 0;
+        for (u32 i = 0; i < n; i += 1)
+            if (((mask >> i) & 1u) != 0) sum += items->at((usize)i);
+        return sum;
+    }
+
+    pub u64 bestSubsetSum(const Vec<u64>* items, u32 n) {
+        @assertOut(n <= 32u, "2^n enumeration needs a small n");
+        u64 best = 0;
+        u64 total = (u64)1 << n;
+        for (u64 mask = 0; mask < total; mask += 1) {
+            u64 s = subsetSum(items, n, mask);
+            if (s > best) best = s;
+        }
+        return best;
+    }
+
+Mask zero is the empty subset, and it sums to zero, so `best` starts there rather than at a negative sentinel (there is no negative for `u64`). The mask counts in ordinary binary, and the bit pattern is the subset; the loop is the enumeration. There is nothing hidden.
+
+Cost and notes. `bestSubsetSum` is O(2^n * n): the outer loop doubles with `n`, and each mask costs a walk over `n` bits. For `n` up to about twenty that is a million times twenty, which is fine; at thirty it is a billion, which is not. The `n <= 32` assertion keeps `1 << n` inside the `u64`, but the practical limit is far lower and is set by time, not by the type.
+
+Edge cases. `n` must not exceed the word width, or `(u64)1 << n` is undefined; the assertion refuses it. The caller must pass a vector with at least `n` elements, since the inner loop indexes up to `n - 1`. The mask is `u64` while the index is `u32`, so the shift amount is `i` and the comparison casts nothing because `& 1u` against a `u64` is the same pattern used in 32.2. And a brute force over `2^n` is only as good as its smallest case; an early exit when `best` reaches the sum of all items would save nothing here but is worth remembering when the predicate is a threshold rather than a maximum.
+
+Variation. Replace the per-mask bit walk with the set-bit peel from 32.3: `u64 bits = mask; while (bits != 0) { u32 i = lowBitIndex(bits); sum += items->at((usize)i); bits &= bits - 1; }`. It visits only the members of the subset, which is a real saving when the masks are sparse, and it is exactly the trick from the popcount example reused.
+
+32.11 Reversing the Bits of a Word
+
+The problem. Reverse the order of the bits in a word: bit 0 becomes bit 31, bit 1 becomes bit 30, and so on. It is the operation behind a bit-reversal permutation in a fast Fourier transform, behind some hashing and scrambling schemes, and behind CRC variants that feed bits in from the other end.
+
+The intuition. Do it in stages, like sorting a shuffled deck. First swap every adjacent pair of bits. Then swap every adjacent pair of pairs. Then pairs of nibbles, then pairs of bytes. Each stage moves every bit twice as far as the last, and after the stage that swaps the two halves of the word the whole thing is reversed. Every stage is a mask, a shift, and an OR — the alphabet of the chapter, repeated five times.
+
+The approach. The five-stage masked version for `u32`, the obvious bit-by-bit loop for comparison, and a `u64` built from two `u32` reversals.
+
+The implementation.
+
+    pub u32 reverseBits32(u32 x) {
+        x = ((x & 0x55555555u) << 1) | ((x >> 1) & 0x55555555u);   // swap adjacent bits
+        x = ((x & 0x33333333u) << 2) | ((x >> 2) & 0x33333333u);   // swap pairs
+        x = ((x & 0x0F0F0F0Fu) << 4) | ((x >> 4) & 0x0F0F0F0Fu);   // swap nibbles
+        x = ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu);   // swap bytes
+        x = (x << 16) | (x >> 16);                                  // swap halves
+        return x;
+    }
+
+    pub u32 reverseBitsLoop(u32 x) {
+        u32 result = 0;
+        for (u32 i = 0; i < 32u; i += 1) {
+            result = (result << 1) | (x & 1u);
+            x >>= 1;
+        }
+        return result;
+    }
+
+    pub u64 reverseBits64(u64 x) {
+        u64 low = (u64)reverseBits32((u32)x);
+        u64 high = (u64)reverseBits32((u32)(x >> 32));
+        return (low << 32) | high;
+    }
+
+Read the masks as pairs. `0x55555555` is alternating ones and zeros, so it selects the low bit of every pair; shifting that left and the high bits right, then ORing, swaps each pair. `0x33333333` selects the low two bits of every four, doubling the distance. `0x0F0F0F0F` handles nibbles, `0x00FF00FF` handles bytes, and the last line swaps the two sixteen-bit halves outright. The `u64` version reverses each half and then swaps the halves, which is why the two `reverseBits32` results are placed low-then-high.
+
+Cost and notes. `reverseBits32` is a fixed five stages, no loop, constant time; on a machine with a bit-reverse instruction the compiler may recognise the pattern, but even without one it is roughly twenty instructions. `reverseBitsLoop` is O(width) and exists mainly to show that the masked version is the same operation unrolled. `reverseBits64` is two calls and one swap, constant time.
+
+Edge cases. Every shift is by a value strictly less than the width, so nothing is undefined. The masks are written with a `u` suffix so the literals are unsigned; a signed literal would be a mistake in the top mask for a wider type. The loop version starts `result` at zero and shifts it left every iteration, so after thirty-two steps the first bit read has moved to the last position. And the `u64` composition is correct only because `reverseBits32` is a true 32-bit reversal, not a partial one.
+
+Variation. Reverse all thirty-two bits of four bytes at once with a 256-entry lookup table that holds each byte reversed, then reorder the bytes: `table[(u8)x] << 24 | table[(u8)(x>>8)] << 16 | ...`. It is the same table-lookup trade the popcount example made, and it pays when you reverse millions of words.
+
+32.12 Addition Without +, Using Bits
+
+The problem. Add two integers using only bitwise operations and shifts. It is an interview classic, and it is worth writing once because it makes the ripple-carry adder inside every CPU visible.
+
+The intuition. Separate the two things an addition does. The sum of two bits ignoring carry is XOR: `0 ^ 0 = 0`, `0 ^ 1 = 1`, `1 ^ 1 = 0`. The carry out of a column is AND: it is one exactly when both bits are one. So XOR the operands to get the sum-without-carries, AND them and shift left one to get the carries, and then add *those* together — which is the same problem again, one position to the left. Repeat until there is no carry left. The carry walks up the word and stops.
+
+The approach. A loop that replaces `(a, b)` with `(a ^ b, (a & b) << 1)` until `b` is zero.
+
+The implementation.
+
+    pub u32 addBits(u32 a, u32 b) {
+        while (b != 0) {
+            u32 carry = a & b;
+            a = a ^ b;             // sum of the bits with no carry
+            b = carry << 1;        // the carries move up one position
+        }
+        return a;
+    }
+
+    pub u32 subtractBits(u32 a, u32 b) {
+        return addBits(a, addBits(~b, 1u));   // a + (-b), two's complement
+    }
+
+The subtraction is the two's-complement negation `-b = ~b + 1` fed back into the adder. If that looks like cheating, it is not: the whole point is that a CPU has one adder and derives subtraction from it exactly this way.
+
+Cost and notes. The loop runs once per carry propagation, so its worst case is the width of the word — adding `0xFFFFFFFF` to `1` walks the carry all the way across — making it O(width) iterations, each constant time. Real hardware does the same thing in parallel with a carry-lookahead circuit, but the serial version is the honest model, and it is what you would write in a puzzle or on a machine with no add instruction.
+
+Edge cases. The result is fixed-width addition: the carry out of the top bit is discarded, which is precisely the wraparound behaviour of the machine `+`, so `addBits(0xFFFFFFFF, 1)` is zero just as `0xFFFFFFFFu + 1u` is. The loop always terminates within the width, because each iteration moves the lowest set bit of `b` at least one position higher until it falls off the end. The version is written for unsigned types; on signed two's-complement values the bits are identical, but the arithmetic interpretation of the wraparound is the one from the chapter's introduction. And `subtractBits` relies on `~b` being the full-width complement, which it is for a fixed-width unsigned type.
+
+Variation. Write `multiplyBits(a, b)` as repeated shift-and-add: for each set bit of `b`, shift `a` left by that bit's position and feed it into `addBits`. It is O(width) additions and makes the connection between multiplication and the adder explicit. Then check that `subtractBits` matches `a - b` for a range of inputs.
+
+32.13 Nim: The Game of XOR
+
+The problem. Nim is played with several piles of stones. On your turn you remove any positive number of stones from exactly one pile; whoever takes the last stone wins. Given the pile sizes, decide whether the first player can force a win, and if so which move to make. It is the cleanest example of a combinatorial game whose whole solution is one XOR.
+
+The intuition. Compute the XOR of every pile size; call it the nim-sum. The theorem, and it is short to see, is that a position is losing for the player about to move exactly when the nim-sum is zero. From a zero position, any move changes one pile and therefore makes the nim-sum nonzero. From any nonzero position there is a move that restores the nim-sum to zero: find a pile whose size is larger than its size XORed with the nim-sum and reduce it to exactly that value. So every nonzero position hands a zero position to the opponent, and the player who can always do that wins. The bit operation is the strategy.
+
+The approach. Reduce the pile sizes with XOR, then search for the pile that can be reduced to restore a zero nim-sum.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub bool nimWins(const Vec<u64>* piles) {
+        u64 nimSum = 0;
+        for (usize i = 0; i < piles->count(); i += 1) nimSum ^= piles->at(i);
+        return nimSum != 0;
+    }
+
+    pub i32 nimWinningMove(const Vec<u64>* piles) {
+        u64 nimSum = 0;
+        for (usize i = 0; i < piles->count(); i += 1) nimSum ^= piles->at(i);
+        if (nimSum == 0) return -1;               // losing; there is no winning move
+        for (usize i = 0; i < piles->count(); i += 1) {
+            u64 target = piles->at(i) ^ nimSum;   // the size that zeroes the nim-sum
+            if (target < piles->at(i)) return (i32)i;
+        }
+        return -1;                                // unreachable for a nonzero nim-sum
+    }
+
+Check the move rule against the XOR identity. Leaving pile `i` at `target` means the new nim-sum is `nimSum ^ pile_i ^ target`, and with `target = pile_i ^ nimSum` that is `nimSum ^ pile_i ^ pile_i ^ nimSum = 0`. Requiring `target < pile_i` guarantees it is a legal reduction, and a nonzero nim-sum always has at least one such pile.
+
+Cost and notes. Both functions are O(n) and constant extra space: `nimWins` is a single XOR fold, and `nimWinningMove` adds one more pass to find the move. A game that a naïve search would explore with exponential minimax is decided by one pass over the piles. This is the recurring theme of the chapter, seen as a game: the right bit primitive turns a search into an arithmetic fact.
+
+Edge cases. No piles is a loss for the player to move (there is nothing to take), and the nim-sum of nothing is zero, which agrees. A pile of zero contributes nothing and can never be the winning move, since no positive target is less than zero. `nimWinningMove` returns `-1` for both a losing position and the impossible "no pile found" case; for a nonzero nim-sum the second is unreachable, but returning the same sentinel for both is the kind of ambiguity the error-handling chapter warns about, so a production version would use an `Option<usize>` and reserve `None` for the genuine loss. The index is cast to `i32`, which is safe for any pile count a person will type.
+
+Variation. Solve misère Nim, where the player who takes the last stone loses. The strategy is identical except for one special case: when every pile has size one, the position is a win iff the number of piles is even, the reverse of the normal rule. Implement both and test them against the piles `(1, 1)`, `(1, 1, 1)`, and `(1, 2, 3)` to feel the difference.
+
+32.14 Exercises
 
 1. Comprehension. Explain why `x & (x - 1)` clears the lowest set bit, using the borrow that occurs when you subtract one. Then explain why `x & (0 - x)` isolates that same bit, on an unsigned type.
 

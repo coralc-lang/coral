@@ -168,6 +168,11 @@ node tools/lsp-didchange-check.js
 It exits 0 either way and prints which way it went, so it is safe to run by
 hand without gating a build on a compiler that is a separate workstream.
 
+> **Two proposals live in [ERROR-EXPLANATIONS.md](./ERROR-EXPLANATIONS.md)** —
+> clickable error explanations (`coral/explain` returning the existing
+> `--explain` text via `codeDescription`), and `///` doc comments so hover
+> shows what is written above a declaration. Neither is implemented.
+
 ## Phase 1 — without these the editor feels dead
 
 ### 1. `publishDiagnostics`: send an empty array

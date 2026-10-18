@@ -58,6 +58,16 @@ pub struct SwitchListBuilder
     u32 cap;
 }
 
+/* one `///` block captured by the parser, keyed to the declaration it
+ * documents: fileId + the 1-based line of the decl's name. text is
+ * interned, so it outlives the source buffer. */
+pub struct DocBlock
+{
+    u32 fileId;
+    u32 declLine;
+    Str text;
+}
+
 pub struct VariantListBuilder
 {
     VariantVariant* data;
@@ -84,6 +94,9 @@ pub struct AstContext
     Str* flagNames;
     Str* flagValues;
     u32 flagsLen;
+    DocBlock* docs;
+    u32 docsLen;
+    u32 docsCap;
 
     void init(u32 internCap, u32 typeCap, u32 nodeCap)
     {
@@ -107,7 +120,10 @@ pub struct AstContext
             .targetArch = flag (arch) { x86_64 => { "x86_64" }, arm64 => { "arm64" }, else => { "x86_64" } },
             .flagNames = null,
             .flagValues = null,
-            .flagsLen = 0
+            .flagsLen = 0,
+            .docs = null,
+            .docsLen = 0,
+            .docsCap = 0
         };
 
         if (internCap > 0)
@@ -477,6 +493,50 @@ pub struct AstContext
         e.id = self.internsLen;
         self.internsLen++;
         return e.id;
+    }
+
+    /* parser hook: remember the `///` block above a declaration whose
+     * name is on `declLine` (1-based, within fileId). text is interned by
+     * the caller. re-parses of the same line overwrite (speculation). */
+    void addDocBlock(u32 fileId, u32 declLine, Str text)
+    {
+        if (text == 0 || self.error != 0) return;
+        u32 i = 0;
+        while (i < self.docsLen)
+        {
+            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
+            {
+                self.docs[i].text = text;
+                return;
+            }
+            i++;
+        }
+        if (self.docs == null || self.docsLen >= self.docsCap)
+        {
+            u32 newCap = self.docsCap;
+            rawptr raw = self.grow((rawptr)self.docs, self.docsCap, &newCap, @sizeof(DocBlock));
+            if (raw == null) return;
+            self.docs = (DocBlock*)raw;
+            self.docsCap = newCap;
+        }
+        self.docs[self.docsLen].fileId = fileId;
+        self.docs[self.docsLen].declLine = declLine;
+        self.docs[self.docsLen].text = text;
+        self.docsLen++;
+    }
+
+    /* interned text of the `///` block above the decl whose name is on
+     * `declLine`; 0 when the declaration carries no docs */
+    Str docFor(u32 fileId, u32 declLine)
+    {
+        u32 i = 0;
+        while (i < self.docsLen)
+        {
+            if (self.docs[i].fileId == fileId && self.docs[i].declLine == declLine)
+                return self.docs[i].text;
+            i++;
+        }
+        return 0;
     }
 
     // remember a pointer for deinit to free; nulls are ignored

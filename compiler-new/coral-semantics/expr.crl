@@ -757,8 +757,25 @@ pub extend Sema
             bool lLit = left.index != 0 && self.isIntLitNode(left);
             bool rLit = right.index != 0 && self.isIntLitNode(right);
             if (self.sameType(leftType, rightType)) { self.setExprType(id, leftType); return true; }
-            if (lLit && !rLit && self.intLitAdoptsTo(left, rightType)) { self.setExprType(id, rightType); return true; }
-            if (rLit && !lLit && self.intLitAdoptsTo(right, leftType)) { self.setExprType(id, leftType); return true; }
+            /* two operands with only provisional types (literals and
+             * literal-only arithmetic like `0x7FFF... - 1`): the wider
+             * side wins so nothing has to be typed by hand */
+            bool lGen = lLit || (left.index != 0 && self.isConstIntExpr(left));
+            bool rGen = rLit || (right.index != 0 && self.isConstIntExpr(right));
+            if (lGen && rGen)
+            {
+                u32 lw = self.intWidth(leftType);
+                u32 rw = self.intWidth(rightType);
+                if (lw > rw) self.setExprType(id, leftType);
+                else if (rw > lw) self.setExprType(id, rightType);
+                else if (!self.intSigned(leftType) && self.intSigned(rightType)) self.setExprType(id, leftType);
+                else self.setExprType(id, rightType);
+                return true;
+            }
+            /* a generic side (literal or literal-only arithmetic) adopts
+             * the typed side's integer type */
+            if (lGen && !rGen && (!lLit || self.intLitAdoptsTo(left, rightType))) { self.setExprType(id, rightType); return true; }
+            if (rGen && !lGen && (!rLit || self.intLitAdoptsTo(right, leftType))) { self.setExprType(id, leftType); return true; }
             /* usize/isize are the platform word types; compatible() already
              * treats them as mutually assignable with u64/i64 (C size_t vs
              * uint64_t). Use that same rule here so `i < v.count` where i

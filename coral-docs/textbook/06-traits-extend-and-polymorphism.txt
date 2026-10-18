@@ -24,6 +24,8 @@ You have probably written a function like this:
 
 It works, and it is perfectly good code. You call it as `magnitude(p)`, passing the point in as the first argument. But notice a small friction: every time you think about a Point, you have two pieces of knowledge to keep together — the struct that defines its fields, and a scattered family of free functions that know how to operate on it. Rename the struct, and you hunt down every helper. Add a field, and you check all of them.
 
+In plain words, a method is just a function that has been filed next to the data it works on. Compare the two ways of calling it: `magnitude(p)` takes the point as an argument, while `p.magnitude()` reads as "ask this point for its magnitude." Same work, but the second keeps the tool beside the thing it is used on.
+
 Coral lets you write that same function as a method, living in an extend block beside the type it belongs to:
 
     struct Point {
@@ -103,6 +105,8 @@ Some operations belong to a type without belonging to any particular value of it
         }
     }
 
+In plain words, a static method is something the type can do even when you do not yet have one of its values. "Make a point at the origin" has to happen before any point exists, so it belongs to the type, not to an instance. The choice of `Point::origin()` versus `p.magnitude()` is a visible signal: the double colon means no existing value is involved.
+
 Constructors are static methods by convention, and `new` is the customary name. You call a static method on the type, using the double-colon path: `Point::origin()`, `Point::new(3.0, 4.0)`. You call an instance method on a value, using the dot: `p.magnitude()`. The distinction between `::` and `.` is the distinction between a type and a value, and it is visible at every single call site, which is the whole point. When you see `Point::new(...)`, you know no existing value is involved. When you see `p.scaled(...)`, you know `p` is being operated on.
 
 That visibility is not decoration. It is the same reason Coral writes `self` rather than hiding it: the language would rather your code declare what it is doing than leave the reader to infer it.
@@ -171,6 +175,8 @@ A trait is a job description; an implementation is a hire. A type satisfies a tr
 
 The colon reads as "extends as" or simply "satisfies": `Circle : Shape` means Circle satisfies Shape. Two types, one trait, two sets of bodies — the circle's formulas and the square's formulas. Notice what is absent. There is no sentence saying "a Circle is a kind of Shape." Circle remains exactly Circle; the block merely promises the two methods Shape asked for, implemented with the formulas that are the circle's own. There is no inheritance and no hierarchy. A circle is not a descendant of a shape; it keeps a promise next to its other promises.
 
+In plain words, implementing a trait means filling in the blanks of the checklist. The trait named the questions (`area` and `perimeter`); the extend block supplies this type's answers. Once the answers exist, a Circle can be handed to any code that accepts a Shape.
+
 This is a good moment to say something that trips people coming from class-based languages. Coral's conformance is nominal, not structural. In a structural language, a type satisfies an interface simply by happening to have the right methods, whether it intended to or not — which means a conformance can appear or vanish when someone else's code changes. In Coral, you must declare the conformance explicitly, with the extend block. It means to satisfy the trait, and it says so. The payoff is that a conformance is a stable, searchable fact: if you want to find every type that claims to be Shape, you search for `: Shape`, and you get all of them and nothing else.
 
 The conformance is declared, and because it is declared, it can be checked. The compiler compares the trait's signatures against the block, method by method: `area` must exist with the required signature, `perimeter` must exist with the required signature, and the match must be exact. If a method is missing, or its return type is wrong, or its parameters are wrong, the compiler reports it. A type cannot half-implement a trait. This is the E12xx family of diagnostics: E1202 is a signature mismatch, E1203 is a missing required method. They exist so that "does this type really do what the interface says?" is answered by the compiler, at the conformance site, rather than by a crash at some distant call.
@@ -193,6 +199,8 @@ One rule keeps this neat: a type may conform to a given trait only once. There i
 6.6 Inherent Methods and Trait Methods in the Same Type
 
 A useful type usually has two kinds of methods at once. Inherent methods are the type's own vocabulary — the API its author designed because it is useful. Trait methods are the type's obligations — the part of it that some interface requires. Coral keeps them in separate extend blocks, and the separation is meaningful.
+
+In plain words, inherent methods are the type's own features, chosen by whoever wrote it, while trait methods are promises it made to fit an interface. Keeping them apart is like keeping your own to-do list separate from the forms you filed for other people: both are yours, but one is your design and the other is an obligation.
 
     pub struct Stack<T> {
         Vec<T> items;
@@ -253,6 +261,8 @@ RAII, and why @drop exists
 
 Start with `@drop`, the destructor trait. In C, whenever you open a file, lock a mutex, or allocate a buffer, you must remember to close, unlock, and free it — and you must do it on every early return, every error path, every `goto cleanup`. The classic bug is the path someone forgot. The discipline that fixes it has a name: RAII, for "resource acquisition is initialisation," and it means tying a resource's lifetime to a variable's scope. When the variable goes out of scope, the resource is released, automatically, on every exit path, with no call site to forget.
 
+In plain words, RAII is a bargain the language keeps on your behalf: the instant you acquire something, a variable takes ownership of it, and the instant that variable's scope ends, the thing is released — whether the code left by finishing normally, by returning early, or by an error path. You write the acquisition, and the cleanup is automatic.
+
 Coral expresses RAII as a trait. A type that implements `@drop` must provide a `void drop()` method, and the compiler invokes it automatically when a value of that type goes out of scope:
 
     pub extend FileHandle : @drop {
@@ -278,6 +288,8 @@ There is one more decision to make: which types should implement `@drop` at all.
 
 `@toStr` is the formatting trait. A type that implements it can be printed, or converted to a `str` where a string is required, and the compiler finds the implementation at the formatting call site:
 
+In plain words, `@toStr` is how you teach a type to describe itself as text. Without it, the printing machinery has no idea what one of your Points should look like on screen; with it, `println("{}", p)` knows exactly what to render.
+
     pub extend Point : @toStr {
         str toStr() {
             return "Point(" + formatFloat(self.x) + ", " + formatFloat(self.y) + ")";
@@ -289,6 +301,8 @@ With this conformance, `println("{}", point)` works: the printing machinery, see
 6.9 RAII in Practice, and How to Opt Out
 
 Automatic cleanup is the right default, but it is not free and not always wanted. The compiler must track every local that implements `@drop` and generate a cleanup call on every path out of the scope. For most application code that cost is exactly what you paid for, and you leave it on. But some code — the standard library itself is the canonical case — manages memory by hand with explicit `free` calls and does not want the compiler generating destructor calls it would then have to account for. Coral gives you a graduated set of opt-outs, and it is worth knowing each one, because the wrong choice here is a double free or a leak.
+
+In plain words, the opt-outs let you say "I will handle this cleanup myself" over increasingly broad areas: one variable, one block, or an entire file. They exist for code that manages memory by hand — the standard library is the main example — and a beginner almost never needs them, because the automatic behavior is what you want.
 
 `#[[no_drop_all]]`: turn RAII off for a whole file
 
@@ -427,6 +441,8 @@ Every conformance so far has been static. When the concrete type is known, a cal
 
 Think of a universal remote. It has a row of buttons, and it can control any television that speaks the standard signal. The remote does not contain a television; it holds a reference to one plus enough knowledge to send the right commands. Which television is behind the remote is decided at the moment you point it, not when the remote was made.
 
+In plain words, `any Shape` means "some kind of shape, and we will find out exactly which one when the program runs." The value carries both the object and a way to reach its Shape methods, so one loop can handle a Circle today and a Square tomorrow without being rewritten.
+
     Vec<any Shape> shapes = Vec<any Shape>::new();
     shapes.push(Circle { .radius = 1.0 });
     shapes.push(Square { .side = 2.0 });
@@ -454,6 +470,8 @@ A generic function can work for every type that can do what its body asks. The b
         }
         return sum;
     }
+
+In plain words, this is a recipe written with a blank for the element type: "for any T, if T knows how to `area`, sum them up." The compiler fills the blank separately for each type you actually use, so each version is as fast as one written by hand for that type. The blank is written `<T>`, and you will meet it again in the next chapter.
 
 Inside `totalArea`, the call `s.area()` is checked when the function is instantiated. Call it with `Vec<Circle>` and the compiler generates a `totalArea<Circle>` whose `s.area()` is a direct call to `Circle::area`. Call it with `Vec<str>` — a type with no `area` — and the error is reported naming `str` as missing the operation. The requirement is never declared up front; it is discovered and enforced at each instantiation. If you want to assert it in your own words, or branch on the type, a `comptime` block does that, as Chapter 7 develops.
 

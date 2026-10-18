@@ -24,6 +24,8 @@ Read the angle brackets as "for any type T." The function says: give me two valu
     f64 f = max(1.5, 0.5);      // compiler makes max<f64>
     char c = max('a', 'z');     // compiler makes max<char>
 
+In plain words, the `<T>` is a blank labelled T. When you call `max` with two integers, the compiler writes "i32" in every blank and makes an integer version; call it with two floats and it makes a float version. You wrote the body once, and you got one tailored function per type you used.
+
 Nothing here is dynamic. There is no table of types consulted at runtime; when the compiler sees `max(3, 7)`, it knows the arguments are `i32` and it emits `max<i32>`. When it sees `max(1.5, 0.5)`, it emits `max<f64>`. Two functions, two blocks of machine code, chosen before the program exists. This is what "monomorphised" means — "single shape," one generated copy per shape of the type.
 
 The call site deduces the type arguments from the arguments, so you rarely write `max<i32>(3, 7)`. But you may spell them out, and sometimes must: when deduction is ambiguous, when a parameter does not appear in the argument list, or when you simply want the code to be explicit about what it is asking for.
@@ -67,6 +69,8 @@ A function can be generic; so can a whole type. This is where the standard libra
 
 Every use of Box with a concrete type parameter produces a concrete Box type. `Box<i32>` is a different generated type from `Box<str>`, with a field of the appropriate type and methods specialised to match. The type parameter is in scope throughout the extend block, so methods can mention `T` in their signatures and their bodies. And generic types nest: `Box<Box<i32>>` is a box of a box of an integer, and the compiler generates both layers. A second type parameter is as easy as the first.
 
+In plain words, a generic type is a container whose contents are not decided until you use it. `Box<T>` says "a box of something"; `Box<i32>` says "a box of integers." The type of what is inside is written in angle brackets, and the compiler makes a matching box for whatever you put there.
+
 The standard library's `Vec` is the canonical generic type, and reading its declaration teaches the pattern in one glance: generic over the element type, with an extend block generic in the same parameter, methods that mention `T` throughout. When you implement a container, you write one generic definition and every element type it is used with becomes a monomorphisation. That is the whole discipline, and it is why a `Vec<f64>` is not a boxed array of `void*` — it is a real array of `f64`, with no per-element indirection.
 
 7.3 Value Generics: When the Size Is Part of the Type
@@ -80,6 +84,8 @@ Sometimes the thing that varies is not a type but a number, and that number matt
 The parameters `Rows` and `Cols` are compile-time constants. Because they are constants, the array size `Rows * Cols` is itself a compile-time expression — the compiler can compute the size of a `Matrix` without running anything — and indexing with a literal can be bounds-checked before the program runs:
 
     Matrix<f64, 3, 3> identity = ...;
+
+In plain words, a value generic puts a number into the type's name. `Matrix<f64, 3, 3>` is not just "a matrix"; it is specifically a three-by-three matrix of floats, and the compiler treats a three-by-three and a four-by-four as different types. That means you can never accidentally swap one for the other, because the mistake is caught before the program runs.
 
 Two useful things follow. First, the size is exact and known: `Matrix<f64, 3, 3>` and `Matrix<f64, 4, 4>` are different types, so you cannot accidentally pass one where the other is expected. Second, the size is available to every method as a constant, so a loop over the elements has a bound the compiler can see, and it can unroll it.
 
@@ -99,6 +105,8 @@ A value generic is checked when the type is instantiated, so an impossible insta
     }
 
 There is no macro syntax to learn and no expansion output to decode. The block is Coral. The difference is when it runs.
+
+In plain words, `comptime` means "do this while building the program, not while running it." You write the same code you always write — loops, ifs, arithmetic — but the results are ready before the program ever starts, so they cost the running program nothing. If you have used a spreadsheet, it is like a cell that is computed once when you open the file rather than recomputed every moment.
 
 More powerfully, a comptime block may choose which code is emitted. Because the values and types inside it are known at compile time, a `switch` inside comptime resolves to a single arm, and only that arm survives into the generated program:
 
@@ -140,6 +148,8 @@ It is worth being precise about what `println` is not. It is not a C-style varia
 
 In C, `printf("%d", "hello")` compiles, runs, and prints garbage, because the format string is a runtime string and the arguments have been erased to untyped slots. The compiler cannot know that `%d` was handed a pointer. Coral closes that hole with a compile-time test: `@isFormatLiteral(fmt)` is true when the argument is a literal format string known at compile time, and false otherwise. When it is true, the entire format can be checked against the arguments before the program exists.
 
+In plain words, if you write the format as a literal, Coral can read the `{}` placeholders and compare them to the values you passed right there at build time. That turns a whole class of "printed the wrong thing at runtime" bugs into messages while you are still typing.
+
 The shape of the check is the comptime walk described above, and it produces real diagnostics in the E09xx family. A placeholder with no matching argument, an argument with no matching placeholder, an unknown specifier, or a specifier that demands the wrong kind of argument — each is a compile error with a code and a location:
 
     println("{} {}", a);        // error E0901: too few arguments for 2 placeholders
@@ -161,6 +171,8 @@ This is the clearest example in the book of comptime changing what the language 
 
 To specialise or reject based on a type, a comptime block needs to ask the compiler questions about it. Three queries cover most of the ground, and all three are evaluated during compilation, so they may appear in comptime blocks, in value-generic arguments, and anywhere else a compile-time constant is expected.
 
+In plain words, these are questions you ask the compiler about a type, and the answers are known before the program runs. `@sizeof` asks "how many bytes does this take?", `@typeof` asks "what type is this expression?", and `alignof` asks "what memory boundary does this type prefer?" They let code adapt to the exact machine and the exact types it is given.
+
 `@sizeof(T)` is the size of a type in bytes. It is how you branch on layout — a small type may be passed by value, a large one by pointer — and how you assert a layout assumption:
 
     comptime {
@@ -181,6 +193,8 @@ With these three, a generic can specialise or reject based on the concrete layou
 
 A generic that cannot support a particular instantiation should fail at compile time, not at runtime. `@compileError` is how it says so. It takes a message and, when reached during compilation, stops the build with that message at the offending instantiation:
 
+In plain words, `@compileError` is a way to plant a tripwire in your own code: if someone uses this function in a way it cannot handle, the build stops with the sentence you wrote, right at the line that caused it. It turns a confusing mistake into a clear explanation.
+
     T firstElement<T>(Vec<T> v) {
         comptime {
             if (@sizeof(T) == 0) {
@@ -195,6 +209,8 @@ The compiler evaluates the comptime block during instantiation; if the condition
 7.9 When to Use Which
 
 Four mechanisms can look interchangeable and are not. The rule is always to choose the one that expresses the constraint you actually have.
+
+In plain words, ask one question before choosing: what is it that changes from use to use? If it is a type, use a generic type parameter. If it is a number that must be known while building, use a value generic. If it is something only known while the program runs, use `any Trait`. Most choices fall out of that single question.
 
 Use a generic type parameter when the code works for any type and produces a value of that type. `max<T>`, `Box<T>`, and `Vec<T>` are generic: the algorithm does not care what `T` is, only that it supports the operations it uses.
 

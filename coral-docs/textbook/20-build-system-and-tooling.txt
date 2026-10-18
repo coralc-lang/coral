@@ -68,7 +68,11 @@ The build file is `coral.crlb`. It is declarative — not Coral source, but a sm
 
 The fields mean what they say. `root` is the directory the other paths are relative to. `entry` names the module that contains `main` — the executable's root. `target` selects the backend: `native-x86_64`, `native-arm64`, `wasm32`, or `bytecode`. `opt` is the optimisation profile, one of `debug`, `release`, or `size`. `output` is where the binary lands. `module_map` and `cache_dir` place the generated table and the cache.
 
+Simply put, the build file is a description of the map, not a set of directions. It says which folders are part of the project and where the front door is; it does not say "compile this, then that," because the compiler works the order out from the imports.
+
 The two list fields matter most day to day, and they are the heart of the design. `modules` is the required list of which folders are build modules. Only folders listed here are scanned, so a `vendor` tree sitting in the project does not slow the build or pollute the module table — a stray `lib.crl` in a scratch directory stays invisible because nobody listed it. `skip` excludes subfolders during any scan. Between them you control exactly what the build sees.
+
+An analogy: `modules` is the guest list at a party. Only the names on it get in, so a neighbour who happens to walk by — a stray `lib.crl` in a scratch folder — does not become a guest. The price of a guest list is keeping it up to date, and that is exactly the chore `coralc map` does for you.
 
 Hold on — why an explicit list instead of just walking every folder that happens to contain a `lib.crl`? Because a build graph that can change by accident is a build graph that cannot be trusted. If dropping a `lib.crl` into a folder silently made it part of the build, then a backup directory, a vendored copy, or a half-finished experiment would join the project without anyone deciding it should. The explicit list makes the build graph something a person wrote down. And if maintaining the list by hand sounds tedious, it is — which is exactly why `coralc map`, in 20.6, exists to keep it fresh for you.
 
@@ -121,6 +125,8 @@ A task is a named unit of work with an optional command to run and optional depe
     $ coralc test
 
 When a task called `"run"` exists, `coralc run` executes it; otherwise `coralc run` builds and launches the output binary directly. `coralc NAME` runs any task by name. Tasks let you keep the project's entry points — `run`, `test`, `bench`, `clean` — in the build file rather than in a shell script nobody maintains. A build file with a `test` task is a project where "how do I run the tests?" has an answer a newcomer finds in five seconds.
+
+Why this matters: a task turns a project's unwritten rituals into a command anyone can run. The difference between "ask someone how to run the tests" and "run `coralc test`" is the difference between a project that welcomes newcomers and one that does not.
 
 20.6 Running the Build
 
@@ -184,6 +190,8 @@ When the compiler resolves `import lexer::table`, it consults this map. The map 
 
 The elegant thing about this arrangement is what the compiler does *not* do. It never walks the directory tree looking for modules. The builder walks, once, and writes the map; the compiler reads the map and asks it the single question "where does this name live?" That division is why compiling a single file is fast and why the module graph has one source of truth.
 
+Simply put, the module map is a phone book. The compiler never walks the neighbourhood knocking on doors; it looks the name up in the book and goes straight to the address. The builder is the only one who walks the streets, and it does so once per build.
+
 20.8 The Language Server: the Compiler as an Editor Backend
 
 Now the second hat. `coralc` carries a language-server mode, and it is one of the nicest things about the toolchain because it is not a separate program that reimplements half a compiler. It is the compiler.
@@ -203,6 +211,8 @@ Hover returns real types, not a guess. The compiler sets a resolved type on ever
 The protocol itself is specified in `PROTOCOL.md`, and that document is normative: it gives the exact wire format, the framing rules, the error codes, the payloads, and the capability matrix. `LANGUAGE-SERVER.md` is the status companion — what is wired up today, what an editor should expect, and how to test an integration — and it is explicitly not normative, because the wire format changes rarely while the state of the integration changes often. Keeping them separate is deliberate, and it is a good habit for any protocol you specify.
 
 The honest state of the server today is that diagnostics, hover, and definition work, and a long list of richer features — completion, document symbols, semantic tokens, inlay hints, references, code actions — are planned and tracked in the capability matrix. When a request is not implemented, the server answers `-32601` (MethodNotFound) rather than ignoring it, and that is precisely correct: an editor that receives `-32601` hides the affordance and moves on, while an editor left waiting for a reply that never comes looks broken. Rejecting correctly is half the job of a language server.
+
+Why this matters: because the editor and the build share one compiler, a mistake an editor underlines is the same mistake the build will refuse. You will not get the editor saying "fine" while the build says "no."
 
 20.9 Editors
 
@@ -278,12 +288,11 @@ The entry imports it through the module identity:
     import(lib) std::io::ios { println };
     import math::vec2 { Vec2, vec2Add, vec2Length };
 
-    i32 main() {
+    void main() {
         Vec2 a = Vec2 { .x = 3.0, .y = 4.0 };
         Vec2 b = Vec2 { .x = 1.0, .y = 2.0 };
         Vec2 c = vec2Add(a, b);
         println("sum = ({}, {}), length = {}", c.x, c.y, vec2Length(c));
-        return 0;
     }
 
     // src/lib.crl

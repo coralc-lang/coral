@@ -80,6 +80,8 @@ Everything else in this chapter is the details of the operations: what each one 
 
 An operator is an operation on values, written with a symbol. Where a function has a name, an operator has a glyph: the plus sign, the star, the ampersand. But the difference is only in the writing. Underneath, an operator is exactly a function of a fixed signature, a mapping from operand types to a result type, and the symbol is a promise that this mapping is so fundamental, so universally understood, that it deserves the shortest possible spelling. Addition, comparison, and masking are to a language what vowels are to an alphabet: they appear so often that a single character pays for itself.
 
+If you are new to this, think of an operator as a tiny machine with a fixed number of input slots. You drop values into the slots, the machine does its one job, and out comes a new value. The plus machine takes two numbers and hands back their sum. The less-than machine takes two numbers and hands back `true` or `false`. The symbol is just the machine's name.
+
 Every operator compiles to machine instructions. That is the deep fact of this chapter, and it is why Coral chooses the C operators. The plus operator is not an abstraction the compiler must simulate; it is a direct request for the processor's add instruction, operating on the registers that hold the operands and leaving its result in a register. The equality operator compiles to a compare instruction followed by a branch. Bitwise AND compiles to a single and instruction. Because operators are instructions, they have exactly the properties the instructions have: they are fast, they are defined on the machine's widths, and they behave the way the silicon behaves. Coral puts nothing between your expression and the hardware. When you write x + 1, you are, in the most literal sense, asking the machine to add.
 
 Operators come in three shapes by arity, the number of operands they take. A unary operator takes one operand: the unary minus, logical NOT, bitwise NOT, address-of, dereference, and the prefix and postfix increments. A binary operator takes two operands: the arithmetic, comparison, logical, and bitwise operators are all binary. A ternary operator takes three: the conditional expression is Coral's only ternary operator. Arity is part of an operator's identity, and reading an expression means reading its operators as little machines of one, two, or three inputs.
@@ -113,6 +115,8 @@ The arithmetic operators are the four operations of elementary arithmetic plus t
     /   division
     %   remainder (modulo)
 
+If you have never seen `%` before: "remainder" is what is left over after a division that keeps only whole numbers. Ten divided by three is three with one left over, so `10 % 3` is 1. It is the arithmetic of sharing cookies evenly and counting the crumbs.
+
 These operators come in two flavors, depending on the types of their operands. Integer arithmetic operates on the integer types, i8 through u64. Floating-point arithmetic operates on f32 and f64. The distinction matters enormously, because integer division and floating-point division are different operations with different behaviors, and nothing about the symbol marks which one you are getting. You have to know the types.
 
 The compiler selects the arithmetic instruction from the operand types. Two integer operands select the integer add, subtract, multiply, or divide instruction; two float operands select the floating-point instruction. The two instruction families do not mix. Coral's strict typing means an integer cannot be added to a float in the same expression without an explicit conversion; the code must say whether the integer becomes a float or the float becomes an integer before the operation runs. The same symbols therefore express two different families of operations, and the type system is what keeps them apart.
@@ -127,6 +131,8 @@ The compiler selects the arithmetic instruction from the operand types. Two inte
     f64 d = x / y;      // floating-point division: d is 3.5
 
 The two divisions use the same symbol, a slash, but they compile to different instructions and produce different values from the same digits. Look at the four results and the lesson writes itself. This is the first and most important lesson of the arithmetic operators: the operator is what the operand types make it. The slash does not divide; the slash is the request, and the types decide the response.
+
+A frequent beginner surprise follows directly: `7 / 2` is 3, not 3.5, and no warning is issued. If you want a fractional answer, at least one side must be a float — write `7.0 / 2.0` or convert with `(f64)x / (f64)y`. This same rule is why a program that computes an average of integer counts can print a whole number when you expected a decimal.
 
 Integer division divides one integer by another and produces an integer result, truncating toward zero. The expression 7 / 2 produces 3, not 3.5. The fractional part is discarded, not rounded. This is the behavior of the hardware's integer division instruction, and Coral keeps it. Integer division is used when a count must be divided into whole pieces: splitting a byte count into word counts, computing how many whole items fit into a region, dividing a capacity into segments. The standard library uses integer division constantly, and the results are always integer. When you compute how many pages a byte count needs, you are doing integer division; when the answer comes back 3 because twelve kilobytes make three four-kilobyte pages, truncation was exactly right.
 
@@ -175,6 +181,8 @@ The pair is the inverse of the row-major formula cell = row * cols + col, and it
 
 Division and remainder by zero are undefined behavior in Coral, exactly as in C, because the hardware has no defined result for them. Integer division by zero has no meaningful answer, and the language does not invent one. On most hardware, integer division by zero raises a processor fault that terminates the program, which is the honest outcome: dividing by zero is a bug, and the program should not continue with a made-up result. Better a crash you can see than corruption you cannot.
 
+In plain words, the machine simply has no answer for "how many times does zero fit into five," so Coral does not invent one. The practical habit is to ask before every division, "can the bottom ever be zero?" If the answer is yes, a one-line guard above the division turns a crash into a handled case.
+
 Because the behavior is undefined, no program may rely on it, and the code that divides must ensure the divisor is not zero when the divisor is not known to be safe. The guard is a comparison before the division:
 
     if (divisor == 0) return 0;
@@ -216,6 +224,8 @@ Adding one to the maximum value of a type wraps to the minimum value. Add one to
     s += 1;     // s is now -128, wrapped
     u8 n = 0;
     n -= 1;     // n is now 255, wrapped
+
+In plain words, overflow is what happens when an answer no longer fits in the box you chose. It is like an odometer rolling from 99999 back to 00000. No alarm sounds and no error appears — the number just starts over — so the only defense is to pick a box big enough for the values you expect.
 
 The wrapping is not a special case in the compiler; it is the natural shape of the machine's arithmetic. The processor's arithmetic unit computes the addition on a wider internal width and keeps the low eight bits of the result, and the type u8 is exactly a promise to keep those eight bits. The processor also reports the overflow to any code that asks, through a flag in the status register, but Coral does not read that flag implicitly. The wrapped result is the result, and a program that needs to know about the wrap must check the operands before the operation.
 
@@ -367,6 +377,8 @@ The comparison operators compare two values and produce a bool. They are the equ
     >     greater than
     >=    greater than or equal to
 
+The comparisons are the machines that answer questions. They take two values and hand back a single bool, which is exactly what `if` and `while` expect. A common beginner mistake is comparing the wrong type: `3 == 3.0` mixes an integer with a float, and Coral refuses it rather than quietly converting. When the types differ, decide which one you mean and convert explicitly.
+
 For the integer types, the comparison operators compare numeric values. The result is true when the relationship holds and false otherwise. Comparisons between signed and unsigned values are performed carefully, because the two types interpret the same bits differently, and the compiler handles the conversion explicitly to avoid the classic bugs of mixed-sign comparison.
 
     i32 a = 3;
@@ -403,6 +415,8 @@ The comparison operators apply to primitive types directly. For composite types,
 3.10 Value Equality and Reference Equality
 
 The distinction between value equality and reference equality is one of the most important concepts in programming, and Coral draws it with unusual clarity.
+
+In plain words, value equality asks "do these two things hold the same content?" and reference equality asks "are these two names pointing at the very same object?" Two identical houses can stand on different lots; they are equal in contents but not the same house. Keeping these questions apart is what stops a cache from returning the wrong result because two keys merely looked alike.
 
 Value equality asks whether two values are the same value: whether two integers hold the same number, whether two characters are the same byte. Primitive types have value equality. The expression a == b for two integers is true exactly when a and b hold the same number.
 
@@ -462,6 +476,8 @@ This protocol is the answer to the question of how operators compose into algori
 
 The logical operators combine bool values and produce bool values. They are the operators of boolean logic, and their semantics were introduced in the previous chapter.
 
+In plain words, `&&` means "both must be true," `||` means "at least one must be true," and `!` flips a bool to its opposite. Their most useful property is that they stop early: if the first half of an `&&` is already false, the second half is never even looked at, which is what lets you write a safety check in the same breath as the risky operation it guards.
+
     &&    logical AND
     ||    logical OR
     !     logical NOT
@@ -501,6 +517,8 @@ The logical operators operate only on bool values. They are not bitwise operator
 The conditional expression, written with a question mark and a colon, is the language's expression-level if. It evaluates one of two expressions based on a bool condition, and it produces a value.
 
     condition ? valueIfTrue : valueIfFalse
+
+If this reads oddly at first, say it as a sentence: "if the condition, then the first value, otherwise the second." It is the compact way to choose between two values on one line, and it is an expression, so its result can be stored directly. A small example: `u64 bonus = overtime ? 100 : 0;` gives a bonus of 100 when `overtime` is true, and 0 otherwise.
 
 The condition is evaluated first. If it is true, the expression evaluates to the second operand; if false, to the third. The other branch is not evaluated, so the ternary operator shares the short-circuit property of the logical operators: only one of the two value branches is ever evaluated. This makes it safe to use a branch that would be invalid in the other case.
 
@@ -560,6 +578,8 @@ The bitwise operators treat integers as bit patterns. They are the raw operation
     ~     bitwise NOT (complement)
     <<    left shift
     >>    right shift
+
+If bits are new to you: a value in memory is really a row of on/off switches, and a bitwise operator works on that row position by position. `&` keeps a switch on only where both inputs are on; `|` turns a switch on if either input is on; `^` turns a switch on if exactly one input is on. This is how a program stores many yes/no facts — "is this flag set?" — in a single number.
 
 Bitwise AND, written with a single ampersand, produces a result with a 1 in each bit position where both operands have a 1. It is the masking operator: it can clear selected bits of a value, test whether specific bits are set, and extract fields from a packed value. Bitwise OR, a single vertical bar, produces a 1 where either operand has a 1. It is the setting operator: it can set selected bits without disturbing the others. Bitwise XOR produces a 1 where exactly one operand has a 1. It is the toggling operator: XORing a value with a mask flips the masked bits. Bitwise NOT flips every bit of its single operand.
 
@@ -683,6 +703,8 @@ Pointers are fundamental to Coral, and their operators are the C pointer operato
     ->    member access through pointer
     .     member access
 
+If pointers are new to you, think of a variable as a labelled box and a pointer as a slip of paper with the box's location written on it. `&x` writes down the location of x; `*p` means "go to the location on this slip and use what is there." Passing that slip to a function is how two pieces of code can agree to work on the same box.
+
 The address-of operator, a single ampersand, produces a pointer to its operand. Taking the address of a variable produces a pointer that names that variable, and the pointer can be passed to functions that need to modify the caller's value. The standard library's methods are declared in extend blocks and name their receiver implicitly as self, so a call like v.push(value) passes the receiver without an explicit ampersand; the compiler takes its address when the method needs to modify it.
 
 The two operators are exact inverses at the machine level. Address-of loads the address of a location into a register; dereference loads or stores through that address. Passing the address of a variable to a function gives the function a name for the caller's memory, and the dereference inside the function reaches it:
@@ -753,6 +775,8 @@ Casting converts a value from one type to another. Coral supports the C-style ca
     (u64)value
     (i32)value
     (T*)pointer
+
+In plain words, a cast is you telling the compiler "treat this value as this other type." Coral never converts between types behind your back, so a cast is how a conversion gets written down. Because it can change a value or reinterpret its bits, seeing a cast in code is a signal worth pausing on and checking. Note the spelling: the type goes in parentheses before the value, as in `(u32)x`; there is no `as` keyword.
 
 A cast is an explicit, deliberate type conversion. It is how a value is converted when the compiler's implicit conversions do not apply, and it is the signal that the programmer is taking responsibility for the conversion. Casting between integer types reinterprets or converts the numeric value to the target width. Casting between a pointer and an integer, or between unrelated pointer types, is an unsafe operation that is permitted only where the language's safety rules allow it, and it is exactly the kind of operation that lives in an unsafe context. The language's philosophy is that casts are visible and deliberate, never hidden.
 
@@ -838,6 +862,8 @@ The precedence levels, from highest to lowest:
     logical OR                 ||
     conditional                ? :
     assignment                 =  +=  -=  ...  lowest
+
+If this table looks intimidating, do not memorize it. Remember only the childhood rule — multiplication and division before addition and subtraction — and add parentheses whenever you are unsure. Parentheses always win, they cost almost nothing to type, and they make your intent obvious to the next reader. A parenthesized expression is never wrong.
 
 Read this table from the top: the unary and postfix operators bind tightest, then the arithmetic operators, then the comparisons, then the bitwise operators, then the logical operators, then the conditional, then assignment. A few consequences cause the most bugs, and they are worth stating.
 

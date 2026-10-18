@@ -32,6 +32,8 @@ This chapter covers the two types that carry failure — `Option` and `Result` �
 
 Read those two lines as the two honest answers to "do you have a number for me?" `Some { .value = 42 }` says yes, and here it is. `None` says no. The type `Option<i32>` can be either, and the compiler will not let you treat it as a plain `i32`, which is precisely the point. A bare `i32` has no way to say "no," so a function that needs to sometimes say "no" must return something else, and that something is `Option`.
 
+If you are new to this, here is why `Option` exists at all. In many languages "no value" is smuggled in as a special value of the ordinary type — a null pointer, a -1, an empty string — and nothing in the type warns you. `Option<T>` does not smuggle: it is a box that either holds a `T` or is visibly empty, and the type says "this might be empty." The compiler then refuses to let you use what is inside without first checking whether the box has anything in it. That one rule removes a whole family of crashes where code assumes a value that turned out not to be there.
+
 Why not just use a magic number? Suppose `findUser` returns `i32` and uses `-1` for "not found." That works until a real user has id `-1`, or until someone forgets to check, or until a function that takes an `i32` is handed the `-1` as though it were an id. Every one of those is a bug waiting for a bad day. The sentinel is a convention, and conventions are not checked. `Option<i32>` makes "not found" a case the type knows about, so a caller cannot use the value without first dealing with the possibility that there is no value.
 
 The methods are the vocabulary of optional values. `isSome` and `isNone` ask which case is live; `unwrap` takes the value and trusts it is present; `unwrapOr` takes the value or a fallback; `take` removes the value and leaves `None` behind:
@@ -43,6 +45,16 @@ The methods are the vocabulary of optional values. `isSome` and `isNone` ask whi
     i32 safe = nothing.unwrapOr(-1);      // -1
 
 `unwrap` is a promise. If the `Option` is `None`, `unwrap` has no value to return, and Coral makes that a hard, explicit assertion failure rather than a silent garbage value or a null dereference three frames later. Reaching for `unwrap` should be a decision that the value is present, and a reader is entitled to ask why you are sure. `unwrapOr` is the version that has thought about the `None` case; when the `None` case is genuinely impossible, an assertion is more honest than a default.
+
+    Result<i32, str> r = parseCount(input);
+    if (r.isOk())
+        println("count is {}", r.unwrap());
+    else
+        println("bad count: {}", r.unwrapErr());
+
+The `if` is where the decision lives: the success path reads the value, and the failure path reads the reason. Neither side can accidentally read the other.
+
+A common beginner mistake is to call `unwrap` everywhere, out of habit, and so rebuild the very crashes `Option` was meant to prevent. Before you write `unwrap`, ask how you know the value is present. If you do not know, handle the `None` case, or use `unwrapOr` to supply a fallback.
 
 `take` is the odd one, and it is worth a small example because it is easy to misread. It pulls the value out and, in the same move, puts `None` back where the value was:
 
@@ -95,6 +107,10 @@ A whole family of "look this up, then look that up, or give up" operations reads
 `Ok` carries the success value; `Err` carries the reason. The error type `E` is chosen by the API author; it is usually an enum or variant that enumerates the ways the operation can fail, which is what makes the failure inspectable rather than a string a caller must parse.
 
 The word "reason" is doing a lot of work, so let me be concrete. `Option` is the right tool when the only thing you can say about a failure is "there was nothing" — a search that found nothing, a map lookup for a missing key. `Result` is the right tool when you can say more — "there was nothing because the file does not exist," "the number was too large," "the checksum did not match." The error type is where those distinctions live, and because it is a type, a caller can switch on it and handle each case differently.
+
+In plain words, `Option` answers "is there anything?" while `Result` answers "did it work, and if not, why not?" Use `Option` when absence is the whole story, and `Result` when the caller would benefit from knowing which of several things went wrong.
+
+Why this matters: the choice between them is really a choice about what the caller is allowed to know. A map lookup that returns `Option<V>` says "a value or nothing," which is all a lookup can honestly say. A file open that returns `Result<File, IoError>` says "a file, or a specific reason it could not be opened," and the `IoError` is what lets the caller decide whether to retry, report the path, or fall back to a default.
 
     Result<File, IoError> opened = open("config.txt");
     switch (opened) {
@@ -163,6 +179,10 @@ Same operation, three failure kinds, three tools. Choosing the wrong one of the 
 
 A rule of thumb marks the boundary between `Result` and `@assert`. Ask: "can a caller, in principle, do something reasonable about this?" If yes, it is a `Result`. If the only sensible response is "the program is wrong, stop," it is an assertion. A missing file has a reasonable response (report it, try a default). A violated loop invariant does not; there is nothing to recover, only a bug to find.
 
+Simply put, `Result` is the tool for things the outside world can get wrong, and an assertion is the tool for things your own code should never get wrong. A file that vanished is the world's doing, so it comes back as a value you handle. An index you promised was in range but is not is your own doing, so it stops the program loudly. Same operation, two different questions: "is this a condition or a bug?"
+
+A common beginner mistake is to assert on user input. `@assertOut(count > 0, "empty list")` when `count` comes from a file turns an ordinary, expected condition into a crash. That condition is precisely what `Result` is for; save the assertion for the case where a non-zero count was a promise the program broke against itself.
+
 15.4 Propagating Failure
 
 Coral has no error-propagation operator. There is no question mark that unwraps a `Result` or returns early on `Err`. Propagation is written explicitly, and the explicitness is the point: a reader can see, at every call, whether the failure is handled here or passed up.
@@ -188,7 +208,11 @@ The idiom is a switch that returns the error case and continues on success:
 
 Read the shape of that function. Before each call, nothing can have failed. The call returns a `Result`. The switch asks "did it fail?", and if it did, the function returns immediately, wrapping the underlying error in the `ConfigError` this function promises to produce. If it did not fail, the `else` arm does nothing, and the code falls out of the switch, at which point `unwrap` is safe because the failure path already returned. The invariant is: by the time you reach an `unwrap`, the switch above it has already handled the `Err` case.
 
+A common mistake is to reach for `unwrap` first and add the switch later. That inverts the invariant: with no switch above it, `unwrap` on an `Err` aborts the program instead of reporting the failure. The habit to build is the opposite — handle the `Err` with a switch or a `mapErr`, and let `unwrap` appear only after the failure has genuinely been dealt with.
+
 The repeated shape is a small cost. In exchange, every point at which failure can leave the function is a line of code you can point to, and the error is enriched at each boundary rather than silently unwrapped. A reader auditing "what happens if the file does not exist?" finds the answer on the first switch. You need not trace a call graph hoping to catch an exception thrown from a function three levels down, because nothing is thrown. The exits are all visible.
+
+Here is the propagation walked through once. Suppose `open(path)` fails. The `switch` sees the `Err` case, builds a `ConfigError::Io` carrying the original error, and returns it immediately — so `readAll` and `parseConfig` are never called. Suppose instead `open` succeeds: the `switch` takes the `else`, falls through, `opened.unwrap()` yields the file, and the function continues. Every failure takes the same visible road out: a `switch`, then a `return`.
 
 Two refinements make the idiom less repetitive. `andThen` fuses a chain of fallible steps when the error types line up, so the same logic can be written as:
 
@@ -234,6 +258,8 @@ A variant error type also composes with mapping. When a caller of `loadConfig` i
 
 One more design question separates a good error type from a merely tidy one: does each case say something a handler could act on differently? If two cases would always be handled identically by every caller, they are one case. If a case is only ever logged as a string, it is an enum of log lines, and a plain `str` would have done. The test is not "how many things can go wrong" but "how many kinds of response are there." Design the type around the responses, and the data each response needs, and you will find the cases fall out naturally.
 
+Why this matters: an error type is a small API of its own, and every case is a promise that some caller can respond to it distinctly. If you add a case for something nobody handles differently, you have enlarged the surface every caller must switch over without giving anyone new power. Design the cases around the responses, and the type stays small and useful at the same time.
+
 15.6 The Error and Panic Catalogue
 
 The compiler's own failures follow the same philosophy, and its diagnostics carry codes that classify them. The codes relevant to error handling cluster in two ranges.
@@ -275,6 +301,8 @@ Thread the types through a small problem. A configuration file contains lines li
     }
 
 Read the signatures and the failure modes are already documented. `parseTimeout` returns a `Result` because it can fail; the `Err` type enumerates the three ways. The success path returns the bare `i64` and the language wraps it in `Ok` silently — a function that returns `Result<T, E>` may return a bare `T`, and the compiler converts it. That is worth underlining, because it is the single line of sugar that keeps the happy path readable: the last line is `return value;`, not `return Result<i64, ConfigError>::Ok { .value = value };`. The bare return is allowed only for the success type; to return a failure you must name the `Err` case explicitly, which is exactly the asymmetry you want. It is easy to return success, and you must say a word to return failure.
+
+Why this matters: this small asymmetry shapes how a function reads. The happy path stays quiet — `return value;` — while every failure path is spelled out with an `Err` case, so a reader scanning the body sees exactly where this function can give up. If both success and failure needed the same ceremony, the eye would stop noticing either; making failure the louder line keeps it visible.
 
 Each guard produces the specific error the caller needs, carrying the key, the offending value, and the bounds. At the call site, the caller decides policy:
 

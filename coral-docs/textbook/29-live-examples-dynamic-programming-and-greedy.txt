@@ -433,7 +433,250 @@ Time and space. Greedy is Θ(coins × (amount / min-coin)) in the worst case for
 
 Edge cases and the diagnostic. Before trusting a greedy rule, either prove it with an exchange argument or test it exhaustively against a DP on small inputs. For coin change, "is this denomination system canonical" is a real theorem with a known test (Pearson's), which is a lovely example of turning "is greedy safe here" into a decidable question. The general lesson of the chapter is stated by this example: DP is correct when the problem has optimal substructure and overlapping subproblems, and greedy is correct only when, in addition, some local choice can be proven safe for every input.
 
-29.12 Exercises
+29.12 House Robber
+
+The problem. Given a row of houses, each holding a known amount of money, choose houses to rob so that no two chosen houses are adjacent, maximising the total.
+
+Picture this. You walk down the street with a notebook. At each house you face a choice: rob it and skip its neighbour, or leave it and keep whatever you had. The best loot up to house i is either the best loot up to i−1 (leave house i) or the value of house i plus the best loot up to i−2 (rob it). That sentence is the recurrence, and it is climbing stairs with a maximum in place of a sum.
+
+Brute force, then better. The brute force tries all 2^n ways to choose a non-adjacent subset, which is exponential. The DP keeps, for each prefix of the street, the best total achievable there; each new house needs only the two previous answers, so the whole solution is a single pass with constant state.
+
+    i32 rob(Vec<i32>* nums) {
+        i32 prev2 = 0;      // best loot up to two houses back
+        i32 prev1 = 0;      // best loot up to the previous house
+        for (usize i = 0; i < nums->count(); i += 1) {
+            i32 take = prev2 + nums->at(i);
+            i32 skip = prev1;
+            i32 cur = take > skip ? take : skip;
+            prev2 = prev1;
+            prev1 = cur;
+        }
+        return prev1;
+    }
+
+Two variables carry the whole table. `prev1` is the best loot using the houses seen so far, and `prev2` is the best loot two houses back, which is the only state that matters when you decide to rob the current house. For each house the code compares robbing it (`prev2 + value`) with skipping it (`prev1`), keeps the larger, and slides the window forward. The full table would have one entry per house, but because each entry depends only on the two before it, it collapses into two variables.
+
+Time and space. One pass, constant work per house, so Θ(n) time and O(1) space, against the brute force's O(2^n). This is exactly the space optimisation noted for climbing stairs in 29.2, applied where the recurrence is a maximum rather than a sum.
+
+Edge cases. An empty street yields 0. One house yields its own value. Two houses yield the larger of the two. Non-negative values are the usual assumption; negative values would make "rob nothing" better and subtly shift what the base cases mean. The final answer is `prev1`, the best over the whole street, not the value of any particular house.
+
+A variation. To report which houses were robbed, keep a table of the choice made at each index and walk it backward, or keep a boolean per house and reconstruct. As with knapsack, the total is only half the answer when the question also asks "which ones".
+
+29.13 Unique Paths on a Grid
+
+The problem. A robot starts in the top-left cell of an m × n grid and may move only right or down. How many distinct paths reach the bottom-right cell?
+
+Picture this. You are walking a street grid, and at each intersection you may go right or down. The number of ways to reach a cell is the number of ways to reach the cell above it plus the number of ways to reach the cell to its left, because those are the only two cells you could have come from. The first row and first column each have exactly one path — all rights, or all downs — and those seed the count.
+
+Brute force, then better. The brute force walks every path, and the number of paths is the binomial coefficient C(m+n−2, m−1), which is already enormous for modest grids before the search itself becomes slow. The DP fills the counts in a single pass, and because each cell needs only the cell above and the cell to its left, one row of the table is enough.
+
+    i64 uniquePaths(i32 m, i32 n) {
+        if (m <= 0 || n <= 0) return 0;
+        Vec<i64> dp = Vec<i64>::withCap((usize)n);
+        for (i32 j = 0; j < n; j += 1) {
+            dp.push(1);                 // the first row reaches each cell exactly one way
+        }
+        for (i32 i = 1; i < m; i += 1) {
+            for (i32 j = 1; j < n; j += 1) {
+                dp.set((usize)j, dp.at((usize)j) + dp.at((usize)(j - 1)));
+            }
+        }
+        return dp.at((usize)(n - 1));
+    }
+
+The vector holds the current row of the table. After the first row is initialised to all ones, each later row is computed in place: `dp[j]` still holds the count from the cell above, while `dp[j-1]` has just been overwritten with the count from the cell to the left, so adding them yields the new `dp[j]`. This is the row-collapsing of 29.8's minimum path sum, with addition instead of minimisation and the first row and column seeded to one instead of handled by branches.
+
+Time and space. Every cell is computed once, so Θ(m × n) time. The table is one row, so Θ(n) space — or Θ(min(m, n)) if you iterate along the shorter dimension. The answers are binomial coefficients and grow quickly, so i64 is used rather than i32 to delay the overflow point.
+
+Edge cases. m = 1 or n = 1 gives exactly one path, which falls out of the initialisation and the loops not running. A zero or negative dimension has no paths and returns 0. The count overflows i64 for large grids (around 34 × 34), at which point big integers or modular arithmetic are required, and no cleverness avoids that.
+
+A variation. With obstacles, mark each blocked cell in the table and set its count to zero, skipping it in the recurrence; the first row and column stop contributing past the first obstacle. If diagonal moves are also permitted, the recurrence gains a third predecessor and the seed row and column change, but the grid shape and the row-collapsing remain.
+
+29.14 Best Time to Buy and Sell Stock
+
+The problem. Given a list of daily prices, choose one day to buy and a later day to sell so as to maximise the profit. Return the best profit, or 0 when no profitable trade exists.
+
+Picture this. You watch a price chart over time and may make a single buy followed by a later sell. As you move forward, the best day to have bought so far is the cheapest price seen, and the best trade ending today is today's price minus that cheapest price. You keep a running minimum and a running best profit, and the answer is the best profit anywhere.
+
+Brute force, then better. The brute force checks every (buy, sell) pair, which is O(n^2). One pass records the lowest price so far and the best profit so far; each new day needs only those two numbers, giving O(n) time and O(1) space. Notice this is a greedy scan, not a table: the running minimum is the safe choice so far, and it is always right because a lower buy price can only help.
+
+    i32 maxProfit(Vec<i32>* prices) {
+        i32 best = 0;
+        i64 lowest = 9223372036854775807;   // larger than any possible price
+        for (usize i = 0; i < prices->count(); i += 1) {
+            i64 p = (i64)prices->at(i);
+            if (p < lowest) lowest = p;      // you could have bought today
+            i64 gain = p - lowest;
+            if (gain > (i64)best) best = (i32)gain;
+        }
+        return best;
+    }
+
+`lowest` starts above any possible price so that the first day always sets a new minimum. For each day the code updates the running minimum, then computes the profit from selling today and keeps the best. Updating the minimum before computing the profit permits buying and selling on the same day for zero profit, which is harmless; if you required at least a day between the two, you would compute the profit first and update the minimum after.
+
+Edge cases. Fewer than two days yields 0, because no buy-then-sell pair exists and the gain is never positive. A steadily falling price yields 0, the correct "do not trade" answer. Prices are non-negative in the usual statement, and the i64 arithmetic prevents overflow in the subtraction. If short selling were allowed, the problem would change and the running-minimum trick would no longer apply.
+
+A variation. The "at most one transaction" constraint is what makes the greedy scan sufficient. Allowing unlimited transactions makes the answer the sum of every upward day-to-day move; allowing at most k transactions needs DP over days and transaction counts. The single-transaction case is the one clean case, and it is worth seeing exactly why it is clean.
+
+29.15 Word Break
+
+The problem. Given a string and a dictionary of words, decide whether the string can be split into a sequence of dictionary words, each matching a contiguous piece.
+
+Picture this. You are reading a sentence that has lost its spaces and trying to segment it back into words using a dictionary. You mark each position you can reach; if the string up to some earlier position can be segmented, and the piece between there and here is a dictionary word, then the string up to here can be segmented too. The whole string is segmentable once the mark reaches its end.
+
+Brute force, then better. The brute-force recursion tries every dictionary word at every position and explodes, because the same suffix is attempted from many earlier splits. The DP records, for each prefix length, whether that prefix can be segmented. It fills left to right, and each entry looks back for a word whose length lands exactly on it.
+
+    bool endsWithWordAt(str s, i32 end, str w) {
+        i32 start = end - (i32)w.len;
+        if (start < 0) return false;
+        for (usize k = 0; k < w.len; k += 1) {
+            if (s.at((usize)(start + (i32)k)) != w.at(k)) return false;
+        }
+        return true;
+    }
+
+    bool wordBreak(str s, Vec<str>* dict) {
+        usize n = s.len;
+        Vec<bool> dp = Vec<bool>::withCap(n + 1);
+        for (usize i = 0; i <= n; i += 1) {
+            dp.push(false);
+        }
+        dp.set(0, true);                     // the empty prefix is segmentable
+        for (usize i = 1; i <= n; i += 1) {
+            for (usize d = 0; d < dict->count(); d += 1) {
+                str w = dict->at(d);
+                if ((usize)w.len > i) continue;
+                if (!dp.at(i - w.len)) continue;
+                if (endsWithWordAt(s, (i32)i, w)) {
+                    dp.set(i, true);
+                    break;
+                }
+            }
+        }
+        return dp.at(n);
+    }
+
+`dp[i]` answers "can the first i characters be segmented?". From `dp[0] = true` — the empty string segments into no words — the outer loop extends the reachable frontier one character at a time. For each endpoint, the inner loop offers every dictionary word; a word is usable only if it fits (`w.len <= i`), if the prefix just before it is reachable (`dp[i - w.len]`), and if its bytes actually match ending at `i`. The helper does that byte comparison. As soon as one word completes a segmentable prefix, the endpoint is marked and the inner loop can stop early.
+
+Time and space. The outer loop runs n times and the inner loop once per dictionary word, with a byte comparison of up to the word's length, so the time is O(n × d × L) for d words of maximum length L. The table is n + 1 booleans, so O(n) space, against the exponential recursion it replaces.
+
+Edge cases. The empty string is segmentable and returns true from `dp[0]`. A word longer than the current prefix is skipped by the length guard. Repeated dictionary words are harmless. The comparison is byte by byte, so this is an ASCII-level split; Unicode would require comparing code points. A zero-length dictionary word would create a match that never advances; the usual convention forbids empty entries.
+
+A variation. To reconstruct the segmentation, record for each reachable endpoint which word got you there, then walk back from n to 0. If the dictionary is large, replace the linear scan over words with a hash set of the words and test substrings in increasing length; the recurrence is unchanged, only the membership test gets faster.
+
+29.16 Partition Equal Subset Sum
+
+The problem. Given a list of positive integers, decide whether the list can be split into two groups of equal sum.
+
+Picture this. Two people want to divide a pile of coins exactly evenly. The total must be even, and then each person's share is exactly half. The real question is therefore a subset-sum: is there a subset of the pile summing to half the total? If there is, the rest automatically sums to the other half.
+
+Brute force, then better. The brute force tries all 2^n subsets, exponential. The DP is the 0/1 knapsack of 29.4 asking a yes/no question instead of a maximum: a boolean table says, for each reachable sum, whether some subset achieves it. Each number is offered exactly once, so the sum loop runs downward to keep an item from being reused.
+
+    bool canPartition(Vec<i32>* nums) {
+        i64 total = 0;
+        for (usize i = 0; i < nums->count(); i += 1) {
+            total += (i64)nums->at(i);
+        }
+        if (total % 2 != 0) return false;    // an odd total can never split evenly
+        i64 target = total / 2;
+        Vec<bool> reachable = Vec<bool>::withCap((usize)target + 1);
+        for (i64 s = 0; s <= target; s += 1) {
+            reachable.push(false);
+        }
+        reachable.set(0, true);              // the empty subset sums to zero
+        for (usize i = 0; i < nums->count(); i += 1) {
+            i64 x = (i64)nums->at(i);
+            for (i64 s = target; s >= x; s -= 1) {
+                if (reachable.at((usize)(s - x))) {
+                    reachable.set((usize)s, true);
+                }
+            }
+        }
+        return reachable.at((usize)target);
+    }
+
+The parity check rejects the impossible cases straight away. The boolean vector then marks which sums are achievable, with sum 0 achieved by taking nothing. Each number is offered once, and the inner loop runs from the target down to the number, so that when it reads `reachable[s - x]` it reads the state from before this number was considered. Running the loop upward instead would let a single number be reused, which is the unbounded version of the problem — the same direction rule that separates 0/1 knapsack from its cousins.
+
+Time and space. The time is O(n × total), and the space is O(total). This is the pseudo-polynomial cost of subset-sum: polynomial in the numeric value of the total rather than in the count of items, which is fine for small totals and hopeless for huge ones.
+
+Edge cases. An empty list has total 0, which is even with target 0, so it returns true, since the empty subset sums to zero. A single non-zero number has no partner and returns false. An odd total returns false immediately. A number larger than the target can never be used, and the loop bound `s >= x` skips it. Numbers should be positive; a zero would be a harmless no-op.
+
+A variation. To recover the two groups, store a "this item achieved this sum" mark and walk back from the target. To allow a number to be used repeatedly, run the inner loop upward; that answers a different question — can the total be formed from unlimited copies — and shows once more how one direction change alters the meaning.
+
+29.17 Longest Palindromic Subsequence
+
+The problem. Given a string, find the length of its longest palindromic subsequence: the longest subsequence that reads the same forwards and backwards, characters not necessarily contiguous. For "bbbab" the answer is 4 ("bbbb").
+
+Picture this. You hold the string with a finger at each end. If the two end characters are equal, they can both join a palindromic subsequence, so the answer is two plus the best answer for the inside. If they differ, one of them must be dropped, so the answer is the better of dropping the left and dropping the right. The subproblem is always a range of the string, and the recurrence shrinks that range.
+
+Brute force, then better. The brute force tries all 2^n subsequences, exponential. The DP fills a table indexed by the two ends of a range, from short ranges up to the whole string. Every entry depends only on shorter ranges, so filling by increasing length makes each dependency available.
+
+    i32 longestPalindromicSubseq(str s) {
+        usize n = s.len;
+        if (n == 0) return 0;
+        Vec<i32> dp = Vec<i32>::withCap(n * n);
+        for (usize i = 0; i < n * n; i += 1) {
+            dp.push(0);
+        }
+        for (usize i = 0; i < n; i += 1) {
+            dp.set(i * n + i, 1);            // one character is a palindrome of length 1
+        }
+        for (usize len = 2; len <= n; len += 1) {
+            for (usize i = 0; i + len <= n; i += 1) {
+                usize j = i + len - 1;
+                if (s.at(i) == s.at(j)) {
+                    i32 inner = (len == 2) ? 0 : dp.at((i + 1) * n + (j - 1));
+                    dp.set(i * n + j, inner + 2);
+                } else {
+                    i32 dropLeft = dp.at((i + 1) * n + j);
+                    i32 dropRight = dp.at(i * n + (j - 1));
+                    dp.set(i * n + j, dropLeft > dropRight ? dropLeft : dropRight);
+                }
+            }
+        }
+        return dp.at(n - 1);                 // the cell (0, n-1)
+    }
+
+The flat table stores cell `(i, j)` at index `i * n + j`. The diagonal `(i, i)` is seeded to 1. The outer loop then fills ranges of length 2, 3, and upward, because each cell needs `(i+1, j-1)`, `(i+1, j)`, and `(i, j-1)`, all strictly shorter ranges. When the ends match, the range's length is two more than the inside's; the `len == 2` special case avoids reading `(i+1, j-1)` for an empty inside, which would be an out-of-range cell.
+
+Time and space. Every range is computed once, so Θ(n^2) time, and the flat table has n^2 entries, so Θ(n^2) space. Here the cost lives in the table rather than in the output, since the answer is a single number.
+
+Edge cases. An empty string returns 0 and a single character returns 1. Identical strings reach their full length. Note the contrast with the palindrome-*substring* problem: substrings must be contiguous, and that recurrence asks whether a whole range is a palindrome rather than how long the longest one is. Also, the longest palindromic subsequence of `s` equals the longest common subsequence of `s` and its reverse, which ties this section back to 29.5.
+
+A variation. Because of that equivalence, the LCS code of 29.5 solves this problem without any new recurrence: reverse the string and compute the LCS. Seeing the same table from two directions is a good sign that you understand the structure rather than one recipe.
+
+29.18 Jump Game (Greedy)
+
+The problem. Given an array where each element is the maximum jump length from that position, decide whether you can reach the last index, starting from the first.
+
+Picture this. You are crossing a line of stepping stones, and from each stone you may leap up to a stated distance. You do not need to plan the jumps in advance; you only need to know how far the furthest reachable stone is. Starting from the first stone, that frontier is its jump range, and as you advance through stones you can actually stand on, you extend the frontier by their jump ranges. If the frontier ever reaches the last stone, the answer is yes.
+
+Brute force, then better. The brute force explores every sequence of jumps, exponential because the same position is reached by many routes. The greedy scan keeps a single number — the furthest index reachable so far — and sweeps left to right. At each position it checks that the position is reachable (it is at or before the frontier) and extends the frontier if that stone can throw you further. One pass settles the question.
+
+    bool canJump(Vec<i32>* nums) {
+        usize n = nums->count();
+        if (n == 0) return true;
+        usize farthest = 0;
+        for (usize i = 0; i < n; i += 1) {
+            if (i > farthest) return false;          // this stone is out of reach
+            usize reach = i + (usize)nums->at(i);
+            if (reach > farthest) farthest = reach;
+            if (farthest >= n - 1) return true;      // the last stone is reachable
+        }
+        return true;
+    }
+
+The loop is the whole algorithm. `farthest` is the rightmost index any earlier stone can reach. At stone `i`, if `i` lies beyond `farthest`, there is a gap no jump can cross and the answer is immediately false. Otherwise the stone is reachable, so its jump range extends the frontier. Once the frontier covers the last index, the answer is yes. There is no table and no backtracking, because the only fact that matters at each step is the single best frontier.
+
+Why greedy works here. The frontier only ever grows, and a larger frontier can never make a later stone less reachable, so extending it as far as possible is always safe. This monotonicity is the exchange argument in miniature: keeping the best frontier is never worse than any other choice, so one running maximum is enough.
+
+Time and space. One pass, so Θ(n) time and O(1) space. The brute-force search is exponential, and even a naive DP that marks reachable positions from each stone is O(n^2); the greedy scan collapses both into a single linear pass, because the frontier is all the state needed.
+
+Edge cases. An empty array is vacuously "reached" and returns true. A single element is already at the last index, so it returns true immediately. A zero at some reachable position is fine as long as an earlier jump extended the frontier past it; a run of zeros the frontier cannot cross returns false. Jump lengths are non-negative in the usual statement, and a negative length would be meaningless and would break the cast to usize.
+
+A variation. "Jump Game II" asks for the minimum number of jumps rather than a yes/no, and it is the same frontier sweep with one extra variable: count a jump each time the frontier must be pushed forward, tracking the end of the current jump's range separately from the overall frontier. The greedy spirit is identical; only the bookkeeping grows by one number.
+
+29.19 Exercises
 
 1. Comprehension. State the two ingredients a problem needs for dynamic programming, and give one problem from this chapter that has each, and one everyday problem that has neither.
 
@@ -441,7 +684,7 @@ Edge cases and the diagnostic. Before trusting a greedy rule, either prove it wi
 
 3. Trace. For climbing stairs, write the contents of the `ways` table for n = 6 by hand, one entry per line. At which point do the numbers exceed the number of ways to shuffle a deck?
 
-4. Implementation. Solve the "house robber" problem: given a row of house values, choose a set of non-adjacent houses to maximise the loot. Write the recurrence, then the DP, then say why the answer is the maximum of the table's last two entries.
+4. Implementation. Section 29.12 solves the house robber with two variables and no table. Extend it to also report which houses were robbed, then explain why the answer is `prev1`, the running best over the whole street, rather than the value of any single house.
 
 5. Knapsack. Modify 29.4 to also return which items were chosen. What extra storage do you need, and where do you walk to recover the answer?
 

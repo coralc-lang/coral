@@ -17,6 +17,8 @@ you have not written a comment that says "please inline me" and hoped for the be
 
 Hold on, let me explain that "cannot let a typo pass silently" part more plainly, because it is the whole reason attributes exist instead of mere conventions. Suppose you write `#[[inlne]]` above that function. A comment engine would shrug and move on, and you would walk away believing you had optimised something. An attribute engine reads the name, does not recognise it, and tells you: unknown attribute `inlne`, did you mean `#[[inline]]`? The difference between "silently ignored" and "reported with a suggestion" is the difference between a false belief about your program and a one-line fix. That promise — that the compiler never silently drops an instruction — runs through this entire chapter.
 
+Simply put, a `//` comment is a note you leave for the cleaning staff; the compiler sweeps it away before anyone who matters reads the file. An attribute is a note you leave on the desk of the person doing the work, who will either act on it or tell you it could not understand it — but will never pretend not to have seen it.
+
 The syntax is a bracketed list, written on the line above (or above the field, or above the statement) it modifies:
 
     #[[name]]
@@ -70,9 +72,13 @@ Some of the most important attributes are about memory — about the exact seque
 
 Do the arithmetic and you can see what the attribute bought you. Without `#[[packed]]`, the compiler might insert two bytes of padding after `flags` so that `length` starts on a two-byte boundary, and two more after `length` so that `checksum` starts on a four-byte boundary; the struct would be twelve bytes instead of eight, and every field after the first would sit at the wrong offset. Write that struct to a socket and the receiving machine reads `version` and `flags` correctly and then reads nonsense for `length`, because it is looking at a padding byte. With `#[[packed]]`, the eight declared bytes are the eight bytes on the wire.
 
+The everyday mistake is to build a struct for a file format, forget `#[[packed]]`, and then wonder why the first two fields read correctly while everything after them is nonsense. The early fields work because they happen to land on their natural offsets; the first field that needed padding is the first one that breaks. When a format's bytes are fixed by someone else, pack the struct and stop guessing.
+
 The trade-off is access cost. An unaligned field can be cheaper to skip than to read on some architectures, and packing removes the alignment that made access cheap. So the rule is to pack exactly the structs whose bytes are a public contract and to leave everything else to the compiler.
 
 Let me spell out "public contract," because it is doing a lot of work in that sentence. A struct's layout is a contract when some code outside your program depends on it — code that is not Coral, that you cannot change, and that was written against a fixed byte layout. A C library expecting a header, a file format from the 1980s, a protocol defined in an RFC. Those bytes are promised. For a struct that never leaves your program, nobody promised anything, and the compiler's freedom to rearrange is free performance you should keep.
+
+An analogy: imagine a moving box. A box packed for shipping has everything in a fixed, agreed order so the receiver can unpack it by the label; that box is `#[[packed]]`. A box packed for your own garage can be rearranged any way that fits; that box is `#[[reorder]]`. You may pick one, but you cannot promise both that the order is fixed and that the order is free.
 
 A longer, real example makes the point concrete. The header at the start of a TGA image file is a fixed sequence of little fields, and getting a single offset wrong makes every image load as garbage:
 
@@ -371,6 +377,8 @@ The generator is Coral's answer to a question that arises in every language: how
 
 Not every derived capability suits every type, and the attribute will not stop you from asking for something wrong. `Drop` on a type with no owned resources is a no-op. `Clone` on a type wrapping a file handle would copy the handle, which is almost always wrong — the new value and the old one would both think they own the same file. `Eq` on a type containing a floating-point field compares floats for exact equality, which Chapter 2 warned you against. The generator is a tool, not a policy; using it well means picking the capabilities the type actually has, not the ones that are convenient to type.
 
+Why this matters: `#[[generate]]` is what keeps a struct's behaviour from drifting away from its fields. Every time you add a field, the generated `Eq`, `Debug`, and `Clone` already know about it — the one place that could forget is the one place you just edited. A common mistake is to derive `Clone` on a type that owns a resource, such as a file handle, and end up with two values that both think they own the same thing. Derive only what the type genuinely has.
+
 21.8 Tooling, Platform, and the Entry Point
 
 The final family configures how a program is built, tested, and started, rather than how it runs on a particular data structure. These attributes connect the source to the build system of Chapter 20, and each one is a seam where your code meets something outside it.
@@ -470,6 +478,8 @@ A duplicate attribute on the same item is reported as E0807. Writing `#[[packed]
 A conflicting pair is a separate error. `#[[packed]]` with `#[[reorder]]`, or `#[[align(4)]]` with `#[[align(8)]]`, are instructions that cannot both be true, and the compiler refuses to choose a winner. The family exists because an annotation is a statement of intent, and the compiler's job is to make sure the intent is legible — to you now and to the next reader. An annotation that cannot be honoured is worse than no annotation, because it teaches a reader something false.
 
 One name is deliberately absent from the whole catalogue, and it is worth saying why. There is no `#[[pub]]`. Visibility is not an annotation in Coral; `pub` is a keyword, written as part of the declaration, and it is the one and only way to make an item visible outside its module (Chapter 14). A `#[[pub]]` attribute would be a second spelling of a thing that already has one, and a language with two ways to say the same thing has two ways to disagree with itself. So `pub` stayed a keyword, and the attribute list stayed honest.
+
+Simply put, an attribute is a sentence you say to the compiler, and the compiler is required either to act on it or to tell you it could not. That is why a misspelling is reported rather than ignored: silence would let you walk away believing something was configured that never was.
 
 21.10 A Worked Example: A Network Packet
 

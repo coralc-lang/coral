@@ -507,7 +507,400 @@ Edge cases and a variation
 
 An empty list and a single node with no self-loop both return false. A node that points to itself forms a cycle of length one, and the loop detects it on the first iteration, because `slow` and `fast` both land on it. The variation, and a lovely one: find not only *whether* there is a cycle but *where* it begins. Once the two pointers meet, move one pointer back to the head and advance both one step at a time; they meet again exactly at the entry node of the cycle. The proof is a short piece of arithmetic on the distances traveled, and implementing it is the standard follow-up. The same tortoise-and-hare idea also solves Chapter 25's Happy Number in constant space, a nice sign that you have understood the pattern rather than memorized it for lists.
 
-26.9 Exercises
+26.9 Sliding Window Maximum
+
+The problem
+
+Given an array and a window width `k`, return the maximum of every contiguous window of width `k`. So for `[1, 3, -1, -3, 5, 3]` with `k = 3`, the windows are `[1,3,-1]`, `[3,-1,-3]`, `[-1,-3,5]`, and `[-3,5,3]`, giving `[3, 3, 5, 3]`.
+
+Picture this
+
+A monotonically decreasing deque of *candidate* indices. Its front is always the index of the current window's maximum. When a new value arrives, it kicks off the back every candidate it beats, because those can never be the maximum again while the new, larger value is still in the window. The new index then enters at the back. When the front index falls out the left side of the window, drop it. Keeping indices, not values, is what lets us notice that the front has left the window.
+
+Brute force
+
+For each window, scan its `k` elements and take the maximum. There are about `n` windows and each scan is `k` steps, so `O(n · k)`, which is quadratic when `k` is a constant fraction of `n`.
+
+The better approach
+
+One pass with a double-ended queue of indices whose values are strictly decreasing from front to back. Before inserting index `i`, pop from the back while the back's value is less than or equal to `v[i]`; those are dominated forever. Insert `i`. If the front index is now outside the window, pop it from the front. Once the window is full, the front is the answer. Each index enters and leaves the deque once, so the total work is linear even though the inner loop looks nested.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::deque { Deque };
+    import(lib) std::io::ios { println };
+
+    Vec<i32> maxSlidingWindow(const Vec<i32>* nums, usize k) {
+        Vec<i32> out = Vec<i32>::new();
+        Deque<usize> dq = Deque<usize>::new();
+        for (usize i = 0; i < nums->count(); i++) {
+            while (!dq.isEmpty() && nums->at(dq.back()) <= nums->at(i)) {
+                dq.popBack();
+            }
+            dq.pushBack(i);
+            if (dq.front() + k <= i) {
+                dq.popFront();
+            }
+            if (i + 1 >= k) {
+                out.push(nums->at(dq.front()));
+            }
+        }
+        return out;
+    }
+
+The `<=` in the back-pop is deliberate: a new value equal to a candidate also retires it, because the newer index will outlive the older one as the window slides. Using strict `<` would leave stale equal-valued indices in the deque and waste space, though it would still be correct. The front-eviction test `dq.front() + k <= i` says "the front index is no longer inside `[i - k + 1, i]`," which is exactly when it must leave.
+
+The cost
+
+Time is linear: each index is pushed once and popped at most once from either end, so the total number of inner-loop iterations across the whole run is bounded by `n`. Space is `O(k)`, the most indices the deque can hold, which is the window width. The quadratic scan collapses to linear because the monotonic property lets each element be discarded once and only once.
+
+Edge cases and a variation
+
+A window wider than the array yields an empty result, because the `i + 1 >= k` test never fires. `k = 1` returns the array itself. A strictly decreasing array keeps every index until it ages out, which is the worst case for space and still linear in time. The variation: return the maximum *with* its index, by outputting `dq.front()` instead of the value at it. A second variation: sliding-window *minimum* flips the comparison, giving a monotonically increasing deque. The only design choice, as with every monotonic structure in this chapter, is the direction the deque is kept sorted in.
+
+26.10 Implement a Stack Using Queues
+
+The problem
+
+Implement a last-in-first-out stack using only queue operations (enqueue at the back, dequeue from the front), and support push and pop.
+
+Picture this
+
+A queue serves the oldest first, the opposite of what a stack wants. The trick is to make a push wait its turn behind everything already present, and then reverse the order by rotating: after enqueuing the new element, dequeue and re-enqueue every older element once, so the new element ends up at the front. Now the front is always the most recently pushed value, and pop is just a dequeue. One queue, a full rotation on push.
+
+Brute force
+
+A single queue has no way to pop the newest element directly. You could dequeue everything into a temporary, take the last one, and enqueue the rest back, which is `O(n)` per pop and reinvents the rotation on the wrong side.
+
+The better approach
+
+One queue and a rotation on push. Push `v`, note how many elements were already in the queue, then move exactly those older elements from the front to the back by dequeuing and re-enqueuing them. After the rotation, `v` sits at the front and pop is `O(1)`. The cost simply moves from pop to push: push is `O(n)`, pop is `O(1)`, which is the mirror image of the two-stack queue of 26.5.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::collections::queue { Queue };
+    import(lib) std::io::ios { println };
+
+    struct QueueStack {
+        Queue<i32> q;
+
+        static QueueStack new() {
+            return QueueStack { .q = Queue<i32>::new() };
+        }
+
+        void push(i32 v) {
+            usize older = self.q.count();
+            self.q.enqueue(v);
+            for (usize i = 0; i < older; i++) {
+                self.q.enqueue(self.q.dequeue());
+            }
+        }
+
+        i32 pop() {
+            return self.q.dequeue();
+        }
+
+        i32 top() {
+            return self.q.peek();
+        }
+
+        bool isEmpty() {
+            return self.q.isEmpty();
+        }
+    }
+
+`older` is captured *before* the enqueue, so the rotation moves exactly the elements that were present before the new one, leaving the new one at the front. Rotate one too few or one too many and the new value ends up in the wrong place. `peek` gives the top without changing the order, because the queue's front is already the newest element.
+
+The cost
+
+Push is `O(n)` and pop is `O(1)`, a clean trade against 26.5's stack queue, where enqueue is `O(1)` and dequeue is amortized `O(1)`. There is no way to make both ends constant with a single queue, and that asymmetry is the point of the problem: the direction you pay on is a choice. Space is linear in the number of elements.
+
+Edge cases and a variation
+
+Popping from an empty stack asserts through the underlying queue's dequeue, the correct loud failure. Pushing onto an empty stack rotates nothing, so the value is immediately the top. The variation: build it with *two* queues instead, always enqueuing onto the secondary queue and then moving the primary into it, swapping their roles; the amortized analysis is the same as 26.5 read backward. A second variation: make push `O(1)` and pop pay the rotation instead, which some argue is the more natural stack behavior. Write both and compare, because the exercise is really about noticing that the expensive operation can be pushed to either side.
+
+26.11 Remove the Nth Node From the End
+
+The problem
+
+Given the head of a linked list and an integer `n`, remove the `n`th node counting from the end, and return the (possibly new) head. Do it in one pass.
+
+Picture this
+
+Two runners spaced `n` nodes apart. Start the fast runner `n` steps ahead of the slow one. When the fast runner reaches the last node, the slow runner is standing exactly `n` nodes from the end, which means the node it must remove is the one *after* it. Advance them in lockstep until fast runs out, then unlink the target. The spacing is set up once and maintained mechanically.
+
+Brute force
+
+Walk the list once to count its length, then walk again to the `(length - n)`th node and unlink it. Two passes, and the arithmetic is easy to get off by one. It is correct and it does not hold any extra pointers.
+
+The better approach
+
+One pass with two pointers and a *dummy* node before the head. The dummy exists so that removing the first node is not a special case: slow starts at the dummy, fast starts at the dummy, fast takes `n + 1` steps to open the gap, and when fast reaches null, slow sits on the node just before the target. Unlink, free, and return `dummy->next`.
+
+The implementation
+
+    import(lib) std::mman { alloc, dealloc };
+    import(lib) std::io::ios { println };
+
+    struct Node {
+        i32 value;
+        Node* next;
+    }
+
+    Node* newNode(i32 v) {
+        Node* n = alloc<Node>(1);
+        n->value = v;
+        n->next = null;
+        return n;
+    }
+
+    Node* removeNthFromEnd(Node* head, i32 n) {
+        Node* dummy = newNode(0);
+        dummy->next = head;
+        Node* fast = dummy;
+        Node* slow = dummy;
+
+        for (i32 i = 0; i <= n; i++) {
+            if (fast == null) {
+                break;
+            }
+            fast = fast->next;
+        }
+        while (fast != null) {
+            fast = fast->next;
+            slow = slow->next;
+        }
+
+        Node* target = slow->next;
+        if (target != null) {
+            slow->next = target->next;
+            dealloc<Node>(target);
+        }
+
+        Node* result = dummy->next;
+        dealloc<Node>(dummy);
+        return result;
+    }
+
+The gap is `n + 1`, not `n`, and that off-by-one is the entire difficulty of the problem. With a gap of `n + 1`, when `fast` falls off the end, `slow` is on the node *before* the one to remove, which is exactly the node whose `next` must be rewritten. A gap of `n` would land `slow` on the target itself, with no way to reach its predecessor in a singly linked list.
+
+The cost
+
+Time is linear: one pass, each node visited a constant number of times. Space is constant, the two pointers and one temporary dummy node. The dummy node is freed before returning; the removed node is freed at unlink time. This is the same dummy-head trick that made 26.7's merge clean, applied to deletion.
+
+Edge cases and a variation
+
+Removing the only node leaves the head null, which works because slow is the dummy and `dummy->next` becomes null. Removing the first node of a longer list is handled without a special branch, the whole reason for the dummy. If `n` exceeds the list length, the gap loop stops at the end and the function removes nothing rather than crashing, which is a choice worth documenting. The variation: remove the middle node given only a pointer to it, in `O(1)`, by copying the next node's value into it and unlinking the next. It is a party trick that fails on the last node, and it is a good example of how the singly linked list's one-way arrows constrain every solution.
+
+26.12 Add Two Numbers
+
+The problem
+
+You are given two non-negative integers represented as linked lists whose digits are stored in reverse order, one digit per node. Add them and return the sum as a linked list in the same format. So `(2 -> 4 -> 3)` plus `(5 -> 6 -> 4)` is `(7 -> 0 -> 8)`, because 342 + 465 = 807.
+
+Picture this
+
+Primary-school column addition, but the columns arrive as list nodes from least significant digit upward, which is convenient: you add the two current digits and the carry, write the units digit, and pass the tens digit along. A dummy head owns the result, and a tail pointer extends it. The process continues while either list still has digits *or* a carry remains, and that last condition is the one people forget.
+
+Brute force
+
+Convert each list to an integer, add, and convert back. It works for small numbers and silently overflows for the length of list that makes the problem interesting. It also discards the whole point, which is to do the addition position by position.
+
+The better approach
+
+Walk both lists together with a running `carry`. Each step, sum the carry with whichever current digits exist, compute the new digit as `sum % 10` and the new carry as `sum / 10`, then append the digit. The loop's three-way condition — `a` not done, `b` not done, or carry nonzero — guarantees a final carry becomes its own node.
+
+The implementation
+
+    import(lib) std::mman { alloc, dealloc };
+    import(lib) std::io::ios { println };
+
+    struct Node {
+        i32 value;
+        Node* next;
+    }
+
+    Node* newNode(i32 v) {
+        Node* n = alloc<Node>(1);
+        n->value = v;
+        n->next = null;
+        return n;
+    }
+
+    Node* addTwoNumbers(Node* a, Node* b) {
+        Node* dummy = newNode(0);
+        Node* tail = dummy;
+        i32 carry = 0;
+
+        while (a != null || b != null || carry != 0) {
+            i32 sum = carry;
+            if (a != null) {
+                sum = sum + a->value;
+                a = a->next;
+            }
+            if (b != null) {
+                sum = sum + b->value;
+                b = b->next;
+            }
+            carry = sum / 10;
+            tail->next = newNode(sum % 10);
+            tail = tail->next;
+        }
+
+        Node* result = dummy->next;
+        dealloc<Node>(dummy);
+        return result;
+    }
+
+Digits are stored least-significant first precisely so the carry flows in the same direction as the list, so no reversal is needed. The elements of the two input lists are read but not consumed or freed; the caller still owns them. Only the dummy is allocated and freed here, and the new nodes are owned by the returned list.
+
+The cost
+
+Time is linear in the longer list, plus one step if there is a final carry. Space is linear in the length of the result, which is at most one node longer than the longer input. No arithmetic wider than `i32` is needed because each column sums at most `9 + 9 + 1 = 19`.
+
+Edge cases and a variation
+
+Two empty lists sum to zero, which the loop produces as a single `0` node because `carry` is zero but both lists are null; adjust the condition if you want an empty result instead. Lists of different lengths are handled by the `if (a != null)`/`if (b != null)` guards. The variation: store the digits most-significant first instead, which forces a reversal of both inputs or a recursive solution that defers the carry. A second variation: subtract two numbers by borrowing, which is the same skeleton with the carry replaced by a borrow and a sign test.
+
+26.13 Palindrome Linked List
+
+The problem
+
+Decide whether a singly linked list reads the same forwards and backwards, in `O(n)` time and `O(1)` extra space.
+
+Picture this
+
+Find the middle with two pointers at different speeds, reverse the second half in place, then compare the two halves from the outside in. The first half is unchanged; the second half now runs toward the middle. When the comparisons finish, reverse the second half again to restore the list, because a good function leaves its input as it found it.
+
+Brute force
+
+Copy the list's values into a vector, then use the two-pointer palindrome test of 24.2 on the vector. Linear time, but linear extra space, which the problem forbids.
+
+The better approach
+
+Slow and fast pointers to the middle, the 26.6 reversal for the back half, then a lockstep comparison, then a second reversal to undo the damage. The middle finding and the reversal are both problems already solved in this chapter; the new idea is only that they combine, and that the mutation must be repaired before returning.
+
+The implementation
+
+    import(lib) std::mman { alloc, dealloc };
+    import(lib) std::io::ios { println };
+
+    struct Node {
+        i32 value;
+        Node* next;
+    }
+
+    Node* newNode(i32 v) {
+        Node* n = alloc<Node>(1);
+        n->value = v;
+        n->next = null;
+        return n;
+    }
+
+    Node* reverseList(Node* head) {
+        Node* prev = null;
+        Node* cur = head;
+        while (cur != null) {
+            Node* next = cur->next;
+            cur->next = prev;
+            prev = cur;
+            cur = next;
+        }
+        return prev;
+    }
+
+    bool isPalindromeList(Node* head) {
+        if (head == null || head->next == null) return true;
+
+        Node* slow = head;
+        Node* fast = head;
+        while (fast->next != null && fast->next->next != null) {
+            slow = slow->next;
+            fast = fast->next->next;
+        }
+
+        Node* second = reverseList(slow->next);
+        Node* p1 = head;
+        Node* p2 = second;
+        bool ok = true;
+        while (p2 != null) {
+            if (p1->value != p2->value) {
+                ok = false;
+                break;
+            }
+            p1 = p1->next;
+            p2 = p2->next;
+        }
+
+        slow->next = reverseList(second);
+        return ok;
+    }
+
+The middle-finding loop stops with `slow` on the last node of the first half for both even and odd lengths, so `slow->next` is always the start of the second half and the split is clean. The comparison runs while `p2` is non-null, which correctly ignores the middle node of an odd-length list. The final `reverseList(second)` restores the link, so the list is left exactly as it arrived.
+
+The cost
+
+Time is linear: the middle walk, the reversal, the comparison, and the restore each touch each node a constant number of times. Space is constant: four pointers, no allocation, no array. This is the `O(1)`-space answer to a problem the brute force solves with a full copy, and it earns its keep only when the list is large.
+
+Edge cases and a variation
+
+An empty list and a single node are palindromes, returned before any mutation. A two-node list is a palindrome only when both values are equal, which the middle walk handles with `slow` on the first node. The critical discipline is the restore: skip it and the caller's list is silently reordered, a bug that may not surface until much later. The variation: if the problem permits destroying the input, drop the final reversal and save the work. A second variation: check whether the list is a palindrome *after deleting at most one node*, which follows 24.2's "valid palindrome II" by trying both skips when the comparison first disagrees.
+
+26.14 Largest Rectangle in Histogram
+
+The problem
+
+Given bar heights along a baseline, find the area of the largest rectangle that fits entirely under the skyline. So for `[2, 1, 5, 6, 2, 3]` the answer is 10, from the two bars of height 5 and 6 with a width of 2.
+
+Picture this
+
+Each bar can be the short side of a rectangle that stretches left and right until it hits a shorter bar. So the question for each bar is: how far left and right can it extend before something shorter blocks it? A monotonically increasing stack answers exactly that. When a new, shorter bar arrives, every taller bar on the stack now knows its right boundary, and its left boundary is the bar just below it on the stack. Pop, compute the area, and keep the best.
+
+Brute force
+
+For each bar, expand left and right while the neighbours are at least as tall, and compute the width times height. That is `O(n²)` and it re-expands through the same gaps for every bar.
+
+The better approach
+
+One pass with a stack of indices kept in increasing height order. Before pushing index `i`, pop every index whose height is greater than or equal to `h[i]`, because `i` is their right boundary. For a popped index `j`, its height is the rectangle's height, its left boundary is the index now on top of the stack (or the start of the array), and its width is `i` minus that left boundary. A sentinel bar of height zero at the end flushes the stack, since zero is shorter than everything. Widen the areas to `i64`; a wide histogram times a tall bar overflows `i32` easily.
+
+The implementation
+
+    import(lib) std::vec { Vec };
+    import(lib) std::io::ios { println };
+
+    i64 largestRectangle(const Vec<i32>* h) {
+        Vec<usize> stack = Vec<usize>::new();
+        i64 best = 0;
+        usize n = h->count();
+
+        for (usize i = 0; i <= n; i++) {
+            i64 cur = (i == n) ? 0 : (i64)h->at(i);
+            while (!stack.isEmpty() && (i64)h->at(stack.back()) >= cur) {
+                i64 height = (i64)h->at(stack.pop());
+                usize left = stack.isEmpty() ? 0 : stack.back() + 1;
+                i64 width = (i64)(i - left);
+                i64 area = height * width;
+                if (area > best) best = area;
+            }
+            stack.push(i);
+        }
+        return best;
+    }
+
+The virtual bar at `i == n` with height zero is the sentinel, and it is why the loop runs one step past the end. When a bar is popped, the new top of the stack is the nearest shorter bar to its left, so `stack.back() + 1` is the first column the rectangle can occupy on the left. The `>=` comparison retires equal-height bars too; using `>` would still be correct but would leave them for a later pop, and either way each bar is popped exactly once.
+
+The cost
+
+Time is linear: each index is pushed once and popped at most once, so the inner loop does `O(n)` work in total across the whole run. Space is `O(n)` in the worst case, a strictly increasing histogram that keeps every index until the sentinel. This is the same "nested loop, linear total" accounting as the monotonic stack of 26.4, and the same structure answers both, only with different bookkeeping when the item is popped.
+
+Edge cases and a variation
+
+An empty histogram returns zero, because the loop's single sentinel step pops nothing. A single bar returns its own height. A non-decreasing histogram keeps every bar on the stack until the sentinel, at which point they are popped right to left with increasing widths. The variation: the *maximal rectangle* in a binary matrix, which runs this routine once per row, treating the 1s as heights and resetting a column's height to zero wherever the row has a 0. That is the same monotonic stack applied row by row, and it is the natural next problem from this one.
+
+26.15 Exercises
 
 1. Comprehension. In 26.1, why does the stack automatically enforce the *nesting* rule, not just the counting of opens and closes? Give a string with equal numbers of each bracket that is invalid, and trace the stack to show where it fails.
 

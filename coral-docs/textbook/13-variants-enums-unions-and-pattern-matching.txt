@@ -64,6 +64,18 @@ You write an enum value with two colons:
 
 The double colon :: is just "the case Red of the type TrafficLight." It is how you reach inside a named set.
 
+In plain words, `TrafficLight::Red` reads as "the `Red` member of the `TrafficLight` family." The double colon is the same operator that reaches into a module (`std::io`) or a type's static method (`Vec::new`); the left side is the container, and the right side is the item inside it.
+
+Why this matters: the moment a value's legal choices have names, the compiler can hold you to them. A function that takes a `TrafficLight` can never be handed a stray `3`, and a switch over it can be checked for completeness. The enum converts a fact that used to live only in a comment — "these are the only three lights" — into something the compiler reads and enforces.
+
+    switch (light) {
+        TrafficLight::Red    => stop(),
+        TrafficLight::Green  => go(),
+        TrafficLight::Yellow => slowDown(),
+    }
+
+Three arms, no `else`, and the compiler is satisfied because all three lights are covered. Add a fourth light tomorrow and this switch stops building until the new case is handled.
+
 A Layer Behind: the actual integers
 
 Now, here is the "hold on a moment" part. Underneath, an enum really is an integer. Red is 0, Green is 1, Yellow is 2. The compiler picks the numbering for you, starting at zero and counting up in the order you wrote the cases. Most of the time you should not care and should not rely on which number is which — the whole point of the enum is that you refer to it by name, not by number.
@@ -127,6 +139,8 @@ Now the syntax. You build a variant value by naming the case and giving its fiel
 
 The `{ .radius = 1.0 }` is the same "designated field" syntax you would use to initialise a struct: name the field, `=`, give the value. A case with no fields is written as just the case name, `Shape::Point`, optionally with empty braces.
 
+A common beginner mistake is to leave off the case name and write just `{ .radius = 1.0 }`. That reads as a bare struct literal, not a `Shape` value: it carries no tag, so the compiler cannot tell which case it is and will refuse it where a `Shape` is expected. The case name `Shape::Circle` is what places the value in the right family.
+
 Here is the same model for a system that sends messages over a network. A message might be a login, a logout, or a piece of data. Each carries different things:
 
     variant Message {
@@ -137,6 +151,8 @@ Here is the same model for a system that sends messages over a network. A messag
     }
 
 Every message is exactly one of those four. A Ping carries nothing. A Login carries a username and a password. You cannot send a message that is half Login and half Data. If you need a fifth kind of message later, you add a case, and — this is the payoff — every switch that handles messages will refuse to compile until it handles the new case too. We will see why in a moment.
+
+Simply put, a variant is a labelled box: the label on the outside says which case this is, and inside the box is exactly the cargo for that label and nothing else. A `Login` box holds a username and a password and has no room for a payload; a `Data` box holds a sequence number and a payload and no password. Because the label is part of the value, the compiler can always tell you which cargo is truly there, which is the difference between a variant and a bare union of the same bytes.
 
 The recursive example: JSON, and why it matters
 
@@ -202,6 +218,8 @@ Every one of those is a case where you are dealing with bytes as bytes, and you 
 
 If you do use a union, two habits keep it from being a footgun. First, hide it behind a function or a method that documents the invariant and the endianness assumptions — never let raw union access spread across a codebase. Second, keep it private. A union crossing a module boundary as a bare field is a promise no reader can verify; expose a typed accessor instead.
 
+Why this matters: unions are the tool of last resort, the one you reach for when you are matching a layout the outside world dictated — a C struct, a network header, a hardware register. Every other time, the variant gives you the same compact storage with a label the compiler can check. Using a union where a variant would do is like shipping a parcel with no address on it and hoping the courier guesses.
+
 One more thing about memory layout, because it comes up with unions and with structs across a program. By default the compiler is free to insert padding between fields and to leave gaps for alignment, and it may reorder fields for efficiency. For a union that must match an external layout, you pin the layout with attributes. `#[[packed]]` removes the padding so the bytes lie exactly where you put them; `#[[reorder]]` gives the compiler explicit permission to permute fields for a tighter fit. These are covered properly in Chapter 21, but know they exist, because the moment you care what the bytes look like — FFI, files, networks — you will need them.
 
 13.4 Pattern Matching: switch as a Decision Procedure
@@ -217,6 +235,8 @@ Here is the everyday shape. Suppose you have a command character typed by a user
     }
 
 Read it left to right as a sentence: for this command, if it is 'q' or 'Q', quit; if it is 'h', help; otherwise, unknown. Each line is called an arm. The thing on the left of `=>` is a pattern — a shape to match against — and the thing on the right is what to do when it matches. The first arm that matches wins, and the rest are not tried.
+
+Here is `switch` walked through with a concrete value. Suppose `command` is `'h'`. The switch tests the first arm, `'q' | 'Q'`: the value is neither, so it moves on. It tests the second arm, `'h'`: that matches, so it runs `help()` and the whole switch is done. The `else` arm is never reached. Now suppose `command` is `'z'`: neither of the first two arms matches, so the `else` arm runs `unknown()`.
 
 Notice the `else`. It is the catch-all, the "anything that did not match above." Notice also the missing piece you might expect from C: there is no `break` between arms. A Coral switch does not fall through from one arm to the next. Each arm is self-contained; when its body finishes, the whole switch is done. This is the opposite of C, and it is the opposite on purpose, because accidental fallthrough is one of the classic C bugs. If you genuinely want two cases to share a body, you list both patterns on one arm, joined by a vertical bar `|`, as `'q' | 'Q'` does above. The `|` reads as "or": this arm matches 'q' or 'Q'. It is the same separator you would use for a set of alternatives anywhere else, and it is what the standard library and the compiler's own back end (wallvm) use throughout — you will search a switch body and see `IrOpcode::Load | IrOpcode::Gep | IrOpcode::AtomicLoad => ...`, one arm covering several opcodes at once.
 
@@ -300,6 +320,8 @@ The first rule: be exhaustive. A switch over an enum or variant must either cove
 
 The error tells you exactly what is missing, so the fix is one line. And this is the property that makes the whole variant style worth adopting. When someone later adds a Color::Purple case to the enum, every switch that did not anticipate it stops compiling, and the compiler hands you the list of every place that needs updating. "I forgot a place" has gone from a silent bug that ships to a build failure that ends in a minute.
 
+In plain words, exhaustiveness means the compiler will not let you leave a case unhandled. Imagine a form that must be filled in completely: instead of a clerk silently accepting a blank box, the compiler hands the form back and points at the missing line. That is why adding a case to a variant is a safe change — the compiler visits every switch and makes each one decide what to do.
+
 The second rule: be reachable. An arm that can never run is an error too. If you list a duplicate case, or a variant that an earlier arm already covered, the compiler tells you:
 
     switch (c) {
@@ -325,6 +347,8 @@ The third rule: fallthrough must be deliberate. Coral's arms do not fall through
 The `#[[fallthrough]]` on the last statement of the Initialize arm tells the compiler "yes, I meant to fall into Run." Without it, the compiler warns you that the case falls through, because a case that falls through by accident is almost always a bug. With it, you have recorded the intent, and a reader sees it too. Putting `#[[fallthrough]]` on the very last arm of a switch — where there is nothing to fall into — is itself an error (E0610), because it is always a leftover from copying an arm.
 
 So the three rules, together, say this: every case is either handled, or caught by `else`, or deliberately fallen through to the next, and someone must have said so on purpose in every instance. The language refuses to let a case slip through the cracks quietly.
+
+A common beginner mistake is to assume a missing case is only a warning. It is not: a non-exhaustive switch over an enum or variant is an error (E0608) and the program will not build. The compiler is not being fussy — it is telling you that some value could reach the switch and fall through with nothing to do, and it would rather stop you now than let that value surprise you at runtime.
 
 13.6 switch That Computes a Value
 
@@ -354,6 +378,8 @@ Each arm is an expression, and because all the arms are strings and the switch c
     }
 
 A switch used purely for its side effects is a statement and takes a semicolon like any other. A switch used for a value is written where a value is expected.
+
+Why this matters: a switch that computes a value lets you turn a label into a result without a chain of temporary variables. The compiler still checks exhaustiveness, so the function that returns `switch (level) { ... }` cannot silently miss a level — the value it promises is guaranteed for every case in the type.
 
 13.7 Matching on Ranges and the Exhaustiveness Check Applied
 
@@ -398,6 +424,8 @@ Now evaluate one. To evaluate a number, return it. To evaluate a sum, evaluate b
     }
 
 Two things are happening that are worth noticing. First, `eval` is total: it covers all four cases, so the compiler guarantees no shape of Expr is forgotten. If someone adds `Expr::Div`, `eval` stops compiling until it handles division. Second, the structure of the code mirrors the structure of the data. `eval` recurses on the children; the `Num` case, which has no children, stops the recursion. This correspondence — one function per operation, one case per shape — is sometimes called the functional style, and the variant is what makes it natural.
+
+Here is `(3 + 4)` evaluated, step by step. `eval` sees `Expr::Add { left, right }`, so it binds `left` to `Num { .value = 3.0 }` and `right` to `Num { .value = 4.0 }`, then computes `eval(left) + eval(right)`. Evaluating `left` matches the `Num` arm and returns `3.0`; evaluating `right` returns `4.0`; the sum is `7.0`. The recursion bottoms out at the `Num` cases, which is what stops it.
 
 Now print one, to see the same mirroring from a different operation:
 

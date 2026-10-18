@@ -40,6 +40,7 @@ import(lib) std::parser::json {
 };
 import(lib) std::io::fs { readFileToString, IoError };
 import(lib) std::io::ios { print, readChar };
+import(lib) platform::libc { write };
 
 pub struct LspDoc
 {
@@ -84,6 +85,10 @@ void lspSend(JsonValue* msg)
 }
 
 /* ── transport  */
+
+/* stderr only: stdout carries the protocol, so framing trouble must be
+ * reported on the other channel or it would corrupt the stream */
+void lspStderrLine(str s) { write(2, (const cchar*)s.ptr, s.len); }
 
 /* read header bytes up to the blank line, return Content-Length
  * (-1 = EOF, -2 = malformed header) */
@@ -999,6 +1004,16 @@ String lspDeclCard(LspDoc* d, Decl* decl, u32 fileId, str rootPath, u8* buf, usi
         s.pushView(" = ");
         lspPushType(&s, d, decl->kind.payload.Distinct.baseType, buf, cap);
     }
+    /* `///` block the parser captured above this declaration */
+    if (d->unit.ctx != null)
+    {
+        Str docText = d->unit.ctx.docFor(fileId, locLine(decl->nameLoc));
+        if (docText != 0)
+        {
+            s.pushView("\n\n");
+            s.pushView(lspInternText(d, docText));
+        }
+    }
     String echo = lspDeclDetail(d, decl, buf, cap);
     if (echo.len > 0)
     {
@@ -1533,10 +1548,15 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
 
     if (d->unit.ctx != null && d->unit.sema != null)
     {
+        /* a literal token describes itself even when its text matches an
+         * identifier: `"x"` must show the string, not the variable x */
+        String litFirst = lspLiteralCard(d, line0, char0);
+        if (litFirst.len > 0) { val = litFirst; have = true; }
+
         u8* wptr = null;
         usize wlen = 0;
         u32 wsid = 0;
-        if (lspWordAt(d, line0, char0, &wptr, &wlen, &wsid))
+        if (!have && lspWordAt(d, line0, char0, &wptr, &wlen, &wsid))
         {
             // named symbol (covers std lib / other merged files)
             Symbol* sym = d->unit.sema.scopes.lookupFrom(wsid, 0);
@@ -1638,6 +1658,14 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
                         if (recvTy != 0)
                         {
                             MemberInfo mi = d->unit.sema.findMember(recvTy, wsid);
+                            if (mi.kind == 0)
+                            {
+                                /* fields first; a `.name` that is not a field
+                                 * may still be a method from an extend block
+                                 * (all str methods live in extends) */
+                                MemberInfo mm = d->unit.sema.findMethod(recvTy, wsid);
+                                if (mm.kind == 2) mi = mm;
+                            }
                             if (mi.kind == 2 && mi.declaration.index != 0 && mi.declaration.index < d->unit.ctx.nodesLen)
                             {
                                 Node* mn2 = d->unit.ctx.nodes + mi.declaration.index;
@@ -1673,14 +1701,45 @@ JsonValue lspHoverResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
                     }
                 }
             }
+            if (!have)
+            {
+                /* method declarations inside struct/extend bodies are not
+                 * in the global scope: match the Decl's name position to
+                 * the start of the hovered word */
+                u8* base = d->text.asU8();
+                usize woff = (usize)(wptr - base);
+                usize lstart = 0;
+                i64 ln2 = 0;
+                while (lstart < woff && ln2 < line0)
+                {
+                    if (base[lstart] == 10) ln2++;
+                    lstart++;
+                }
+                i64 wcol = 0;
+                u8* pp = base + lstart;
+                while (pp < wptr)
+                {
+                    usize sz = (usize)lspUtf8Seq(pp[0]);
+                    if (sz == 4) wcol = wcol + 2; else wcol = wcol + 1;
+                    pp = pp + sz;
+                }
+                u32 line1 = (u32)line0 + 1;
+                u32 col1 = (u32)wcol + 1;
+                u32 j = 1;
+                while (j < d->unit.ctx.nodesLen)
+                {
+                    Node* nd = d->unit.ctx.nodes + j;
+                    j++;
+                    if (nd->kind.tag != NodeKind::Decl) continue;
+                    Decl* dcl = &nd->kind.payload.Decl.value;
+                    SourceLoc nl = dcl->nameLoc;
+                    if (locFile(nl) != 0 || locLine(nl) != line1 || locCol(nl) != col1) continue;
+                    val = lspDeclCard(d, dcl, locFile(nd->loc), rootPath, buf, 512);
+                    if (val.len > 0) have = true;
+                    break;
+                }
+            }
         }
-    }
-
-    if (!have)
-    {
-        // literals describe themselves
-        String lit = lspLiteralCard(d, line0, char0);
-        if (lit.len > 0) { val = lit; have = true; }
     }
 
     if (!have)
@@ -1836,6 +1895,44 @@ JsonValue lspDefinitionResult(LspDoc* d, i64 line0, i64 char0, str rootPath)
     Symbol* sym = d->unit.sema.scopes.lookupFrom(sid, 0);
     if (sym != null) declId = sym->declaration;
     if (declId.index == 0) declId = lspLocalDecl(d, sid, (u32)line0 + 1);
+    if (declId.index == 0)
+    {
+        /* member access `.name` / `->name`: fields and methods live in the
+         * receiver's decl, not the global scope */
+        u8* q = base + s;
+        while (q > base && (q[-1] == 32 || q[-1] == 9)) q--;
+        bool isMember = false;
+        if (q > base && q[-1] == 46) { isMember = true; q--; }
+        else if (q > base + 1 && q[-1] == 62 && q[-2] == 45) { isMember = true; q = q - 2; }
+        if (isMember)
+        {
+            while (q > base && (q[-1] == 32 || q[-1] == 9)) q--;
+            u8* rs = q;
+            while (rs > base && lspWordByte(rs[-1])) rs--;
+            if (rs < q)
+            {
+                i64 rcol = 0;
+                u8* pp = base + lineStart;
+                while (pp < rs)
+                {
+                    usize sz = (usize)lspUtf8Seq(pp[0]);
+                    if (sz == 4) rcol = rcol + 2; else rcol = rcol + 1;
+                    pp = pp + sz;
+                }
+                Ty recvTy = lspHoverType(d, line0, rcol);
+                if (recvTy != 0)
+                {
+                    MemberInfo mi = d->unit.sema.findMember(recvTy, sid);
+                    if (mi.kind == 0)
+                    {
+                        MemberInfo mm = d->unit.sema.findMethod(recvTy, sid);
+                        if (mm.kind == 2) mi = mm;
+                    }
+                    if (mi.kind != 0 && mi.declaration.index != 0) declId = mi.declaration;
+                }
+            }
+        }
+    }
     if (declId.index == 0) return JsonValue::nullVal();
     if (declId.index >= d->unit.ctx.nodesLen) return JsonValue::nullVal();
     Node* dn = d->unit.ctx.nodes + declId.index;
@@ -1967,8 +2064,20 @@ pub i32 runServer(Slice buildFile, bool buildFileSet)
     while (true)
     {
         i32 len = lspReadContentLength();
-        if (len < 0) return 0;
-        if (len > 16777216) return 0;
+        /* clean EOF (client closed the pipe) is a normal exit; anything
+         * else means the stream is out of sync and the client would wait
+         * forever for replies to frames we can no longer find */
+        if (len == -1) return 0;
+        if (len == -2)
+        {
+            lspStderrLine("coralc: malformed LSP header; exiting\n");
+            return 1;
+        }
+        if (len > 16777216)
+        {
+            lspStderrLine("coralc: LSP message too large; exiting\n");
+            return 1;
+        }
         u8* body = alloc<u8>((usize)len + 1);
         if (body == null) return 3;
         usize off = 0;

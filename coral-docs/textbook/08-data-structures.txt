@@ -26,6 +26,8 @@ Third, it is a cost: for each operation, how much work it does and how many memo
 
 The three are inseparable. The layout is what makes the operations possible; the operations are what the layout is for; the cost is the price of both. When you choose a data structure you are choosing all three together, and the mistake to avoid is choosing an interface you like while ignoring the layout that must pay for it.
 
+If you are new to this, here is the whole idea in one sentence: a data structure is a choice about how to arrange data in the computer's memory, and each arrangement makes some jobs fast and others slow. It is like a kitchen. A spice rack, a chest freezer, and a junk drawer each make some tasks easy and others awkward, and none of them is simply the best one.
+
 In Coral the layout is not hidden behind an opaque type. Here is the vector, fields and all, exactly as the standard library declares it in `std::collections::vec`:
 
     pub struct Vec<T>
@@ -62,6 +64,8 @@ The two kinds of work show up in every structure differently:
 
 The recurring trade is now visible. Contiguous storage makes location cheap and movement expensive. Scattered storage makes location expensive and movement cheap. That single sentence explains why arrays and linked lists exist side by side and why neither is simply "better": they are optimized for opposite kinds of work.
 
+You could say it like this: if you want to find things quickly, pack them together; if you want to rearrange things quickly, let them live apart. No single layout does both, which is why the chapter keeps both an array and a list in the toolbox. The array is a well-stocked shelf you can point at; the list is a chain of hooks you can unhook and rehook without moving the shelf.
+
 8.3 Contiguity, Locality, and the Cost of Indirection
 
 The arithmetic-versus-movement trade is the algorithmic half of the story. The memory-system half is locality, and for large collections it is the half that dominates.
@@ -71,6 +75,12 @@ When elements are contiguous, iterating them means reading consecutive addresses
 When elements are scattered, iterating them means reading a value, following a pointer to a random address, reading another value, following another pointer, and so on. Each hop is a fresh cache line, and you use perhaps eight of its sixty-four bytes. The hardware calls this a cache miss, and a program that misses on every element can be an order of magnitude slower than a program that never misses — even though both do the same number of "steps" in the algorithmic sense.
 
 Programmers call the scattered pattern pointer chasing, or indirection. A pointer is an indirection: instead of holding the thing, you hold its address and go get it. Indirection buys flexibility — a node can live anywhere, and you can connect things in any order — and it costs a cache miss every time you follow one.
+
+If a pointer is a new idea, think of it as a slip of paper with an address written on it. The paper is tiny and cheap to pass around, but whenever you actually want the thing, you have to travel to the address. Reading contiguous memory is like reading a book page by page; following pointers is like chasing a trail of notes, each one left in a different building.
+
+    i32 value = 42;
+    i32* address = &value;    // a pointer: the address of value
+    println("{}", *address);  // 42 — follow the address to reach the value
 
 This is why the vector is the default in Coral and almost everywhere else, and why the linked list, despite being the structure every beginner finds most intuitive, is the special case. A linked list and a vector both iterate in linear time by the algorithm's reckoning, but the vector's iteration reads memory forward and the list's iteration jumps around it, and on modern hardware that difference is enormous.
 
@@ -97,6 +107,16 @@ The access operations mirror the formula from the previous section. `at` reads a
     println("first is {}, last is {}", months.front(), months.back());
 
 Because `N` is a compile-time constant, the storage is exact and the bounds are knowable. The array's deal is simple: its size is fixed and its layout is contiguous. The reader knows from the type how much memory an array occupies, and the operations know from the type how many elements they may touch. A lookup table, a fixed conversion table, a small buffer whose size is a constant of the program — these are arrays, and they need no allocation, no growth, and no bookkeeping beyond the storage itself.
+
+A tiny example makes the "no allocation, no growth" promise concrete:
+
+    Arr<i32, 4> dice = Arr<i32, 4> { 1, 2, 3, 4 };
+    i32 total = 0;
+    for (var face : dice)
+        total += face;
+    println("four dice total {}", total);
+
+Why this matters: when a count is truly fixed and known — the twelve months, the four suits, a checksum table — an `Arr` states that fact in the type, so no caller can ever make it larger or forget to grow it. The size lives in the type, and the compiler reads it.
 
 The array is also the base case against which everything else is measured. Every other collection in this chapter is, at bottom, "an array plus a strategy" or "a set of arrays connected by pointers." The vector is an array that can move to a longer street. The hash map is an array whose index is computed from a key. The heap is an array that happens to encode a tree. The bitset is an array of machine words used as a field of bits.
 
@@ -151,9 +171,13 @@ The middle operations have their costs written into their shapes. `insert` and `
 
 Capacity management is how you turn a vector from convenient into fast. `reserve` grows to a requested capacity ahead of time; `reserveExact` allocates exactly the requested amount; `shrinkToFit` releases spare capacity after a vector has been trimmed; and `clear` resets the length to zero without freeing the buffer, so the next round of pushes reuses the space. The vector is the default choice for "many elements of one type": it reads like an array, it grows like a list, and its elements are contiguous, so it is cache-friendly and cheap to free.
 
+A common beginner mistake is to confuse `count()` with capacity. `count()` reports the live elements; the capacity is the room behind them, which only `withCap`, `reserve`, or a growth changes. A related surprise is that `clear` does not give memory back — it sets the length to zero and keeps the buffer, which is a feature when you plan to refill it and a surprise if you expected the memory to return.
+
 8.6 Growth, Doubling, and What "Amortized" Means
 
 A single push that triggers growth copies every live element into a new buffer, which for a large vector is expensive. Yet appending to a vector is described as constant time. Both statements are true, and resolving them is the clearest introduction to amortized cost.
+
+In plain words, "amortized constant time" means the rare expensive step is paid for by a long run of cheap ones. It is like pouring a large bag of coins into a jar: a single handful is a lot of coins, but the average per handful over the whole bag stays small.
 
 When the buffer is full, the vector does not grow by one slot; it doubles. The new capacity is twice the old, with a floor of four for the very first growth:
 
@@ -168,6 +192,15 @@ The doubling is the entire trick. After a growth, the vector has at least as muc
 
 The arithmetic is worth doing once. Start empty and push until the vector holds a million elements. The capacities as it grows are 4, 8, 16, and so on. Each growth copies the current length, and the copies total roughly the final capacity — about a million element moves across all of the growths combined. So the work to push a million elements is around two million element operations, about two per push. A constant. Meanwhile a strategy that grew by one slot per push would copy the whole vector on every push, and the total would be quadratic — the difference between a collection that slows down as it grows and one that does not.
 
+Here is the same idea as a small trace, starting from an empty vector whose first growth takes it to capacity four:
+
+    // push 1..4   -> room already there, no copy
+    // push 5      -> buffer full: copy 4 elements, grow capacity to 8
+    // push 6..8   -> room already there, no copy
+    // push 9      -> buffer full: copy 8 elements, grow capacity to 16
+
+Four pushes triggered a copy and seven did not, and as the vector gets larger the fraction that triggers a copy keeps shrinking.
+
 The same analysis applies to every growable collection in the standard library. The vector's `reserve`, the string's `_ensure`, the deque's `_grow`, and the hash map's rehash all follow the doubling pattern, and all of them are amortized constant for the same reason: double, so that the occasional expensive copy is paid for by many cheap appends.
 
 The strategy also puts the growth in your hands rather than hiding it. When the count is known in advance, `withCap` allocates exactly that and the vector never copies. When the count is bounded, `reserve` makes the big allocation up front. The standard library does not hide the growth; it names the method that controls it, so a caller who knows the future can spare the collection the surprise.
@@ -175,6 +208,8 @@ The strategy also puts the growth in your hands rather than hiding it. When the 
 8.7 A Stack Is a Usage, Not a Type
 
 Some structures are not types at all; they are usages of a type, and the stack is the clearest example. A stack is last-in-first-out: remember a value, and get it back in reverse order. It is so fundamental that every program has one running underneath it — the call stack, which records functions in flight and returns to them in reverse order.
+
+In plain words, a stack is a pile of plates. You add a plate to the top and you take a plate from the top, so the last plate you set down is the first one you pick up. That is the whole meaning of last-in, first-out.
 
 Coral has no separate `Stack` type, and that is not an omission. A stack is a `Vec` used with two operations, `push` and `pop`, both at the same end:
 
@@ -216,6 +251,8 @@ The lesson generalizes: when a problem says "use a stack" or "use a queue," look
 8.8 Linked Nodes: The Other Way to Connect
 
 If the array is one end of the spectrum — everything packed, location computed, movement expensive — the linked list is the other. Instead of putting all elements in one block, a linked list gives each element its own block, called a node, and connects the nodes with pointers. To reach the tenth element you start at the first and follow nine pointers. Nothing is ever moved; to insert you rewrite a couple of pointers.
+
+In plain words, a linked list is a treasure hunt. Each clue tells you where the next clue is hidden, so to reach the tenth clue you must first visit the nine before it. A vector is more like a row of numbered boxes: because the boxes sit side by side, you can walk straight to box ten without opening the others.
 
 In Coral a node is an ordinary struct with a value and one or more pointers, and the list is an ordinary struct with a pointer to the first node. The standard library's `std::collections::linkedlist` declares a doubly linked version, each node pointing both ways:
 
@@ -268,6 +305,8 @@ You can build the same idea by hand, singly linked, when you want to see the poi
 The list's operations are the operations its structure makes natural. In the standard library, `pushFront` and `pushBack` add at the ends, `popFront` and `popBack` remove from them, `insertAfter` and `remove` work on individual nodes, and `each` walks the chain from head to tail calling a function on every value. Each end operation is constant time because the list holds both ends. An element in the middle is reached by walking from the head, one node at a time — linear time — and there is no index operation at all.
 
 The cost profile is the mirror image of the vector's. Insertion and removal at the ends are constant time with no copying, since the list rearranges pointers instead of moving elements. But reaching the middle is linear, and iteration touches a different cache line per element. The list is what you reach for when the work is at the ends and the elements are inserted and removed often, not when the work is indexing.
+
+A common beginner mistake is to assume the linked list is the "proper" or "more advanced" collection and reach for it by default. On modern hardware that is usually backwards: the vector wins for almost every workload that reads and stores, and the list earns its place only when addresses must stay put or the churn is at the ends. The beginner's intuition and the cache's preference point in opposite directions, and the cache gets the last word.
 
 8.9 Pointer Stability, and When Indirection Wins
 
@@ -374,6 +413,8 @@ The mark-then-enqueue order is the part to read twice. A node is marked the mome
 
 The collections so far index by position or by walking. The hash map indexes by value: you give it a key, and it finds the associated value. It does this not by searching but by computing — it runs the key through a hash function to get a number, reduces that number to a slot in a table, and looks there. This is the single most important trick in practical data structures, because it turns "search for the key" into "compute where the key must be."
 
+If hashing is new, think of a coat check. You hand over your coat and receive a numbered ticket; when you return, the number takes you straight to the shelf holding your coat, without searching every shelf. The "hash function" is the rule that turns your key into the ticket number, and the table is the wall of shelves. One consequence follows at once: the shelves are arranged by ticket number, not by anything about the coats, so the map makes no promise about the order of its keys.
+
 The standard hash map is a table of entries with open addressing: the entries live in one array, and each entry records whether it is occupied. It is a struct whose fields include the two functions that define what a key means:
 
     pub struct HashMapEntry<K, V>
@@ -404,6 +445,8 @@ The two function fields are the crucial part. A hash map cannot hash an arbitrar
     names.insert(11, "eleven");
 
 A hash function is a deterministic scramble. The same key must always produce the same number, and a good hash spreads different keys across the whole range of the integer type so that they land in different slots. The hash is not an ordering: two keys that hash near each other have no relationship at all. That is why the hash map makes no promise about the order of its entries — the table is arranged by hash, not by key — and why the hash map is the wrong structure when you need the keys in order.
+
+A common beginner mistake is to expect a hash map to remember the order in which entries were added. It does not, because it stores each key wherever its hash happens to land. If you need the entries back in insertion order, use a vector; if you need them sorted by key, use the tree map of Section 8.15.
 
 Lookup hashes the key and walks the table from the resulting slot:
 
@@ -447,6 +490,8 @@ The load factor is a trade. A denser table uses less memory and probes more; a s
     Result<V, CollectionError> insert(K key, V value)  // may allocate
 
 The map is the choice for key lookup when order does not matter. Finding a key is constant time on average, independent of how many entries there are, and the words "on average" carry the condition that the hash spreads its keys. A good hash keeps the probes short; a poor hash piles keys into one cluster and turns the map into a linear scan. Section 8.14 writes both functions by hand and shows the rules they must obey.
+
+You could say the load factor is a car park that is deliberately kept half empty. If every space were filled, finding a free one would mean circling a long row of occupied slots; keeping half the spaces open means a driver almost always finds a spot in a step or two. The empty spaces cost memory — the very trade the section names — and they are what keeps lookups fast.
 
 8.14 The Frequency Counter: A Map Put to Work
 

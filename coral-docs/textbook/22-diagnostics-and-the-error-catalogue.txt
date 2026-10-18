@@ -8,6 +8,8 @@ You have had a compiler error that told you nothing. Everyone has. You stared at
 
 A compiler's first job is to translate correct programs. Its second job, and the one that determines whether the first is usable, is to explain incorrect ones. A diagnostic is not a failure message; it is a piece of writing whose reader is a person who has just made a mistake and wants to know what it was and how to fix it. Getting that wrong is expensive. A vague error sends a programmer on a search; a good one ends the search in ten seconds. Coral's diagnostics are organised around this idea, and the organisation shows in two things: every diagnostic carries a stable code, and every code has a defined audience, from a lexical typo at one end to a subtle lifetime violation at the other.
 
+An analogy: a bad error is a car alarm blaring in a full parking lot — you know something is wrong somewhere. A good diagnostic is a note under your windscreen wiper that says which tyre is flat and where the spare is kept. Coral aims for the note.
+
 This chapter is a tour of the catalogue. It is organised by what kind of mistake each range catches, with a worked example of the shape each one takes. It also covers how the compiler is invoked to surface them, and what makes a diagnostic good — because the conventions here are part of the language, not an implementation detail, and code that reads well is code whose mistakes read well too.
 
 22.1 How Diagnostics Are Invoked
@@ -48,6 +50,8 @@ That is not a diagnostic; it is the compiler leaking its own internals. The `[mo
       |     ^^^^^^^^^^^^^^^^^^^ expected 2 arguments, found 1
 
 The compiler may not have two classes of diagnostic, one for its own mistakes and one, uglier, for the ones it surfaces on behalf of a library. If the format machinery detects that a print has more placeholders than arguments, that is a formatted diagnostic with a location, not a debug line. The catalogue is uniform, and the uniformity is what makes it learnable. A reader should never have to learn a second, secret error format for library mistakes.
+
+Why this matters: the moment a compiler has two error formats, a reader has to work out which one they are looking at before they can understand it. One format, one vocabulary, one place to look when something goes wrong.
 
 The same rule covers build output. A line like `modules.map written (1 modules, 0 aliases)` printed on every compile is debug noise, not information; the module map is a hidden log-style artefact, and if it has no reader it should not be printed. Diagnostics earn their place by being read.
 
@@ -99,6 +103,8 @@ The compiler cannot compute Node's size because Node's size depends on Node's si
     }
 
 The message explains the cycle and names the field that closes it. This is not merely a limitation; it is the compiler refusing to emit a type that has no bytes. Note that the same error appears for recursive variants, which is why the interpreter of Chapter 13 stores its sub-expressions behind pointers.
+
+Simply put, the compiler is being asked to size a box that is defined to contain itself, and it can never finish the sum. A pointer is the escape: it does not contain the other box, it only says where to find it, and a piece of paper with an address on it has a size no matter how big the building is.
 
 E0202 catches a zero-sized field in a position that forces it to overlap adjacent data — a hardware reference, or pointer arithmetic on a zero-sized type that the language would have to give a distinct address it does not have. E0203 catches a representation that conflicts with the target's alignment rules: `#[[align(N)]]`, say, or a C-compatible layout on a struct whose fields demand an alignment the target cannot honour. E0204 catches bitfields that exceed their backing storage — more bitfield bits than the underlying integer has room for. E0205 catches an attempt to cast a composite type, a union or struct, directly to a primitive with no explicit serialisation pattern:
 
@@ -211,6 +217,8 @@ E0603, unreachable code after diverging statement, catches statements after `ret
 
 Each of these is a class of bug that has shipped in every language that lacked the check, and Coral's position is that the compiler can see them, so it should. None of them requires running the program; all of them are visible in the shape of the control flow.
 
+Definite-assignment analysis reads like a careful proofreader: it walks every path the program could take and asks, on each one, "is this variable certainly set by now?" If even one path skips the assignment, it stops you. A common beginner surprise is that assigning inside `if (c) { ... }` does not count as assigned afterwards, because the branch might not have run.
+
 22.9 E07xx — Parse Ambiguities
 
 The E07xx range is unusual and worth understanding, because it is about grammar rather than semantics: it catches places where a piece of C-like syntax has two readings and the compiler must choose one.
@@ -271,6 +279,8 @@ E0902, format placeholder type mismatch, fires when a specifier demands an integ
     println("{q}", value);  // error E0903: unknown specifier `q`; did you mean `{}`?
 
 This range is the payoff of the comptime machinery: because the format string and the arguments are both visible at compile time, a class of error that is a runtime crash in C and a runtime surprise in many dynamic languages is a build failure in Coral. And as the chapter opener insisted, when this check fires — including in a library's own comptime code — it is reported as a normal E09xx diagnostic with a location, not as an internal failure string. The trade, as Chapter 17 noted, is that a format string built at runtime cannot be checked; but the overwhelming majority of format strings are literals, and for those the check is free.
+
+Simply put, because Coral can see the format string and the values together before the program runs, it treats a wrong number of values the same way it treats a typo: a build error, not a surprise at three in the morning.
 
 22.12 E10xx — Const and Mutation
 

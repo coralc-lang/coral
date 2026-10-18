@@ -14,7 +14,7 @@ import diag::code { ErrorCode };
 import base { Parser, ParserMark };
 import context::context { AstContext, InternEntry, NodeListBuilder, StrListBuilder, TyListBuilder, VariantListBuilder };
 import ast {
-    id { NodeId, Str, SourceLoc },
+    id { NodeId, Str, SourceLoc, locLine },
     decl { Decl, DeclKind, Param, Field, GenericParam, EnumVariant, VariantVariant, ImportSymbol, Attribute },
     node { Node, NodeKind },
     types { Ty, TypeEntry, TypeKind }
@@ -30,6 +30,66 @@ struct ImportSymList
 pub extend Parser
 {
     /* ── node constructors ── */
+
+    /* the contiguous `///` block immediately above the token the parser is
+     * looking at: leading `///` (and one optional space) stripped, lines
+     * joined with \n. `//` and `////` are plain comments and stop the walk;
+     * a blank line breaks the block. Returns an interned string (0 when
+     * there is no block). */
+    Str scanDocsAbove()
+    {
+        if (self.current.kind == TokenKind::Eof) return 0;
+        u8* bufStart = self.lexer.getBufStart();
+        u8* p = self.current.data.ptr;
+        if (p == null || p < bufStart) return 0;
+        /* start of the line the decl head sits on */
+        while (p > bufStart && p[-1] != 10) p--;
+        u8* starts[64];
+        u8* ends[64];
+        u32 n = 0;
+        i64 endLine = (i64)self.current.line - 1;
+        i64 lineNo = endLine;
+        while (n < 64 && p > bufStart && lineNo > 0)
+        {
+            u8* lineEnd = p - 1;
+            u8* s = lineEnd;
+            while (s > bufStart && s[-1] != 10) s--;
+            u8* q = s;
+            while (q < lineEnd && (q[0] == 32 || q[0] == 9)) q++;
+            if (q + 2 >= lineEnd) break;
+            if (q[0] != 47 || q[1] != 47 || q[2] != 47) break;
+            if (q + 3 < lineEnd && q[3] == 47) break;
+            starts[n] = q + 3;
+            ends[n] = lineEnd;
+            n++;
+            p = s;
+            lineNo = lineNo - 1;
+        }
+        if (n == 0) return 0;
+        String out = String::new();
+        u32 k = n;
+        while (k > 0)
+        {
+            k--;
+            u8* s = starts[k];
+            u8* e = ends[k];
+            if (s < e && (s[0] == 32 || s[0] == 9)) s++;
+            while (e > s && e[-1] == 13) e--;
+            if (out.len > 0) out.pushByte(10);
+            out.pushView(str { .ptr = s, .len = (usize)(e - s) });
+        }
+        return self.ctx.intern(out.asView());
+    }
+
+    /* remember a `///` block against the declaration's name line so the
+     * server can render it in hover (see scanDocsAbove) */
+    void attachDoc(NodeId id, Str doc)
+    {
+        if (doc == 0 || id.index == 0) return;
+        Node* n = self.ctx.nodes + id.index;
+        if (n->kind.tag != NodeKind::Decl) return;
+        self.ctx.addDocBlock(self.fileId, locLine(n->kind.payload.Decl.value.nameLoc), doc);
+    }
 
     // loc comes from the last consumed token. attrs are never materialized:
     // parseAttrList only surfaces the const bit
@@ -56,6 +116,112 @@ pub extend Parser
     {
         value.loc = self.tokenLoc(self.previous);
         return self.storeNode(NodeKind::Field{ .value = value });
+    }
+
+    /* attribute names this compiler recognizes; keep in sync with the LSP
+     * attribute cards (server.crl lspAttributeCard) and mono's planned set
+     * (`inline_always`, `hot`, `cold`, `vectorise` are accepted ahead of
+     * implementation) */
+    bool isKnownAttr(Str name)
+    {
+        if (name == self.ctx.intern("const")) return true;
+        if (name == self.ctx.intern("condassign")) return true;
+        if (name == self.ctx.intern("no_drop")) return true;
+        if (name == self.ctx.intern("no_drop_all")) return true;
+        if (name == self.ctx.intern("fallthrough")) return true;
+        if (name == self.ctx.intern("inline")) return true;
+        if (name == self.ctx.intern("inline_always")) return true;
+        if (name == self.ctx.intern("hot")) return true;
+        if (name == self.ctx.intern("cold")) return true;
+        if (name == self.ctx.intern("vectorise")) return true;
+        if (name == self.ctx.intern("deprecated")) return true;
+        if (name == self.ctx.intern("packed")) return true;
+        if (name == self.ctx.intern("noreturn")) return true;
+        if (name == self.ctx.intern("reorder")) return true;
+        if (name == self.ctx.intern("generate")) return true;
+        if (name == self.ctx.intern("generated")) return true;
+        if (name == self.ctx.intern("generator")) return true;
+        return false;
+    }
+
+    /* edit distance for attribute misspellings; mirrors the semantics
+     * helper nameDistance (member.crl) but over the parser's intern
+     * table. names are short; the windows cap at 40 bytes */
+    u32 attrNameDistance(Str a, Str b)
+    {
+        if (a == b) return 0;
+        if (a == 0 || b == 0) return 4;
+        str sa = self.ctx.interns[a];
+        str sb = self.ctx.interns[b];
+        if (sa.len > 40) sa.len = 40;
+        if (sb.len > 40) sb.len = 40;
+        usize* prev = alloc<usize>(41);
+        usize* cur = alloc<usize>(41);
+        if (prev == null || cur == null)
+        {
+            if (prev != null) dealloc<usize>(prev);
+            if (cur != null) dealloc<usize>(cur);
+            return 4;
+        }
+        usize i = 0;
+        while (i <= sb.len) { prev[i] = i; i++; }
+        usize j = 1;
+        while (j <= sa.len)
+        {
+            cur[0] = j;
+            i = 1;
+            while (i <= sb.len)
+            {
+                usize cost = 1;
+                if (sa.ptr[j - 1] == sb.ptr[i - 1]) cost = 0;
+                usize best = prev[i] + 1;
+                if (cur[i - 1] + 1 < best) best = cur[i - 1] + 1;
+                if (prev[i - 1] + cost < best) best = prev[i - 1] + cost;
+                cur[i] = best;
+                i++;
+            }
+            i = 0;
+            while (i <= sb.len) { prev[i] = cur[i]; i++; }
+            j++;
+        }
+        u32 d = (u32)prev[sb.len];
+        dealloc<usize>(prev);
+        dealloc<usize>(cur);
+        return d > 40 ? 40 : d;
+    }
+
+    /* closest known attribute for a misspelled one, 0 when none is close */
+    Str closestAttrName(Str name)
+    {
+        Str best = 0;
+        u32 bestD = 3;
+        Str cands[24];
+        u32 n = 0;
+        cands[n] = self.ctx.intern("const"); n++;
+        cands[n] = self.ctx.intern("condassign"); n++;
+        cands[n] = self.ctx.intern("no_drop"); n++;
+        cands[n] = self.ctx.intern("no_drop_all"); n++;
+        cands[n] = self.ctx.intern("fallthrough"); n++;
+        cands[n] = self.ctx.intern("inline"); n++;
+        cands[n] = self.ctx.intern("inline_always"); n++;
+        cands[n] = self.ctx.intern("hot"); n++;
+        cands[n] = self.ctx.intern("cold"); n++;
+        cands[n] = self.ctx.intern("vectorise"); n++;
+        cands[n] = self.ctx.intern("deprecated"); n++;
+        cands[n] = self.ctx.intern("packed"); n++;
+        cands[n] = self.ctx.intern("noreturn"); n++;
+        cands[n] = self.ctx.intern("reorder"); n++;
+        cands[n] = self.ctx.intern("generate"); n++;
+        cands[n] = self.ctx.intern("generated"); n++;
+        cands[n] = self.ctx.intern("generator"); n++;
+        u32 i = 0;
+        while (i < n)
+        {
+            u32 d = self.attrNameDistance(name, cands[i]);
+            if (d < bestD) { bestD = d; best = cands[i]; }
+            i++;
+        }
+        return best;
     }
 
     /* `#[[name(args), …]]*`: one or more attribute lists.
@@ -171,11 +337,13 @@ pub extend Parser
      * diagnostics from the discarded pass */
     NodeId parseDecl()
     {
+        Str doc = self.scanDocsAbove();
         Attribute* attrs = null;
         u32 attrsLen = 0;
         u8 attrFlags = self.parseAttrListTo(&attrs, &attrsLen);
         NodeId id = self.parseDeclBody(attrFlags);
         self.attachAttrs(id, attrs, attrsLen);
+        self.attachDoc(id, doc);
         return id;
     }
 
@@ -524,9 +692,12 @@ pub extend Parser
     // attrs already consumed by a member loop get folded in here
     NodeId parseFuncDeclFlags(u8 attrFlags)
     {
+        Str doc = self.scanDocsAbove();
         attrFlags |= self.parseAttrList();
         bool isConst = (attrFlags & 1) != 0;
-        return self.parseFuncOrVarDecl(false, false, false, isConst);
+        NodeId id = self.parseFuncOrVarDecl(false, false, false, isConst);
+        self.attachDoc(id, doc);
+        return id;
     }
 
     /* one parameter. flags: 1 = isSelf, 8 = unnamed/type-only,
@@ -652,7 +823,9 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
+                self.attachDoc(method, methodDoc);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 self.match(TokenKind::Semicolon);
                 continue;
@@ -874,7 +1047,9 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
                 NodeId method = self.parseFuncOrVarDecl(fieldFlags == 1, mIsExtern, mIsStatic, (memberAttrs & 1) != 0);
+                self.attachDoc(method, methodDoc);
                 if (!self.ctx.nodeListAppend(&methods, method)) self.reportAllocFailed();
                 self.match(TokenKind::Semicolon);
                 continue;
@@ -957,7 +1132,9 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
                 method = self.parseFuncOrVarDecl(false, mIsExtern, mIsStatic, false);
+                self.attachDoc(method, methodDoc);
             }
             else {
                 method = self.parseFuncDecl();
@@ -1034,7 +1211,9 @@ pub extend Parser
                     self.expect(TokenKind::RParen);
                 }
                 bool mIsStatic = self.match(TokenKind::Static);
+                Str methodDoc = self.scanDocsAbove();
                 method = self.parseFuncOrVarDecl(false, mIsExtern, mIsStatic, false);
+                self.attachDoc(method, methodDoc);
             }
             else
             {

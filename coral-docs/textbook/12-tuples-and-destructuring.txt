@@ -42,7 +42,11 @@ A tuple type is written with the `struct` keyword and a comma-separated list of 
 
 This is the only way to write a tuple type. No second spelling drops the outer `struct`, and that is deliberate rather than an oversight. A bare parenthesised type already means something else in the language — grouping — and a statement that begins with `(` is read as a cast, so a parenthesised type cannot do the aggregating job without ambiguity. The `struct` keyword is what makes a tuple type unmistakable in every position: declarations, parameters, return types, and generic arguments alike. When you see `struct(` you are looking at a tuple, everywhere, always.
 
+In plain words, the `struct` keyword in front is a signpost. It tells the compiler, and you, "the parentheses that follow are a bundle of types, not a grouped type or a cast." Without the signpost the compiler could not tell the tuple `struct(i32, f64)` from a grouped `i32`.
+
 Each of those is a distinct type. `struct(i32, f64)` is not the same type as `struct(f64, i32)`, even though the two contain the same components — order is part of the identity, because position is the only name a tuple element has. Two tuples are the same type only when they have the same number of elements and each position has the same type. This is stricter than it might first appear, and it is a feature: the compiler will not let you feed a `struct(f64, i32)` where a `struct(i32, f64)` is expected, so a "swap the arguments" mistake becomes a compile error instead of a silent corruption.
+
+A common mistake is to build a tuple in the wrong order and expect it to fit a variable declared the other way. `struct(i32, f64)` and `struct(f64, i32)` hold the same two kinds of value, but the compiler treats them as unrelated types, so `struct(f64, i32) swapped = (1, 2.5);` fails. The position is the name, and a name in the wrong place is the wrong name.
 
 A single-element tuple is written the same way:
 
@@ -57,6 +61,8 @@ The empty tuple has a value and a type, and they are spelled the same way:
 A `struct()` has exactly one value, written `()`, and it means "no information." A function that returns nothing is, under the hood, returning the unit type. Coral lets you write `void` for that role in most places, and usually you should, because `void` reads as "this returns nothing." But `struct()` has a job that `void` cannot do: it is a real, usable type when a generic construct needs "a type whose values carry no data." A `Map<str, struct()>` is a set of strings. A channel of `struct()` is a signal. A state-machine transition that yields nothing can yield `struct()`. Unit is not nothing; it is a type whose only value takes zero bytes.
 
 There is one more idea here, and it explains a lot of the rest. Underneath, a tuple is a struct whose fields happen to be numbered. `struct(i32, f64)` is a struct with a field named `0` of type `i32` and a field named `1` of type `f64`. That is why access is `.0` and `.1`: they are field accesses, the same syntax you use for a named field, with numbers for names because the tuple never gave them names. It is also why the tuple's layout is exactly a struct's layout: declaration order, each element aligned to its natural boundary. No hidden header, no heap, no bookkeeping. If you remember only one sentence from this section, remember this one: a tuple is a struct that forgot to name its fields.
+
+Simply put, a tuple and a struct are the same bytes; the only difference is whether the fields were given names. A struct says "the first field is called `x`"; a tuple says "the first field is just first." That is why a tuple costs nothing extra and why `t.0` feels so much like `p.x` — it is the very same field access, with a number standing in for a name.
 
 12.3 Writing a Tuple Value
 
@@ -101,6 +107,12 @@ Tuples are indexed by position with a dot and a decimal integer:
 
 Two things distinguish this from array indexing. First, the index is not an expression; it is part of the syntax. `t.0` is valid, `t.i` is not — the compiler will reject the letter. Second, because the index is fixed at compile time, the compiler always knows the exact type of every element. If `t` is `struct(i32, f64, bool)`, then `t.0` is `i32`, `t.1` is `f64`, and `t.2` is `bool`, known at compile time with no runtime lookup and no bounds check. Compare an array, where `arr[i]` has one element type and the index is computed at runtime.
 
+    var pair = (1, 2.5);
+    var first  = pair.0;     // an i32
+    var second = pair.1;     // an f64
+
+Each read knows its type before the program runs, which is why a tuple can hold values of different types where an array cannot.
+
 Hold on — why does it matter that the index is a literal and not a variable? Because that is precisely what lets the compiler turn each access into a fixed offset. `t.0` compiles to "the first field," not "look up field number zero." If the index could be a runtime value, the compiler would have to keep the types of the fields in some table and check the index at run time, and a tuple could hold elements of different types only if every access returned "one of these, we are not sure which." Because the index is a compile-time constant, a tuple can mix types freely and every access is a plain, typed field read. That is why a tuple access is free, and why tuples can be heterogeneous while arrays cannot.
 
 You can assign a whole tuple to a mutable variable, and you can reassign a tuple-valued location:
@@ -127,6 +139,8 @@ If you only want one piece, this is not a compromise; it is the clearest thing y
     var pair = (10, 20);
     var keep = pair.0;        // just read the first element
 
+If you are coming from Rust or Python, this restriction can feel like a step backwards, so here is the intuition to put in place of the missing syntax. A tuple is a bucket of values identified by position, and `.0` and `.1` are the labels printed on the bucket's compartments. You reach into the compartment whose label you want; there is no shorthand that names every compartment at once. When you want *all* the pieces, you use a `switch` pattern, which is the next section.
+
 Now, when do you want *all* the pieces at once? That is what patterns are for, and they live where values are matched rather than where they are declared. A tuple is a value, and a tuple pattern is a way to ask the question "does this value have this shape, and if so, name the pieces." The next section is entirely about that.
 
 12.6 Patterns: Matching Tuples in a switch
@@ -139,6 +153,8 @@ A `switch` takes a value, tries its arms in order, and runs the first one whose 
     }
 
 Each arm is a tuple pattern: it matches the tuple position by position and binds the pieces it names. Because a `bool` has exactly two values and both arms are present, this switch is exhaustive and the compiler confirms it. If you later decide `divide` must also report an error string, the type changes and the compiler walks you through every switch that has to change — the same exhaustiveness benefit Chapter 13 describes at length.
+
+Here is that switch walked through slowly. Suppose `divide(10, 0)` returns the tuple `(0, false)`. The switch tries the first arm, `(value, true)`: it needs the second component to be `true`, but it is `false`, so this arm does not match. It tries the second arm, `(value, false)`: the second component is `false`, so it matches, binding `value` to `0` and running `println("division failed")`. First match wins, and the rest are skipped.
 
 Patterns nest, because the type nests:
 
@@ -238,6 +254,10 @@ Because tuples nest and compose, you can also have a map whose values are tuples
 
 The one thing you cannot do is give a tuple methods, and we should be honest about how far this reaches. You cannot write an `extend` block for `struct(i32, i32)`, and you cannot implement a trait for a bare tuple. A tuple's only behaviour is its layout. That is the boundary line between tuples and structs, and it is Section 12.9.
 
+In plain words, a tuple is data and nothing more. It has no methods, no name, and no behaviour beyond the bytes it holds. The moment you want a tuple to *do* something — to print itself, compare itself, or clean up after itself — it has grown beyond a tuple and wants to be a struct.
+
+Why this matters: because tuples are plain data, they are the cheapest way to return several answers and the easiest to use in a hot loop. A `struct(str, i32)` inside a `Vec` costs exactly what a two-field struct costs and nothing more — no methods, no vtable, no hidden allocation. The lightness you gain is the same lightness that stops you adding behaviour later, so choose it when the data really is just passing through.
+
 12.9 Tuple or Struct?
 
 The two look similar and get used for the same job at different scales. The question "should this pair be a tuple or a struct?" comes up constantly, so here is a decision you can apply without agonising.
@@ -308,6 +328,8 @@ Here is the conversion that makes the two types useful rather than merely separa
 Wait — `f.0`? Yes. When a `distinct` type's representation is a tuple, the value has positional access, because underneath it is still a tuple. `pub distinct Point = struct(f64, f64);` gives you `p.0` and `p.1` while still refusing to let a `Point` stand where an unrelated `struct(f64, f64)` is expected. You get positional convenience and nominal safety at the same time. For a `distinct` whose representation is a single scalar, there is nothing to index; you cast to the underlying type when you need the bytes, which is a visible reminder at every use site that a unit conversion could be happening.
 
 Think of `distinct` as a sticky note you put on a type. Under the note, `Meters` is just an `f64`, laid out in eight bytes. But the compiler reads the note, and it refuses to do arithmetic between two values whose notes differ, and it refuses to hand a `Meters` to code that asked for `f64` without a deliberate cast. You keep the tuple's cheap layout and gain the struct's identity.
+
+Why this matters: `distinct` is how a program says two things that look alike are not the same thing. Money in dollars and money in euros, a distance in meters and a distance in feet, a user id and an order id — all of them are the same number underneath and all of them are dangerous to mix. The `distinct` type gives you the cheap layout of the underlying value with the safety of a real name, and costs nothing at run time.
 
 12.11 A Worked Example: Bounds and Statistics
 
@@ -391,6 +413,8 @@ Finally, let us put the tuples to work together, which is the reason to write an
 Look at what has happened. Three functions, each with its own tuple type, compose into a fourth without a single out-parameter, without a single pre-declared buffer, and without a single comment explaining which argument was an input. Every piece of the answer has a name at the point where it is used, and a reader can follow the data from `bounds` and `partition` into the print in one glance.
 
 This is the pattern to internalise for the whole chapter: one function returns a tuple, the caller reads the pieces it needs by position, and positional access replaces a pile of out-parameters and pre-declared storage. Where the tuple's meaning stops being obvious — which happens as soon as it holds three or more same-typed values and travels across a function boundary — you promote it to a struct, and the compiler starts helping you again. The worked example above is right at the edge of that trade-off: `struct(i32, i32, usize, usize, usize)` is the largest tuple you should tolerate before reaching for a `Summary` struct with named fields. Chapter 15's `Option` and `Result` are what you reach for when a piece of the answer might not be there at all.
+
+Why this matters: nearly every programming task begins by asking a function for more than one thing — a value and its status, a slice and its length, a minimum and a maximum. A tuple is the small, cheap answer that keeps the call site readable, and the habit of returning several values in one place instead of threading out-parameters is the one that makes the later chapters' code feel tidy.
 
 12.12 Exercises
 

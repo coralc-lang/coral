@@ -10,6 +10,8 @@ Here is the difference in worlds, and it is worth holding onto for the whole cha
 
 Thin does not mean trivial. The discipline is real, and the chapter's plan is: learn to declare foreign functions, learn to pass and receive data across the boundary, learn to represent C's types, and then learn the most valuable habit of all — to build a wrapper so that the rest of your program never touches the raw interface. A good FFI is invisible from the outside. That is the standard this chapter is aiming at.
 
+An analogy: the FFI is a border crossing. Coral has its own language, currency, and rules; C on the other side has different ones. A pointer is a passport number with no photo, a C string is a name with no promised length, and a struct is a parcel whose contents match only if both sides packed it the same way. The wrapper of 19.7 is the customs officer who translates once, so the rest of your program never has to cross.
+
 19.1 What the FFI Is For
 
 It helps to be concrete about why you would ever need this. There are four jobs, and almost every use of the FFI is one of them.
@@ -58,6 +60,19 @@ The standard library's own platform bindings are the model to read, because they
 
 Two things are visible in the Windows fragment that are not in the POSIX one. The names are longer, because the platform's API is longer, and the types `u32` and `bool` show up where C has `unsigned` and its own boolean — we will meet the translation table in 19.4. The point is that adding a binding the library does not yet have is a one-line addition of a declaration. That is the whole extension mechanism.
 
+A whole binding can be smaller than a sentence. This complete program opens a file and closes it, with no wrapper at all:
+
+    import(lib) platform::libc { open, close };
+
+    void main() {
+        i32 fd = open(C"/etc/hosts", 0, 0);
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+It works, and it shows why the wrapper of 19.7 is worth writing: the raw `i32` descriptor and the magic `0, 0` flags are exactly the details a wrapper is meant to hide.
+
 19.3 Calling Conventions and Function Pointers
 
 A function's calling convention is the low-level agreement about how arguments are passed and who cleans up — in registers or on the stack, in what order, who pops. For the ordinary C convention, `extern` alone is enough, because the default is the platform's C convention. When a function uses a non-default convention, the convention is named:
@@ -79,11 +94,10 @@ The type `i32(const rawptr, const rawptr)` is "a pointer to a function taking tw
         return x - y;
     }
 
-    i32 main() {
+    void main() {
         i32 data[5];
         data[0] = 5; data[1] = 3; data[2] = 4; data[3] = 1; data[4] = 2;
         qsort((rawptr)data, 5u, 4u, compareInts);
-        return 0;
     }
 
 The one subtlety is the calling convention. A callback invoked by C must use the C convention, so a Coral function passed across the boundary must have a C-compatible signature — it must take and return only FFI-compatible types, and it must not assume it can throw or unwind. An owned Coral type with drop behaviour is not something C can pass by value; keep callbacks simple, and if a callback needs context, pass it through a raw pointer, exactly as C does.
@@ -119,6 +133,8 @@ And the sizes are not universal. `long` is 64 bits on the LP64 model (Linux, mac
 
 The single largest source of FFI bugs is string handling, and Coral attacks it by making the two representations distinct types. A Coral `str` is a pointer and a length. A C string is a pointer to nul-terminated bytes with no length. They are not interchangeable, and the language does not pretend they are.
 
+Simply put, a `str` is a page with the number of words written at the top, and a C string is a page that just stops at the first blank line. Hand the first kind to a function that expects the second and it keeps reading past your last word until it happens to find a blank — or walks off the page.
+
 To call a C function that wants a C string, you must have a C string. A literal with the `C` prefix is one:
 
     open(C"/etc/hosts", 0, 0);
@@ -135,6 +151,8 @@ For a runtime string — a `String` or a `str` — you convert explicitly. A `St
     open(tmp.asCstr(), 0, 0);
 
 The conversion is not free and it is not implicit, and that is the point: turning a length-carrying string into a nul-terminated one is a decision with a cost — either an allocation or a guarantee about a trailing byte — and the API makes you write the decision down. `asCstr()` does not allocate; it hands back the `String`'s own bytes, which is why the `String` must outlive the pointer. That lifetime rule is yours to keep.
+
+The common mistake here is to write `open(tmp.asCstr(), ...)` where `tmp` was a temporary that is already gone by the time C reads it. `asCstr` does not copy; it lends you the `String`'s own bytes, so the `String` must still be alive when the C function uses the pointer. If the pointer has to outlive the string, copy the bytes yourself first.
 
 The reverse direction is equally explicit. `String::fromCstr` measures the C string and copies it into an owned `String`; `str::fromCstr` measures it and returns a borrowed view:
 
@@ -224,6 +242,8 @@ Wrap it in an owned type with a drop and a `Result`-returning open:
 
 Everything that made the C API awkward is hidden here. `fopen`'s null-on-failure becomes a typed error in a `Result`. The raw handle is wrapped in a struct that owns it and frees it through `@drop`, so a `File` going out of scope closes the descriptor — RAII at the boundary, which is the single most valuable thing a wrapper provides. The C-string conversion is done once, inside. Callers write `fileOpen("config.txt")` and get a `Result`, and they never hold a `rawptr` or remember to close.
 
+Why this matters: a wrapper is what turns a C library from a pile of footguns into a tool your teammates can use without reading the C manual. The boundary work is done once, in one file, and every caller afterwards writes ordinary Coral.
+
 The wrapper is also where the ownership contract is decided. The `File` owns the handle, so copying a `File` would double-close it; the wrapper must either forbid copying or use a reference count the way a file descriptor is meant to be shared. The language does not decide this for you, because C did not decide it for you. The wrapper's job is to make the decision once, in one place, and to express it in the type so that the rest of the program inherits it.
 
 Two more details make a wrapper feel finished. First, map error codes to a small closed set of cases, so callers can switch on them. Second, use the switch's `|` to group cases that share a handling path:
@@ -254,6 +274,8 @@ The grammar is small. An `asm` statement is the keyword, an optional `volatile`,
     asm [volatile] { "template" [ : outputs ] [ : inputs ] [ : clobbers ] }
 
 or `volatile asm { ... }`; the qualifier is accepted on either side and means the same thing (it sets one flag bit, `flags & 1`, the `isVolatile` bit on `StmtKind::Asm`). The template is one or more string literals; a comma between pieces is optional, so adjacent literals join, exactly as C concatenates adjacent string literals. After the template come three optional colon-delimited sections, in the order C's extended asm uses: outputs, then inputs, then clobbers. Sections may be omitted from the right, and a `::` (lexed as one `ColonColon` token) closes a section and makes the next one empty, which is how the common barrier `asm volatile { "" ::: "memory" }` leaves both operand lists empty and reaches the clobber list. Operands in the output and input sections are `"constraint"(expression)` pairs — a string literal followed by a parenthesized Coral expression — while the clobber list is bare string literals. The parser stores them in the same shape the AST declares: `StmtKind::Asm { template, outputs, inputs, clobbers, flags }` (coral-ast/stmt.crl:127).
+
+Simply put, an `asm` block is a place where you write a few instructions in the machine's own language and hand them to the C compiler to place around your Coral variables. The template is the instruction text; the outputs, inputs, and clobbers are the note card telling the compiler which of its variables and registers the block reads, writes, and tramples, so it can keep them straight.
 
 The template is emitted verbatim, wrapped in the host C compiler's `__asm__` (or `__asm__ volatile` when the qualifier is present), because Coral's backend lowers the statement straight to GNU inline assembly (coral-backend/codegen.crl:4908). Two consequences follow. First, the operand placeholders are the C compiler's: `%0`, `%1`, … number the operands in order, outputs first and then inputs, and a literal percent in an x86 template is written `%%`, so a register is `%%rax` and instruction streams are separated with `\n\t`. Second, the constraint letters are the C compiler's, not Coral's: Coral copies each constraint string into the right slot without interpreting it (codegen.crl:4955), so any constraint GCC or Clang accepts works. `"r"` is a general-purpose register, `"m"` a memory location, `"i"` an immediate; on x86 `"a"`, `"D"`, `"S"`, `"d"` name AX, DI, SI, DX, and `"q"` a byte-addressable register. An output constraint carries `=` (`"=r"`, `"=m"`), a read-write operand carries `+` (`"+r"`, `"+m"`), and a digit constraint like `"0"` ties an input to the output with that number, so the two share a register or location. Operands bind to Coral variables by being lvalues: `"=r"(v)` names the local `v`, and the C compiler loads the input operands before the block and stores the output operands after it. The semantic check walks the template, output, and input expressions and type-checks each one (coral-semantics/stmt.crl:203); it does not check constraints or clobbers.
 
@@ -376,12 +398,11 @@ Then the program that uses it, which never sees C at all:
         return Result<String, FileError>::Ok { .value = out };
     }
 
-    i32 main() {
+    void main() {
         switch (readWholeFile("config.txt")) {
             Ok { value }  => println("read {} bytes", value.len),
             Err { error } => eprintln("could not open the file"),
         }
-        return 0;
     }
 
 `main` never sees a `rawptr`, a `cchar`, or a return code. It sees a `Result` and a `String`, because `readWholeFile` turned C's `fopen`/`fread`/`fclose` world into Coral's `Result` world and hid the difference. The `File` is owned, so it is closed automatically when `readWholeFile` returns — success or failure, the descriptor is released. The buffer is a fixed array, passed down as a pointer and a length, converted by the wrapper. This is what a good FFI looks like from the outside: the boundary is invisible, and the discipline of the boundary lives in one wrapper rather than scattered across the program.

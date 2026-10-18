@@ -531,11 +531,10 @@ The before. Verification by printing.
         return a;
     }
 
-    pub i32 main() {
+    pub void main() {
         println("{}", gcd(12, 18));    // expect 6
         println("{}", gcd(18, 12));    // expect 6
         println("{}", gcd(17, 5));     // expect 1
-        return 0;
     }
 
 The output must be read by a human and compared to a remembered expectation. Nothing fails automatically. Change `gcd` to return `b` by mistake and these lines still print numbers, and the program still exits zero.
@@ -606,7 +605,7 @@ The intuition. This is the capstone, and it uses every principle at once. What f
 
 The before.
 
-    pub i32 main() {
+    pub void main() {
         Vec<f64> scores = Vec<f64>::new();
         u32 bad = 0;
 
@@ -635,7 +634,6 @@ The before.
         } else {
             println("average: {}", avg);
         }
-        return 0;
     }
 
 The problems are all here at once: `line`, `s`, `v`, `comma` are opaque; `-1.0` is a sentinel for "no scores," and a legitimate average of `-1` would be indistinguishable; the parsing, the validation, the statistics, and the formatting are one knot; the magic bound `100.0` appears inline; and there is no way to test the average without running the whole program.
@@ -702,7 +700,7 @@ The after.
             println("average: {}", s->sum / (f64)s->valid);
     }
 
-    pub i32 main() {
+    pub void main() {
         Vec<Record> records = Vec<Record>::new();
         u32 rejected = 0;
         String line = String::new();
@@ -714,7 +712,6 @@ The after.
         }
         Summary s = summarise(&records, rejected);
         printReport(&s);
-        return 0;
     }
 
 The same behaviour, restructured. `parseRecord` owns the parse-and-validate knowledge and returns a `Result` that names each failure mode, so an unknown error is impossible. `summarise` is pure arithmetic that can be tested with a hand-built vector and no input. `printReport` decides the "no scores" case explicitly, and the sentinel is gone: `valid == 0` is the honest test, and an average of zero is reported as zero. `main` is six lines of composition, each calling a function whose name says what it does. The magic bounds are named constants. Every principle from this chapter is present, and the function grew by names rather than by lines.
@@ -725,7 +722,269 @@ When the before is fine. A script that runs once, on one file, and is then delet
 
 Variation. Add a second output format (a CSV summary) by adding `printReportCSV` and changing `main`'s last line. Then add the ability to filter records below a threshold, which now means filtering the `Vec<Record>` before `summarise`. Notice that neither change touches the parser, and say which principle that shows.
 
-35.11 Exercises
+35.11 The Law of Demeter
+
+The principle. A piece of code should talk only to its immediate collaborators, and only through their interfaces — not through their collaborators' collaborators. Do not navigate a chain of fields and methods to reach a piece of data; ask the object that owns it.
+
+The intuition. A long navigation chain is a public statement of how the types are wired together. `a->customer.address.city` tells the reader — and the compiler — that this code depends on `Order` having a `Customer` field, on `Customer` having an `Address` field, and on `Address` having a `city`. Any of those can change and this line breaks, even though this code has no business knowing any of them. The rule, often stated as "don't talk to strangers," is to move the question down the chain: let `Address` compare cities, let `Customer` compare addresses, and let `Order` compare orders. Each method then reaches only one step.
+
+The before. A function that reaches through two levels to compare two orders.
+
+    pub struct Address { str city; str postalCode; }
+    pub struct Customer { Address address; }
+    pub struct Order { Customer customer; f64 total; }
+
+    pub bool shipsToSameCity(const Order* a, const Order* b) {
+        return a->customer.address.city.equals(b->customer.address.city);
+    }
+
+The comparison knows the entire object graph. Introduce a `Region` between `Customer` and `Address` and this function fails to compile, as does every other function that made the same reach.
+
+The after. Each type answers a question at its own level, reaching one step at most.
+
+    pub struct Address {
+        str city;
+        str postalCode;
+
+        bool sameCity(const Address* other) {
+            return self.city.equals(other->city);
+        }
+    }
+
+    pub struct Customer {
+        Address address;
+
+        bool livesInSameCityAs(const Customer* other) {
+            return self.address.sameCity(&other->address);
+        }
+    }
+
+    pub struct Order {
+        Customer customer;
+
+        bool shipsToSameCityAs(const Order* other) {
+            return self.customer.livesInSameCityAs(&other->customer);
+        }
+    }
+
+Now `Order::shipsToSameCityAs` knows only that it has a `Customer`, and `Customer` knows only that it has an `Address`; the call site is `a->shipsToSameCityAs(b)`. If a `Region` type is introduced later, the change is confined to `Address`, and the call sites never mention its internals.
+
+Cost and notes. The refactor adds one method per level and slightly more code, and `const` pointers keep the methods from mutating their inputs. The benefit is that the dependency graph is shallow: each method is testable with a single object and a fake collaborator, and a change to one type's internals does not ripple outward. This is the mirror image of DRY — instead of giving knowledge one home, it refuses to let knowledge leak.
+
+When the before is fine. Plain data-transfer structs, whose whole purpose is to be read field by field, are not molested by this rule; reaching into a `Point` for its `x` is not a Demeter violation, it is the point. The rule is about behaviour and about deep chains, not about a single field access.
+
+Variation. Find a "train wreck" in your own code — a line with three or more dots — and give the type a method that answers the underlying question. Then ask whether the question belongs to the first type in the chain or to one further down, and put it at the lowest level that can answer it.
+
+35.12 Immutability and Pure Functions
+
+The principle. Prefer values that do not change after they are created, and functions that compute a result without touching anything outside themselves. A pure function — one whose answer depends only on its arguments — is easier to test, safe to call twice, safe to run in parallel, and safe to cache.
+
+The intuition. The enemy is state that drifts. The moment two pieces of information must be kept in agreement by hand, a change to one that forgets the other is a bug waiting to happen. A pure function has no such agreement to maintain: you give it inputs, it returns an output, and there is nothing left behind to be inconsistent. Immutability is the same idea applied to values. If a value never changes, then a reference to it can be shared freely, called twice, or stored without fear.
+
+The before. A cart that caches its own total and mutates in place.
+
+    import(lib) std::vec { Vec };
+
+    pub struct Cart {
+        Vec<f64> prices;
+        f64 total;      // kept in step with prices by hand
+    }
+
+    pub void addItem(Cart* c, f64 price) {
+        c->prices.push(price);
+        c->total += price;
+    }
+
+    pub f64 applyDiscount(Cart* c, f64 percent) {
+        c->total = c->total * (1.0 - percent);
+        return c->total;
+    }
+
+Calling `applyDiscount` twice discounts twice. Adding an item after a discount loses the discount, because `total` and `prices` have quietly fallen out of agreement. The two fields are a contract that nothing enforces.
+
+The after. A value, plus functions that read it through a `const` pointer and return a new value.
+
+    import(lib) std::vec { Vec };
+
+    pub struct Cart { Vec<f64> prices; }
+
+    pub f64 cartTotal(const Cart* c) {
+        f64 sum = 0.0;
+        for (usize i = 0; i < c->prices.count(); i += 1) sum += c->prices.at(i);
+        return sum;
+    }
+
+    pub Cart withItem(const Cart* c, f64 price) {
+        Cart next;
+        next.prices = Vec<f64>::new();
+        for (usize i = 0; i < c->prices.count(); i += 1) next.prices.push(c->prices.at(i));
+        next.prices.push(price);
+        return next;
+    }
+
+    pub Cart discounted(const Cart* c, f64 percent) {
+        Cart next;
+        next.prices = Vec<f64>::new();
+        for (usize i = 0; i < c->prices.count(); i += 1)
+            next.prices.push(c->prices.at(i) * (1.0 - percent));
+        return next;
+    }
+
+`cartTotal` is pure: call it once or a hundred times and the answer is the same, and it cannot change the cart. `discounted` returns a new cart and leaves the original alone, so discounting twice is an explicit choice, not an accident. The `const` on each parameter is the compiler's help: a function that promised not to mutate cannot, even by mistake.
+
+Cost and notes. Immutability copies. `withItem` and `discounted` each allocate a new vector, where the mutating version edited in place. For a cart of ten prices that is nothing, and for a hot loop over a million elements it is a real cost, which is why performance-critical code either mutates a local buffer it owns outright or uses a persistent data structure that shares the unchanged parts. The trade is deliberate: pay a copy to remove a whole class of bugs and to make the functions trivially testable.
+
+When the before is fine. A tight numeric loop mutating a buffer it created and will throw away is exactly right; the discipline is about shared, long-lived values, not about every temporary. The mistake is exposing the mutation: a mutating function on a value that callers hold and reuse is where the bugs live.
+
+Variation. Take the `summarise` function from 35.3 and note that it is already pure, then add a memoised wrapper that caches the last result for a repeated identical input and argue why caching is safe only because the function is pure.
+
+35.13 The Strategy Pattern with Function Pointers
+
+The principle. When a piece of code has several interchangeable algorithms, give the algorithm its own name and pass it in, rather than selecting between them with a type switch buried in the middle. The code that uses the strategy stops knowing which one it has.
+
+The intuition. A switch over an operation enum welds the caller to the whole family: every new operation edits the function, and the function must know every case. Passing the operation as a value inverts that. The caller names the operation it wants, the code that consumes it calls it through the common shape, and adding an operation is adding a function — no edit to the code that uses it. In Coral the lightest such value is a function pointer, because there is no inheritance to carry the idea.
+
+The before. A calculator that switches on an operation tag.
+
+    enum Op { Add, Sub, Mul }
+
+    pub f64 compute(Op op, f64 a, f64 b) {
+        switch (op) {
+            Op::Add => return a + b,
+            Op::Sub => return a - b,
+            Op::Mul => return a * b,
+        }
+    }
+
+Every new operation is an edit to `compute` and to the enum, and every edit risks the operations that already worked.
+
+The after. The operation is a function value; the consumer knows only its shape.
+
+    import(lib) std::vec { Vec };
+
+    pub f64 addOp(f64 a, f64 b) { return a + b; }
+    pub f64 subOp(f64 a, f64 b) { return a - b; }
+    pub f64 mulOp(f64 a, f64 b) { return a * b; }
+
+    pub f64 compute(f64(f64, f64) op, f64 a, f64 b) {
+        return op(a, b);
+    }
+
+    pub f64 reduce(const Vec<f64>* xs, f64(f64, f64) op) {
+        @assertOut(xs->count() > 0, "reduce needs at least one element");
+        f64 acc = xs->at(0);
+        for (usize i = 1; i < xs->count(); i += 1) acc = op(acc, xs->at(i));
+        return acc;
+    }
+
+`compute(addOp, 3.0, 4.0)` and `compute(mulOp, 3.0, 4.0)` choose the algorithm at the call site, and `compute` itself has one line. A fourth operation is a new function and no change to `compute`, which is the open/closed idea of 35.5 in its smallest form. `reduce` shows the same strategy reused for a fold, which is why the standard library's `sortBy` takes a comparison function of exactly this shape.
+
+Cost and notes. A call through a function pointer is an indirect call, which the compiler may not inline unless it knows the concrete target at the call site; the switch version inlines easily. The compensating benefit is that adding operations is open, and the caller decides the behaviour at runtime, which a switch over a fixed enum cannot do without editing the enum. The second cost is the loss of exhaustiveness: the compiler no longer proves that every operation is handled, because a function pointer can be anything.
+
+When the before is fine. A small, closed set of operations used in exactly one place is fine as a switch, and the compiler's exhaustiveness check is worth more than openness there. Reach for the function pointer when the set will grow or when the choice is data-driven.
+
+Variation. Add a `bool(f64, f64) less` strategy to a manual sort and observe that it is the same pattern as `Vec::sortBy`, then compare the function-pointer strategy with the trait-based strategy of 35.5 and say when each is the right tool: the pointer for stateless algorithms, the trait when the strategy carries state.
+
+35.14 The Null Object Pattern
+
+The principle. When a collaborator may be absent, do not make every caller check for the absence. Provide an object that implements the same interface and does nothing, and callers treat presence and absence identically.
+
+The intuition. A nullable collaborator puts a check at every use, and one forgotten check is a crash. The null object removes the special case: the interface is always callable, and "do nothing" is a legitimate, explicit behaviour rather than an absence the caller must remember. It is the difference between "there is a logger, and it is the silent one" and "there may or may not be a logger, and you must ask first." The type system can then guarantee that nobody forgot, because there is nothing to forget.
+
+The before. A process that must check its logger everywhere.
+
+    pub struct ConsoleLogger {
+        void log(str msg) { println("{}", msg); }
+    }
+
+    pub void process(ConsoleLogger* logger, u64 taskId) {
+        if (logger != null) logger->log("start");
+        // ... do the work ...
+        if (logger != null) logger->log("done");
+    }
+
+The check is repeated at every call, and a caller with no logger must pass `null` and hope every site checks. A single missed check is a null dereference far from the call that allowed it.
+
+The after. A trait, a real implementation, and a silent one.
+
+    trait Logger {
+        void log(str msg);
+    }
+
+    pub struct ConsoleLogger { str label; }
+    pub extend ConsoleLogger : Logger {
+        void log(str msg) { println("[{}] {}", self.label, msg); }
+    }
+
+    pub struct NullLogger { str label; }
+    pub extend NullLogger : Logger {
+        void log(str msg) { }          // stays silent, on purpose
+    }
+
+    pub void process<T>(T* logger, u64 taskId) {
+        logger->log("start");
+        // ... do the work ...
+        logger->log("done");
+    }
+
+Now there is no null and no check. A caller that wants logs passes a `ConsoleLogger`; a caller that wants silence passes a `NullLogger`; a test passes a recording logger and asserts on what it saw. Each new collaborator is a struct and an `extend` block, and `process` does not change.
+
+Cost and notes. The null object still requires constructing a value to pass, which is trivial, and it adds one struct and one no-op method per interface. The type system now prevents the forgotten check, because there is no check. The discipline is to use it only for genuinely benign absence: a silent logger is fine, but a silent database is not, because a dropped write that reports success is a lie. A no-op is for operations whose absence is meaningful and harmless, not for hiding failure.
+
+When the before is fine. When the collaborator's absence means something the caller must branch on — connecting to a required service, opening a file that must exist — a `Result` or an `Option` is the honest type, and a null object would swallow the problem. Use the null object for the log-and-metrics-shaped seams where "off" is a real mode.
+
+Variation. Add a `RecordingLogger` that appends every message to a `Vec<str>`, use it in a test, and note that this is now possible without a real console or a mock framework. Then make a `FanoutLogger` that forwards each message to two other loggers, and observe that composition, not inheritance, is what makes it easy.
+
+35.15 Backwards-Compatible API Design
+
+The principle. When a widely used type or function must gain a capability, design the change so existing callers keep compiling and behaving as before. Extend the surface; do not reshape it.
+
+The intuition. The most common source of breakage is not a broken feature; it is a helpful one. A struct with public fields is written literally by every caller, so adding a field breaks all of them at once. A function that takes exactly the arguments a caller passes cannot grow a parameter without editing every call. The fix is to own construction: give the type a constructor that supplies defaults, keep the fields private, and add new capabilities as separate functions or as optional builder steps. Then a new field is a default inside the constructor, and no caller notices.
+
+The before. A request struct that every caller builds with a literal.
+
+    pub struct Request {
+        str url;
+        u32 timeoutMs;
+    }
+
+    pub void send(const Request* r) { /* ... */ }
+
+Every caller writes `Request { .url = "...", .timeoutMs = 1000 }`. The maintainer now wants a `u32 retries` field with a default of zero; adding it breaks every literal in the codebase. The feature was small and the breakage is total.
+
+The after. A constructor owns the defaults, and new options are additive.
+
+    pub struct Request {
+        str url;
+        u32 timeoutMs;
+        u32 retries;
+    }
+
+    pub Request request(str url) {
+        return Request { .url = url, .timeoutMs = 1000, .retries = 0 };
+    }
+
+    pub Request withTimeout(Request r, u32 ms) {
+        r.timeoutMs = ms;
+        return r;
+    }
+
+    pub Request withRetries(Request r, u32 n) {
+        r.retries = n;
+        return r;
+    }
+
+    pub void send(const Request* r) { /* ... */ }
+
+Callers write `send(&withRetries(request(url), 3))`, or `send(&request(url))` for the defaults. When `retries` was added, it was one line in `request`, and no call site moved. The next field added will be the same. The fields are private, so callers cannot construct a `Request` that skips the defaults.
+
+Cost and notes. The type is no longer a transparent record; callers must use the constructor and the builder steps, which is more ceremony than a literal. The payoff is that additive change is free, which matters the moment there is more than one caller you do not control. The same rule applies to functions: rather than changing `send` to take retries, add `sendWithOptions`, or add the new field to the options struct that `send` already takes. An enum is the harder case, because adding a variant breaks every exhaustive switch; that is an argument for handling unknown cases with an `else` arm, or for a second function, when the enum crosses a module boundary.
+
+When the before is fine. An internal struct with one or two call sites in one file is cheaper to change directly; the constructor and the private fields are overhead that a small module does not need. The discipline earns its keep at the boundary between teams, where you cannot edit the callers.
+
+Variation. Take the `AgeError` variant from 35.7 and add a fourth failure case. Count how many `switch` statements must change, then add the same information as a new function instead and count again. The difference is the cost of a breaking change measured in call sites.
+
+35.16 Exercises
 
 1. Naming. Take a function of your own whose name includes `data`, `info`, `handle`, or `process`, and rename it so the name states precisely what it transforms. Then write the one-sentence doc comment the new name makes unnecessary.
 

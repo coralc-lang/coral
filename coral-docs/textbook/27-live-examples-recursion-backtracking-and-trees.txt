@@ -527,7 +527,254 @@ Edge cases. If a is an ancestor of b, the function returns a, which is correct b
 
 A variation. For a binary search tree, the LCA can be found without recursion over the whole tree. Walk down from the root: if both a and b are less than the current value, the meeting point is to the left; if both are greater, it is to the right; otherwise the current node is where their paths split, and it is the answer. That is O(h) time — logarithmic for a balanced tree — and O(1) space with a plain loop. It is a striking illustration of the core lesson: when the data has extra structure (here, the ordering), the algorithm can be dramatically better than the general one.
 
-27.11 Exercises
+27.11 Word Search on a Grid
+
+The problem. Given a rectangular grid of characters and a target word, decide whether the word can be traced through the grid by moving between horizontally or vertically adjacent cells, using each cell at most once.
+
+Picture this. You are playing a word game on a lettered board. You start on any cell that matches the first letter, then walk to a neighbouring cell matching the next letter, and so on. You may not step on a cell you have already used in the current word, so you leave a footprint behind you and wipe it away when you back out. If you ever complete the whole word, you win.
+
+Brute force, then better. A brute force would enumerate every path of the right length, most of which die on the first mismatch. Backtracking with rollback prunes those immediately: at each step you extend the path only if the next letter matches, and the "used" mark is set before the recursive call and cleared after it, so the board returns to its original state when you retreat.
+
+    import(lib) std::vec { Vec };
+
+    bool searchFrom(Vec<str>* board, str word, usize r, usize c, usize k, Vec<Vec<bool>>* used, usize rows, usize cols) {
+        if (k == word.len) return true;
+        if (r >= rows || c >= cols) return false;
+        if (used->atPtr(r)->at(c)) return false;
+        if (board->at(r).at(c) != word.at(k)) return false;
+
+        used->atPtr(r)->set(c, true);
+        bool found = false;
+        if (r > 0)                  found = searchFrom(board, word, r - 1, c, k + 1, used, rows, cols);
+        if (!found && r + 1 < rows) found = searchFrom(board, word, r + 1, c, k + 1, used, rows, cols);
+        if (!found && c > 0)        found = searchFrom(board, word, r, c - 1, k + 1, used, rows, cols);
+        if (!found && c + 1 < cols) found = searchFrom(board, word, r, c + 1, k + 1, used, rows, cols);
+        used->atPtr(r)->set(c, false);      // rollback: wipe the footprint
+        return found;
+    }
+
+    bool wordSearch(Vec<str>* board, str word) {
+        usize rows = board->count();
+        if (word.len == 0) return true;
+        if (rows == 0) return false;
+        usize cols = board->at(0).len;
+        Vec<Vec<bool>> used = Vec<Vec<bool>>::new();
+        for (usize i = 0; i < rows; i += 1) {
+            Vec<bool> row = Vec<bool>::new();
+            for (usize j = 0; j < cols; j += 1) {
+                row.push(false);
+            }
+            used.push(row);
+        }
+        for (usize i = 0; i < rows; i += 1) {
+            for (usize j = 0; j < cols; j += 1) {
+                if (searchFrom(board, word, i, j, 0, &used, rows, cols)) return true;
+            }
+        }
+        return false;
+    }
+
+The recursion carries the whole state it needs: where it stands (`r`, `c`), how far into the word it has got (`k`), and the shared `used` grid. The first three checks are the base cases and the fast rejections — off the board, already stepped on, wrong letter — and any one of them returning false unwinds the branch immediately. The four conditional calls are the four directions, and the named `found` short-circuits them so that once a direction succeeds, the others are not tried. The single line that clears the mark is the whole difference between a search for simple paths and a search that may trample its own trail.
+
+Time and space. Each cell is tried as a starting point, and each start can branch in up to four directions for each of the word's L letters, so the worst case is O((rows × cols) × 4^L), although the letter check prunes it heavily on real boards. The `used` grid is O(rows × cols), and the recursion stack is O(L).
+
+Edge cases. An empty word returns true at once, and an empty board returns false. A word longer than the number of cells can never be found; the recursion discovers that by running out of fresh neighbours rather than by any explicit test. The rollback is what enforces "each cell at most once": delete it and a board containing a single 'a' will happily spell "aa".
+
+A variation. To return all distinct paths instead of a yes/no, keep a growing list of cells and push a copy of it whenever `k` reaches the word's length, then pop as you retreat. To allow a cell to be reused — the "no used rule" variant — delete both the `used` check and the rollback line together; the walk then explores every walk up to length L and still terminates, because `k` grows to the word's length regardless.
+
+27.12 Letter Combinations of a Phone Number
+
+The problem. Given a string of digits from 2 to 9, return every letter string the digits could spell on a telephone keypad. The digits 2 through 6 and 8 each carry three letters, and 7 and 9 carry four.
+
+Picture this. You are old enough to remember texting on a numeric keypad. To spell a word you press one key per letter, and each key offers a small menu of letters. Building every possible word is a walk over the digits where, at each digit, you branch over its menu and continue to the next digit. When the digits run out, the letters you chose make one word.
+
+Brute force, then better. There is no cleverer idea than generating the combinations — there are 3^L or 4^L of them and the answer is all of them. The work is in doing it cleanly: a recursive walk that appends one letter per digit into a growing buffer, instead of loops nested to a depth that depends on the input.
+
+    import(lib) std::vec { Vec };
+
+    void buildCombos(str digits, usize i, Vec<str>* keypad, String* current, Vec<String>* out) {
+        if (i == digits.len) {
+            out->push(current->clone());
+            return;
+        }
+        u8 d = digits.at(i);
+        str letters = keypad->at((usize)(d - (u8)'2'));
+        for (usize j = 0; j < letters.len; j += 1) {
+            current->pushChar(letters.at(j));      // choose a letter
+            buildCombos(digits, i + 1, keypad, current, out);
+            current->truncate(current->len - 1);   // undo the choice
+        }
+    }
+
+    Vec<String> letterCombinations(str digits) {
+        Vec<str> keypad = Vec<str>::new();
+        keypad.push("abc");
+        keypad.push("def");
+        keypad.push("ghi");
+        keypad.push("jkl");
+        keypad.push("mno");
+        keypad.push("pqrs");
+        keypad.push("tuv");
+        keypad.push("wxyz");
+
+        Vec<String> out = Vec<String>::new();
+        if (digits.len == 0) return out;
+        String current = String::new();
+        buildCombos(digits, 0, &keypad, &current, &out);
+        return out;
+    }
+
+The keypad is a small table indexed by the digit minus the byte `'2'`, so `'2'` lands on "abc", `'7'` on "pqrs", and `'9'` on "wxyz". The buffer `current` is shared across the whole walk, and each level appends its chosen byte, recurses, then truncates it away. The `truncate` is the rollback: it is the string-building equivalent of the `pop` in every other problem in this chapter. At the base case the buffer is complete, so we clone it — `clone` copies the bytes, because the buffer is about to be overwritten by the next combination.
+
+Time and space. If the digits yield c combinations each of length L, the time is O(c × L), dominated by the copying at each leaf, and the space is O(c × L) for the output plus O(L) for the recursion, the buffer, and the keypad. As with the other enumerations, the size of the answer is the true limit.
+
+Edge cases. An empty digit string yields no combinations, not one empty string, which is the common convention. A digit outside 2..9 would index the keypad out of range, so callers must pass only valid digits. Forget the `truncate` and every combination is polluted by the letters of its siblings, which is exactly the "forgot the undo" failure seen throughout this chapter.
+
+A variation. The number of combinations is the product of each pressed key's letter count, and that count needs no recursion at all: multiply the lengths as you walk the digits once. It is a good sanity check on the generator and a reminder that sometimes the count is the easy half of "enumerate them all".
+
+27.13 Generate All Balanced Parentheses
+
+The problem. Given n pairs of parentheses, produce every string of n openers and n closers that is well-formed. For n = 3 the five strings are "((()))", "(()())", "(())()", "()(())", and "()()()".
+
+Picture this. You are writing brackets from left to right, and at every position you face the same two choices: write an opener, or write a closer. But not every sequence of choices is legal. You may write a closer only if some opener is still waiting to be closed, and you may write an opener only while unplaced openers remain. Those two rules keep you on the path of valid strings, and when both budgets reach zero you have one complete balanced string.
+
+Brute force, then better. The brute force writes all 2^(2n) strings of n openers and n closers and tests each for balance — wasteful, since most candidates are illegal. The backtracking keeps two counters and only makes choices that keep both non-negative, so every leaf it reaches is already a valid string and no final balance check is needed.
+
+    import(lib) std::vec { Vec };
+
+    void parenFrom(i32 open, i32 close, String* current, Vec<String>* out) {
+        if (open == 0 && close == 0) {
+            out->push(current->clone());
+            return;
+        }
+        if (open > 0) {
+            current->pushChar((u8)'(');
+            parenFrom(open - 1, close + 1, current, out);
+            current->truncate(current->len - 1);
+        }
+        if (close > 0) {
+            current->pushChar((u8)')');
+            parenFrom(open, close - 1, current, out);
+            current->truncate(current->len - 1);   // rollback
+        }
+    }
+
+    Vec<String> generateParentheses(i32 n) {
+        Vec<String> out = Vec<String>::new();
+        String current = String::new();
+        parenFrom(n, 0, &current, &out);
+        return out;
+    }
+
+The two counters carry the state. `open` is how many openers are still unwritten, and `close` is how many openers are currently unmatched and may therefore be closed. Writing an opener spends one of the former and creates one of the latter (`open - 1, close + 1`); writing a closer spends one of the latter (`close - 1`), and the guard `close > 0` is what forbids a closer with nothing to close. The base case fires only when both are zero, which can happen only after all n pairs have been placed and matched.
+
+Time and space. The number of valid strings is the nth Catalan number, about 4^n / (n^1.5), so the work is proportional to the output times n, and the space is the output plus O(n) for the buffer and the recursion. Catalan growth is still exponential, but it is dramatically smaller than 2^(2n): the pruning refuses to build the illegal strings at all.
+
+Edge cases. n = 0 yields one string, the empty one, because the base case fires immediately. A negative n is nonsense and is not guarded; nothing would ever be placed. The two `if` guards are the entire correctness argument: remove the `close > 0` guard and the walk writes unclosable closers, and remove both guards and it writes every arrangement, balanced or not.
+
+A variation. The same two-counter walk counts the Catalan numbers without building strings: return 1 at the base and add the results of the two branches. To generalise to several kinds of bracket at once — all three of `()`, `[]`, and `{}` — the two counters become a stack that must be popped in matching order, which is the valid-parentheses check of Chapter 26 folded into the generator.
+
+27.14 Validate a Binary Search Tree
+
+The problem. Given a binary tree of integers, decide whether it is a valid binary search tree: every node's value is greater than every value in its left subtree and less than every value in its right subtree.
+
+Picture this. A binary search tree is a building with a strict rule: everything in a left wing must be smaller than the floor above it, and everything in a right wing must be larger. The trap is that checking a node against only its two children is not enough. A value deep in the right wing could still be smaller than an ancestor several floors up, so each node must be checked against a whole allowed range, not just against its parent.
+
+Brute force, then better. The tempting wrong answer checks, at each node, that the left child is smaller and the right child is larger. That accepts trees that are not search trees, because it never relates a node to its grandparent. The correct method threads an open interval (low, high) down the recursion; a node is valid only if its value lies strictly inside the interval, and then the left subtree inherits (low, value) and the right subtree inherits (value, high).
+
+    bool validRange(TreeNode* root, i64 low, i64 high) {
+        if (root == null) return true;
+        i64 v = (i64)root->value;
+        if (v <= low || v >= high) return false;
+        return validRange(root->left, low, v) && validRange(root->right, v, high);
+    }
+
+    bool isValidBst(TreeNode* root) {
+        return validRange(root, -2147483649, 2147483648);
+    }
+
+This reuses the `TreeNode` introduced in 27.8. The bounds start just outside the range of every possible i32 value, so even a node holding the smallest or largest legal integer can be validated. Each recursive call narrows the interval: a left child's upper bound becomes its parent's value, and a right child's lower bound becomes it. A node that violates its interval is caught no matter how deep it sits, which is precisely the case the naive child-only test misses.
+
+Time and space. Every node is visited once, so the time is O(n), and the recursion descends to the tree's height, so the space is O(h) — logarithmic for a balanced tree, linear for a chain. No auxiliary table is allocated.
+
+Edge cases. A null tree is a valid search tree by definition. The comparisons are strict, so duplicate values are rejected; a tree that should allow equal values on one side relaxes that side to `<=` or `>=`. The i64 interval is deliberate: with i32 bounds there is no spare value outside the legal range to use as a sentinel, so a tree containing the extreme integer could not be validated.
+
+A variation. An inorder walk of a search tree visits values in strictly increasing order, so a second valid method walks the tree in order while remembering the previous value and checks that each is larger. That version is also O(n), and it is really the same interval reasoning seen from a different angle; the interval version stays local to each node, the inorder version keeps one running state.
+
+27.15 Level-Order Traversal
+
+The problem. Given a binary tree, return its values level by level, top to bottom and left to right: the root, then all its children, then all its grandchildren, and so on. Each level is returned as its own group.
+
+Picture this. You are reading a building floor by floor. On each floor you note everyone standing there before moving up, and while you do you write down where the people on the next floor can be found. A queue is exactly the right shape for this: first in, first out means the oldest waiting node is always handled next, so an entire floor is finished before anyone on the floor above is touched.
+
+Brute force, then better. The recursive traversals of 27.8 cannot produce level order directly, because recursion dives to the bottom of a branch before it returns. A queue does it in a single pass: hold the root, and repeatedly remove a node, record it, and enqueue its children. Because the queue is FIFO, the children of the current level line up behind one another, ahead of the next level's children.
+
+    import(lib) std::collections::queue { Queue };
+
+    Vec<Vec<i32>> levelOrder(TreeNode* root) {
+        Vec<Vec<i32>> out = Vec<Vec<i32>>::new();
+        if (root == null) return out;
+        Queue<TreeNode*> q = Queue<TreeNode*>::new();
+        q.enqueue(root);
+        while (!q.isEmpty()) {
+            usize levelSize = q.count();
+            Vec<i32> level = Vec<i32>::new();
+            for (usize i = 0; i < levelSize; i += 1) {
+                TreeNode* node = q.dequeue();
+                level.push(node->value);
+                if (node->left != null) q.enqueue(node->left);
+                if (node->right != null) q.enqueue(node->right);
+            }
+            out.push(level);
+        }
+        return out;
+    }
+
+The one subtle line is `usize levelSize = q.count();`. At the top of the outer loop the queue holds exactly the nodes of the current level, so snapshotting its size before the inner loop marks where the level ends. Enqueuing children grows the queue during the inner loop, and without the snapshot those new nodes would be consumed in the same level and the floors would smear together.
+
+Time and space. Each node is enqueued and dequeued exactly once, so the time is O(n). The queue holds at most the widest level, up to about n/2 nodes, and the output holds every value, so the space is O(n).
+
+Edge cases. A null tree returns an empty vector. A single node returns one level holding one value. A partly filled last level is handled with no special case, because only children that actually exist are enqueued. A tree that is a straight chain is still valid input; it yields one value per level and a queue that never exceeds one.
+
+A variation. For a flat list of values rather than groups, drop the inner batching: enqueue the root and, on each dequeue, record the value and enqueue both children. To return the levels bottom-up, reverse the outer vector at the end with `out.reverse()`; the levels themselves are untouched.
+
+27.16 Kth Smallest Element in a BST
+
+The problem. Given a binary search tree and an integer k, return the kth smallest value in the tree, counting from 1.
+
+Picture this. A search tree is already arranged so that an inorder walk visits its values from smallest to largest — that is the defining property of the structure. So the kth smallest is simply the kth value you meet on such a walk. You need not sort anything or examine the whole tree; you can stop the instant you have counted k values.
+
+Brute force, then better. The brute force collects every value, sorts the collection, and indexes k − 1, which is O(n log n) and ignores the ordering the tree already encodes. An inorder walk is O(h + k): it descends to the smallest value, then yields values in increasing order and can stop as soon as k of them have been seen. The better method exploits the structure instead of flattening it.
+
+    void inorderCount(TreeNode* root, i32 k, i32* seen, i32* answer) {
+        if (root == null) return;
+        if (*seen >= k) return;
+        inorderCount(root->left, k, seen, answer);
+        if (*seen >= k) return;
+        *seen += 1;
+        if (*seen == k) {
+            *answer = root->value;
+            return;
+        }
+        inorderCount(root->right, k, seen, answer);
+    }
+
+    i32 kthSmallest(TreeNode* root, i32 k) {
+        i32 seen = 0;
+        i32 answer = -1;
+        inorderCount(root, k, &seen, &answer);
+        return answer;
+    }
+
+The walk is the ordinary inorder of 27.8 with two additions: a counter `seen`, passed by pointer so it is shared across the whole traversal, and an early `if (*seen >= k) return;` at the top and after the left subtree. The counter is bumped when the current node is visited — after its left subtree, before its right — which is exactly the position that makes the values emerge in sorted order. Once the count reaches k the answer is recorded and every remaining frame returns without descending further.
+
+Time and space. The best case visits O(h + k) nodes and stops; the worst case, when k is the largest value, visits all n. The recursion stack is O(h). Nothing is sorted and no auxiliary collection is built, which is the whole point relative to the brute force.
+
+Edge cases. A null tree returns the sentinel −1, meaning "not enough nodes." A k below 1 or above the node count is outside the problem's contract and produces that same sentinel rather than an error, a quiet failure rather than a crash. Duplicate values are counted normally, though a strict search tree does not contain them.
+
+A variation. If k is queried repeatedly, or the tree changes between queries, store at each node the number of nodes in its subtree. Then the kth smallest is found by descending once: compare k with the left subtree's size and go left, right, or stop. That is an order-statistic tree, and it is the same "carry one extra number in each node" trick used for the tree diameter in 27.9.
+
+27.17 Exercises
 
 1. Comprehension. In your own words, what are the two mandatory parts of every recursive function, and what happens if the first one is missing? Use factorial or Fibonacci to make the answer concrete.
 

@@ -44,7 +44,7 @@ Here is the smallest threaded program worth writing. It passes a number to a wor
         return null;
     }
 
-    i32 main() {
+    void main() {
         i32 value = 21;
         Result<Thread, ThreadError> created = threadCreate(worker, (rawptr)&value);
         if (created.isOk()) {
@@ -52,7 +52,6 @@ Here is the smallest threaded program worth writing. It passes a number to a wor
             threadJoin(t, null);
             println("{}", value);        // 42
         }
-        return 0;
     }
 
 Three things are happening that deserve to be said out loud.
@@ -94,16 +93,17 @@ An atomic fixes this for a single word. The thread module provides `AtomicU64` a
 
     AtomicU64 counter;
 
-    i32 main() {
+    void main() {
         counter.store(0);
         u64 old = counter.fetchAdd(1);   // read-modify-write as one step
         println("{} {}", old, counter.load());
-        return 0;
     }
 
 The operations are the ones the hardware actually offers. `load()` reads the value; `store(v)` writes it; `fetchAdd(delta)` and `fetchSub(delta)` both read and update in one indivisible step; `compareExchange(expected, desired)` writes `desired` only if the current value equals `expected`, and reports whether it did. Underneath, on the machine you are most likely sitting at, these are the `lock xadd` and `lock cmpxchg` instructions; on an ARM machine they are the load-exclusive/store-exclusive pair. None of them is simulated. Each is a hardware guarantee that no other thread can observe the operation half-done.
 
 Here is the rule of thumb, and it is worth more than the details. Use an atomic when the shared state is exactly one integer: a counter, a flag, a ticket number, an index. Use a mutex (next section) when the shared state is anything larger. An atomic guards one cell; a mutex guards a region. Do not try to build a region out of atomics.
+
+Simply put, an atomic is a turnstile that lets one thread through for a single tiny operation, so nobody can catch the counter halfway. A mutex, next, is a door with one key for a whole room.
 
     AtomicU64 ticket;
 
@@ -159,6 +159,8 @@ A polite word about `relaxed`. Relaxed ordering gives you atomicity and nothing 
 18.4 Mutex, Read-Write Locks, and Semaphores
 
 An atomic guards one word. Most shared state is bigger than a word, and for that the first tool is the mutex — a mutual-exclusion lock. The rule is mechanical: lock before touching the shared data, unlock after.
+
+A useful picture is a room with one key hanging on a hook. To touch anything in the room you must take the key; anyone else who wants in waits at the door until you hang it back up. A `Mutex` is that key, and "lock before you touch, unlock after" is just "take the key, hang it back." The most common beginner mistake is to forget the unlock, or to return early from inside the locked region. Both leave the key taken forever and every other thread waiting at a door that will never open; there is no timer that rescues them.
 
     import(lib) std::concurrent::mutex { Mutex };
 
@@ -360,7 +362,7 @@ The program that uses it is the pattern in motion — one thread producing a hun
         return null;
     }
 
-    i32 main() {
+    void main() {
         BoundedQueue q;
         q.init(16);
 
@@ -369,10 +371,13 @@ The program that uses it is the pattern in motion — one thread producing a hun
         if (p.isOk()) threadJoin(p.unwrap(), null);
         if (c.isOk()) threadJoin(c.unwrap(), null);
         q.destroy();
-        return 0;
     }
 
 The buffer holds sixteen, the producer pushes a hundred, and the queue never drops and never overflows: the sum always comes out `5050`, because the producer blocks when the buffer is full and the consumer wakes it. That blocking is backpressure — the fast side waiting for the slow side instead of the memory growing until the machine dies — and we will meet the word again in 18.17. Notice also that the consumer's loop ends on `false`: the `close` broadcast woke it, `count` was zero, and `pop` returned false. The join is not even the synchronization here; the queue itself was. This single program is the seed of the thread pool, the channel, and the actor, and everything that follows is this exchange in different dress.
+
+Simply put, the producer and the consumer take turns through one shared lunchbox: the producer may only put food in when there is room, the consumer may only take food out when there is some, and neither may look inside without holding the lock. The two condition variables are the two wake-up bells — "food is ready" and "room is free."
+
+A common mistake is to write `if (empty) wait()` instead of `while (empty) wait()`. The `if` checks once; if the thread then wakes for any reason and the item is already gone, it proceeds to reach into the empty box. The `while` checks again after every wake, which is the rule, not a style choice.
 
 18.7 Thread Pools
 
@@ -433,11 +438,10 @@ Coral's async module is built on fibers — lightweight stacks the runtime switc
             async::await(f.unwrap());        // suspend this fiber until done
     }
 
-    i32 main() {
+    void main() {
         async::init();
         Result<async::Future*, async::AsyncError> c = async::spawn(coordinator, null);
         async::run();                        // drive the scheduler to completion
-        return 0;
     }
 
 `spawn(fn, arg)` schedules a function on a fresh fiber and returns a `Future*` — a one-shot result cell. `await(future)` suspends the calling fiber until the future is ready, then returns its result. `run()` drives the scheduler until every spawned fiber has finished. `runOnce()` runs one slice and returns, for a caller that wants to interleave the runtime with its own loop. `poolRun(pool, fn, arg)` offloads a job to a thread pool and returns a future that resolves when the pool finishes it, bridging the two worlds.
@@ -482,6 +486,8 @@ The strength of shared memory is speed and directness. The data is where the cod
 Two real systems make the difference concrete. A game engine: the render thread and the physics thread share the world state, the physics thread updates it at a fixed rate, the render thread reads it at the frame rate, and a lock guards the exchange — shared memory, chosen because the state is huge and copying it sixty times a second would waste it. A chat server: a hundred connections, each owned by its handler thread, and the handlers never touch each other's state — they send messages carrying a name and a line of text, and the only shared thing is the exchange channel — message passing, chosen because the data is small and the isolation is worth more than the copy.
 
 The decision rule that falls out is not ideological. Where the data is small and the boundary is clean, pass the message and sleep at night. Where the data is large and the access is frequent, share it under a mutex and make the guard part of the structure. Where the boundary is between administrative domains — a worker pool and its manager, a server and its clients — the message is the natural shape, and the mutex that would guard shared state between them is a design smell. The skill this section is teaching is reading which part of a program is which, and being ready to move a boundary when the traffic changes.
+
+Two roommates make the choice concrete. If they share a whiteboard in the kitchen, whoever writes must make sure the other is not mid-sentence — that is shared memory and its lock. If instead each keeps their own notebook and passes folded notes under the door, nobody ever reads a half-written thought — that is message passing and its protocol. The whiteboard is faster to update; the notes are safer to share.
 
 The channel is message passing's tool, and the `BoundedQueue` of 18.6 is already one: its `push` is a send that blocks when full, its `pop` is a receive that blocks when empty, and the capacity is the bound. The three flavors are three policy choices over the same engine. A bounded channel holds a fixed number of messages and applies backpressure when full — a video encoder's frame queue that cannot grow past sixteen frames. An unbounded channel never blocks the sender, at the price that a slow receiver makes memory grow — a logging pipeline where a burst must never block the application, and the memory is the price the program chose. A synchronous channel is the bounded channel of capacity zero: the send is a rendezvous that blocks until a receiver takes the message, useful when the meeting itself is the point.
 
@@ -662,6 +668,8 @@ Every pattern in this chapter hits the same ceiling, and the ceiling has a name 
     speedup(N) = 1 / ((1 − P) + P/N)
 
 As `N` grows, the speedup approaches `1/(1 − P)`, and the serial part rules absolutely. A program that is 90% parallel is capped at 10× no matter how many cores you add. A program that is 50% parallel is capped at 2×. A program that is 99% parallel caps at 100× — each extra nine of the parallel fraction buys one more zero of headroom, which is why serious parallel programmers spend their lives hunting percentages, not cores.
+
+A convoy makes the idea plain. Ten cars on a highway can all drive at the same speed, but if they must all pass through one toll booth, the booth sets the pace for everyone, and adding more cars behind it does not help. The toll booth is the serial fraction, and Amdahl's law is the arithmetic of that queue.
 
 The serial part is everything the earlier sections guarded: the critical section under the mutex, the join that gathers results, the single queue every worker drains, the straggler the pipeline waits for, the parsing of the first input that must precede the parallel work and the writing of the last output that must follow it. The classic report generator shows the shape: read the file, transform in parallel, write the output, and the two I/O seconds at the ends are serial time however parallel the middle becomes. Each serial second is a term in `(1 − P)`, invisible on one core and dominant on sixteen.
 

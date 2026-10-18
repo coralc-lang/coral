@@ -6,11 +6,11 @@ Learning From Data, Without the Framework
 
 There is a kind of magic attributed to "AI" that dissolves the moment you write it down. A model that predicts a price, classifies an email, or clusters customers is, underneath, three ordinary things: a guess function with a handful of tunable numbers, a way to measure how wrong the guess is, and a rule for nudging the numbers to make the measurement smaller. That is the entire engine. The famous libraries are conveniences built on top of it: fast array operations, automatic differentiation, and a great deal of engineering so that the same idea runs on a hundred GPUs. None of that is the idea. The idea fits in a few dozen lines, and writing those lines once changes how you read every headline about a new model.
 
-This chapter builds eight small pieces of that engine, in Coral, with `Vec<f64>` as the only data structure and `std::math` as the only numerical help. We start by fitting a line to points, deriving the gradient by hand. Then we normalise features, because otherwise the fit crawls. Then the same machinery becomes logistic regression for yes-or-no answers, then two classic non-parametric methods, k-nearest-neighbours and k-means, then a complete one-hidden-layer neural network with the backward pass derived by hand, then the metrics that tell you whether any of it works, and finally a way to check that your hard-won gradient is even correct.
+This chapter builds thirteen small pieces of that engine, in Coral, with `Vec<f64>` as the only data structure and `std::math` as the only numerical help. We start by fitting a line to points, deriving the gradient by hand. Then we normalise features, because otherwise the fit crawls. Then the same machinery becomes logistic regression for yes-or-no answers, then two classic non-parametric methods, k-nearest-neighbours and k-means, then a complete one-hidden-layer neural network with the backward pass derived by hand, then the metrics that tell you whether any of it works, and then a way to check that your hard-won gradient is even correct. After those, a second handful of classic models shows how little the machinery changes: a perceptron, naive Bayes, one-hot and hashed features, a decision stump, and principal components by power iteration.
 
 Everything here is deliberately tiny. The datasets are tens of points, not millions. The point is not to build the fastest learner. It is to see each moving part, name it, and understand why it is there. Once you have trained a two-parameter line by hand, `w = w - lr * grad` stops being a line of framework incantation and becomes exactly what it says: move the weight a little in the direction that decreases the error.
 
-A note on what a number is doing here, before the first line of code. Unless stated otherwise, every value in this chapter is an `f64`, and every operation is floating point. That means the arithmetic is the approximate arithmetic of Chapter 31.9, not the exact arithmetic of the rationals. Training loops run for many iterations, and small errors accumulate, which is why learning curves sometimes go sideways and why a loss that should decrease can wobble. It is also why gradient checking, the last example, exists. It cannot make floating point exact, but it can catch a sign error in a derivative before you spend an afternoon blaming the data.
+A note on what a number is doing here, before the first line of code. Unless stated otherwise, every value in this chapter is an `f64`, and every operation is floating point. That means the arithmetic is the approximate arithmetic of Chapter 31.9, not the exact arithmetic of the rationals. Training loops run for many iterations, and small errors accumulate, which is why learning curves sometimes go sideways and why a loss that should decrease can wobble. It is also why gradient checking exists. It cannot make floating point exact, but it can catch a sign error in a derivative before you spend an afternoon blaming the data.
 
 33.1 Linear Regression by Gradient Descent
 
@@ -516,7 +516,308 @@ Edge cases. The step must be neither too large (the estimate measures the averag
 
 Variation. Add a gradient check to the `TinyNet` from 33.6: for each weight and bias, compare the backward pass's value against the numerical estimate, and assert they agree on a small network with a couple of examples. Running it once and watching every parameter pass is the most convincing evidence that the backpropagation is correct, and it is the first thing to do whenever a network refuses to learn.
 
-33.9 Exercises
+33.9 The Perceptron
+
+The problem. Learn a straight-line decision boundary directly from labelled examples, with the smallest update rule that works. Logistic regression gives you a probability; the perceptron gives you only the hard answer, and it is worth seeing how much can be dropped while still learning.
+
+The intuition. A perceptron classifies by the sign of `w*x + b`: positive score means class one, otherwise class zero. It learns by reacting to mistakes and nothing else. When it sees a positive example it called negative, it nudges the weights toward that example; when it sees a negative example it called positive, it nudges away; when it is already right, it does nothing at all. There is no loss to minimise, no sigmoid, no gradient. Frank Rosenblatt's theorem is that if the data can be separated by a line at all, this simple nudging is guaranteed to find one in a finite number of steps.
+
+The approach. The same shape as logistic regression minus the sigmoid: predict a hard label, turn the prediction error into a small push on the weights, and repeat over the data.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub struct Perceptron {
+        f64 w;
+        f64 b;
+
+        static Perceptron new() {
+            return Perceptron { .w = 0.0, .b = 0.0 };
+        }
+
+        i32 predict(f64 x) {
+            return (self.w * x + self.b) > 0.0 ? 1 : 0;
+        }
+
+        void fit(const Vec<f64>* xs, const Vec<i32>* ys, f64 lr, u64 epochs) {
+            usize n = xs->count();
+            @assertOut(ys->count() == n, "xs and ys must have the same length");
+
+            for (u64 epoch = 0; epoch < epochs; epoch += 1) {
+                for (usize i = 0; i < n; i += 1) {
+                    f64 target = (f64)ys->at(i);          // 0 or 1
+                    f64 error = target - (f64)self.predict(xs->at(i));
+                    self.w += lr * error * xs->at(i);     // only moves on a mistake
+                    self.b += lr * error;
+                }
+            }
+        }
+    }
+
+The `error` is one of `-1`, `0`, or `1`, so the update is a plain nudge in the right direction rather than a scaled gradient. Compare that with the logistic update from 33.3, which multiplies the same error by a probability and by a learning rate and divides by the batch size. The perceptron is the coarse ancestor, and it is often all you need.
+
+Cost and notes. O(epochs * n), the same as linear and logistic regression; each step is a handful of arithmetic with no exponential. The convergence guarantee is real but conditional: it holds only when the classes are linearly separable, and the number of mistakes is bounded by a quantity that grows with the margin between the classes. For data that cannot be separated by a line, the weights cycle forever and never settle, which is the perceptron's honest limitation and the reason logistic regression with a smooth loss is usually preferred.
+
+Edge cases. Labels must be zero or one; any other encoding silently produces the wrong push. A constant feature scale matters for exactly the reason it did in 33.1 and 33.2, so standardise first when the inputs are large. The prediction is the sign of the score, and the score is never negative zero in a way that matters because the comparison is `> 0.0`, a boundary the two classes share. And because the update only fires on a mistake, a perfectly classified pass through the data changes nothing, which is a clean stopping test if you would rather halt early than run a fixed number of epochs.
+
+Variation. Generalise to two features and return the boundary line, then train on XOR and watch the weights fail to settle: no line separates XOR, so the perceptron cannot learn it, and that failure is exactly what motivates the hidden layer in 33.6.
+
+33.10 Naive Bayes
+
+The problem. Classify with a tiny probabilistic model that is built from counts rather than gradients. It is the workhorse behind decades of spam filters and document classifiers, and it trains in a single pass.
+
+The intuition. Bayes' rule says the odds of a class given the features are proportional to the prior odds of the class times the likelihood of the features under the class. The feature likelihood is hard in general, but the "naive" assumption is that the features are independent once you know the class, which turns that likelihood into a product of per-feature terms. For binary features "this word is present," each term is just a count: how often was the feature on in examples of this class? Two practical corrections make it work. Smooth the counts by pretending you saw each outcome once more than you did, so an unseen feature does not multiply everything by zero. And add the logarithms instead of multiplying probabilities, so a document with hundreds of words does not underflow to zero.
+
+The approach. Two classes, binary features. Train by counting feature-on occurrences per class; predict by summing log-probabilities and choosing the larger.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::math::math { log };
+
+    pub struct NaiveBayes {
+        Vec<f64> pOnGiven0;
+        Vec<f64> pOnGiven1;
+        f64 prior1;
+        usize features;
+
+        static NaiveBayes new(usize numFeatures) {
+            NaiveBayes nb;
+            nb.features = numFeatures;
+            nb.prior1 = 0.5;
+            nb.pOnGiven0 = Vec<f64>::new();
+            nb.pOnGiven1 = Vec<f64>::new();
+            for (usize j = 0; j < numFeatures; j += 1) {
+                nb.pOnGiven0.push(0.5);
+                nb.pOnGiven1.push(0.5);
+            }
+            return nb;
+        }
+
+        void fit(const Vec<Vec<u8>>* rows, const Vec<i32>* labels, u64 smoothing) {
+            usize n = rows->count();
+            @assertOut(labels->count() == n, "rows and labels must align");
+
+            Vec<u64> count0 = Vec<u64>::new();
+            Vec<u64> count1 = Vec<u64>::new();
+            for (usize j = 0; j < self.features; j += 1) { count0.push(0); count1.push(0); }
+
+            u64 n0 = 0;
+            u64 n1 = 0;
+            for (usize i = 0; i < n; i += 1) {
+                i32 c = labels->at(i);
+                if (c == 1) n1 += 1; else n0 += 1;
+                for (usize j = 0; j < self.features; j += 1) {
+                    if (rows->at(i).at(j) != 0) {
+                        if (c == 1) count1.set(j, count1.at(j) + 1);
+                        else count0.set(j, count0.at(j) + 1);
+                    }
+                }
+            }
+
+            if (n > 0) self.prior1 = (f64)n1 / (f64)n;
+
+            f64 s = (f64)smoothing;
+            for (usize j = 0; j < self.features; j += 1) {
+                self.pOnGiven0.set(j, ((f64)count0.at(j) + s) / ((f64)n0 + 2.0 * s));
+                self.pOnGiven1.set(j, ((f64)count1.at(j) + s) / ((f64)n1 + 2.0 * s));
+            }
+        }
+
+        i32 predict(const Vec<u8>* row) {
+            f64 log0 = log(1.0 - self.prior1);
+            f64 log1 = log(self.prior1);
+            for (usize j = 0; j < self.features; j += 1) {
+                bool on = row->at(j) != 0;
+                f64 p0 = on ? self.pOnGiven0.at(j) : 1.0 - self.pOnGiven0.at(j);
+                f64 p1 = on ? self.pOnGiven1.at(j) : 1.0 - self.pOnGiven1.at(j);
+                log0 += log(p0);
+                log1 += log(p1);
+            }
+            return log1 > log0 ? 1 : 0;
+        }
+    }
+
+The smoothing constant appears in both the numerator and the denominator, adding one imagined observation of each outcome; with `smoothing` of one, the estimate of a feature never used once is a half, not zero, so a single missing word cannot veto a prediction. The training is counting, nothing more, and the whole fit is one pass.
+
+Cost and notes. Training is O(n * features) and prediction is O(features), both cheaper than the gradient methods and with no learning rate to tune. The price is the independence assumption, which is usually false and often still works: correlated features are effectively counted more than once, which distorts the probabilities but leaves the ranking of the classes intact. That is why naive Bayes is praised for classification and distrusted for calibration.
+
+Edge cases. A class with no examples gives a zero count, and the smoothing keeps the division finite; `smoothing` must be greater than zero, or an unseen feature produces a `log(0)` of negative infinity. The features must be binary as written; multi-valued or continuous features need a different likelihood, such as a count-per-value or a Gaussian. `log(0.0)` is the sharp edge if the prior is exactly zero, which cannot happen here because the prior is a ratio of counts and `n > 0` is checked. And the model has no notion of a feature that was never seen in training but appears at prediction time, because the feature space is fixed at construction; real text classifiers add new words to a defaultly smoothed count.
+
+Variation. Turn the binary presence features into word counts and use the multinomial form: the likelihood of a class becomes a product of powers of the per-word probabilities, and the training counts how often each word appears rather than whether it appears. It is the version every introductory text classifier actually uses, and it is a small change to the counting loops.
+
+33.11 One-Hot Encoding and Feature Hashing
+
+The problem. A model consumes numbers, but a raw feature is often a label: a colour name, an operating system, a word. Turn categories into numeric vectors, and when the set of categories is unbounded, compress them into a fixed-size vector without losing too much.
+
+The intuition. One-hot encoding is the honest map for a small fixed vocabulary: give every category its own dimension and set that coordinate to one, everything else to zero. The vectors are far apart and the model can treat the categories independently. The trouble starts when the vocabulary is the words of a language, where a one-hot vector would need a dimension per word. Feature hashing, also called the hashing trick, trades exactness for a bound: hash the category to an index in a fixed-size vector and count the hit there. Two categories can collide, but collisions are rare in a large table and the model usually shrugs them off. The memory is now fixed and promised, which is the whole point.
+
+The approach. A one-hot function over a known vocabulary, and a hashing function that maps any token sequence into a fixed number of buckets using the standard library's FNV-1a hash.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::crypto::hash { fnv1aStr };
+
+    pub Vec<f64> oneHot(str category, const Vec<str>* vocab) {
+        Vec<f64> v = Vec<f64>::withCap(vocab->count());
+        for (usize j = 0; j < vocab->count(); j += 1) v.push(0.0);
+        for (usize j = 0; j < vocab->count(); j += 1) {
+            if (vocab->at(j).equals(category)) {
+                v.set(j, 1.0);
+                break;
+            }
+        }
+        return v;                          // unknown category: all zeros
+    }
+
+    pub Vec<f64> hashFeatures(const Vec<str>* tokens, usize buckets) {
+        @assertOut(buckets > 0, "need at least one bucket");
+
+        Vec<f64> v = Vec<f64>::withCap(buckets);
+        for (usize j = 0; j < buckets; j += 1) v.push(0.0);
+
+        for (usize i = 0; i < tokens->count(); i += 1) {
+            u64 h = fnv1aStr(tokens->at(i));
+            usize idx = (usize)(h % (u64)buckets);
+            v.set(idx, v.at(idx) + 1.0);   // count occurrences in the bucket
+        }
+        return v;
+    }
+
+The one-hot vector has a one where the category lives and zeros elsewhere, so its dot product with a weight vector picks out exactly that category's weight. The hashed vector is denser and shorter; its coordinates count how many tokens fell into each bucket, and a linear model learns a weight per bucket. An unknown category in `oneHot` yields all zeros, which contributes nothing, and that is a deliberate signal that the model has never seen it.
+
+Cost and notes. `oneHot` is O(vocab) to build and to search, because the vocabulary is scanned linearly; a hash map from category to index would make it O(1), and that is the natural improvement when the vocabulary is large. `hashFeatures` is O(tokens) with an FNV hash per token, and its memory is exactly `buckets` doubles no matter how many tokens arrive. The hashing trick is what makes online learning on text possible with a fixed memory budget, at the cost of a small, predictable amount of collision noise.
+
+Edge cases. A vocabulary with a duplicate category makes `oneHot` set the first match and ignore the rest; the duplicates should be removed when the vocabulary is built. An unknown category produces a zero vector that is indistinguishable from "category absent," so a caller that needs to tell them apart should reserve an index for "unknown." The hashing trick is lossy in principle and cannot be inverted, and two different tokens landing in one bucket share a weight; the error this introduces falls as the bucket count rises. And `fnv1aStr` is deterministic, which is required: the training and prediction runs must hash a token to the same bucket, so a randomised hash would break the model.
+
+Variation. Add a sign to the hashing trick by hashing each token a second way and using the low bit as `+1` or `-1`. Collisions then tend to cancel instead of always adding, which reduces the bias the plain version introduces, and the change is one more hash and a multiply.
+
+33.12 A Decision Stump
+
+The problem. Build the simplest possible decision tree: one feature, one threshold, two constant predictions. A stump is a legible model on its own and the weak learner that boosting stacks into a strong one.
+
+The intuition. A stump asks a single yes-or-no question. "Is this value above or below a threshold?" It splits the data into two groups and predicts the majority label in each. Because there are only a few sensible thresholds — the values between adjacent data points — you can afford to try them all and keep the split that classifies the most examples correctly. The beauty is transparency: you can read the rule aloud. The limitation is that one split can only cut the space in two, which is exactly why a single stump cannot solve XOR and why the remedy is to combine many.
+
+The approach. Try every data value as a threshold, and for each threshold try both labellings of the two sides, keeping the combination with the lowest error. This is deliberately quadratic to keep the code short.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+
+    pub struct Stump {
+        f64 threshold;
+        i32 leftLabel;       // prediction when x <= threshold
+        i32 rightLabel;      // prediction when x > threshold
+        f64 error;
+
+        static Stump new() {
+            return Stump { .threshold = 0.0, .leftLabel = 0, .rightLabel = 0, .error = 1.0 };
+        }
+
+        i32 predict(f64 x) {
+            return x <= self.threshold ? self.leftLabel : self.rightLabel;
+        }
+    }
+
+    u64 mistakesAt(const Vec<f64>* xs, const Vec<i32>* ys, f64 t, i32 left, i32 right) {
+        u64 wrong = 0;
+        for (usize i = 0; i < xs->count(); i += 1) {
+            i32 pred = xs->at(i) <= t ? left : right;
+            if (pred != ys->at(i)) wrong += 1;
+        }
+        return wrong;
+    }
+
+    pub Stump fitStump(const Vec<f64>* xs, const Vec<i32>* ys) {
+        usize n = xs->count();
+        @assertOut(n > 0 && ys->count() == n, "need aligned, non-empty data");
+
+        Stump best = Stump::new();
+        for (usize i = 0; i < n; i += 1) {
+            f64 t = xs->at(i);
+            for (i32 left = 0; left <= 1; left += 1) {
+                for (i32 right = 0; right <= 1; right += 1) {
+                    u64 wrong = mistakesAt(xs, ys, t, left, right);
+                    f64 err = (f64)wrong / (f64)n;
+                    if (err < best.error) {
+                        best.threshold = t;
+                        best.leftLabel = left;
+                        best.rightLabel = right;
+                        best.error = err;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+For each candidate threshold the code tries all four labellings of the two sides, which is more than strictly necessary but keeps the search obviously complete. The best error starts at `1.0`, the worst possible, so the first real split improves on it. At the end, `threshold`, the two labels, and `error` fully describe the rule.
+
+Cost and notes. The search is O(n^2) because each of `n` thresholds costs a full pass and four labellings: for the tens of points in this chapter that is nothing, but it does not scale. The standard efficient version sorts the feature once and sweeps left to right, maintaining running label counts, which is O(n log n) for the sort and O(n) for the sweep. The stump itself is O(1) to evaluate.
+
+Edge cases. A threshold set exactly at a data value means the point on the boundary is assigned to the left side, `x <= t`; using `<` instead would flip that point's group, and the choice matters when values repeat. If the labels are perfectly separable by one split, the error reaches zero and every further tie is ignored because the comparison is strict, so the first perfect split wins. For data that is not linearly separable in one dimension — XOR again — the best error stays above zero, and reporting that error honestly is better than pretending a stump fit. And the label search is written for two classes, which is the only case a function pointer stump needs.
+
+Variation. Generalise to choose the threshold as the midpoint between adjacent sorted values rather than a data point, so unseen examples fall cleanly to one side, and add a `predict` that returns the error-weighted vote for boosting. Then train two stumps on XOR and add their votes to see how a small ensemble beats a single split.
+
+33.13 Principal Component Analysis by Power Iteration
+
+The problem. Take data with many correlated features and find the single direction along which it varies most, so you can compress it to one number, visualise it, or reduce noise. That direction is the first principal component.
+
+The intuition. If the data is spread out in a cloud, the direction of greatest spread is an eigenvector of the covariance matrix, and the largest eigenvalue measures how much spread. Forming that matrix explicitly is wasteful and error-prone. Instead, recall what an eigenvector means: applying the matrix to it returns the same direction, only longer. Power iteration exploits this by starting with any vector, applying the matrix over and over, and renormalising each time. The component of the vector along the dominant direction is stretched more than the others on every round, so the direction converges to the top eigenvector and the rest fades away. For a data matrix you never build the covariance matrix: each "multiply" is one pass to project the data onto the current vector and one pass to accumulate back.
+
+The approach. Standardise each dimension first (33.2), start from a unit vector, and iterate `v ← normalise(Xᵀ(Xv))` a fixed number of times.
+
+The implementation.
+
+    import(lib) std::vec { Vec };
+    import(lib) std::math::math { sqrt };
+
+    f64 dotProduct(const Vec<f64>* a, const Vec<f64>* b) {
+        f64 s = 0.0;
+        for (usize i = 0; i < a->count(); i += 1) s += a->at(i) * b->at(i);
+        return s;
+    }
+
+    f64 norm(const Vec<f64>* v) {
+        f64 s = 0.0;
+        for (usize i = 0; i < v->count(); i += 1) s += v->at(i) * v->at(i);
+        return sqrt(s);
+    }
+
+    // rows: n examples, each a d-dimensional point, already standardised
+    pub Vec<f64> firstPrincipalComponent(const Vec<Vec<f64>>* rows, usize d, u64 iters) {
+        usize n = rows->count();
+        Vec<f64> v = Vec<f64>::withCap(d);
+        for (usize j = 0; j < d; j += 1) v.push(1.0 / sqrt((f64)d));   // unit start
+
+        for (u64 step = 0; step < iters; step += 1) {
+            Vec<f64> next = Vec<f64>::withCap(d);
+            for (usize j = 0; j < d; j += 1) next.push(0.0);
+
+            for (usize i = 0; i < n; i += 1) {
+                f64 proj = dotProduct(rows->atPtr(i), &v);             // X v
+                for (usize j = 0; j < d; j += 1)
+                    next.set(j, next.at(j) + proj * rows->at(i).at(j)); // Xᵀ (X v)
+            }
+
+            f64 len = norm(&next);
+            if (len == 0.0) break;                                     // no variance to find
+            for (usize j = 0; j < d; j += 1) v.set(j, next.at(j) / len);
+        }
+        return v;
+    }
+
+The two nested loops are the multiplication by the data matrix and its transpose, written out so the covariance matrix never exists as an object. The fixed number of iterations is a simplification: in practice you stop when the direction stops changing, but a dozen iterations is plenty for a small, well-separated problem, and it keeps the code loop-bounded.
+
+Cost and notes. Each iteration is O(n * d): one projection and one accumulation per example. The whole routine is O(iters * n * d), which is the same order as reading the data a few times. Convergence is geometric, at a rate set by the ratio of the first two eigenvalues; when those are close, the direction is ill-defined and the iteration is slow to settle, which is a property of the data, not the code.
+
+Edge cases. Standardising first is not optional: without it, a feature measured in millions dominates a feature measured in units, and the "principal" direction is just the loudest column. The sign of the returned vector is arbitrary, because `v` and `-v` are the same direction; do not compare components for equality across runs. If the data is all zeros or constant, `norm` returns zero and the routine stops, leaving the starting vector as a defensible answer. And with two nearly equal top eigenvalues there is no single best direction, so any answer is unstable; this is the case to detect by also computing the eigenvalues rather than trusting the vector.
+
+Variation. Deflate and repeat to get the second component: subtract each row's projection onto the first component before running the iteration again, and check that the second direction is orthogonal to the first. Then compute the variance along each component and report the fraction of the total variance it captures, which is the number you use to decide how many components to keep.
+
+33.14 Exercises
 
 1. Comprehension. Derive, on paper, the partial derivatives of the mean squared error `(1/n) * sum (w*x + b - y)^2` with respect to `w` and `b`. Compare them to the code in 33.1 and explain each factor.
 
