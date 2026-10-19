@@ -1,0 +1,38 @@
+import(lib) std::concurrent::thread {
+    threadCreate, threadJoin, Thread, ThreadError, AtomicU64
+};
+
+// the same field, once plain and once atomic
+struct PlainCounter { u64 value; }
+struct AtomicCounter { AtomicU64 value; }
+
+rawptr bumpPlain(rawptr arg) {
+    PlainCounter* c = (PlainCounter*)arg;
+    // read-modify-write as three separate steps: the race lives here
+    for (u64 i = 0; i < 1000000u; i += 1) c->value += 1;
+    return null;
+}
+
+rawptr bumpAtomic(rawptr arg) {
+    AtomicCounter* c = (AtomicCounter*)arg;
+    // one indivisible instruction, so no increment can be lost
+    for (u64 i = 0; i < 1000000u; i += 1) c->value.fetchAdd(1u);
+    return null;
+}
+
+pub void main() {
+    PlainCounter plain = PlainCounter { .value = 0 };
+    // both threads write through the same pointer; the counter must outlive them
+    Result<Thread, ThreadError> a = threadCreate(bumpPlain, (rawptr)&plain);
+    Result<Thread, ThreadError> b = threadCreate(bumpPlain, (rawptr)&plain);
+    if (a.isOk()) threadJoin(a.unwrap(), null);
+    if (b.isOk()) threadJoin(b.unwrap(), null);
+    println("plain  {}", plain.value);          // often less than 2000000
+
+    AtomicCounter atomic = AtomicCounter { .value = AtomicU64 { .value = 0 } };
+    Result<Thread, ThreadError> c = threadCreate(bumpAtomic, (rawptr)&atomic);
+    Result<Thread, ThreadError> d = threadCreate(bumpAtomic, (rawptr)&atomic);
+    if (c.isOk()) threadJoin(c.unwrap(), null);
+    if (d.isOk()) threadJoin(d.unwrap(), null);
+    println("atomic {}", atomic.value.load());  // always 2000000
+}

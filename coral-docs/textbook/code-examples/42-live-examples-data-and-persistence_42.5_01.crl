@@ -1,0 +1,107 @@
+import(lib) std::io::fs { fileOpen, fileClose, fileSeek, File, IoError, SEEK_SET };
+import(lib) std::io::bio { FileReader, FileWriter };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+import(lib) std::vec { Vec };
+
+const u32 MAGIC = 0x41524F43u;               // 'CORA' little-endian
+const u16 VERSION = 1u;
+
+// Exactly sixteen bytes: 4 + 2 + 2, then the u64 at its aligned offset 8.
+struct Header {
+    u32 magic;                               // offset 0
+    u16 version;                             // offset 4
+    u16 flags;                               // offset 6
+    u64 count;                               // offset 8
+}
+
+// Exactly sixteen bytes: a u64 id, then an f64 score, both 8-aligned.
+struct Entry {
+    u64 id;                                  // offset 0
+    f64 score;                               // offset 8
+}
+
+// Frozen address of record i: header, then sixteen bytes per record.
+usize entryOffset(u64 i) {
+    return (usize)(16 + i * 16);
+}
+
+// Write the 16-byte header followed by n fixed records.
+bool writeRecords(str path, const Vec<Entry>* rows) {
+    comptime {
+        if (@sizeof(Header) != 16) @compileError("Header must be 16 bytes");
+        if (@sizeof(Entry) != 16) @compileError("Entry must be 16 bytes");
+    }
+
+    Result<File, IoError> fo = fileOpen(path, "w");
+    // Error path: cannot open the file, so report failure.
+    if (fo.isErr()) return false;
+    File f = fo.unwrap();
+    FileWriter w = FileWriter::fromFd(f);
+
+    // Fields are written explicitly, little-endian, never by struct dump.
+    // Header: magic, version, reserved flags, then the record count.
+    w.writeU32Le(MAGIC);
+    w.writeU16Le(VERSION);
+    w.writeU16Le((u16)0);                    // flags reserved for now
+    w.writeU64Le((u64)rows->count());
+
+    // Each record lands at 16 + i*16 because both writes are fixed-width.
+    // Each record is written field by field, little-endian.
+    for (usize i = 0; i < rows->count(); i += 1) {
+        Entry e = rows->at(i);
+        w.writeU64Le(e.id);
+        w.writeF64Le(e.score);
+    }
+    // Flush and close before returning success.
+    fileClose(f);
+    return true;
+}
+
+// Read the header, then seek to and load each record.
+bool readRecords(str path, Vec<Entry>* out) {
+    Result<File, IoError> fo = fileOpen(path, "r");
+    if (fo.isErr()) return false;
+    File f = fo.unwrap();
+    FileReader r = FileReader::fromFd(f);
+
+    // Read the header fields in the order they were written.
+    u32 magic = r.readU32Le();
+    u16 version = r.readU16Le();
+    r.readU16Le();                           // flags: read, not needed here
+    u64 count = r.readU64Le();
+    // A wrong magic or version means this is not our file.
+    if (magic != MAGIC || version != VERSION) { fileClose(f); return false; }
+
+    for (u64 i = 0; i < count; i += 1) {
+        // Jump to the frozen offset, then read the two fields in order.
+        // Seek to the frozen offset instead of reading sequentially.
+        fileSeek(f, (isize)entryOffset(i), SEEK_SET);
+        u64 id = r.readU64Le();
+        f64 score = r.readF64Le();
+        // Append the decoded record to the output vector.
+        out->push(Entry { .id = id, .score = score });
+    }
+    fileClose(f);
+    return true;
+}
+
+void main() {
+    Vec<Entry> rows = Vec<Entry>::new();
+    rows.push(Entry { .id = 1, .score = 91.5 });
+    rows.push(Entry { .id = 2, .score = 99.25 });
+    rows.push(Entry { .id = 3, .score = 72.0 });
+
+    String path = String::from("/tmp/coral-records.bin");
+    // Error path: if the write fails, stop.
+    if (!writeRecords(path.asView(), &rows)) { println("write failed"); return; }
+    println("wrote {} entries", rows.count());
+
+    // Read the records back and print them.
+    Vec<Entry> back = Vec<Entry>::new();
+    if (!readRecords(path.asView(), &back)) { println("read failed"); return; }
+    for (usize i = 0; i < back.count(); i += 1) {
+        Entry e = back.at(i);
+        println("id {} score {}", e.id, e.score);
+    }
+}

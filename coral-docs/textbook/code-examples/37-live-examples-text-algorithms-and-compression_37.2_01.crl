@@ -1,0 +1,146 @@
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::io::ios { println };
+import(lib) std::collections::priorityqueue { PriorityQueue };
+
+struct HNode {
+    u32 freq;
+    i32 left;
+    i32 right;
+    i32 parent;
+    u8 bit;
+    u8 symbol;
+    bool leaf;
+}
+
+struct HeapItem {
+    u32 freq;
+    i32 node;
+}
+
+bool heapLess(HeapItem a, HeapItem b) {
+    return a.freq < b.freq;
+}
+
+i32 huffmanBuild(str input, Vec<HNode>* pool, Vec<i32>* leafOf) {
+    Vec<u32> freq = Vec<u32>::new();
+    // one slot per possible byte value, all counts starting at zero
+    for (usize i = 0; i < 256; i += 1) freq.push(0);
+    // tally each byte in a single pass
+    for (usize i = 0; i < input.len; i += 1) {
+        u8 b = input.at(i);
+        // freq[byte] counts how many times that byte occurred
+        freq.set((usize)b, freq.at((usize)b) + 1);
+    }
+    // leafOf maps a symbol to its leaf node; -1 means the symbol is unused
+    for (usize i = 0; i < 256; i += 1) leafOf->push(-1);
+
+    // min-heap ordered by frequency, so the two rarest nodes pop first
+    PriorityQueue<HeapItem> pq = PriorityQueue<HeapItem>::new(heapLess);
+    for (usize s = 0; s < 256; s += 1) {
+        // only symbols that actually occur become leaves
+        if (freq.at(s) > 0) {
+            // a new leaf's index is the pool's current size
+            i32 idx = (i32)pool->count();
+            // a leaf stores its symbol and weight and has no children
+            pool->push(HNode {
+                .freq = freq.at(s), .left = -1, .right = -1, .parent = -1,
+                .bit = 0, .symbol = (u8)s, .leaf = true
+            });
+            // remember where this symbol's leaf lives for encoding
+            leafOf->set(s, idx);
+            // the leaf enters the merge queue
+            pq.push(HeapItem { .freq = freq.at(s), .node = idx });
+        }
+    }
+
+    // merge the two lightest nodes until a single tree remains
+    while (pq.count() > 1) {
+        HeapItem a = pq.pop();
+        HeapItem b = pq.pop();
+        i32 idx = (i32)pool->count();
+        // internal node's weight is the sum of its children
+        pool->push(HNode {
+            .freq = a.freq + b.freq, .left = a.node, .right = b.node,
+            .parent = -1, .bit = 0, .symbol = 0, .leaf = false
+        });
+        // link each child back to the new parent and record its path bit
+        pool->atPtr((usize)a.node)->parent = idx;
+        pool->atPtr((usize)a.node)->bit = 0;
+        pool->atPtr((usize)b.node)->parent = idx;
+        pool->atPtr((usize)b.node)->bit = 1;
+        // reinsert the merged node with its combined weight
+        pq.push(HeapItem { .freq = a.freq + b.freq, .node = idx });
+    }
+    // empty input: no leaves were ever created
+    if (pool->count() == 0) return -1;
+    // the single remaining node is the tree root
+    return pq.pop().node;
+}
+
+String huffmanEncode(str input, const Vec<HNode>* pool, const Vec<i32>* leafOf) {
+    String out = String::new();
+    // scratch buffer reused to collect each symbol's bits
+    Vec<u8> path = Vec<u8>::new();
+    // a lone symbol has a root that is itself a leaf and needs a special case
+    bool single = pool->count() == 1;
+    for (usize i = 0; i < input.len; i += 1) {
+        // one bit per character is enough when there is only one symbol
+        if (single) { out.pushByte((u8)'0'); continue; }
+        // start the walk at this symbol's leaf
+        i32 cur = leafOf->at((usize)input.at(i));
+        path.clear();
+        // walk up to the root, gathering bits least-significant first
+        while (pool->at((usize)cur).parent != -1) {
+            HNode nd = pool->at((usize)cur);
+            path.push(nd.bit);
+            cur = nd.parent;
+        }
+        // emit the collected bits in reverse: root direction comes first
+        isize k = (isize)path.count() - 1;
+        while (k >= 0) {
+            out.pushByte((u8)('0' + path.at((usize)k)));
+            k -= 1;
+        }
+    }
+    return out;
+}
+
+String huffmanDecode(str bits, const Vec<HNode>* pool, i32 root) {
+    String out = String::new();
+    if (pool->count() == 0) return out;
+    // single-symbol tree: every bit stands for that one symbol
+    if (pool->at((usize)root).leaf) {
+        u8 sym = pool->at((usize)root).symbol;
+        for (usize i = 0; i < bits.len; i += 1) out.pushByte(sym);
+        return out;
+    }
+    // start each code at the root and walk down
+    i32 cur = root;
+    for (usize i = 0; i < bits.len; i += 1) {
+        HNode nd = pool->at((usize)cur);
+        // a '0' turns left, anything else turns right
+        if (bits.at(i) == (u8)'0') cur = nd.left;
+        else cur = nd.right;
+        HNode c = pool->at((usize)cur);
+        // landing on a leaf completes a symbol; reset to the root
+        if (c.leaf) {
+            out.pushByte(c.symbol);
+            cur = root;
+        }
+    }
+    return out;
+}
+
+void main() {
+    str text = "this is an example of a huffman tree";
+    Vec<HNode> pool = Vec<HNode>::new();
+    Vec<i32> leafOf = Vec<i32>::new();
+    i32 root = huffmanBuild(text, &pool, &leafOf);
+    if (root < 0) return;
+    String bits = huffmanEncode(text, &pool, &leafOf);
+    String back = huffmanDecode(bits.asView(), &pool, root);
+    println("input   {} bytes", text.len);
+    println("encoded {} bits", bits.len);
+    println("roundtrip {}", back.asView().equals(text));
+}

@@ -1,0 +1,66 @@
+import(lib) std::vec { Vec };
+import(lib) std::io::ios { println };
+import(lib) std::math::math { minF64, maxF64, floor, ceil };
+
+// Twice the signed area of triangle (a, b, p): the barycentric edge test.
+// Half the cross product of (b - a) and (p - a).
+f64 edgeFn(f64 ax, f64 ay, f64 bx, f64 by, f64 px, f64 py) {
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+void rasterTriangle(Image* img,
+                    f64 x0, f64 y0, f64 x1, f64 y1, f64 x2, f64 y2,
+                    Color c0, Color c1, Color c2) {
+    // Signed area of the whole triangle.
+    f64 area = edgeFn(x0, y0, x1, y1, x2, y2);
+    if (area == 0.0) return;                    // degenerate triangle
+
+    // Bounding box of the three vertices, in floating point.
+    f64 minX = minF64(x0, minF64(x1, x2));
+    f64 maxX = maxF64(x0, maxF64(x1, x2));
+    f64 minY = minF64(y0, minF64(y1, y2));
+    f64 maxY = maxF64(y0, maxF64(y1, y2));
+
+    // Clip the box out to whole pixel rows and columns.
+    // Round the box outward to integer pixel bounds.
+    isize px0 = (isize)floor(minX);
+    isize px1 = (isize)ceil(maxX);
+    isize py0 = (isize)floor(minY);
+    isize py1 = (isize)ceil(maxY);
+
+    // Scan every candidate pixel inside the bounding box.
+    for (isize py = py0; py <= py1; py += 1) {
+        for (isize px = px0; px <= px1; px += 1) {
+            f64 cx = (f64)px + 0.5;             // test the pixel center
+            f64 cy = (f64)py + 0.5;
+            // Barycentric weight of each corner; divided by area they sum to one.
+            // Weights for each corner at the pixel center.
+            f64 w0 = edgeFn(x1, y1, x2, y2, cx, cy) / area;
+            f64 w1 = edgeFn(x2, y2, x0, y0, cx, cy) / area;
+            f64 w2 = edgeFn(x0, y0, x1, y1, cx, cy) / area;
+            // Inside when all three weights are non-negative.
+            if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) {
+                // Blend the corner colors with the same weights.
+                Color c = Color {
+                    .r = w0 * c0.r + w1 * c1.r + w2 * c2.r,
+                    .g = w0 * c0.g + w1 * c1.g + w2 * c2.g,
+                    .b = w0 * c0.b + w1 * c1.b + w2 * c2.b
+                };
+                // Drop pixels that fall outside the image before writing.
+                if (px >= 0 && py >= 0)
+                    img->setPixel((usize)px, (usize)py, toByte(c.r), toByte(c.g), toByte(c.b));
+            }
+        }
+    }
+}
+
+void main() {
+    Image img = Image::new(200, 200);
+    // One RGB triangle: each corner carries its own color.
+    rasterTriangle(&img, 100.0, 20.0, 180.0, 170.0, 20.0, 170.0,
+        Color { .r = 1.0, .g = 0.1, .b = 0.1 },
+        Color { .r = 0.1, .g = 1.0, .b = 0.2 },
+        Color { .r = 0.1, .g = 0.2, .b = 1.0 });
+    writePPM("/tmp/coral-triangle.ppm", &img);
+    println("wrote /tmp/coral-triangle.ppm");
+}

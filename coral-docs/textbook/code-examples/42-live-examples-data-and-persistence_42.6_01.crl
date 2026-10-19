@@ -1,0 +1,59 @@
+import(lib) std::io::fs { readFileToString, writeFileFromString, IoError };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+import(lib) std::fmt::fmt { formatHex };
+
+// Reflected CRC-32, polynomial 0xEDB88320, one bit per input bit. The
+// register is threaded through so callers can feed data in pieces.
+u32 crc32Update(u32 crc, const u8* data, usize len) {
+    u32 c = crc;
+    for (usize i = 0; i < len; i += 1) {
+        // Fold each input byte into the low bits of the register.
+        c ^= (u32)data[i];                   // fold the next byte in
+        // Eight shifts, conditionally XOR-ing the reflected polynomial.
+        for (u8 k = 0; k < 8; k += 1) {
+            if ((c & 1u) != 0) c = (c >> 1) ^ 0xEDB88320u;
+            else c = c >> 1;                 // shift, sometimes xor
+        }
+    }
+    return c;
+}
+
+// Whole-buffer CRC: preset all ones, then complement the final register.
+u32 crc32(str data) {
+    // Preset all ones, then complement the final value.
+    return crc32Update(0xFFFFFFFFu, data.asU8(), data.len) ^ 0xFFFFFFFFu;
+}
+
+void main() {
+    // The standard check value: crc32("123456789") == 0xCBF43926.
+    // The nine-byte test string used to sanity-check the CRC.
+    str check = "123456789";
+    println("check {}", formatHex((u64)crc32(check), true).asView());
+
+    String payload = String::from("the quick brown fox");
+    u32 sum = crc32(payload.asView());
+    String record = payload.clone();          // payload plus its trailer
+    // Write the four trailer bytes, least significant first.
+    record.pushByte((u8)sum);                 // checksum, little-endian
+    record.pushByte((u8)(sum >> 8));
+    record.pushByte((u8)(sum >> 16));
+    record.pushByte((u8)(sum >> 24));
+    // Persist payload and trailer as one buffer.
+    writeFileFromString("/tmp/coral-crc.bin", &record);
+
+    // Read the whole record back.
+    Result<String, IoError> rr = readFileToString("/tmp/coral-crc.bin");
+    if (rr.isErr()) return;
+    // Parse guard: fewer than four bytes cannot hold a trailer.
+    String back = rr.unwrap();
+    if (back.len < 4) return;                 // too short to hold a crc
+    // The body is everything except the trailing four bytes.
+    str body = back.asView().slice(0, back.len - 4);
+    u32 stored = (u32)back.at(back.len - 4) |
+                 ((u32)back.at(back.len - 3) << 8) |
+                 ((u32)back.at(back.len - 2) << 16) |
+                 ((u32)back.at(back.len - 1) << 24);
+    // Verification: the recomputed CRC must match the stored one.
+    println("verified {}", stored == crc32(body));
+}

@@ -1,0 +1,73 @@
+import(lib) std::io::fs { readFileToString, writeFileFromString, IoError };
+import(lib) std::io::ios { println, parseU64 };
+import(lib) std::text::string { String };
+import(lib) std::text::strutil { splitVec };
+import(lib) std::collections::hashmap { HashMap };
+import(lib) std::option { Option };
+import(lib) std::vec { Vec };
+
+// Hash and equality for str keys. The map stores borrowed views, so the
+// whole config buffer must outlive it (see main); eq must match hash.
+usize hashView(str s) {
+    usize h = 5381;
+    // Fold each byte into the running hash.
+    for (usize i = 0; i < s.len; i += 1)
+        h = h * 33 + (usize)s.at(i);         // djb2: cheap, spreads bytes
+    return h;
+}
+
+// Equality must match hashView, or lookups miss.
+bool eqView(str a, str b) {
+    return a.equals(b);                      // consistent with hashView
+}
+
+// Parse the whole buffer into a map of views.
+HashMap<str, str> parseConfig(str text) {
+    HashMap<str, str> cfg = HashMap<str, str>::new(hashView, eqView);
+    Vec<str> lines = splitVec(text, (u8)'\n');
+    for (usize i = 0; i < lines.count(); i += 1) {
+        // Trim surrounding whitespace before deciding.
+        str line = lines.at(i).trim();       // drop edge whitespace
+        if (line.len == 0) continue;         // blank line
+        if (line.at(0) == (u8)'#') continue; // comment line
+        // Split on the first '=', so a value may itself contain '='.
+        usize eq = line.findByte((u8)'=');
+        if (eq >= line.len) continue;        // no '=' => not an assignment
+        // Key and value are trimmed slices of the buffer.
+        str key = line.slice(0, eq).trim();
+        str val = line.slice(eq + 1, line.len).trim();
+        if (key.len == 0) continue;          // refuse an empty key
+        cfg.insert(key, val);                // duplicate key: last wins
+    }
+    return cfg;
+}
+
+// Typed accessor: default on a missing key or a malformed number.
+u64 getConfigU64(HashMap<str, str>* cfg, str key, u64 fallback) {
+    Option<str> v = cfg->get(key);
+    if (v.isNone()) return fallback;         // absent key uses the default
+    bool ok;
+    // parseU64 signals failure through its bool out-parameter.
+    u64 n = parseU64(v.unwrap(), &ok);
+    return ok ? n : fallback;                // malformed value -> default
+}
+
+void main() {
+    String sample = String::from("# coral demo\nhost = localhost\nport = 8080\nretries=5\n");
+    String path = String::from("/tmp/coral.conf");
+    writeFileFromString(path.asView(), &sample);
+
+    // Read it back; text owns the bytes the map will view.
+    Result<String, IoError> rr = readFileToString(path.asView());
+    if (rr.isErr()) { println("cannot read config"); return; }
+    String text = rr.unwrap();               // owns the bytes the map views
+
+    // Parse into a map whose keys and values borrow text.
+    HashMap<str, str> cfg = parseConfig(text.asView());
+    println("keys {}", cfg.count());
+    Option<str> host = cfg.get("host");
+    if (host.isSome()) println("host = {}", host.unwrap());
+    println("port = {}", getConfigU64(&cfg, "port", 80u));
+    println("retries = {}", getConfigU64(&cfg, "retries", 3u));
+    println("missing = {}", getConfigU64(&cfg, "missing", 7u));
+}

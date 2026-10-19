@@ -1,0 +1,80 @@
+import(lib) std::vec { Vec };
+import(lib) std::collections.hashmap { HashMap };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::io::ios { println };
+
+// a block is just a sequence of statements, so nesting is free
+struct Block { Vec<Stmt*> stmts; }
+
+variant Stmt {
+    Assign { str name; Expr* value; }
+    Print { Expr* value; }
+    ExprStmt { Expr* value; }
+    If { Expr* cond; Block* thenBody; Block* elseBody; }
+    // while has no else: either the body runs or it does not
+    While { Expr* cond; Block* body; }
+}
+
+Block* mkBlock(Vec<Stmt*> stmts) {
+    Block* b = alloc<Block>(1);
+    // ownership of the vector moves into the block
+    b->stmts = stmts;
+    return b;
+}
+
+Stmt* mkIf(Expr* cond, Block* thenBody, Block* elseBody) {
+    // a null elseBody is the "no else clause" case
+    Stmt* s = alloc<Stmt>(1);
+    *s = Stmt::If { .cond = cond, .thenBody = thenBody, .elseBody = elseBody };
+    return s;
+}
+
+Stmt* mkWhile(Expr* cond, Block* body) {
+    Stmt* s = alloc<Stmt>(1);
+    *s = Stmt::While { .cond = cond, .body = body };
+    return s;
+}
+
+void runBlock(Block* b, HashMap<str, i64>* env) {
+    // statements run left to right, sharing the environment
+    for (usize i = 0; i < b->stmts.count(); i += 1) {
+        runStmt(b->stmts.at(i), env);
+    }
+}
+
+// now five cases, two of which recurse into blocks
+void runStmt(Stmt* s, HashMap<str, i64>* env) {
+    Stmt st = *s;
+    switch (st) {
+        Stmt::Assign { name, value } => { env->insert(name, eval(value, env)); },
+        Stmt::Print { value } => println("{}", eval(value, env)),
+        Stmt::ExprStmt { value } => eval(value, env),
+        Stmt::If { cond, thenBody, elseBody } => {
+            // a null elseBody means there was no else clause
+            if (eval(cond, env) != 0) runBlock(thenBody, env);
+            else if (elseBody != null) runBlock(elseBody, env);
+        },
+        Stmt::While { cond, body } => {
+            // re-test before every pass, so the condition can change
+            while (eval(cond, env) != 0) runBlock(body, env);
+        },
+    }
+}
+
+void main() {
+    HashMap<str, i64> env = HashMap<str, i64>::new(hashStr, eqStr);
+    Vec<Stmt*> program = Vec<Stmt*>::new();
+    // sum = 0; i = 1; while (i < 6) { sum = sum + i; i = i + 1; } print sum;
+    Vec<Stmt*> body = Vec<Stmt*>::new();
+    // the loop body adds i to sum, then advances i
+    body.push(mkAssign("sum", mkBin(Op::Add, mkVar("sum"), mkVar("i"))));
+    body.push(mkAssign("i", mkBin(Op::Add, mkVar("i"), mkNum(1))));
+    program.push(mkAssign("sum", mkNum(0)));
+    program.push(mkAssign("i", mkNum(1)));
+    program.push(mkWhile(mkBin(Op::Less, mkVar("i"), mkNum(6)), mkBlock(body)));
+    program.push(mkPrint(mkVar("sum")));
+    for (usize i = 0; i < program.count(); i += 1) {
+        runStmt(program.at(i), &env);
+    }
+    env.dispose();
+}

@@ -1,0 +1,48 @@
+// Socket calls, the handle type, and the shared error variant.
+import(lib) std::io::net {
+    tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+
+// Echo one connection to completion, one byte at a time.
+void echoLoop(TcpSocket client)
+{
+    u8 b = 0;
+    // tcpRecv is read-exactly, so ask for a single byte: that is the
+    // only request that returns as soon as one byte has arrived.
+    while (true)
+    {
+        Result<isize, IoError> r = tcpRecv(client, &b, 1);
+        if (r.isErr()) break;                  // the connection broke
+        if (r.unwrap() == 0) break;            // the peer closed cleanly
+
+        // Send the byte straight back; a send failure also ends the loop.
+        Result<isize, IoError> w = tcpSend(client, &b, 1);
+        if (w.isErr()) break;
+    }
+}
+
+i32 main()
+{
+    // Create the listening socket on port 8080 for every IPv4 interface.
+    Result<TcpSocket, IoError> server = tcpListen((u16)8080);
+    if (server.isErr()) { println("could not listen on port 8080"); return 1; }
+
+    TcpSocket listener = server.unwrap();
+    println("echo server listening on port 8080");
+
+    // Accept connections forever; each one is a separate conversation.
+    while (true)
+    {
+        Result<TcpSocket, IoError> conn = tcpAccept(listener);
+        if (conn.isErr()) break;
+
+        // Service this client, then close only its socket, not the listener.
+        TcpSocket client = conn.unwrap();
+        echoLoop(client);
+        tcpClose(client);
+    }
+
+    tcpClose(listener);
+    return 0;
+}

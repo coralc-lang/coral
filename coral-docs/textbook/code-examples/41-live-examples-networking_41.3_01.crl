@@ -1,0 +1,64 @@
+import(lib) std::io::net {
+    tcpListen, tcpAccept, tcpConnect, tcpSend, tcpRecv, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::text::string { String };
+
+// Reads bytes into `out` until '\n' arrives, the peer closes, or `max`
+// bytes have been read. Returns the number of bytes appended.
+Result<isize, IoError> readLine(TcpSocket sock, String* out, usize max)
+{
+    // Reset the accumulator so callers can reuse the same String.
+    out.clear();
+    while (out.len < max)
+    {
+        u8 b = 0;
+        // One-byte reads are the only framing tool this blocking API offers.
+        Result<isize, IoError> r = tcpRecv(sock, &b, 1);
+        if (r.isErr()) return r;
+        if (r.unwrap() == 0) break;            // peer closed: end of unit
+
+        // Keep the delimiter in the result; the caller may strip it.
+        out.pushByte(b);
+        if (b == (u8)'\n') break;              // delimiter reached
+    }
+    return Result<isize, IoError>::Ok { .value = (isize)out.len };
+}
+
+i32 main()
+{
+    // Listen first; the connection below queues in the backlog, needing no thread.
+    Result<TcpSocket, IoError> server = tcpListen((u16)8090);
+    if (server.isErr()) return 1;
+    TcpSocket listener = server.unwrap();
+
+    // A connection made to our own listener is queued by the kernel as
+    // soon as listen() has run, so accept() below returns at once and the
+    // whole exchange can run in one thread.
+    Result<TcpSocket, IoError> opened = tcpConnect("127.0.0.1", (u16)8090);
+    if (opened.isErr()) { tcpClose(listener); return 1; }
+    TcpSocket client = opened.unwrap();
+
+    Result<TcpSocket, IoError> accepted = tcpAccept(listener);
+    if (accepted.isErr()) { tcpClose(client); tcpClose(listener); return 1; }
+    TcpSocket peer = accepted.unwrap();
+
+    // Two sends become one stream; readLine slices it back into units.
+    str first = "first line\n";
+    str second = "second line\n";
+    tcpSend(client, first.ptr, first.len);
+    tcpSend(client, second.ptr, second.len);
+
+    // One accumulator reused for both lines; readLine clears it each call.
+    String line = String::new();
+    readLine(peer, &line, 256);
+    println("server got: {}", line);
+    readLine(peer, &line, 256);
+    println("server got: {}", line));
+
+    // Close all three descriptors: the accepted peer, the client, and the listener.
+    tcpClose(peer);
+    tcpClose(client);
+    tcpClose(listener);
+    return 0;
+}

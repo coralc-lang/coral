@@ -1,0 +1,69 @@
+import(lib) std::io::ios { println, eprintln };
+import(lib) std::io::fs { IoError, readFileToString };
+import(lib) std::io::cmd { commandLine };
+import(lib) std::text::string { String };
+import(lib) std::option { Option };
+import(lib) std::result { Result };
+
+// Linux: the raw command line is argv[0]\0argv[1]\0...\0.
+// Returns argv[1] as a view, or "" when there is none.
+str firstArg() {
+    Option<str> cl = commandLine();
+    if (cl.isNone()) return "";
+    str all = cl.unwrap();
+    usize i = 0;
+    while (i < all.len && all.ptr[i] != 0) i += 1;   // skip argv[0]
+    if (i >= all.len) return "";
+    i += 1;
+    usize start = i;
+    while (i < all.len && all.ptr[i] != 0) i += 1;
+    if (i == start) return "";
+    return str::fromParts(all.ptr + start, i - start);
+}
+
+void reportIoError(str path, IoError e) {
+    switch (e) {
+        IoError::Os { code, op }  => { eprintln("{}: {} (os error {})", path, op, code); },
+        IoError::Eof { op }       => { eprintln("{}: unexpected end of file during {}", path, op); },
+        IoError::BadUsage { msg } => { eprintln("{}: {}", path, msg); },
+    }
+}
+
+bool isSpaceByte(u8 c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+i32 main() {
+    str path = firstArg();
+    if (path.len == 0) {
+        eprintln("usage: wc <file>");
+        return 1;
+    }
+
+    Result<String, IoError> loaded = readFileToString(path);
+    if (loaded.isErr()) {
+        reportIoError(path, loaded.unwrapErr());
+        return 1;
+    }
+
+    String text = loaded.unwrap();
+    usize lines = 0;
+    usize words = 0;
+    bool inWord = false;
+    // one byte-based pass: a newline ends a line, whitespace ends a word
+    for (usize i = 0; i < text.len; i += 1) {
+        u8 c = text.at(i);
+        if (c == '\n') lines += 1;
+        if (isSpaceByte(c)) {
+            inWord = false;
+        } else if (!inWord) {
+            words += 1;
+            inWord = true;
+        }
+    }
+
+    // {:d} prints the counts as decimal, then the byte size and path
+    println("{:d} {:d} {:d} {}", lines, words, text.len, path);
+    text.free();   // release the String returned by readFileToString
+    return 0;
+}

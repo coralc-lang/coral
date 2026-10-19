@@ -1,0 +1,45 @@
+import(lib) std::io::net {
+    tcpConnect, tcpSend, tcpRecv, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::text::string { String };
+import(lib) std::mman { alloc, dealloc };
+
+i32 main()
+{
+    // Speak HTTP/1.0 by hand over one plain TCP connection.
+    Result<TcpSocket, IoError> opened = tcpConnect("127.0.0.1", (u16)8080);
+    if (opened.isErr()) { println("connect failed"); return 1; }
+    TcpSocket sock = opened.unwrap();
+
+    // Assemble the exact request bytes; HTTP requires CRLF line endings.
+    String request = String::from("GET / HTTP/1.0\r\n");
+    request.appendView("Host: 127.0.0.1\r\n");
+    request.appendView("Connection: close\r\n");
+    request.appendView("\r\n");
+
+    // Send the whole request head in one call; short writes are handled.
+    str head = request.asView();
+    Result<isize, IoError> sent = tcpSend(sock, head.ptr, head.len);
+    if (sent.isErr()) { tcpClose(sock); return 1; }
+
+    // A single reusable buffer: the response streams out, not stored.
+    u8* buf = alloc<u8>(4096);
+    if (buf == null) { tcpClose(sock); return 1; }
+
+    // Read until tcpRecv returns zero, the server's close after the body.
+    while (true)
+    {
+        Result<isize, IoError> r = tcpRecv(sock, buf, 4096);
+        if (r.isErr()) { println("recv failed"); break; }
+        isize n = r.unwrap();
+        if (n == 0) break;                     // server closed: response done
+        // Emit exactly the bytes just received, whatever they encode.
+        print("{}", str::fromParts(buf, (usize)n));
+    }
+
+    // Release the buffer and the socket; the program owns both.
+    dealloc<u8>(buf);
+    tcpClose(sock);
+    return 0;
+}

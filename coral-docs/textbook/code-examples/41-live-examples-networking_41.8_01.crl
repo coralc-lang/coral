@@ -1,0 +1,142 @@
+import(lib) std::io::net {
+    tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::concurrent::thread { threadCreate, Thread, ThreadError };
+import(lib) std::concurrent::mutex { Mutex };
+import(lib) std::text::string { String };
+import(lib) std::mman { alloc, dealloc };
+
+// Cap the room; a joining client beyond this is refused.
+const u32 ROOM_CAPACITY = 8;
+
+// The shared state: the set of connected sockets behind one mutex.
+struct Room
+{
+    // Guards the client list; only list operations happen under it.
+    Mutex mutex;
+    // Fixed-size array of live sockets; their order does not matter.
+    TcpSocket* clients;
+    u32 count;
+
+    bool init()
+    {
+        // Allocate the list and start with no members.
+        self.clients = alloc<TcpSocket>((usize)ROOM_CAPACITY);
+        if (self.clients == null) return false;
+        self.mutex.init();
+        self.count = 0;
+        return true;
+    }
+
+    bool join(TcpSocket sock)
+    {
+        // Under the lock, check for room and append the socket.
+        self.mutex.lock();
+        bool ok = self.count < ROOM_CAPACITY;
+        if (ok) { self.clients[self.count] = sock; self.count += 1; }
+        self.mutex.unlock();
+        return ok;
+    }
+
+    void leave(TcpSocket sock)
+    {
+        self.mutex.lock();
+        // Find the socket, then compact by moving the last entry into its slot.
+        u32 i = 0;
+        while (i < self.count && (i32)self.clients[i] != (i32)sock) i += 1;
+        if (i < self.count)
+        {
+            self.clients[i] = self.clients[self.count - 1];
+            self.count -= 1;
+        }
+        self.mutex.unlock();
+    }
+
+    void broadcast(TcpSocket from, str line)
+    {
+        self.mutex.lock();
+        // Send the line to every member except its originator.
+        for (u32 i = 0; i < self.count; i += 1)
+        {
+            if ((i32)self.clients[i] != (i32)from)
+                tcpSend(self.clients[i], line.ptr, line.len);
+        }
+        self.mutex.unlock();
+    }
+}
+
+struct ClientJob { Room* room; TcpSocket sock; }
+
+// The same one-byte framing helper used in 40.3.
+Result<isize, IoError> readLine(TcpSocket sock, String* out, usize max)
+{
+    out.clear();
+    while (out.len < max)
+    {
+        u8 b = 0;
+        Result<isize, IoError> r = tcpRecv(sock, &b, 1);
+        if (r.isErr()) return r;
+        if (r.unwrap() == 0) break;
+        out.pushByte(b);
+        if (b == (u8)'\n') break;
+    }
+    return Result<isize, IoError>::Ok { .value = (isize)out.len };
+}
+
+rawptr chatClient(rawptr arg)
+{
+    // Unpack the job and take ownership of its socket.
+    ClientJob* job = (ClientJob*)arg;
+    Room* room = job->room;
+    TcpSocket sock = job->sock;
+    dealloc<ClientJob>(job);
+
+    // Refuse and close if the room is already full.
+    if (!room->join(sock)) { tcpClose(sock); return null; }
+
+    // One reusable line buffer for the client's whole session.
+    String line = String::new();
+    while (true)
+    {
+        Result<isize, IoError> r = readLine(sock, &line, 512);
+        if (r.isErr()) break;
+        if (r.unwrap() == 0) break;
+        room->broadcast(sock, line.asView());
+    }
+
+    // Leave before closing so no broadcast targets a dead socket.
+    room->leave(sock);
+    tcpClose(sock);
+    return null;
+}
+
+i32 main()
+{
+    // The room lives in main's frame, so it outlives every worker.
+    Room room;
+    if (!room.init()) return 1;
+
+    // Listener for the chat; one worker thread per connection.
+    Result<TcpSocket, IoError> server = tcpListen((u16)8080);
+    if (server.isErr()) { return 1; }
+    TcpSocket listener = server.unwrap();
+    println("chat server listening on port 8080");
+
+    while (true)
+    {
+        Result<TcpSocket, IoError> conn = tcpAccept(listener);
+        if (conn.isErr()) break;
+
+        // Each job carries a pointer to the shared room and its own socket.
+        ClientJob* job = alloc<ClientJob>(1);
+        if (job == null) { tcpClose(conn.unwrap()); break; }
+        job->room = &room;
+        job->sock = conn.unwrap();
+
+        Result<Thread, ThreadError> t = threadCreate(chatClient, (rawptr)job);
+        if (t.isErr()) { tcpClose(job->sock); dealloc<ClientJob>(job); }
+    }
+    tcpClose(listener);
+    return 0;
+}

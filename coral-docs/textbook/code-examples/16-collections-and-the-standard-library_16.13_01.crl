@@ -1,0 +1,69 @@
+import(lib) std::io::ios { println, readLine };
+import(lib) std::text::strutil { splitVec, trim };
+import(lib) std::collections.hashmap { HashMap, HashMapEntry };
+import(lib) std::collections.priorityqueue { PriorityQueue };
+import(lib) std::text::string { String };
+
+// The keys are owned Strings, so hash and compare their bytes (FNV-1a).
+usize hashString(String s) {
+    str v = s.asView();
+    u64 h = 14695981039346656037u;
+    for (usize i = 0; i < v.len; i += 1) {
+        h ^= (u64)(u8)v.ptr[i];
+        h *= 1099511628211u;
+    }
+    return h;
+}
+bool eqString(String a, String b) { return a.asView().equals(b.asView()); }
+
+struct WordCount {
+    str word;            // a view; valid while the map that owns it lives
+    i32 count;
+}
+
+bool moreFrequent(WordCount a, WordCount b) {
+    return a.count > b.count;          // under `less`, larger counts pop first
+}
+
+void freeEntry(HashMapEntry<String, i32>* e) { e->key.free(); }
+
+void main() {
+    HashMap<String, i32> counts = HashMap<String, i32>::new(hashString, eqString);
+
+    String line = String::new();
+    while (readLine(&line)) {
+        if (line.isEmpty()) break;
+        for (str raw : splitVec(line.asView(), ' ')) {
+            str trimmed = trim(raw);
+            if (trimmed.len == 0) continue;
+
+            String key = String::from(trimmed);   // take a copy we can own
+            key.toLower();
+            Option<i32*> slot = counts.getPtr(key);
+            if (slot.isSome()) {
+                i32* p = slot.unwrap();
+                *p = *p + 1;
+                key.free();                       // already present; drop the probe
+            } else {
+                (void)counts.insert(key, 1).unwrap();   // the map keeps this buffer
+            }
+        }
+    }
+
+    PriorityQueue<WordCount> top = PriorityQueue<WordCount>::new(moreFrequent);
+    Vec<String> words = counts.keys();            // shallow copies sharing the map's buffers
+    for (usize i = 0; i < words.count(); i += 1) {
+        String w = words.at(i);
+        top.push(WordCount { .word = w.asView(), .count = counts.get(w).unwrap() });
+    }
+
+    for (i32 i = 0; i < 10 && !top.isEmpty(); i += 1) {
+        WordCount wc = top.pop();
+        println("{}: {}", wc.word, wc.count);
+    }
+
+    counts.eachEntry(freeEntry);   // free every key buffer the map owns ...
+    counts.dispose();              // ... then the hash table's storage
+    words.dispose();
+    top.dispose();
+}

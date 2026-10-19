@@ -1,0 +1,89 @@
+import(lib) std::io::fs { readFileToString, fileOpen, fileClose, fileSeek,
+                           File, IoError, SEEK_SET };
+import(lib) std::io::bio { FileReader };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+import(lib) std::collections::hashmap { HashMap };
+import(lib) std::option { Option };
+
+// The same djb2 hash as 41.3; eqView must match it.
+usize hashView(str s) {
+    usize h = 5381;
+    for (usize i = 0; i < s.len; i += 1) h = h * 33 + (usize)s.at(i);
+    return h;
+}
+
+bool eqView(str a, str b) { return a.equals(b); }
+
+// One pass over the in-memory log; each key maps to the offset of its
+// newest record. Later inserts overwrite earlier ones, so last wins.
+void buildIndex(str log, HashMap<str, usize>* index) {
+    usize off = 0;
+    // Parse guard: stop unless a full 8-byte header remains.
+    while (off + 8 <= log.len) {
+        // Read keyLen then valLen, both little-endian.
+        u32 klen = (u32)log.at(off) | ((u32)log.at(off + 1) << 8) |
+                   ((u32)log.at(off + 2) << 16) | ((u32)log.at(off + 3) << 24);
+        u32 vlen = (u32)log.at(off + 4) | ((u32)log.at(off + 5) << 8) |
+                   ((u32)log.at(off + 6) << 16) | ((u32)log.at(off + 7) << 24);
+        // Record size: two lengths, payloads, then the CRC trailer.
+        usize recLen = 8 + (usize)klen + (usize)vlen + 4;  // + crc trailer
+        // A record that runs past the end is a torn tail: stop.
+        if (off + recLen > log.len) break;               // truncated tail
+        // The key is a view into the log buffer.
+        str key = log.slice(off + 8, off + 8 + (usize)klen);
+        // A repeated key overwrites, so the last offset wins.
+        index->insert(key, off);                         // view into log
+        off += recLen;
+    }
+}
+
+// Seek straight to the indexed record and read only that one.
+bool indexedGet(str path, str key, HashMap<str, usize>* index, String* out) {
+    // Absent key: never written, so fail.
+    Option<usize> slot = index->get(key);
+    if (slot.isNone()) return false;                     // never written
+    usize off = slot.unwrap();
+
+    Result<File, IoError> fo = fileOpen(path, "r");
+    if (fo.isErr()) return false;
+    File f = fo.unwrap();
+    FileReader r = FileReader::fromFd(f);
+    fileSeek(f, (isize)off, SEEK_SET);                   // skip everything before
+
+    // Read the two length prefixes from the indexed record.
+    u8 hb[8];
+    if (r.readBytes(hb, 8).isErr()) { fileClose(f); return false; }
+    u32 klen = (u32)hb[0] | ((u32)hb[1] << 8) | ((u32)hb[2] << 16) | ((u32)hb[3] << 24);
+    u32 vlen = (u32)hb[4] | ((u32)hb[5] << 8) | ((u32)hb[6] << 16) | ((u32)hb[7] << 24);
+    if (klen > 255u || vlen > 255u) { fileClose(f); return false; }
+    u8 kbuf[256];
+    u8 vbuf[256];
+    // Read the payloads; a short read fails the lookup.
+    if (r.readBytes(kbuf, (u64)klen).isErr() || r.readBytes(vbuf, (u64)vlen).isErr()) {
+        fileClose(f);
+        return false;
+    }
+    out->clear();
+    out->appendView(str::fromParts(vbuf, (usize)vlen));
+    fileClose(f);
+    return true;
+}
+
+void main() {
+    String path = String::from("/tmp/coral-kv.log");
+    Result<String, IoError> rr = readFileToString(path.asView());
+    if (rr.isErr()) { println("no log yet (run 41.7 first)"); return; }
+    String log = rr.unwrap();                // owns the bytes the keys view
+
+    // Build the index once, then use it for lookups.
+    HashMap<str, usize> index = HashMap<str, usize>::new(hashView, eqView);
+    buildIndex(log.asView(), &index);
+    println("indexed {} keys", index.count());
+
+    String v = String::new();
+    if (indexedGet(path.asView(), "alpha", &index, &v))
+        println("alpha = {}", v.asView());
+    else
+        println("alpha absent");
+}

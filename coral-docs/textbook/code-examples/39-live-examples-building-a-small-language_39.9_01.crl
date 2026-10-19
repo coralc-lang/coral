@@ -1,0 +1,170 @@
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::collections.hashmap { HashMap };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::result { Result };
+import(lib) std::io::ios { println, readLine };
+
+// the tokenizer, tree, and parser helpers are as in 39.1 through 39.6
+variant ParseError {
+    Unexpected { str what; usize pos; }
+    TrailingTokens { usize pos; }
+}
+
+// a fresh parser per line; the environment persists across lines
+struct Parser {
+    Vec<Token> toks;
+    usize pos;
+    // failed latches once per line; the first error is kept
+    bool failed;
+    ParseError err;
+}
+
+void fail(Parser* p, str what, usize pos) {
+    // first error wins; later ones are usually downstream symptoms
+    if (p->failed) return;
+    p->failed = true;
+    p->err = ParseError::Unexpected { .what = what, .pos = pos };
+}
+
+// expect consumes the wanted token or records an error and moves on
+Token expect(Parser* p, TokenKind k, str what) {
+    if (check(p, k)) return advance(p);
+    Token t = peek(p);
+    fail(p, what, t.pos);
+    return t;
+}
+
+// the statement grammar is deliberately small: three forms
+Stmt* parseStatement(Parser* p) {
+    // print is a keyword, so it is recognized before names
+    if (check(p, TokenKind::Print)) {
+        advance(p);
+        Expr* value = parseExpr(p);
+        expect(p, TokenKind::Semi, "expected ';' after print");
+        return mkPrint(value);
+    }
+    // a leading name followed by '=' is an assignment
+    if (check(p, TokenKind::Ident)) {
+        Token name = peek(p);
+        if (p->toks.at(p->pos + 1).kind == TokenKind::Assign) {
+            advance(p);
+            advance(p);
+            Expr* value = parseExpr(p);
+            expect(p, TokenKind::Semi, "expected ';' after assignment");
+            return mkAssign(name.text, value);
+        }
+    }
+    // anything else is an expression statement, which a REPL echoes
+    Expr* value = parseExpr(p);
+    expect(p, TokenKind::Semi, "expected ';'");
+    return mkExprStmt(value);
+}
+
+Result<Stmt*, ParseError> parseLine(str src) {
+    Parser p = Parser {
+        .toks = tokenize(src), .pos = 0, .failed = false,
+        .err = ParseError::TrailingTokens { .pos = 0 }
+    };
+    Stmt* s = parseStatement(&p);
+    if (!p.failed && !check(&p, TokenKind::Eof)) {
+        p.failed = true;
+        p.err = ParseError::TrailingTokens { .pos = peek(&p).pos };
+    }
+    if (p.failed) return Result<Stmt*, ParseError>::Err { .error = p.err };
+    return Result<Stmt*, ParseError>::Ok { .value = s };
+}
+
+// the environment owns its keys, because the input line is reused
+usize hashString(String key) {
+    // hash the bytes the String owns, via a borrowed view
+    str s = key.asView();
+    usize h = 5381;
+    for (usize i = 0; i < s.len; i += 1) {
+        h = h * 33 + (usize)s.at(i);
+    }
+    return h;
+}
+
+// compare contents, not pointers: two copies of "x" are equal
+bool eqString(String a, String b) { return a.equalsView(b.asView()); }
+
+void assign(HashMap<String, i64>* env, str name, i64 value) {
+    // copy the name so it survives the next readLine
+    String key = String::from(name);
+    bool existed = env->get(key).isSome();
+    env->insert(key, value);
+    // on overwrite the map keeps its old key, so this copy is redundant
+    if (existed) key.free();
+}
+
+i64 lookup(HashMap<String, i64>* env, str name) {
+    // the map is keyed by owned String, so build a temporary key
+    String key = String::from(name);
+    i64 v = env->get(key).unwrapOr(0);
+    // the temporary key is freed as soon as the lookup finishes
+    key.free();
+    return v;
+}
+
+// the evaluator is identical to 39.6 except for the key type
+i64 eval(Expr* e, HashMap<String, i64>* env) {
+    Expr node = *e;
+    switch (node) {
+        Expr::Num { value } => return value,
+        Expr::Var { name } => return lookup(env, name),
+        Expr::Neg { operand } => return -eval(operand, env),
+        Expr::Bin { op, left, right } => {
+            i64 l = eval(left, env);
+            i64 r = eval(right, env);
+            switch (op) {
+                Op::Add => return l + r,
+                Op::Sub => return l - r,
+                Op::Mul => return l * r,
+                Op::Div => return r == 0 ? 0 : l / r,
+                Op::Less => return l < r ? 1 : 0,
+                Op::Greater => return l > r ? 1 : 0,
+            }
+        },
+    }
+}
+
+// three statement forms in the REPL
+void runStmt(Stmt* s, HashMap<String, i64>* env) {
+    Stmt st = *s;
+    switch (st) {
+        Stmt::Assign { name, value } => assign(env, name, eval(value, env)),
+        // at a terminal, a print and a bare expression both show a value
+        Stmt::Print { value } => println("{}", eval(value, env)),
+        Stmt::ExprStmt { value } => println("{}", eval(value, env)),
+    }
+}
+
+void report(ParseError e) {
+    // errors report a byte offset into the current line
+    switch (e) {
+        ParseError::Unexpected { what, pos } => println("error at {}: {}", pos, what),
+        ParseError::TrailingTokens { pos } => println("error at {}: trailing tokens", pos),
+    }
+}
+
+void main() {
+    HashMap<String, i64> env = HashMap<String, i64>::new(hashString, eqString);
+    // one reused buffer holds every line the user types
+    String line = String::new();
+    println("tiny repl; type statements, ctrl-d to quit");
+    // readLine returns false only at end of input
+    while (readLine(&line)) {
+        // a blank line produces no statement and no output
+        if (line.isEmpty()) continue;
+        Result<Stmt*, ParseError> r = parseLine(line.asView());
+        // a bad line is reported and skipped; the session continues
+        if (r.isErr()) {
+            report(r.unwrapErr());
+            continue;
+        }
+        runStmt(r.unwrap(), &env);
+    }
+    line.free();
+    env.dispose();
+}

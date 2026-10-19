@@ -1,0 +1,40 @@
+import(lib) std::concurrent::async;
+import(lib) std::io::ios { println };
+
+pub void producerStage(rawptr arg) {
+    async::AsyncChannel* ch = (async::AsyncChannel*)arg;
+    // the producer emits five values with a pause between them
+    for (u64 i = 1; i <= 5; i += 1) {
+        async::await(async::sleep(10));       // pretend to do I/O
+        ch->send((rawptr)i);
+    }
+}
+
+pub void consumerStage(rawptr arg) {
+    async::AsyncChannel* ch = (async::AsyncChannel*)arg;
+    // the consumer accumulates whatever it receives
+    u64 total = 0;
+    for (u64 i = 0; i < 5; i += 1) {
+        // await suspends this fiber, freeing its thread for other work
+        Result<rawptr, async::AsyncError> got = async::await(ch->recv());
+        if (got.isOk()) total += (u64)got.unwrap();
+    }
+    println("async total {}", total);
+}
+
+pub i32 main() {
+    // bring up the runtime, then a buffered channel
+    async::init();
+    async::AsyncChannel ch;
+    if (!ch.init(4)) return 1;
+
+    // spawn both stages as fibers; each returns a future
+    Result<async::Future*, async::AsyncError> p = async::spawn(producerStage, (rawptr)&ch);
+    Result<async::Future*, async::AsyncError> c = async::spawn(consumerStage, (rawptr)&ch);
+    if (p.isErr() || c.isErr()) return 1;
+
+    async::run();     // drive until every spawned fiber has finished
+    // scheduler drained; tear the channel down
+    ch.deinit();
+    return 0;
+}

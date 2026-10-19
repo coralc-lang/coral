@@ -1,0 +1,80 @@
+import(lib) std::io::ios { readLine, parseF64, println };
+import(lib) std::text::string { String };
+import(lib) std::vec { Vec };
+
+// the bounds are named constants instead of inline magic numbers
+pub const f64 MIN_SCORE = 0.0;
+pub const f64 MAX_SCORE = 100.0;
+
+pub struct Record {
+    f64 score;      // the name is validated here; a real program would keep
+                    // an owned copy, since a str would view the reused line
+}
+
+pub variant ParseError {
+    // every rejection reason is a distinct case
+    NoComma      { str text; },
+    BadScore     { str text; },
+    OutOfRange   { f64 value; },
+}
+
+// one concern: turn a line into a record or an error
+pub Result<Record, ParseError> parseRecord(str line) {
+    usize comma = line.findByte(',');
+    if (comma >= line.len)
+        return Result<Record, ParseError>::Err { .error = ParseError::NoComma { .text = line } };
+
+    str scoreText = str::fromParts(line.ptr + comma + 1, line.len - comma - 1);
+
+    bool ok;
+    f64 value = parseF64(scoreText, &ok);
+    if (!ok)
+        return Result<Record, ParseError>::Err { .error = ParseError::BadScore { .text = scoreText } };
+    // range check against the named bounds
+    if (value < MIN_SCORE || value > MAX_SCORE)
+        return Result<Record, ParseError>::Err { .error = ParseError::OutOfRange { .value = value } };
+
+    return Result<Record, ParseError>::Ok { .value = Record { .score = value } };
+}
+
+pub struct Summary {
+    // the computed statistics, ready for display
+    u32 valid;
+    u32 rejected;
+    f64 sum;
+}
+
+// one concern: the statistics, with no I/O and no formatting
+pub Summary summarise(const Vec<Record>* records, u32 rejected) {
+    f64 sum = 0.0;
+    for (usize i = 0; i < records->count(); i += 1) sum += records->at(i).score;
+    return Summary { .valid = (u32)records->count(), .rejected = rejected, .sum = sum };
+}
+
+// one concern: the presentation; "no scores" is a real case, not a sentinel
+pub void printReport(const Summary* s) {
+    println("=== Report ===");
+    println("records: {}", s->valid);
+    println("bad:     {}", s->rejected);
+    // valid == 0 is the honest test; a zero average prints as zero
+    if (s->valid == 0)
+        println("average: n/a");
+    else
+        println("average: {}", s->sum / (f64)s->valid);
+}
+
+pub void main() {
+    // main is now composition: parse, summarise, print
+    Vec<Record> records = Vec<Record>::new();
+    u32 rejected = 0;
+    String line = String::new();
+    while (readLine(&line)) {
+        // the Result forces us to count the rejected lines
+        switch (parseRecord(line.asView())) {
+            Result::Ok { value }  => records.push(value),
+            Result::Err { error } => rejected += 1,
+        }
+    }
+    Summary s = summarise(&records, rejected);
+    printReport(&s);
+}

@@ -1,0 +1,108 @@
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::io::ios { println };
+
+bool rotationLess(str s, usize i, usize j) {
+    usize n = s.len;
+    // compare the two rotations character by character
+    for (usize k = 0; k < n; k += 1) {
+        u8 a = s.at((i + k) % n);
+        u8 b = s.at((j + k) % n);
+        // the first differing character decides the order
+        if (a != b) return a < b;
+    }
+    // identical rotations compare as equal
+    return false;
+}
+
+void sortRotations(str s, Vec<usize>* idx) {
+    // insertion sort; it is stable, which matters for equal rotations
+    for (usize i = 1; i < idx->count(); i += 1) {
+        usize key = idx->at(i);
+        isize j = (isize)i - 1;
+        // shift larger rotations right to open a slot for key
+        while (j >= 0 && rotationLess(s, key, idx->at((usize)j))) {
+            idx->set((usize)(j + 1), idx->at((usize)j));
+            j -= 1;
+        }
+        // drop key into its sorted place
+        idx->set((usize)(j + 1), key);
+    }
+}
+
+String bwtEncode(str s, usize* primaryIndex) {
+    usize n = s.len;
+    String last = String::new();
+    *primaryIndex = 0;
+    if (n == 0) return last;
+    Vec<usize> idx = Vec<usize>::new();
+    // each rotation is identified by the index it starts at
+    for (usize i = 0; i < n; i += 1) idx.push(i);
+    // sort the start indices by their rotation
+    sortRotations(s, &idx);
+    // the last column holds the character just before each rotation's start
+    for (usize i = 0; i < n; i += 1) {
+        usize start = idx.at(i);
+        last.pushByte(s.at((start + n - 1) % n));
+    }
+    // find the row that is the unrotated string; the inverse needs it
+    for (usize i = 0; i < n; i += 1) {
+        if (idx.at(i) == 0) {
+            *primaryIndex = i;
+            break;
+        }
+    }
+    return last;
+}
+
+String bwtDecode(str last, usize primary) {
+    usize n = last.len;
+    String out = String::new();
+    if (n == 0) return out;
+    Vec<usize> count = Vec<usize>::new();
+    for (usize i = 0; i < 256; i += 1) count.push(0);
+    // count how often each byte appears in the last column
+    for (usize i = 0; i < n; i += 1) {
+        u8 b = last.at(i);
+        count.set((usize)b, count.at((usize)b) + 1);
+    }
+    Vec<usize> C = Vec<usize>::new();
+    usize total = 0;
+    // C[b] is where byte b's block begins in the first column
+    for (usize i = 0; i < 256; i += 1) {
+        C.push(total);
+        total += count.at(i);
+    }
+    // occ tracks how many times each byte has been seen so far
+    Vec<usize> occ = Vec<usize>::new();
+    for (usize i = 0; i < 256; i += 1) occ.push(0);
+    Vec<usize> lf = Vec<usize>::new();
+    // lf maps a last-column row to its row in the first column
+    for (usize i = 0; i < n; i += 1) {
+        u8 b = last.at(i);
+        // rank within the byte's block, plus the block's start
+        lf.push(C.at((usize)b) + occ.at((usize)b));
+        occ.set((usize)b, occ.at((usize)b) + 1);
+    }
+    // start at the row holding the original string
+    usize row = primary;
+    // follow the last-to-first links, emitting one byte per step
+    for (usize k = 0; k < n; k += 1) {
+        out.pushByte(last.at(row));
+        row = lf.at(row);
+    }
+    // the walk yields the string backward, so flip it
+    out.reverse();
+    return out;
+}
+
+void main() {
+    str text = "banana";
+    usize primary = 0;
+    String last = bwtEncode(text, &primary);
+    String back = bwtDecode(last.asView(), primary);
+    println("input     {}", text);
+    println("bwt       {}", last.asView());
+    println("primary   {}", primary);
+    println("roundtrip {}", back.asView().equals(text));
+}

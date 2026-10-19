@@ -1,0 +1,73 @@
+import(lib) std::io::net {
+    tcpListen, tcpAccept, tcpSend, tcpRecv, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::text::string { String };
+import(lib) std::fmt::fmt { formatInt };
+import(lib) std::mman { alloc, dealloc };
+
+// Read request headers until CRLFCRLF, or the peer closes, or the cap.
+void readHeaders(TcpSocket client, u8* hdr, usize cap)
+{
+    // Track how many head bytes have been collected so far.
+    usize used = 0;
+    while (used < cap)
+    {
+        u8 b = 0;
+        // One byte at a time so the CRLFCRLF boundary cannot be overshot.
+        Result<isize, IoError> r = tcpRecv(client, &b, 1);
+        if (r.isErr()) break;
+        if (r.unwrap() == 0) break;
+        // Store the byte, then test the last four for the blank line.
+        hdr[used] = b;
+        used += 1;
+        if (used >= 4 &&
+            hdr[used - 4] == (u8)'\r' && hdr[used - 3] == (u8)'\n' &&
+            hdr[used - 2] == (u8)'\r' && hdr[used - 1] == (u8)'\n')
+            break;
+    }
+}
+
+// Answer one request with a fixed page and close the connection.
+void serveOnce(TcpSocket client)
+{
+    // The page never changes; the request path is ignored.
+    str body = "<!doctype html><title>hi</title><p>Hello from Coral.</p>\n";
+    // Read and discard the request head; only its ending blank line matters.
+    u8* hdr = alloc<u8>(4096);
+    if (hdr == null) { tcpClose(client); return; }
+    readHeaders(client, hdr, 4096);
+    dealloc<u8>(hdr);
+
+    // Derive Content-Length from the body so the two can never disagree.
+    String response = String::from("HTTP/1.0 200 OK\r\n");
+    response.appendView("Content-Type: text/html; charset=utf-8\r\n");
+    response.appendView("Content-Length: ");
+    String length = formatInt((i64)body.len, 10u, false);
+    response.appendView(length.asView());
+    response.appendView("\r\nConnection: close\r\n\r\n");
+    response.appendView(body);
+
+    // One send for status line, headers, and body; the library loops.
+    str out = response.asView();
+    tcpSend(client, out.ptr, out.len);
+    tcpClose(client);
+}
+
+i32 main()
+{
+    Result<TcpSocket, IoError> server = tcpListen((u16)8080);
+    if (server.isErr()) { println("could not listen on port 8080"); return 1; }
+    TcpSocket listener = server.unwrap();
+    println("serving a fixed page on http://127.0.0.1:8080/");
+
+    // HTTP/1.0 sends one request per connection, so a serial loop suffices.
+    while (true)
+    {
+        Result<TcpSocket, IoError> conn = tcpAccept(listener);
+        if (conn.isErr()) break;
+        serveOnce(conn.unwrap());
+    }
+    tcpClose(listener);
+    return 0;
+}

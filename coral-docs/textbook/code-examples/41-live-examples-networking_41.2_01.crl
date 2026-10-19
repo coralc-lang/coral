@@ -1,0 +1,41 @@
+import(lib) std::io::net {
+    tcpConnect, tcpRecv, tcpSend, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::text::string { String };
+
+i32 main()
+{
+    // Connect to the echo server of 40.1 on the loopback address.
+    Result<TcpSocket, IoError> opened = tcpConnect("127.0.0.1", (u16)8080);
+    if (opened.isErr())
+    {
+        println("connect failed, is the echo server from 40.1 running?");
+        return 1;
+    }
+    TcpSocket sock = opened.unwrap();
+
+    // The request is a str; ptr and len give tcpSend its bytes and count.
+    str line = "hello from the client\n";
+    Result<isize, IoError> sent = tcpSend(sock, line.ptr, line.len);
+    if (sent.isErr()) { tcpClose(sock); return 1; }
+
+    // The reply length is unknown, so grow an owned String as bytes land.
+    String reply = String::new();
+    u8 b = 0;
+    // Read one byte at a time until newline or close, capping the result.
+    while (reply.len < 256)
+    {
+        Result<isize, IoError> r = tcpRecv(sock, &b, 1);
+        if (r.isErr()) break;
+        if (r.unwrap() == 0) break;
+        // Accumulate the byte, then stop once the terminator is seen.
+        reply.pushByte(b);
+        if (b == (u8)'\n') break;              // the line is complete
+    }
+
+    // asView() prints exactly the bytes received, NUL and all.
+    println("client received: {}", reply.asView());
+    tcpClose(sock);
+    return 0;
+}

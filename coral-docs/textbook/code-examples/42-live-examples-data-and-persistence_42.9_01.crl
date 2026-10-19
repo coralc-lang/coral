@@ -1,0 +1,42 @@
+import(lib) std::io::fs { writeFileFromString, renameFile, deleteFile, IoError };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+
+// Write `data` to `target` by writing a sibling temp file and renaming
+// it over the target. On return the target is entirely old or entirely
+// new; on failure the target is exactly as it was.
+bool atomicWrite(str target, const String* data) {
+    // Copy the target path so a suffix can be appended.
+    String tmp = String::from(target);
+    tmp.appendView(".tmp");                  // sibling => same filesystem
+
+    // Write the complete contents to the temporary file.
+    Result<bool, IoError> wr = writeFileFromString(tmp.asView(), data);
+    if (wr.isErr()) {
+        deleteFile(tmp.asView());            // leave nothing behind
+        // Free the temp path string before returning.
+        tmp.free();
+        return false;
+    }
+
+    // Swap the temp into place; rename is atomic on one filesystem.
+    Result<bool, IoError> rn = renameFile(tmp.asView(), target);
+    if (rn.isErr()) {
+        deleteFile(tmp.asView());            // and keep the old target
+        // Free the temp path string before returning.
+        tmp.free();
+        return false;
+    }
+    tmp.free();
+    return true;
+}
+
+void main() {
+    String path = String::from("/tmp/coral-state.txt");
+    String first = String::from("generation 1\n");
+    String second = String::from("generation 2\n");
+
+    // Publish the first contents, then replace them with the second.
+    if (atomicWrite(path.asView(), &first)) println("published 1");
+    if (atomicWrite(path.asView(), &second)) println("published 2");
+}

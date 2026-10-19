@@ -1,0 +1,95 @@
+import(lib) std::io::fs { readFileToString, IoError };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+import(lib) std::text::strutil { splitVec };
+import(lib) std::vec { Vec };
+
+// A parsed field, plus whether it was written in quotes.
+struct Field {
+    str text;
+    bool quoted;
+}
+
+// Parse one line into fields; quoted fields may hold commas.
+Vec<Field> parseCsvLine(str line) {
+    Vec<Field> fields = Vec<Field>::new();
+    usize i = 0;
+    // Walk the line; i is the position of the next unread byte.
+    while (i <= line.len) {
+        if (i == line.len) {
+            break;
+        }
+        // A leading quote begins a quoted field.
+        if (line.at(i) == (u8)'"') {
+            i += 1;
+            usize start = i;
+            // A quoted field cannot be returned as a single view if it
+            // contains doubled quotes, so build only when needed.
+            usize extraQuotes = 0;
+            usize scan = i;
+            // Scan to the closing quote, skipping doubled pairs.
+            while (scan < line.len) {
+                if (line.at(scan) == (u8)'"') {
+                    if (scan + 1 < line.len && line.at(scan + 1) == (u8)'"') {
+                        extraQuotes += 1;
+                        scan += 2;
+                        continue;
+                    }
+                    break;
+                }
+                scan += 1;
+            }
+            // No escapes: the field is a zero-copy slice of the line.
+            if (extraQuotes == 0) {
+                fields.push(Field { .text = line.slice(start, scan),
+                                    .quoted = true });
+            } else {
+                // Escaped: build a decoded copy of the field.
+                usize cap = (scan - start) - extraQuotes;
+                // Reserve exactly once so views into buf stay valid.
+                String buf = String::withCap(cap + 1);
+                usize p = start;
+                while (p < scan) {
+                    if (line.at(p) == (u8)'"' && p + 1 < scan &&
+                        line.at(p + 1) == (u8)'"') {
+                        buf.pushChar((u8)'"');
+                        p += 2;
+                    } else {
+                        buf.pushChar(line.at(p));
+                        p += 1;
+                    }
+                }
+                fields.push(Field { .text = buf.asView(), .quoted = true });
+            }
+            // Skip the closing quote and, if present, the comma.
+            i = scan + 1;
+            if (i < line.len && line.at(i) == (u8)',') i += 1;
+        } else {
+            // Bare field: scan to the next comma.
+            usize start = i;
+            while (i < line.len && line.at(i) != (u8)',') i += 1;
+            fields.push(Field { .text = line.slice(start, i),
+                                .quoted = false });
+            if (i < line.len) i += 1;
+        }
+    }
+    return fields;
+}
+
+void describe(str line) {
+    Vec<Field> fs = parseCsvLine(line);
+    // Header count, then one indented line per field.
+    println("{} fields:", fs.count());
+    for (usize i = 0; i < fs.count(); i += 1) {
+        Field f = fs.at(i);
+        println("  [{}] {}{}", i, if (f.quoted) "Q " else "B ", f.text);
+    }
+}
+
+void main() {
+    // Exercise bare, escaped, embedded-comma, and empty lines.
+    describe("Ada Lovelace,36,91.5");
+    describe("\"Grace \"\"Amazing\"\" Hopper\",45,99.25");
+    describe("\"a,b\",c");
+    describe("");
+}

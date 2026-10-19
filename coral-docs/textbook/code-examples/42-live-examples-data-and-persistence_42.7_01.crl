@@ -1,0 +1,107 @@
+import(lib) std::io::fs { fileOpen, fileClose, deleteFile, File, IoError };
+import(lib) std::io::bio { FileReader, FileWriter };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+
+const u32 KV_MAX_FIELD = 255u;               // one stack buffer per field
+
+// Same reflected CRC-32 as 41.6, threaded so key and value hash in turn.
+u32 crc32Update(u32 crc, const u8* data, usize len) {
+    u32 c = crc;
+    for (usize i = 0; i < len; i += 1) {
+        c ^= (u32)data[i];
+        for (u8 k = 0; k < 8; k += 1)
+            c = (c & 1u) != 0 ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
+    }
+    return c;
+}
+
+// Read a 4-byte little-endian u32, or fail at EOF.
+bool readU32Le(FileReader* r, u32* out) {
+    u8 b[4];
+    if (r->readBytes(b, 4).isErr()) return false;  // clean EOF or error
+    *out = (u32)b[0] | ((u32)b[1] << 8) | ((u32)b[2] << 16) | ((u32)b[3] << 24);
+    return true;
+}
+
+// Append one record: lengths, key, value, then a CRC trailer.
+bool kvPut(str path, str key, str val) {
+    if (key.len > KV_MAX_FIELD || val.len > KV_MAX_FIELD) return false;
+
+    Result<File, IoError> fo = fileOpen(path, "a");   // create + append
+    // Error path: cannot open for append, so report failure.
+    if (fo.isErr()) return false;
+    File f = fo.unwrap();
+    FileWriter w = FileWriter::fromFd(f);
+
+    // CRC the key, then extend it over the value.
+    u32 crc = crc32Update(0xFFFFFFFFu, key.asU8(), key.len);
+    crc = crc32Update(crc, val.asU8(), val.len) ^ 0xFFFFFFFFu;
+
+    w.writeU32Le((u32)key.len);              // lengths first, then payload
+    w.writeU32Le((u32)val.len);
+    w.writeBytes(key.asU8(), key.len);
+    w.writeBytes(val.asU8(), val.len);
+    w.writeU32Le(crc);                       // trailer last
+    fileClose(f);
+    return true;
+}
+
+// Scan the log; the last record for `key` wins, and an empty value is
+// a tombstone meaning the key is deleted.
+bool kvGet(str path, str key, String* out) {
+    // Mode "r" opens an existing log; a missing file is an error.
+    Result<File, IoError> fo = fileOpen(path, "r");
+    if (fo.isErr()) return false;
+    File f = fo.unwrap();
+    FileReader r = FileReader::fromFd(f);
+
+    bool found = false;
+    // Read records until EOF or a malformed one stops the scan.
+    while (true) {
+        u32 klen = 0;
+        u32 vlen = 0;
+        if (!readU32Le(&r, &klen)) break;             // end of log
+        if (!readU32Le(&r, &vlen)) break;             // truncated record
+        if (klen > KV_MAX_FIELD || vlen > KV_MAX_FIELD) break;  // corrupt
+        // Fixed stack buffers; the length check above bounds them.
+        u8 kbuf[256];
+        u8 vbuf[256];
+        if (r.readBytes(kbuf, (u64)klen).isErr()) break;
+        if (r.readBytes(vbuf, (u64)vlen).isErr()) break;
+        u32 storedCrc = 0;
+        // Read the CRC trailer, if present.
+        if (!readU32Le(&r, &storedCrc)) break;
+
+        // Recompute the CRC over key plus value.
+        u32 crc = crc32Update(0xFFFFFFFFu, kbuf, (usize)klen);
+        crc = crc32Update(crc, vbuf, (usize)vlen) ^ 0xFFFFFFFFu;
+        if (crc != storedCrc) continue;       // skip a corrupt record
+
+        // Only the record for our key matters.
+        str recKey = str::fromParts(kbuf, (usize)klen);
+        if (recKey.equals(key)) {
+            out->clear();
+            out->appendView(str::fromParts(vbuf, (usize)vlen));
+            found = vlen > 0;                 // empty value deletes
+        }
+    }
+    fileClose(f);
+    return found;
+}
+
+void main() {
+    // Start from a clean log so the demo is deterministic.
+    String path = String::from("/tmp/coral-kv.log");
+    deleteFile(path.asView());                // start from a clean log
+    kvPut(path.asView(), "alpha", "1");
+    kvPut(path.asView(), "beta", "2");
+    kvPut(path.asView(), "alpha", "3");       // overwrite: last wins
+
+    // Look up two existing keys and one absent key.
+    String v = String::new();
+    if (kvGet(path.asView(), "alpha", &v)) println("alpha = {}", v.asView());
+    if (kvGet(path.asView(), "beta", &v)) println("beta = {}", v.asView());
+    if (kvGet(path.asView(), "gamma", &v)) println("gamma = {}", v.asView());
+    else println("gamma absent");
+}

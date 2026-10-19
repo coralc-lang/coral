@@ -1,0 +1,112 @@
+import(lib) std::concurrent::mutex { Mutex };
+import(lib) std::concurrent::thread {
+    ConditionVar, threadCreate, threadJoin, Thread, ThreadError
+};
+import(lib) std::mman { alloc, dealloc };
+
+pub struct Queue {
+    // all fields below are guarded by this one mutex
+    Mutex mutex;
+    ConditionVar itemReady;
+    ConditionVar roomFree;
+    u64* items;
+    usize cap;
+    usize head;          // index of the oldest live slot
+    usize count;         // how many slots are currently live
+    bool closed;
+
+    bool init(usize capacity) {
+        // one contiguous block of ring slots
+        self.items = alloc<u64>(capacity);
+        if (self.items == null) return false;
+        self.mutex.init();
+        self.itemReady.init();
+        self.roomFree.init();
+        self.cap = capacity;
+        self.head = 0;
+        self.count = 0;
+        self.closed = false;
+        return true;
+    }
+
+    void destroy() {
+        // tear down synchronisation, then free the ring
+        self.mutex.destroy();
+        self.itemReady.destroy();
+        self.roomFree.destroy();
+        dealloc<u64>(self.items);
+    }
+
+    void push(u64 value) {
+        // take the lock before touching any shared field
+        self.mutex.lock();
+        // wait in a loop: recheck the full condition after every wake
+        while (self.count == self.cap && !self.closed)
+            self.roomFree.wait(&self.mutex);
+        // shutdown wins over a pending push
+        if (self.closed) { self.mutex.unlock(); return; }
+
+        // ring write at the tail; count tracks the live slots
+        self.items[(self.head + self.count) % self.cap] = value;
+        self.count += 1;
+        self.itemReady.signal();
+        self.mutex.unlock();
+    }
+
+    bool pop(u64* out) {
+        self.mutex.lock();
+        // same loop protocol, this time for the empty condition
+        while (self.count == 0 && !self.closed)
+            self.itemReady.wait(&self.mutex);
+        if (self.count == 0) { self.mutex.unlock(); return false; }
+
+        // the output pointer receives one value on success
+        *out = self.items[self.head];
+        // advance head and free a slot, which wakes the producer
+        self.head = (self.head + 1) % self.cap;
+        self.count -= 1;
+        self.roomFree.signal();
+        self.mutex.unlock();
+        return true;
+    }
+
+    void close() {
+        self.mutex.lock();
+        // set the flag under the lock so the wake cannot be missed
+        self.closed = true;
+        // broadcast, not signal: every waiter must see the closure
+        self.itemReady.broadcast();
+        self.roomFree.broadcast();
+        self.mutex.unlock();
+    }
+}
+
+rawptr producer(rawptr arg) {
+    Queue* q = (Queue*)arg;
+    // push one through one hundred, then poison-pill the queue
+    for (u64 i = 1; i <= 100; i += 1) q->push(i);
+    q->close();
+    return null;
+}
+
+rawptr consumer(rawptr arg) {
+    Queue* q = (Queue*)arg;
+    u64 value;
+    u64 sum = 0;
+    // drains until pop reports the queue closed and empty
+    while (q->pop(&value)) sum += value;
+    println("sum {}", sum);
+    return null;
+}
+
+pub i32 main() {
+    Queue q;
+    if (!q.init(16)) return 1;
+    // two threads share the queue; both must join before destroy
+    Result<Thread, ThreadError> p = threadCreate(producer, (rawptr)&q);
+    Result<Thread, ThreadError> c = threadCreate(consumer, (rawptr)&q);
+    if (p.isOk()) threadJoin(p.unwrap(), null);
+    if (c.isOk()) threadJoin(c.unwrap(), null);
+    q.destroy();
+    return 0;
+}

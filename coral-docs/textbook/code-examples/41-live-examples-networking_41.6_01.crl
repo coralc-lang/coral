@@ -1,0 +1,63 @@
+import(lib) std::io::net {
+    udpSocket, udpBind, udpSendTo, udpRecvFrom, udpClose, UdpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::mman { alloc, dealloc };
+
+i32 main()
+{
+    // Receiver: a datagram socket bound to a known local port.
+    Result<UdpSocket, IoError> receiverRes = udpSocket();
+    if (receiverRes.isErr()) return 1;
+    UdpSocket receiver = receiverRes.unwrap();
+    if (udpBind(&receiver, (u16)9999).isErr())
+    {
+        udpClose(&receiver);
+        return 1;
+    }
+
+    // Sender: unbound; the OS assigns a source port on the first send.
+    Result<UdpSocket, IoError> senderRes = udpSocket();
+    if (senderRes.isErr()) { udpClose(&receiver); return 1; }
+    UdpSocket sender = senderRes.unwrap();
+
+    // A datagram keeps its boundary; the bytes travel as one unit.
+    str message = "ping over udp\n";
+    // A UDP send reports only local errors; loss on the wire is silent.
+    Result<isize, IoError> sent =
+        udpSendTo(&sender, message.ptr, message.len, "127.0.0.1", (u16)9999);
+    if (sent.isErr())
+    {
+        println("send failed");
+        udpClose(&sender);
+        udpClose(&receiver);
+        return 1;
+    }
+
+    // A datagram larger than this buffer is truncated with no error.
+    u8* buf = alloc<u8>(512);
+    if (buf == null)
+    {
+        udpClose(&sender);
+        udpClose(&receiver);
+        return 1;
+    }
+
+    // Exactly one datagram is received per call, or the call blocks.
+    Result<isize, IoError> got = udpRecvFrom(&receiver, buf, 512);
+    if (got.isErr())
+    {
+        println("receive failed");
+    }
+    else
+    {
+        isize n = got.unwrap();
+        println("received {} bytes: {}", n, str::fromParts(buf, (usize)n));
+    }
+
+    // Release the buffer and both socket handles.
+    dealloc<u8>(buf);
+    udpClose(&sender);
+    udpClose(&receiver);
+    return 0;
+}

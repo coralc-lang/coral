@@ -1,0 +1,37 @@
+import(lib) std::io::net { tcpConnect, tcpClose, TcpSocket };
+import(lib) std::io::fs { IoError };
+import(lib) std::time { sleepMs };
+
+i32 main()
+{
+    // Three attempts; each tcpConnect may block for the kernel timeout.
+    for (u32 attempt = 1; attempt <= 3; attempt += 1)
+    {
+        // Port 9 is the conventional discard port; nothing is listening,
+        // so this connect is refused immediately on a local host.
+        Result<TcpSocket, IoError> opened = tcpConnect("127.0.0.1", (u16)9);
+        if (opened.isOk())
+        {
+            println("connected on attempt {}", attempt);
+            tcpClose(opened.unwrap());
+            return 0;
+        }
+
+        // Pull the error apart by case; naming all three keeps it exhaustive.
+        IoError e = opened.unwrapErr();
+        switch (e)
+        {
+            IoError::Os { code, op } =>
+                println("attempt {}: {} failed, errno {}", attempt, op, code),
+            IoError::BadUsage { msg } =>
+                println("bad address: {}", msg),
+            IoError::Eof { op } =>
+                println("unexpected end of stream in {}", op),
+        }
+        // Fixed short back-off; a real client would widen it each round.
+        sleepMs(250);
+    }
+
+    println("gave up after three attempts");
+    return 1;
+}

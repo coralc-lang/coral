@@ -1,0 +1,91 @@
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::io::ios { println, print };
+
+enum Op { Add, Sub, Mul, Div, Less, Greater }
+
+variant Expr {
+    Num { i64 value; }
+    Var { str name; }
+    Neg { Expr* operand; }
+    Bin { Op op; Expr* left; Expr* right; }
+}
+
+Expr* mkNum(i64 value) {
+    // one node per allocation; the tag records which case is live
+    Expr* e = alloc<Expr>(1);
+    *e = Expr::Num { .value = value };
+    return e;
+}
+
+Expr* mkVar(str name) {
+    // the name is a view into the source, not a copy
+    Expr* e = alloc<Expr>(1);
+    *e = Expr::Var { .name = name };
+    return e;
+}
+
+Expr* mkNeg(Expr* operand) {
+    // negation holds a single child pointer
+    Expr* e = alloc<Expr>(1);
+    *e = Expr::Neg { .operand = operand };
+    return e;
+}
+
+Expr* mkBin(Op op, Expr* left, Expr* right) {
+    // a binary node is the only case with two children
+    Expr* e = alloc<Expr>(1);
+    *e = Expr::Bin { .op = op, .left = left, .right = right };
+    return e;
+}
+
+str opName(Op op) {
+    // the symbol, for printing a tree back out
+    switch (op) {
+        Op::Add => return "+",
+        Op::Sub => return "-",
+        Op::Mul => return "*",
+        Op::Div => return "/",
+        Op::Less => return "<",
+        Op::Greater => return ">",
+    }
+}
+
+void show(Expr* e) {
+    // copy the variant out so its fields are bound by the switch
+    Expr node = *e;
+    switch (node) {
+        Expr::Num { value } => print("{}", value),
+        Expr::Var { name } => print("{}", name),
+        Expr::Neg { operand } => { print("(- "); show(operand); print(")"); },
+        Expr::Bin { op, left, right } => {
+            // fully parenthesized so grouping is unambiguous
+            print("(");
+            show(left);
+            print(" {} ", opName(op));
+            show(right);
+            print(")");
+        },
+    }
+}
+
+// deallocate bottom-up: children before the parent that points at them
+void freeExpr(Expr* e) {
+    Expr node = *e;
+    switch (node) {
+        // leaves own nothing beneath them
+        Expr::Num | Expr::Var => {},
+        Expr::Neg { operand } => freeExpr(operand),
+        Expr::Bin { left, right } => { freeExpr(left); freeExpr(right); },
+    }
+    // children are freed first, so the parent's pointers are dead here
+    dealloc<Expr>(e);
+}
+
+void main() {
+    // 1 + 2 * 3, built by hand for now; the parser comes next
+    Expr* e = mkBin(Op::Add, mkNum(1), mkBin(Op::Mul, mkNum(2), mkNum(3)));
+    // the printed form should read (+ 1 (* 2 3))
+    show(e);
+    println("");
+    freeExpr(e);
+}

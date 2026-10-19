@@ -1,0 +1,132 @@
+import(lib) std::vec { Vec };
+import(lib) std::io::ios { println };
+
+enum TokenKind {
+    Number, Ident,
+    Plus, Minus, Star, Slash, Less, Greater,
+    LParen, RParen, LBrace, RBrace,
+    Semi, Assign,
+    If, Else, While, Print,
+    Eof,
+}
+
+// a token is a tag, a source offset, a value, and its spelling
+struct Token {
+    TokenKind kind;
+    usize pos;
+    i64 value;
+    str text;
+}
+
+// byte classifiers keep the scanner's branches short
+bool isDigit(u8 c) { return c >= '0' && c <= '9'; }
+
+bool isAlpha(u8 c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool isAlnum(u8 c) { return isAlpha(c) || isDigit(c); }
+
+void pushToken(Vec<Token>* out, TokenKind kind, usize pos, i64 value, str text) {
+    // text is a view into the source; nothing is copied
+    out->push(Token { .kind = kind, .pos = pos, .value = value, .text = text });
+}
+
+Vec<Token> tokenize(str src) {
+    Vec<Token> out = Vec<Token>::new();
+    // i is the cursor over the source bytes
+    usize i = 0;
+    // one pass of the loop produces exactly one token
+    while (i < src.len) {
+        u8 c = src.at(i);
+        // whitespace separates tokens but carries no meaning of its own
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i += 1; continue; }
+        // a number: fold digits with Horner's rule
+        if (isDigit(c)) {
+            usize start = i;
+            i64 value = 0;
+            // consume the whole run of digits, not just the first
+            while (i < src.len && isDigit(src.at(i))) {
+                value = value * 10 + (i64)(src.at(i) - '0');
+                i += 1;
+            }
+            pushToken(&out, TokenKind::Number, start, value, src.slice(start, i));
+            continue;
+        }
+        // a name, or a keyword that looks exactly like one
+        if (isAlpha(c)) {
+            usize start = i;
+            // a name runs until a byte that cannot be part of one
+            while (i < src.len && isAlnum(src.at(i))) i += 1;
+            str word = src.slice(start, i);
+            TokenKind kind = TokenKind::Ident;
+            // the four reserved words are recognized by spelling alone
+            if (word.equals("if")) kind = TokenKind::If;
+            else if (word.equals("else")) kind = TokenKind::Else;
+            else if (word.equals("while")) kind = TokenKind::While;
+            else if (word.equals("print")) kind = TokenKind::Print;
+            pushToken(&out, kind, start, 0, word);
+            continue;
+        }
+        // every other byte is a one-character operator or delimiter
+        // the default is overwritten by whichever case matches below
+        TokenKind kind = TokenKind::Eof;
+        switch (c) {
+            '+' => kind = TokenKind::Plus,
+            '-' => kind = TokenKind::Minus,
+            '*' => kind = TokenKind::Star,
+            '/' => kind = TokenKind::Slash,
+            '<' => kind = TokenKind::Less,
+            '>' => kind = TokenKind::Greater,
+            '(' => kind = TokenKind::LParen,
+            ')' => kind = TokenKind::RParen,
+            '{' => kind = TokenKind::LBrace,
+            '}' => kind = TokenKind::RBrace,
+            ';' => kind = TokenKind::Semi,
+            '=' => kind = TokenKind::Assign,
+            // an unknown byte is skipped: this is a tokenizer, not a checker
+            else => { i += 1; continue; },
+        }
+        // record the operator at its own byte, then step past it
+        pushToken(&out, kind, i, 0, src.slice(i, i + 1));
+        i += 1;
+    }
+    // the End Of File sentinel never has a real position past the source
+    pushToken(&out, TokenKind::Eof, src.len, 0, "");
+    return out;
+}
+
+str kindName(TokenKind k) {
+    // a printable name, used for diagnostics and for this demo
+    switch (k) {
+        TokenKind::Number  => return "Number",
+        TokenKind::Ident   => return "Ident",
+        TokenKind::Plus    => return "Plus",
+        TokenKind::Minus   => return "Minus",
+        TokenKind::Star    => return "Star",
+        TokenKind::Slash   => return "Slash",
+        TokenKind::Less    => return "Less",
+        TokenKind::Greater => return "Greater",
+        TokenKind::LParen  => return "LParen",
+        TokenKind::RParen  => return "RParen",
+        TokenKind::LBrace  => return "LBrace",
+        TokenKind::RBrace  => return "RBrace",
+        TokenKind::Semi    => return "Semi",
+        TokenKind::Assign  => return "Assign",
+        TokenKind::If      => return "If",
+        TokenKind::Else    => return "Else",
+        TokenKind::While   => return "While",
+        TokenKind::Print   => return "Print",
+        TokenKind::Eof     => return "Eof",
+    }
+}
+
+void main() {
+    str src = "x = 1 + 2*3; if x < 10 { print x; }";
+    Vec<Token> toks = tokenize(src);
+    for (usize i = 0; i < toks.count(); i += 1) {
+        Token t = toks.at(i);
+        // the text column is the exact slice the token covers
+        println("{} {}", kindName(t.kind), t.text);
+    }
+}

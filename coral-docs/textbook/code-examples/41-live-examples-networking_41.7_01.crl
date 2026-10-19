@@ -1,0 +1,72 @@
+import(lib) std::io::net {
+    tcpListen, tcpAccept, tcpRecv, tcpSend, tcpClose, TcpSocket
+};
+import(lib) std::io::fs { IoError };
+import(lib) std::concurrent::thread {
+    threadCreate, threadJoin, Thread, ThreadError
+};
+import(lib) std::mman { alloc, dealloc };
+
+// Bound the number of concurrent clients; each gets one thread.
+const u32 MAX_CLIENTS = 4;
+
+// Hand a heap-owned socket to a worker across the thread boundary.
+struct ClientJob { TcpSocket sock; }
+
+// Worker entry point: own the job, echo its socket, then close it.
+rawptr handleClient(rawptr arg)
+{
+    // Recover the job, copy the socket out, and free the job at once.
+    ClientJob* job = (ClientJob*)arg;
+    TcpSocket sock = job->sock;
+    dealloc<ClientJob>(job);                   // the worker owns the job
+
+    u8 b = 0;
+    // Same byte-at-a-time echo as 40.1, but on this worker's own socket.
+    while (true)
+    {
+        // A recv error, a clean close, or a failed send all end the worker.
+        Result<isize, IoError> r = tcpRecv(sock, &b, 1);
+        if (r.isErr()) break;
+        if (r.unwrap() == 0) break;
+        if (tcpSend(sock, &b, 1).isErr()) break;
+    }
+    tcpClose(sock);
+    return null;
+}
+
+i32 main()
+{
+    Result<TcpSocket, IoError> server = tcpListen((u16)8080);
+    if (server.isErr()) return 1;
+    TcpSocket listener = server.unwrap();
+
+    // Keep one join handle per client so the stacks can be reclaimed.
+    Thread* workers = alloc<Thread>((usize)MAX_CLIENTS);
+    if (workers == null) { tcpClose(listener); return 1; }
+
+    // Accept a bounded batch; the server drains it before exiting.
+    u32 accepted = 0;
+    while (accepted < MAX_CLIENTS)
+    {
+        Result<TcpSocket, IoError> conn = tcpAccept(listener);
+        if (conn.isErr()) break;
+
+        // Package the accepted socket so the worker can take ownership.
+        ClientJob* job = alloc<ClientJob>(1);
+        if (job == null) { tcpClose(conn.unwrap()); break; }
+        job->sock = conn.unwrap();
+
+        // Spawn the worker; on failure reclaim both socket and job here.
+        Result<Thread, ThreadError> t = threadCreate(handleClient, (rawptr)job);
+        if (t.isErr()) { tcpClose(job->sock); dealloc<ClientJob>(job); continue; }
+        workers[accepted] = t.unwrap();
+        accepted += 1;
+    }
+
+    // Join every worker so no thread outlives the buffers it used.
+    for (u32 i = 0; i < accepted; i += 1) threadJoin(workers[i], null);
+    dealloc<Thread>(workers);
+    tcpClose(listener);
+    return 0;
+}

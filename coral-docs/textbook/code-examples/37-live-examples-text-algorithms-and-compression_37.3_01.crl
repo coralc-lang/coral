@@ -1,0 +1,74 @@
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::io::ios { println };
+
+struct LzToken {
+    usize offset;
+    usize length;
+    u8 literal;
+}
+
+Vec<LzToken> lz77Encode(str input, usize windowSize) {
+    Vec<LzToken> tokens = Vec<LzToken>::new();
+    usize n = input.len;
+    usize pos = 0;
+    // produce one token per position, advancing pos each time
+    while (pos < n) {
+        // the search window begins windowSize bytes back, or at 0
+        usize start = pos > windowSize ? pos - windowSize : 0;
+        // track the longest match seen so far and how far back it starts
+        usize bestLen = 0;
+        usize bestOff = 0;
+        // try every earlier position inside the window
+        for (usize s = start; s < pos; s += 1) {
+            // measure how far the candidate and current position agree
+            usize l = 0;
+            // the guard keeps the read inside the input
+            while (pos + l < n && input.at(s + l) == input.at(pos + l)) {
+                l += 1;
+            }
+            // a longer match replaces the previous best
+            if (l > bestLen) {
+                bestLen = l;
+                bestOff = pos - s;
+            }
+            // cannot beat matching to the end of input; stop early
+            if (bestLen == n - pos) break;
+        }
+        // the literal that follows the match, or 0 if the match reached the end
+        u8 lit = pos + bestLen < n ? input.at(pos + bestLen) : 0;
+        tokens.push(LzToken {
+            .offset = bestOff, .length = bestLen, .literal = lit
+        });
+        // consume the match plus its terminating literal
+        pos += bestLen + 1;
+    }
+    return tokens;
+}
+
+String lz77Decode(const Vec<LzToken>* tokens) {
+    String out = String::new();
+    for (usize i = 0; i < tokens->count(); i += 1) {
+        LzToken t = tokens->at(i);
+        // a zero-length token means the literal stands alone
+        if (t.length > 0) {
+            // offset is measured back from the current output end
+            usize from = out.len - t.offset;
+            // copy byte by byte so an overlap can read bytes just written
+            for (usize k = 0; k < t.length; k += 1) {
+                out.pushByte(out.at(from + k));
+            }
+        }
+        out.pushByte(t.literal);
+    }
+    return out;
+}
+
+void main() {
+    str text = "abracadabra abracadabra abracadabra";
+    Vec<LzToken> toks = lz77Encode(text, 16);
+    String back = lz77Decode(&toks);
+    println("input  {} bytes", text.len);
+    println("tokens {}", toks.count());
+    println("roundtrip {}", back.asView().equals(text));
+}

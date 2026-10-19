@@ -1,0 +1,132 @@
+import(lib) std::io::ios { println, parseI64 };
+import(lib) std::text::string { String };
+import(lib) std::fmt::fmt { formatInt };
+
+struct Server {
+    String name;                             // owned, so it outlives `json`
+    i32 port;
+    bool tls;
+}
+
+// Write `s` as a JSON string: wrap in quotes, escape " and \ and newline.
+void jsonEscape(String* out, str s) {
+    out->pushChar((u8)'"');
+    for (usize i = 0; i < s.len; i += 1) {
+        u8 c = s.at(i);
+        if (c == (u8)'"' || c == (u8)'\\') {
+            out->pushChar((u8)'\\');         // a backslash before the byte
+            out->pushChar(c);
+        // A newline becomes the two-character escape \n.
+        } else if (c == (u8)'\n') {
+            out->appendView("\\n");          // two characters for a newline
+        } else {
+            out->pushChar(c);                // ordinary byte passes through
+        }
+    }
+    out->pushChar((u8)'"');
+}
+
+// Serialize the struct field by field, in a fixed order.
+String jsonFromServer(const Server* s) {
+    String out = String::from("{");
+    out.appendView("\"name\":");
+    jsonEscape(&out, s->name.asView());
+    out.appendView(",\"port\":");
+    String p = formatInt((i64)s->port, 10u, false);
+    out.appendView(p.asView());
+    out.appendView(",\"tls\":");
+    out.appendView(s->tls ? "true" : "false");
+    out.pushChar((u8)'}');
+    return out;
+}
+
+// Read a JSON string beginning at json.at(i) == '"'; unescape into `out`
+// and return the index just past the closing quote.
+usize jsonReadString(str json, usize i, String* out) {
+    i += 1;                                  // skip the opening quote
+    while (i < json.len) {
+        u8 c = json.at(i);
+        if (c == (u8)'"') { i += 1; break; } // closing quote ends it
+        // A backslash begins a two-byte escape sequence.
+        if (c == (u8)'\\' && i + 1 < json.len) {
+            u8 e = json.at(i + 1);
+            if (e == (u8)'n') out->pushChar((u8)'\n');
+            else out->pushChar(e);           // \" and \\ map to themselves
+            i += 2;                          // consume the pair
+        } else {
+            out->pushChar(c);
+            i += 1;
+        }
+    }
+    return i;
+}
+
+// Advance i past JSON's insignificant whitespace.
+void jsonSkipSpace(str json, usize* i) {
+    while (*i < json.len) {
+        u8 c = json.at(*i);
+        if (c == (u8)' ' || c == (u8)'\t' || c == (u8)'\n') *i += 1;
+        else break;
+    }
+}
+
+// Parse an object into the struct, keyed by field name.
+bool jsonToServer(str json, Server* out) {
+    usize i = 0;
+    jsonSkipSpace(json, &i);
+    if (i >= json.len || json.at(i) != (u8)'{') return false;
+    i += 1;                                  // past the opening brace
+    while (i < json.len) {
+        jsonSkipSpace(json, &i);
+        // A closing brace means the object is complete.
+        if (i < json.len && json.at(i) == (u8)'}') return true;  // done
+        if (i >= json.len || json.at(i) != (u8)'"') return false;
+        String key = String::withCap(16);    // scratch key, freed below
+        i = jsonReadString(json, i, &key);
+        jsonSkipSpace(json, &i);
+        // A missing colon means malformed input.
+        if (i >= json.len || json.at(i) != (u8)':') { key.free(); return false; }
+        i += 1;                              // consume the colon
+        jsonSkipSpace(json, &i);
+        // Dispatch on the key name, not its position.
+        if (key.asView().equals("name")) {
+            out->name.clear();
+            i = jsonReadString(json, i, &out->name);
+        } else if (i < json.len && json.at(i) == (u8)'"') {
+            String discard = String::new();  // unknown string: read and drop
+            i = jsonReadString(json, i, &discard);
+            discard.free();
+        } else {
+            // Otherwise read a bare token up to ',' or '}'.
+            usize start = i;
+            while (i < json.len && json.at(i) != (u8)',' && json.at(i) != (u8)'}') i += 1;
+            str token = json.slice(start, i).trim();
+            bool ok;
+            i64 n = parseI64(token, &ok);
+            // Assign only the matching key.
+            if (ok && key.asView().equals("port")) out->port = (i32)n;
+            if (token.equals("true") && key.asView().equals("tls")) out->tls = true;
+            if (token.equals("false") && key.asView().equals("tls")) out->tls = false;
+        }
+        key.free();
+        jsonSkipSpace(json, &i);
+        // A comma separates this pair from the next.
+        if (i < json.len && json.at(i) == (u8)',') i += 1;  // next pair
+    }
+    // Ran out of input without a closing brace.
+    return false;                            // no closing brace: malformed
+}
+
+void main() {
+    Server s = Server { .name = String::from("db \"primary\""), .port = 5432, .tls = true };
+    String json = jsonFromServer(&s);
+    println("{}", json.asView());
+
+    Server back = Server { .name = String::new(), .port = 0, .tls = false };
+    // Parse it back into a fresh struct with known defaults.
+    bool ok = jsonToServer(json.asView(), &back);
+    println("parsed {} name={} port={} tls={}",
+            ok, back.name.asView(), back.port, back.tls);
+
+    s.name.free(); back.name.free(); json.free();  // replenish the heap
+}

@@ -1,0 +1,81 @@
+import(lib) std::io::fs { fileOpen, fileClose, fileWrite, writeFileFromString,
+                           readFileToString, File, IoError };
+import(lib) std::io::ios { println };
+import(lib) std::text::string { String };
+import(lib) std::text::strutil { splitVec, trim };
+import(lib) std::fmt::fmt { formatInt, formatFloat };
+import(lib) std::vec { Vec };
+
+struct Row {
+    str name;
+    i32 age;
+    f64 score;
+}
+
+void csvField(String* out, str field) {
+    // Quote the field only when a comma, quote, or newline would split it.
+    bool needsQuotes = field.containsByte((u8)',') ||
+                       field.containsByte((u8)'"') ||
+                       field.containsByte((u8)'\n');
+    // Bare field: copy the bytes through unchanged.
+    if (!needsQuotes) {
+        out->appendView(field);
+        return;
+    }
+    // Quoted field: wrap it and double any embedded quote.
+    out->pushChar((u8)'"');
+    for (usize i = 0; i < field.len; i += 1) {
+        u8 c = field.at(i);
+        if (c == (u8)'"') out->pushChar((u8)'"');   // a quote becomes two
+        out->pushChar(c);
+    }
+    out->pushChar((u8)'"');
+}
+
+String csvFromRows(const Vec<Row>* rows) {
+    // Header line first, then one line per record.
+    String out = String::from("name,age,score");
+    for (usize i = 0; i < rows->count(); i += 1) {
+        out.pushChar((u8)'\n');
+        Row r = rows->at(i);
+        // The name is the only field that may need quoting.
+        csvField(&out, r.name);
+        out.pushChar((u8)',');
+        // Integers and floats become ASCII digits via the fmt helpers.
+        String age = formatInt((i64)r.age, 10u, false);
+        out.appendView(age.asView());
+        out.pushChar((u8)',');
+        String score = formatFloat(r.score, 2u);
+        out.appendView(score.asView());
+    }
+    return out;
+}
+
+void main() {
+    Vec<Row> rows = Vec<Row>::new();
+    rows.push(Row { .name = "Ada Lovelace", .age = 36, .score = 91.5 });
+    rows.push(Row { .name = "Grace \"Amazing\" Hopper", .age = 45, .score = 99.25 });
+
+    String csv = csvFromRows(&rows);
+    String path = String::from("/tmp/coral-people.csv");
+
+    // Mode "w" creates or truncates the file, then writes the buffer whole.
+    Result<bool, IoError> wr = writeFileFromString(path.asView(), &csv);
+    // Error path: the write failed, so stop before reading.
+    if (wr.isErr()) { println("write failed"); return; }
+    println("wrote {} bytes", csv.len);
+
+    // Read the entire file back into an owned buffer.
+    Result<String, IoError> rr = readFileToString(path.asView());
+    // Error path: nothing to parse if the read failed.
+    if (rr.isErr()) { println("read failed"); return; }
+    String back = rr.unwrap();
+    // Split on newlines; the trailing newline yields one empty line.
+    Vec<str> lines = splitVec(back.asView(), (u8)'\n');
+    for (usize i = 0; i < lines.count(); i += 1) {
+        str line = lines.at(i);
+        // Skip the empty field after the final newline.
+        if (line.len == 0) continue;
+        println("line {}: {}", i, line);
+    }
+}

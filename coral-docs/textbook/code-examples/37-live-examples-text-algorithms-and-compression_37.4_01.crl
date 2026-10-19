@@ -1,0 +1,118 @@
+import(lib) std::vec { Vec };
+import(lib) std::text::string { String };
+import(lib) std::io::ios { println };
+
+Vec<i32> lzwEncode(str input) {
+    Vec<i32> out = Vec<i32>::new();
+    // no input, no codes
+    if (input.len == 0) return out;
+    Vec<Vec<i32>> dict = Vec<Vec<i32>>::new();
+    // seed the dictionary with the 256 single-byte codes
+    for (usize s = 0; s < 256; s += 1) {
+        Vec<i32> row = Vec<i32>::new();
+        for (usize c = 0; c < 256; c += 1) row.push(-1);
+        dict.push(row);
+    }
+    // next free code; new entries grow past the base alphabet
+    i32 next = 256;
+    // w is the longest prefix seen so far, tracked as a dictionary code
+    i32 w = (i32)input.at(0);
+    // i starts at 1 because the first byte already seeded w
+    for (usize i = 1; i < input.len; i += 1) {
+        u8 c = input.at(i);
+        // does w followed by c already have a code?
+        i32 found = dict.atPtr((usize)w)->at((usize)c);
+        if (found != -1) {
+            // extend the current string without emitting anything yet
+            w = found;
+        } else {
+            // no extension: emit w and register w+c as a new code
+            out.push(w);
+            dict.atPtr((usize)w)->set((usize)c, next);
+            // grow the flat table by one all-(-1) row
+            Vec<i32> row = Vec<i32>::new();
+            for (usize k = 0; k < 256; k += 1) row.push(-1);
+            dict.push(row);
+            next += 1;
+            w = (i32)c;
+        }
+    }
+    // flush the final pending string
+    out.push(w);
+    return out;
+}
+
+void lzwEmit(String* out, i32 code, const Vec<i32>* dprev, const Vec<u8>* dsuf) {
+    Vec<i32> stack = Vec<i32>::new();
+    i32 c = code;
+    // climb the prefix chain down to a base single-byte code
+    while (c >= 256) {
+        stack.push(c);
+        c = dprev->at((usize)c);
+    }
+    // the base byte begins the expansion
+    out->pushByte((u8)c);
+    // replay the suffixes from the deepest prefix outward
+    isize k = (isize)stack.count() - 1;
+    while (k >= 0) {
+        out->pushByte(dsuf->at((usize)stack.at((usize)k)));
+        k -= 1;
+    }
+}
+
+u8 lzwFirst(i32 code, const Vec<i32>* dprev) {
+    i32 c = code;
+    // walk to the base entry; that single byte is the string's first
+    while (c >= 256) c = dprev->at((usize)c);
+    return (u8)c;
+}
+
+String lzwDecode(const Vec<i32>* codes) {
+    String out = String::new();
+    if (codes->count() == 0) return out;
+    Vec<i32> dprev = Vec<i32>::new();
+    Vec<u8> dsuf = Vec<u8>::new();
+    // base entries: codes below 256 are single bytes with no prefix
+    for (usize i = 0; i < 256; i += 1) {
+        dprev.push(-1);
+        dsuf.push(0);
+    }
+    i32 next = 256;
+    i32 prev = codes->at(0);
+    // the first code has no predecessor, so emit it directly
+    lzwEmit(&out, prev, &dprev, &dsuf);
+    // each later code may refer to an entry not built yet (the KwKwK case)
+    for (usize i = 1; i < codes->count(); i += 1) {
+        i32 code = codes->at(i);
+        if (code < next) {
+            // known code: emit it, then add the entry the encoder made
+            lzwEmit(&out, code, &dprev, &dsuf);
+            // the new entry's prefix is the previous string
+            dprev.push(prev);
+            // and its trailing byte is the first byte of the code just emitted
+            dsuf.push(lzwFirst(code, &dprev));
+            next += 1;
+        } else {
+            // code == next: it is prev plus prev's own first byte
+            u8 fb = lzwFirst(prev, &dprev);
+            lzwEmit(&out, prev, &dprev, &dsuf);
+            // append that first byte to finish the new entry
+            out.pushByte(fb);
+            dprev.push(prev);
+            dsuf.push(fb);
+            next += 1;
+        }
+        // the current code becomes the prefix source for the next iteration
+        prev = code;
+    }
+    return out;
+}
+
+void main() {
+    str text = "TOBEORNOTTOBEORTOBEORNOT";
+    Vec<i32> codes = lzwEncode(text);
+    String back = lzwDecode(&codes);
+    println("input  {} bytes", text.len);
+    println("codes  {}", codes.count());
+    println("roundtrip {}", back.asView().equals(text));
+}

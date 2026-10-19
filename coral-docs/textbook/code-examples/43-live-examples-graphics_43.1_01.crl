@@ -1,0 +1,89 @@
+import(lib) std::vec { Vec };
+import(lib) std::io::ios { println };
+import(lib) std::io::fs { fileOpen, fileClose, fileWrite, File, IoError };
+import(lib) std::fmt::fmt { formatInt };
+import(lib) std::text::string { String };
+
+struct Image {
+    usize w;             // width in pixels
+    usize h;             // height in pixels
+    Vec<u8> px;          // w * h * 3 bytes, RGB, row-major, row 0 on top
+
+    // Allocate a black w-by-h image: reserve up front, then zero-fill.
+    static Image new(usize w, usize h) {
+        Image img = Image {
+            .w = w,
+            .h = h,
+            .px = Vec<u8>::withCap(w * h * 3)
+        };
+        for (usize i = 0; i < w * h * 3; i += 1) img.px.push(0);  // zero-fill
+        return img;
+    }
+
+    // Store one RGB triple; out-of-bounds writes are dropped.
+    void setPixel(usize x, usize y, u8 r, u8 g, u8 b) {
+        if (x >= self.w || y >= self.h) return;   // drop out-of-bounds writes
+        usize i = (y * self.w + x) * 3;           // first byte of pixel (x, y)
+        self.px.set(i, r);
+        self.px.set(i + 1, g);
+        self.px.set(i + 2, b);
+    }
+}
+
+// formatInt returns an owned String; copy its bytes into the output buffer.
+void appendInt(Vec<u8>* out, i64 value) {
+    String s = formatInt(value, 10u, false);      // base 10, lowercase digits
+    for (usize i = 0; i < s.len; i += 1) out->push(s.ptr[i]);
+}
+
+// Serialize the framebuffer to a binary P6 PPM file.
+void writePPM(str path, const Image* img) {
+    // Assemble the P6 header and the raw bytes in a single output buffer.
+    // Reserve the header slack plus every pixel byte.
+    Vec<u8> out = Vec<u8>::withCap(img->px.count() + 32);
+    out.push((u8)'P');                          // "P6": binary PPM magic
+    out.push((u8)'6');
+    out.push((u8)'\n');
+    appendInt(&out, (i64)img->w);               // width in ASCII decimal
+    out.push((u8)' ');
+    appendInt(&out, (i64)img->h);               // height in ASCII decimal
+    out.push((u8)'\n');
+    appendInt(&out, 255);                       // max value: one byte per channel
+    out.push((u8)'\n');                         // exactly one whitespace before the data
+
+    // Pixel bytes: red, green, blue per pixel, left-to-right then top-to-bottom.
+    for (usize i = 0; i < img->px.count(); i += 1) out.push(img->px.at(i));
+
+    Result<File, IoError> fo = fileOpen(path, "w");  // "w" = create and truncate
+    // Error path: report and return if the file cannot be opened.
+    if (fo.isErr()) { println("could not open {}", path); return; }
+    File f = fo.unwrap();
+
+    usize off = 0;                              // fileWrite may write short; loop
+    while (off < out.count()) {
+        // Loop until every byte of the buffer has been written.
+        Result<isize, IoError> wr = fileWrite(f, out.ptr() + off, out.count() - off);
+        if (wr.isErr()) { println("write failed"); break; }
+        // Guard against a stall: stop if the write makes no progress.
+        isize put = wr.unwrap();
+        if (put <= 0) break;                    // nothing moved: stop
+        off += (usize)put;                      // advance past what got written
+    }
+    fileClose(f);
+}
+
+void main() {
+    // A 160-by-100 image.
+    Image img = Image::new(160, 100);
+    // Two-axis ramp: red grows across, green grows down, blue is fixed.
+    for (usize y = 0; y < img.h; y += 1) {
+        for (usize x = 0; x < img.w; x += 1) {
+            // Scale each channel to [0, 255], guarding a one-pixel axis.
+            u8 r = img.w > 1 ? (u8)(x * 255 / (img.w - 1)) : 128;
+            u8 g = img.h > 1 ? (u8)(y * 255 / (img.h - 1)) : 128;
+            img.setPixel(x, y, r, g, 96);
+        }
+    }
+    writePPM("/tmp/coral-framebuffer.ppm", &img);
+    println("wrote /tmp/coral-framebuffer.ppm ({}x{})", img.w, img.h);
+}
