@@ -1,3 +1,75 @@
+import(lib) std::concurrent::mutex { Mutex };
+import(lib) std::concurrent::thread { ConditionVar };
+import(lib) std::mman { alloc, dealloc };
+import(lib) std::concurrent::thread { threadCreate, threadJoin, Thread, ThreadError };
+import(lib) std::io::ios { println };
+
+
+pub struct BoundedQueue {
+    Mutex mutex;
+    ConditionVar itemReady;
+    ConditionVar roomFree;
+    u64* items;
+    usize cap;
+    usize head;
+    usize count;
+    bool closed;
+
+    bool init(usize capacity) {
+        self.items = alloc<u64>(capacity);
+        if (self.items == null) return false;
+        self.mutex.init();
+        self.itemReady.init();
+        self.roomFree.init();
+        self.cap = capacity;
+        self.head = 0;
+        self.count = 0;
+        self.closed = false;
+        return true;
+    }
+
+    void destroy() {
+        self.mutex.destroy();
+        self.itemReady.destroy();
+        self.roomFree.destroy();
+        dealloc<u64>(self.items);
+    }
+
+    void push(u64 v) {
+        self.mutex.lock();
+        while (self.count == self.cap && !self.closed)
+            self.roomFree.wait(&self.mutex);
+        if (self.closed) { self.mutex.unlock(); return; }
+
+        self.items[(self.head + self.count) % self.cap] = v;
+        self.count = self.count + 1;
+        self.itemReady.signal();
+        self.mutex.unlock();
+    }
+
+    bool pop(u64* out) {
+        self.mutex.lock();
+        while (self.count == 0 && !self.closed)
+            self.itemReady.wait(&self.mutex);
+        if (self.count == 0) { self.mutex.unlock(); return false; }
+
+        *out = self.items[self.head];
+        self.head = (self.head + 1) % self.cap;
+        self.count = self.count - 1;
+        self.roomFree.signal();
+        self.mutex.unlock();
+        return true;
+    }
+
+    void close() {
+        self.mutex.lock();
+        self.closed = true;
+        self.itemReady.broadcast();
+        self.roomFree.broadcast();
+        self.mutex.unlock();
+    }
+}
+
 rawptr producerMain(rawptr arg) {
     BoundedQueue* q = (BoundedQueue*)arg;
     for (u64 i = 1; i <= 100; i += 1)
