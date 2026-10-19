@@ -6,7 +6,7 @@ A Language Without a Library Is a Set of Keywords
 
 Here is a thought experiment. Take away every library from the language you use most. No arrays that grow, no strings that build, no maps, no files, no printing, no math beyond arithmetic. What is left? A set of keywords and a way to move bytes around. Everything that makes the language useful to a human being, the container that holds a list whose length is unknown, the text buffer that accumulates a message, the lookup table that turns a name into a value, lives in the standard library. The language is the grammar; the library is the vocabulary.
 
-Coral's standard library is deliberately organised around one idea, and if you understand the idea you will always know where a tool lives. The idea is that a module groups a capability, and the tree of modules is a tree of capabilities. Under the root `std` sit `collections`, `text`, `io`, `fmt`, `math`, `memory`, `crypto`, `concurrent`, `parser`, `data`, and `testing`. Under `collections` sit the individual structures: `arr`, `vec`, `map`, `hashmap`, `unordered_map`, `set`, `queue`, `deque`, `ringbuf`, `priorityqueue`, `linkedlist`, `tree`, `trie`, `bitset`, `cache`, and the two cross-cutting utilities `iter` and `sort`. Every one of those seventeen modules is real, and this chapter documents every type in them. You never have to guess; you only have to ask "what kind of thing am I doing?" and walk to that branch.
+Coral's standard library is deliberately organised around one idea, and if you understand the idea you will always know where a tool lives. The idea is that a module groups a capability, and the tree of modules is a tree of capabilities. Under the root `std` sit `collections`, `text`, `io`, `fmt`, `math`, `memory`, `crypto`, `concurrent`, `parser`, `data`, and `testing`. Under `collections` sit the individual structures: `arr`, `vec`, `map`, `hashmap`, `unordered_map`, `set`, `queue`, `deque`, `ringbuf`, `priorityqueue`, `linkedlist`, `tree`, `trie`, `bitset`, `cache`, and the three cross-cutting utilities `iter`, `sort`, and `range`. Every one of those eighteen modules is real, and this chapter documents every type in them. You never have to guess; you only have to ask "what kind of thing am I doing?" and walk to that branch.
 
 There is one more distinction, and it is worth stating before the first type. `std` is the portable surface, the same names and signatures on every platform. `core` is what the language itself is built from: `str` (the borrowed view, whose methods live in `core::str`), `cchar`, `char_util`, and the numeric limits in `core::limits`. A normal program imports from `std` and never thinks about `core`. `platform` wraps the operating system (on Linux, the libc surface) and is reached only when a program is deliberately doing something close to the metal.
 
@@ -42,6 +42,7 @@ Before the tour, a map of the territory. Every module below lives under `std::co
     std::collections.cache             Cache<K, V>        hash map + LRU list         recency       O(1) average
     std::collections.iter              free functions over a `Vec<T>`
     std::collections.sort              free functions over a `Vec<T>`
+    std::collections.range             IterRange          half-open index bounds      index         O(1)
 
 Three facts hold across the whole table. First, every container is generic and monomorphised: `Vec<i32>` and `Vec<String>` are separate types that share one source, exactly as in Chapter7. Second, no container takes an allocator parameter. They all allocate through the single process-wide allocator in `std::memory::mman` (`alloc<T>`, `dealloc<T>`, `realloc<T>`, which route to `defaultAllocator`). That is why the allocators and arenas live in their own section, 16.12, and why they are described there honestly as a separate facility rather than as a knob on the containers. Third, struct fields carry no visibility keyword, `pub` is a declaration modifier, not a field modifier, so a container's fields are readable and writable from anywhere. `Vec.data`, `Vec.len`, `Vec.cap`, and `MapEntry`'s fields are part of the observable interface, not hidden behind it.
 
@@ -238,7 +239,7 @@ When you want to modify a value in place rather than copy it out, `getPtr` hands
         *slot.unwrap() = *slot.unwrap() + 1;   // increment in place
     }
 
-Because a Map is ordered, iteration is in key order, and it is done with the `each` method rather than a range-for, because the map exposes no iterator of its own:
+Because a Map is ordered, iteration is in key order, and it is done with the `each` method rather than a range-for, because the map implements no `@iter` of its own:
 
     void printAge(str key, i32 value) {
         println("{} = {}", key, value);
@@ -251,7 +252,7 @@ The complete method set is: `new`, `dispose`, `count`, `isEmpty`, `insert`, `get
 
 Two source-level details are worth knowing because they explain behaviour you will see. First, `insert` returns `Result<V, CollectionError>::Ok { .value = value }`, it hands your value straight back, so `insert` is not "insert-or-update returning the old value"; it always returns what you passed in. Second, the AVL deletion uses the in-order successor: it copies the successor's key and value up into the removed node and then deletes the successor. For value types that is invisible; for a key or value type that owns heap memory it means the *same* value object can be moved between nodes, which is fine because the map never frees keys or values (see 16.12).
 
-Descending order, lowest key, and ranges are worth a sentence because they are the things people expect an ordered map to give them and this one largely does not. There is no iterator, no reverse iterator, no `firstKey`/`lastKey`, and no range scan. If you need keys in descending order you can collect them with `each` into a `Vec<K>` and reverse, or, if the order is a permanent property of the application, pass a negated comparator (`i32 reverseCmp(K a, K b) { return -cmpAsc(a, b); }`) and let the same AVL invariants maintain a descending tree with no other change. For "all keys in `[lo, hi)`", collect and filter, or reach for a structure with a range operation. The tree holds the information; the module is simply not built to expose it.
+Descending order, lowest key, and ranges are worth a sentence because they are the things people expect an ordered map to give them and this one largely does not. There is no `@iter` implementation, no reverse iteration, no `firstKey`/`lastKey`, and no range scan. If you need keys in descending order you can collect them with `each` into a `Vec<K>` and reverse, or, if the order is a permanent property of the application, pass a negated comparator (`i32 reverseCmp(K a, K b) { return -cmpAsc(a, b); }`) and let the same AVL invariants maintain a descending tree with no other change. For "all keys in `[lo, hi)`", collect and filter, or reach for a structure with a range operation. The tree holds the information; the module is simply not built to expose it.
 
 16.4 The Hashed Maps: HashMap and UnorderedMap
 
@@ -554,9 +555,19 @@ The structure is a `HashMap<K, CacheEntry<K, V>*>` plus an intrusive doubly-link
 
 Having an LRU cache in the standard library means you do not rebuild it, subtly differently, in every project. We use it in the second worked example.
 
-16.11 iter and sort
+16.11 Iteration, iter, and sort
 
-Two utilities cut across every container.
+Three utilities cut across every container, and the first is the `@iter` protocol that drives the ranged for loop of Chapter 4.
+
+Iteration is index based. A container opts into `@iter` by providing `usize count()`, `T at(usize i)`, and, for bounded loops, `IterRange range(usize start, usize end)`, all in an `@iter` extend block. The ranged for asks `count()` once, then calls `at(i)` for each index. The types that opt in are `Vec`, `Arr`, `Deque`, `RingBuf`, `Queue`, `LinkedList`, `PriorityQueue`, and `Bitset`; the associative containers (`Map`, `HashMap`, `Set`, `Tree`, `Trie`, `Cache`, and `UnorderedMap`) do not, because they have no single canonical indexed order, and are walked with `each()` instead. The supporting type `IterRange`, with its fields `start` and `end`, lives in `std::collections::range`:
+
+    import(lib) std::collections::range { IterRange };
+
+    for (var x : v)             { ... }   // whole vector
+    for (var x : v(1, 3))       { ... }   // indexes 1 and 2, half-open
+    for (var x : v.range(1, 3)) { ... }   // the same, method spelling
+
+The bounded form clamps its bounds to `count()` and treats `end < start` as an empty loop, so a runtime range never indexes out of bounds. The loop variable is a copy; use an index loop with `atPtr()` when you need to write through it.
 
 `std::collections::sort` implements the ordering algorithms on Vecs, with typed entry points for the common element types and a generic one for the rest:
 
@@ -604,7 +615,7 @@ Simply put, these adaptors turn a loop into a sentence. `map` means "do this to 
 
 The fine print of `iter` is where correct programs are won, so here it is, function by function. `map`, `filter`, `take`, `skip`, `slice`, `zip`, `unique`, `flatten`, and `enumerate` *allocate and return new Vecs*; the caller owns them and must let them drop. `reduce`, `forEach`, `find`, `findIndex`, `hasAny`, `all`, `countIf`, `minBy`, `maxBy`, `sum`, and `average` return a scalar and allocate nothing. `find` is the trap: it returns the element if found and `T()`, the zero/default value of `T`, if not, so `find` on `Vec<i32>` returning `0` is ambiguous between "found a zero" and "found nothing". Use `findIndex`, which returns an `isize` index or `-1`, when you need to distinguish. `minBy`, `maxBy`, and `sum` assert that the vector is non-empty; `average` returns `0.0` for an empty vector instead. `slice(v, start, end)` is half-open and clamps `end` to `count()`; if `start >= end` or `start >= count()` it returns an empty Vec. `zip` stops at the shorter input and yields `Vec<Pair<T, U>>`, where `Pair` has the fields `first` and `second`. `enumerate` is not what its name suggests if you are used to other languages: it returns a `Vec<usize>` of the indices `0..count()`, and you pair those with values yourself (conventionally via `zip`). `unique` is O(n^2) because it scans the result for each element; it is a convenience, not a set, and it takes an equality function rather than hashing. `flatten` is the one adaptor whose parameter type is `Vec<Vec<T>>*`.
 
-`sort` is a quicksort with a median-of-three pivot, exactly as the earlier `Vec::sortBy` uses internally, and the typed entry points call the corresponding partition routine. `sortI32`, `sortusize`, `sortF64`, `sortBy`, and `reverse` mutate the vector in place and take a non-const `Vec<T>*`; `isSortedI32`, `isSortedusize`, `isSortedBy`, `binarySearchI32`, `binarySearchusize`, and `binarySearchBy` only read and take `const Vec<T>*`. The typed sorts compare with `<` directly, so `sortF64` inherits whatever floats do with `NaN`; the generic `sortBy` uses the `less` predicate you supply. `binarySearchBy` takes a three-way comparator `i32(T, T) cmp`, *not* a `less` predicate, and all three binary searches return an `isize` index or `-1` when the key is absent, so they are not stable-two-way and cannot tell you an insertion point.
+`sort` is a quicksort with a median-of-three pivot, exactly as the earlier `Vec::sortBy` uses internally, and the typed entry points call the corresponding partition routine. `sortI32`, `sortusize`, `sortF64`, `sortBy`, and `reverse` mutate the vector in place and take a non-const `Vec<T>*`; `isSortedI32`, `isSortedusize`, `isSortedBy`, `binarySearchI32`, `binarySearchusize`, and `binarySearchBy` only read and take `const Vec<T>*`. The typed sorts compare with `<` directly, so `sortF64` inherits whatever floats do with `NaN`; the generic `sortBy` uses the `less` predicate you supply. `binarySearchBy` takes a three-way comparator `i32(T, T) cmp`, *not* a `less` predicate, and all three binary searches return an `isize` index or `-1` when the key is absent, so they are not stable-two-way and cannot tell you an insertion point. Neither `iter` nor `sort` is an `@iter` adapter: the helpers in `iter` take a `Vec<T>` pointer and are convenience algorithms for vectors, so use the ranged for when you are iterating some other collection.
 
 16.12 Ownership, Allocation, and Who Frees What
 
