@@ -196,7 +196,7 @@ Cost and notes. Each push and pop takes one lock, one or two signals, and O(1) b
 
 Edge cases. The buffer must never be touched outside the locked region; a single unlocked read of `count` reintroduces the race. Both waits recheck after waking, because `signal` wakes one waiter but the woken thread may find the predicate false. `close` uses `broadcast`, not `signal`, because every waiter must see the closure. And a producer that closes while the consumer is mid-`pop` is fine, because `pop` rechecks `count` after the wake and returns what is left before returning false.
 
-Variation. Generalise the element type to `rawptr` so the queue carries pointers to arbitrary jobs, which is exactly what the next example's thread pool does. Then add a second consumer thread and confirm the sum is still 5050 — the correctness does not depend on how many consumers there are, only on the lock discipline.
+Variation. Generalise the element type to `rawptr` so the queue carries pointers to arbitrary jobs, which is exactly what the next example's thread pool does. Then add a second consumer thread and confirm the sum is still 5050, the correctness does not depend on how many consumers there are, only on the lock discipline.
 
 35.3 A Thread-Pool Task Queue
 
@@ -408,7 +408,7 @@ Variation. Replace the map with a parallel reduction: instead of writing each re
 
 35.5 An Async Pipeline with spawn, await, and a Channel
 
-The problem. Coordinate several I/O-shaped stages — fetch, transform, store — so that while one stage waits, the others progress, without dedicating an operating-system thread to each wait.
+The problem. Coordinate several I/O-shaped stages, fetch, transform, store, so that while one stage waits, the others progress, without dedicating an operating-system thread to each wait.
 
 The intuition. A thread that sleeps blocks a thread; an async task that sleeps frees its execution context for other work. Coral's async runtime is a set of lightweight stacks called fibers, driven by whoever calls `run`. `spawn(fn, arg)` puts a function on its own fiber and returns a `Future*`, a one-shot result cell. `await(future)` suspends the calling fiber until the future is ready, then returns its result. `sleep(ms)` returns a future that resolves later, and awaiting it suspends the fiber for that long without blocking a thread. The top level of the program is not a fiber, so it cannot await; instead it spawns a coordinator and calls `run` to drive the scheduler to completion. The rule is: await inside a fiber, drive from outside.
 
@@ -523,7 +523,7 @@ Cost and notes. `wait` and `post` are cheap kernel operations, far cheaper than 
 
 Edge cases. A `post` without a matching `wait` raises the count above its initial value and lets more than the intended number through, so every `wait` must be paired with exactly one `post` on every path. Initialising to zero makes a pure signal, where a producer posts and a consumer waits. The shared counter in this example is safe only because the tasks are joined one at a time; with real parallelism it would need an `AtomicU64`, which is the lesson of 34.1 applied inside a concurrency-limiting pattern.
 
-Variation. Replace the join-one-at-a-time structure with the MiniPool from 34.3: submit all the tasks, have each do `wait`, work, `post`, and use an `AtomicU64` for the completed count. It combines three of this chapter's patterns — a pool, a semaphore, an atomic — into the shape of a real rate-limited service, and watching them fit together is the point of the whole chapter.
+Variation. Replace the join-one-at-a-time structure with the MiniPool from 34.3: submit all the tasks, have each do `wait`, work, `post`, and use an `AtomicU64` for the completed count. It combines three of this chapter's patterns, a pool, a semaphore, an atomic, into the shape of a real rate-limited service, and watching them fit together is the point of the whole chapter.
 
 35.7 A Reader-Writer Lock
 
@@ -681,7 +681,7 @@ Variation. Add a `phase()` method that returns the current generation so a worke
 
 35.9 Parallel Sum by Divide and Conquer
 
-The problem. Sum a large array across several threads, but with a recursive division that mirrors how you would state the algorithm mathematically, rather than the fixed chunking of 34.4. The reduction — combining partial answers — is the pattern this example adds.
+The problem. Sum a large array across several threads, but with a recursive division that mirrors how you would state the algorithm mathematically, rather than the fixed chunking of 34.4. The reduction, combining partial answers, is the pattern this example adds.
 
 The intuition. To sum a range, split it in half, sum each half, and add the two results. Do each half in parallel by giving one to a new thread and doing the other on the current thread. Stop splitting when the range is small enough that the cost of a thread exceeds the cost of just adding the remaining numbers; that cutoff is the only tuning knob. The data is read-only and the two halves are disjoint, so nothing is shared and no lock is needed. The partial sums are combined only after both sides have joined, which is the happens-before edge that makes the result valid.
 
@@ -768,7 +768,7 @@ The implementation.
         return root.result;
     }
 
-Each internal node spawns exactly one thread — for the right half — and uses the current thread for the left, so the number of live threads is bounded by the depth of the recursion rather than by the number of leaves. The `right` job outlives the `threadJoin`, so freeing it afterward is safe; freeing it before the join would be the use-after-free the chapter's opening warns about.
+Each internal node spawns exactly one thread, for the right half, and uses the current thread for the left, so the number of live threads is bounded by the depth of the recursion rather than by the number of leaves. The `right` job outlives the `threadJoin`, so freeing it afterward is safe; freeing it before the join would be the use-after-free the chapter's opening warns about.
 
 Cost and notes. The arithmetic is O(n), the same as a sequential loop, and the parallelism comes from running disjoint halves at once. The overhead is one thread creation per internal node, which is why the cutoff exists: below a few thousand elements, thread creation dominates and the sequential loop wins. This recursive shape is what you would feed into `std::concurrent::threadpool` or a work-stealing scheduler in production, so that a fixed set of workers runs all the tasks instead of creating a fresh thread at every fork.
 
@@ -890,7 +890,7 @@ Variation. Implement the waiter solution: a single mutex guarding a bitmask of f
 
 35.11 A Token-Bucket Rate Limiter
 
-The problem. Allow at most a fixed rate of operations — say four database queries per second — while still permitting a short burst when the work arrives in a clump. How do you enforce a rate without a background timer thread burning cycles?
+The problem. Allow at most a fixed rate of operations, say four database queries per second, while still permitting a short burst when the work arrives in a clump. How do you enforce a rate without a background timer thread burning cycles?
 
 The intuition. Picture a bucket that holds tokens. Tokens drip in at a constant rate up to a maximum, and every operation takes one token; an operation that finds the bucket empty waits until a token drips in. The bucket's capacity is the largest burst you allow, and the drip rate is the sustained rate. The trick that removes the timer is to compute the tokens lazily: store the time of the last refill and, whenever someone touches the bucket, add the tokens that have accrued since then based on elapsed time. No thread sits in the background; the accounting happens on demand.
 
@@ -991,4 +991,4 @@ Variation. Add a `tryAcquireN(u64 n)` for operations that cost more than one tok
 
 7. Correctness audit. Take the producer–consumer code and find every line that touches `items`, `count`, `head`, or `closed`. For each, name the lock that must be held and confirm from the code that it is. Then deliberately move one access outside the lock and explain what can now go wrong.
 
-8. Design. You are building a web server with a fixed number of worker threads and a bounded request queue. Using this chapter's structures, describe the whole design — the queue, the pool, the bound — and say what happens to a request that arrives when the queue is full. Which is the right response, blocking or rejecting, and why?
+8. Design. You are building a web server with a fixed number of worker threads and a bounded request queue. Using this chapter's structures, describe the whole design, the queue, the pool, the bound, and say what happens to a request that arrives when the queue is full. Which is the right response, blocking or rejecting, and why?

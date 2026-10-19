@@ -170,8 +170,10 @@ hand without gating a build on a compiler that is a separate workstream.
 
 > **Two proposals live in [ERROR-EXPLANATIONS.md](./ERROR-EXPLANATIONS.md)** —
 > clickable error explanations (`coral/explain` returning the existing
-> `--explain` text via `codeDescription`), and `///` doc comments so hover
-> shows what is written above a declaration. Neither is implemented.
+> `--explain` text via `codeDescription`), `///` doc comments so hover shows
+> what is written above a declaration, and **§2d — how diagnostics should be
+> presented**, which shows the current message shape is wrong. None are
+> implemented.
 
 ## Phase 1 — without these the editor feels dead
 

@@ -6,15 +6,15 @@ No Exceptions, On Purpose
 
 Coral has no exceptions, no `try`, no `catch`, and no hidden control flow that unwinds the stack when something goes wrong. This is not an oversight and it is not a gap waiting to be filled. It is a design position, and it is stated in the standard library itself, in the header comment above `Option`: "coral has no inbuilt error handling; I will not add try-catch either." Failure in Coral is a value, and a value is something the type system can see, the compiler can check, and the reader can follow.
 
-To feel why this matters, picture what an exception actually does. A function deep in your program hits a problem — a file is missing, a socket closed early — and it does not return. Instead it throws. The throw travels upward, out of the function, out of its caller, out of the caller's caller, until some frame far away decides to catch it. Every function in between is exited without being asked. The line after the throwing call never runs. If any of those lines was going to clean something up, it did not. And the whole journey is invisible: reading the function that calls `open`, you cannot tell from the code that `open` might abandon you mid-line.
+To feel why this matters, picture what an exception actually does. A function deep in your program hits a problem, a file is missing, a socket closed early, and it does not return. Instead it throws. The throw travels upward, out of the function, out of its caller, out of the caller's caller, until some frame far away decides to catch it. Every function in between is exited without being asked. The line after the throwing call never runs. If any of those lines was going to clean something up, it did not. And the whole journey is invisible: reading the function that calls `open`, you cannot tell from the code that `open` might abandon you mid-line.
 
 Coral refuses that. The function that can fail says so in its return type, and when it fails it returns a value that means "failed." The caller receives that value like any other, and the language forces them to look at it in order to get at the good result. Nothing is abandoned without a line of code saying so.
 
 The consequence is a discipline. Every operation that can fail must say so in its return type, and every caller must decide what to do about it. You cannot forget to handle an error, because the error is not a separate channel that can fire at any line; it is the value the function returned, and you must open it to get at the result. The cost is verbosity: the happy path is interrupted by the unhappy one. The benefit is that the unhappy path is visible. A function that returns `Result<Fd, IoError>` has announced its failure mode to every reader and every caller, and no amount of it "working in testing" hides the fact that open can fail.
 
-Here is the mental picture that carries the chapter. A normal return value is a sealed parcel: you get the item, and the item is the whole story. An `Option` is a parcel that may be empty — you might get the item, or you might get nothing, and the parcel is honest about which. A `Result` is a parcel that always contains something, but it might be the item you asked for or a note explaining why you are not getting it. In every case you have to open the parcel. There is no version where the parcel never arrives and the rest of your day quietly falls apart.
+Here is the mental picture that carries the chapter. A normal return value is a sealed parcel: you get the item, and the item is the whole story. An `Option` is a parcel that may be empty, you might get the item, or you might get nothing, and the parcel is honest about which. A `Result` is a parcel that always contains something, but it might be the item you asked for or a note explaining why you are not getting it. In every case you have to open the parcel. There is no version where the parcel never arrives and the rest of your day quietly falls apart.
 
-This chapter covers the two types that carry failure — `Option` and `Result` — then the tools for building and propagating them, then the shape of a good error type, and finally a worked example that threads a real error through several layers.
+This chapter covers the two types that carry failure, `Option` and `Result`, then the tools for building and propagating them, then the shape of a good error type, and finally a worked example that threads a real error through several layers.
 
 15.1 Option<T>: The Absence of a Value
 
@@ -32,7 +32,7 @@ This chapter covers the two types that carry failure — `Option` and `Result` �
 
 Read those two lines as the two honest answers to "do you have a number for me?" `Some { .value = 42 }` says yes, and here it is. `None` says no. The type `Option<i32>` can be either, and the compiler will not let you treat it as a plain `i32`, which is precisely the point. A bare `i32` has no way to say "no," so a function that needs to sometimes say "no" must return something else, and that something is `Option`.
 
-If you are new to this, here is why `Option` exists at all. In many languages "no value" is smuggled in as a special value of the ordinary type — a null pointer, a -1, an empty string — and nothing in the type warns you. `Option<T>` does not smuggle: it is a box that either holds a `T` or is visibly empty, and the type says "this might be empty." The compiler then refuses to let you use what is inside without first checking whether the box has anything in it. That one rule removes a whole family of crashes where code assumes a value that turned out not to be there.
+If you are new to this, here is why `Option` exists at all. In many languages "no value" is smuggled in as a special value of the ordinary type, a null pointer, a -1, an empty string, and nothing in the type warns you. `Option<T>` does not smuggle: it is a box that either holds a `T` or is visibly empty, and the type says "this might be empty." The compiler then refuses to let you use what is inside without first checking whether the box has anything in it. That one rule removes a whole family of crashes where code assumes a value that turned out not to be there.
 
 Why not just use a magic number? Suppose `findUser` returns `i32` and uses `-1` for "not found." That works until a real user has id `-1`, or until someone forgets to check, or until a function that takes an `i32` is handed the `-1` as though it were an id. Every one of those is a bug waiting for a bad day. The sentinel is a convention, and conventions are not checked. `Option<i32>` makes "not found" a case the type knows about, so a caller cannot use the value without first dealing with the possibility that there is no value.
 
@@ -72,7 +72,7 @@ The pointer methods are the bridge to C interfaces and to performance-sensitive 
         *p = 99;
     }
 
-This is the one place an `Option` looks like a nullable pointer — and phrased that way, it is exactly the C idiom, made explicit. The difference is that the type system knows it is an `Option`; you cannot call `.value` on a `None`, and you cannot pass an `Option<i32>` where an `i32` is expected. The optionality is in the type, not in a convention about which pointers are allowed to be null. When you cross into C, `ptr` is the door, and the null check on the other side is the price of the crossing.
+This is the one place an `Option` looks like a nullable pointer, and phrased that way, it is exactly the C idiom, made explicit. The difference is that the type system knows it is an `Option`; you cannot call `.value` on a `None`, and you cannot pass an `Option<i32>` where an `i32` is expected. The optionality is in the type, not in a convention about which pointers are allowed to be null. When you cross into C, `ptr` is the door, and the null check on the other side is the price of the crossing.
 
 The transformation methods express chains without intermediate checks. `map` applies a function if a value is present, in place; `andThen` chains an operation that itself returns an `Option`, flattening the nesting; `orElse` supplies a value when the `Option` is `None`:
 
@@ -80,7 +80,7 @@ The transformation methods express chains without intermediate checks. `map` app
     maybe.andThen(parseMore);             // avoids Option<Option<T>>
     nothing.orElse(computeDefault);       // runs computeDefault only on None
 
-Hold on — look at the shape of those calls. `map`, `andThen`, and `orElse` are declared in the standard library as returning `void`, and they mutate `self` in place. The standard library's `map` is:
+Hold on, look at the shape of those calls. `map`, `andThen`, and `orElse` are declared in the standard library as returning `void`, and they mutate `self` in place. The standard library's `map` is:
 
     void map(T(T) fn)
     {
@@ -106,7 +106,7 @@ A whole family of "look this up, then look that up, or give up" operations reads
 
 `Ok` carries the success value; `Err` carries the reason. The error type `E` is chosen by the API author; it is usually an enum or variant that enumerates the ways the operation can fail, which is what makes the failure inspectable rather than a string a caller must parse.
 
-The word "reason" is doing a lot of work, so let me be concrete. `Option` is the right tool when the only thing you can say about a failure is "there was nothing" — a search that found nothing, a map lookup for a missing key. `Result` is the right tool when you can say more — "there was nothing because the file does not exist," "the number was too large," "the checksum did not match." The error type is where those distinctions live, and because it is a type, a caller can switch on it and handle each case differently.
+The word "reason" is doing a lot of work, so let me be concrete. `Option` is the right tool when the only thing you can say about a failure is "there was nothing", a search that found nothing, a map lookup for a missing key. `Result` is the right tool when you can say more, "there was nothing because the file does not exist," "the number was too large," "the checksum did not match." The error type is where those distinctions live, and because it is a type, a caller can switch on it and handle each case differently.
 
 In plain words, `Option` answers "is there anything?" while `Result` answers "did it work, and if not, why not?" Use `Option` when absence is the whole story, and `Result` when the caller would benefit from knowing which of several things went wrong.
 
@@ -127,7 +127,7 @@ The methods mirror `Option`'s. `isOk` and `isErr` ask the question; `unwrap` ret
     i32 count = parseCount(input).unwrapOr(0);
     IoError e = opened.unwrapErr();
 
-The assertion messages matter. Calling `unwrap` on an `Err` does not crash with a memory fault; it fails with a message that says which value was in the wrong state ("Called unwrap() on an 'Err' value."). That distinction — a diagnostic versus a segmentation fault — is the difference between five minutes and an afternoon. A null dereference tells you a pointer was bad; the `unwrap` message tells you that you had an `Err` and treated it as an `Ok`, which names the mistake instead of the symptom.
+The assertion messages matter. Calling `unwrap` on an `Err` does not crash with a memory fault; it fails with a message that says which value was in the wrong state ("Called unwrap() on an 'Err' value."). That distinction, a diagnostic versus a segmentation fault, is the difference between five minutes and an afternoon. A null dereference tells you a pointer was bad; the `unwrap` message tells you that you had an `Err` and treated it as an `Ok`, which names the mistake instead of the symptom.
 
 `Result` also transforms, with the two-sided vocabulary that its two cases require. `mapOk` applies a function to the success value; `mapErr` applies a function to the error; `andThen` chains a fallible operation onto success; `orElse` recovers from an error by running a fallible recovery:
 
@@ -153,7 +153,7 @@ The `IoError` became a `ConfigError`, and along the way the `ConfigError` can ca
 
 15.3 Assertions: When Failure Is a Bug
 
-Not every failure is recoverable. Some are contract violations — a precondition that the caller was required to satisfy. For those, Coral uses assertions, and it has three forms with three different audiences.
+Not every failure is recoverable. Some are contract violations, a precondition that the caller was required to satisfy. For those, Coral uses assertions, and it has three forms with three different audiences.
 
 `@assert(cond)` is a runtime check that `cond` is true. It is the programmer's assertion that an invariant holds; if it does not, the program aborts with a diagnostic. Use it for conditions that would indicate a bug in the code rather than a condition in the input.
 
@@ -167,7 +167,7 @@ Not every failure is recoverable. Some are contract violations — a preconditio
 
     @compileError("Vec<T> requires T to be movable");
 
-The division of labour is clean and worth keeping clean. Input from the outside world — a file, a socket, a command line — is handled with `Result`, because it can fail for reasons beyond the programmer's control and the caller may have a response. An invariant inside the program is handled with `@assert` or `@assertOut`, because a violation is a bug and the only correct response is to stop loudly. And a constraint that is knowable at compile time is handled with `@compileError`, so that the mistake never becomes a running program.
+The division of labour is clean and worth keeping clean. Input from the outside world, a file, a socket, a command line, is handled with `Result`, because it can fail for reasons beyond the programmer's control and the caller may have a response. An invariant inside the program is handled with `@assert` or `@assertOut`, because a violation is a bug and the only correct response is to stop loudly. And a constraint that is knowable at compile time is handled with `@compileError`, so that the mistake never becomes a running program.
 
 Let me put the three side by side with a single imagined operation, so the boundary is unmistakable. You are writing `average(const i32[] data)`.
 
@@ -175,7 +175,7 @@ Let me put the three side by side with a single imagined operation, so the bound
 - If the function is documented "caller must pass a non-empty slice," then an empty slice is a contract violation, and `@assertOut(data.count() > 0, "average() on empty slice")` at the top stops the bug loudly and names it.
 - If `data` is a fixed-size array whose length is a compile-time constant known to be zero, then `@compileError("average() of a zero-length array")` prevents the call from ever building.
 
-Same operation, three failure kinds, three tools. Choosing the wrong one of the three — returning a `Result` for an internal invariant, or asserting on user input — is one of the most common design errors, and it is worth pausing on every failure you write to ask which of the three it is.
+Same operation, three failure kinds, three tools. Choosing the wrong one of the three, returning a `Result` for an internal invariant, or asserting on user input, is one of the most common design errors, and it is worth pausing on every failure you write to ask which of the three it is.
 
 A rule of thumb marks the boundary between `Result` and `@assert`. Ask: "can a caller, in principle, do something reasonable about this?" If yes, it is a `Result`. If the only sensible response is "the program is wrong, stop," it is an assertion. A missing file has a reasonable response (report it, try a default). A violated loop invariant does not; there is nothing to recover, only a bug to find.
 
@@ -208,11 +208,11 @@ The idiom is a switch that returns the error case and continues on success:
 
 Read the shape of that function. Before each call, nothing can have failed. The call returns a `Result`. The switch asks "did it fail?", and if it did, the function returns immediately, wrapping the underlying error in the `ConfigError` this function promises to produce. If it did not fail, the `else` arm does nothing, and the code falls out of the switch, at which point `unwrap` is safe because the failure path already returned. The invariant is: by the time you reach an `unwrap`, the switch above it has already handled the `Err` case.
 
-A common mistake is to reach for `unwrap` first and add the switch later. That inverts the invariant: with no switch above it, `unwrap` on an `Err` aborts the program instead of reporting the failure. The habit to build is the opposite — handle the `Err` with a switch or a `mapErr`, and let `unwrap` appear only after the failure has genuinely been dealt with.
+A common mistake is to reach for `unwrap` first and add the switch later. That inverts the invariant: with no switch above it, `unwrap` on an `Err` aborts the program instead of reporting the failure. The habit to build is the opposite, handle the `Err` with a switch or a `mapErr`, and let `unwrap` appear only after the failure has genuinely been dealt with.
 
 The repeated shape is a small cost. In exchange, every point at which failure can leave the function is a line of code you can point to, and the error is enriched at each boundary rather than silently unwrapped. A reader auditing "what happens if the file does not exist?" finds the answer on the first switch. You need not trace a call graph hoping to catch an exception thrown from a function three levels down, because nothing is thrown. The exits are all visible.
 
-Here is the propagation walked through once. Suppose `open(path)` fails. The `switch` sees the `Err` case, builds a `ConfigError::Io` carrying the original error, and returns it immediately — so `readAll` and `parseConfig` are never called. Suppose instead `open` succeeds: the `switch` takes the `else`, falls through, `opened.unwrap()` yields the file, and the function continues. Every failure takes the same visible road out: a `switch`, then a `return`.
+Here is the propagation walked through once. Suppose `open(path)` fails. The `switch` sees the `Err` case, builds a `ConfigError::Io` carrying the original error, and returns it immediately, so `readAll` and `parseConfig` are never called. Suppose instead `open` succeeds: the `switch` takes the `else`, falls through, `opened.unwrap()` yields the file, and the function continues. Every failure takes the same visible road out: a `switch`, then a `return`.
 
 Two refinements make the idiom less repetitive. `andThen` fuses a chain of fallible steps when the error types line up, so the same logic can be written as:
 
@@ -222,7 +222,7 @@ Two refinements make the idiom less repetitive. `andThen` fuses a chain of falli
 
 and the switch appears once, at the end, where the caller finally decides. And `mapErr` converts an error into the caller's error type, so a deep layer can rephrase a failure in the terms of the layer that will report it. Choosing between the explicit switch and the `andThen` chain is a readability question: the switch makes each step's failure obvious; the chain makes the successful pipeline obvious. Both are correct; use the one that matches what a reader needs to see.
 
-A note of caution about the `andThen` chain, given the in-place semantics we met earlier. Because `andThen` mutates in place and returns `void`, a chain written on a temporary works differently than one written on a named variable. The standard library's own spelling is the statement form — call `andThen` on the variable, let it rewrite the variable — and the expression form above should be read as shorthand for a sequence of such statements. When in doubt, write the statements, and let the compiler's type for each step tell you whether the error types actually line up.
+A note of caution about the `andThen` chain, given the in-place semantics we met earlier. Because `andThen` mutates in place and returns `void`, a chain written on a temporary works differently than one written on a named variable. The standard library's own spelling is the statement form, call `andThen` on the variable, let it rewrite the variable, and the expression form above should be read as shorthand for a sequence of such statements. When in doubt, write the statements, and let the compiler's type for each step tell you whether the error types actually line up.
 
 15.5 Designing an Error Type
 
@@ -246,15 +246,15 @@ The cases are distinguishable by the compiler. A caller can switch on `ConfigErr
         }
     }
 
-Read the `|` as "or": this arm matches `Timeout` or `WouldBlock` or `Interrupted`, and one body answers all three. It is the same separator Chapter13 uses for literal patterns, and it is how you keep a decision table readable when three cases share a fate. A comma, by contrast, ends an arm and begins the next one — so writing `IoError::Timeout, IoError::WouldBlock => true` would be a different, and probably unintended, program.
+Read the `|` as "or": this arm matches `Timeout` or `WouldBlock` or `Interrupted`, and one body answers all three. It is the same separator Chapter13 uses for literal patterns, and it is how you keep a decision table readable when three cases share a fate. A comma, by contrast, ends an arm and begins the next one, so writing `IoError::Timeout, IoError::WouldBlock => true` would be a different, and probably unintended, program.
 
 Each case carries what its handler needs. `NotFound` carries the path so the caller can report it; `Syntax` carries the line so an editor can point at it; `Io` wraps the underlying error rather than flattening it, so the low-level cause survives.
 
-It is not `E` except when `E` is genuinely one thing. An operation with exactly one failure mode can use that failure's type directly — `Result<str, IoError>` is honest when the only thing that can go wrong is I/O. Introducing a one-case wrapper adds ceremony for nothing. The variant is for operations with several distinct failure modes.
+It is not `E` except when `E` is genuinely one thing. An operation with exactly one failure mode can use that failure's type directly, `Result<str, IoError>` is honest when the only thing that can go wrong is I/O. Introducing a one-case wrapper adds ceremony for nothing. The variant is for operations with several distinct failure modes.
 
 The low-level error shows through where it matters. Wrapping `IoError` in a `ConfigError::Io` case keeps the detail available without forcing every caller of every config function to know about file descriptors. The layer that can do something about an I/O error unwraps it; the layer that cannot handles the category.
 
-A variant error type also composes with mapping. When a caller of `loadConfig` is really only interested in "did it parse," it can switch on the categories and ignore the rest; when it wants detail, the detail is there. And because the type is a variant, adding a new failure case later is a compile-time signal to every switch that needs updating — the same exhaustiveness benefit that Chapter13 described for ordinary data.
+A variant error type also composes with mapping. When a caller of `loadConfig` is really only interested in "did it parse," it can switch on the categories and ignore the rest; when it wants detail, the detail is there. And because the type is a variant, adding a new failure case later is a compile-time signal to every switch that needs updating, the same exhaustiveness benefit that Chapter13 described for ordinary data.
 
 One more design question separates a good error type from a merely tidy one: does each case say something a handler could act on differently? If two cases would always be handled identically by every caller, they are one case. If a case is only ever logged as a string, it is an enum of log lines, and a plain `str` would have done. The test is not "how many things can go wrong" but "how many kinds of response are there." Design the type around the responses, and the data each response needs, and you will find the cases fall out naturally.
 
@@ -266,9 +266,9 @@ The compiler's own failures follow the same philosophy, and its diagnostics carr
 
 The `E06xx` range is the switch and matching family, which is where most "you forgot a case" diagnostics live: a non-exhaustive switch (`E0608`) is the compiler telling you that a `Result` or `Option` or any variant was opened incompletely; an unreachable or duplicate case (`E0609`) catches a handler that can never run; a fallthrough on the last arm (`E0610`) catches a leftover copy-paste. These are the diagnostics that make the explicit error-handling style safe rather than merely verbose. When you add a fifth case to `ConfigError`, the compiler walks every `switch` over it and refuses to build until each one has decided what to do with the new case. That is the automation that makes the discipline affordable.
 
-The `E08xx` range is the lints: unused variable (`E0801`), unused import (`E0802`). Turning these on with `--warn-unused` is how a codebase stays free of the debris that a refactor leaves behind — the error value that was computed and thrown away, the import that a function no longer needs. That first one is more relevant here than it sounds: when you rewrite a function from `unwrap` to a proper switch, the variable that held the unwrapped value may become unused, and the lint will notice.
+The `E08xx` range is the lints: unused variable (`E0801`), unused import (`E0802`). Turning these on with `--warn-unused` is how a codebase stays free of the debris that a refactor leaves behind, the error value that was computed and thrown away, the import that a function no longer needs. That first one is more relevant here than it sounds: when you rewrite a function from `unwrap` to a proper switch, the variable that held the unwrapped value may become unused, and the lint will notice.
 
-Assertion failures are not error codes; they are aborts with a location, because an assertion is a claim that the program is correct, and a violated assertion means it is not. The distinction between "returned an `Err`" and "aborted" is the distinction between a failure the program anticipated and a bug it did not. Chapter23 surveys the full catalogue; this chapter's job is to make the two failure modes — value and abort — a conscious choice rather than an accident.
+Assertion failures are not error codes; they are aborts with a location, because an assertion is a claim that the program is correct, and a violated assertion means it is not. The distinction between "returned an `Err`" and "aborted" is the distinction between a failure the program anticipated and a bug it did not. Chapter23 surveys the full catalogue; this chapter's job is to make the two failure modes, value and abort, a conscious choice rather than an accident.
 
 15.7 A Worked Example: Reading a Number
 
@@ -300,9 +300,9 @@ Thread the types through a small problem. A configuration file contains lines li
         return value;
     }
 
-Read the signatures and the failure modes are already documented. `parseTimeout` returns a `Result` because it can fail; the `Err` type enumerates the three ways. The success path returns the bare `i64` and the language wraps it in `Ok` silently — a function that returns `Result<T, E>` may return a bare `T`, and the compiler converts it. That is worth underlining, because it is the single line of sugar that keeps the happy path readable: the last line is `return value;`, not `return Result<i64, ConfigError>::Ok { .value = value };`. The bare return is allowed only for the success type; to return a failure you must name the `Err` case explicitly, which is exactly the asymmetry you want. It is easy to return success, and you must say a word to return failure.
+Read the signatures and the failure modes are already documented. `parseTimeout` returns a `Result` because it can fail; the `Err` type enumerates the three ways. The success path returns the bare `i64` and the language wraps it in `Ok` silently, a function that returns `Result<T, E>` may return a bare `T`, and the compiler converts it. That is worth underlining, because it is the single line of sugar that keeps the happy path readable: the last line is `return value;`, not `return Result<i64, ConfigError>::Ok { .value = value };`. The bare return is allowed only for the success type; to return a failure you must name the `Err` case explicitly, which is exactly the asymmetry you want. It is easy to return success, and you must say a word to return failure.
 
-Why this matters: this small asymmetry shapes how a function reads. The happy path stays quiet — `return value;` — while every failure path is spelled out with an `Err` case, so a reader scanning the body sees exactly where this function can give up. If both success and failure needed the same ceremony, the eye would stop noticing either; making failure the louder line keeps it visible.
+Why this matters: this small asymmetry shapes how a function reads. The happy path stays quiet, `return value;`, while every failure path is spelled out with an `Err` case, so a reader scanning the body sees exactly where this function can give up. If both success and failure needed the same ceremony, the eye would stop noticing either; making failure the louder line keeps it visible.
 
 Each guard produces the specific error the caller needs, carrying the key, the offending value, and the bounds. At the call site, the caller decides policy:
 
@@ -318,7 +318,7 @@ Each guard produces the specific error the caller needs, carrying the key, the o
 
 The outer failure is handled; the inner error is inspected and each category gets its own response. The switch over `ConfigError` is exhaustive, so adding a fourth failure mode later is a compile error here until the caller decides how to handle it. This is the whole discipline on display in thirty lines: failure is a value, the value names its cases, and the compiler checks that every caller has thought about every way things can go wrong.
 
-Notice the two layers of decision in that call site. The outer switch answers "did it work?" — the universal question. The inner switch answers "why not?" — a question only a caller with a policy can answer. `useDefault` is the right response to a missing key; `warnAndUseDefault` is the right response to a value that is not a number; `clampToRange` is the right response to a value that exists but is out of bounds. Three failures, three responses, and each response had the data it needed because the error type carried it. That is the payoff of designing the error type around the responses rather than around the messages.
+Notice the two layers of decision in that call site. The outer switch answers "did it work?", the universal question. The inner switch answers "why not?", a question only a caller with a policy can answer. `useDefault` is the right response to a missing key; `warnAndUseDefault` is the right response to a value that is not a number; `clampToRange` is the right response to a value that exists but is out of bounds. Three failures, three responses, and each response had the data it needed because the error type carried it. That is the payoff of designing the error type around the responses rather than around the messages.
 
 Now let us extend the example, because the real value of `Result` shows when failures span layers. Suppose `loadSettings` calls `parseTimeout`, and `loadSettings` is called by `main`. `loadSettings` knows the config file's path and wants its own errors to mention it:
 
@@ -358,4 +358,4 @@ Now let us extend the example, because the real value of `Result` shows when fai
 
 9. Transformation. Given `Option<i32> maybe`, write code that doubles it if present and otherwise sets it to `0`, twice: once with `map`/`orElse`, and once with an explicit `switch`. Which is clearer, and what does each do to `maybe`?
 
-10. Meta. The chapter argues that a failure whose only sensible response is "stop, the program is wrong" should be an assertion rather than a `Result`. Find a failure in a program you know that is currently handled as a value, and argue whether it should instead be an assertion — or vice versa. What would change about the callers?
+10. Meta. The chapter argues that a failure whose only sensible response is "stop, the program is wrong" should be an assertion rather than a `Result`. Find a failure in a program you know that is currently handled as a value, and argue whether it should instead be an assertion, or vice versa. What would change about the callers?

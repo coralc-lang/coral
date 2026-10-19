@@ -172,22 +172,32 @@ AsmObject dynamic ELF/COFF shdrs; `.section` arbitrary, `.comm/.lcomm/
   `struct(type, type)`. Parenthesized tuple types `(A, B)` are stripped
   with parse error P0003 pointing at `struct(A, B)`; `var (name, name)`
   destructuring is *not* planned. Tuple members stay **1-based** (`p.1`).
-- **File-scope initializers**: any non-literal global initializer is
-  emitted verbatim and fails in gcc (`initializer element is not
-  constant`). Repro: `print.crl` at repo root (`var _b =
-  _a.isAsciiAlpha();`), `/tmp/opencode/gv2.crl` (`var h = g + 1;`),
-  `/tmp/opencode/gv3.crl` (`const B = A + 1;`). Plan: constant-fold `const`
-  inits over earlier constants; dynamic-init constructor for runtime `var`
-  globals.
-- **Bare `return ;` in a non-void function**: passes analysis, gcc rejects
-  the emitted C (codegen gap; `print.crl` also hits this).
-- **`print.crl` line 22-26** contains pasted compiler output (not Coral)
-  and `println("{}, {}", _a)` has 2 placeholders / 1 arg (E0901) — file
-  cannot compile as written even after the two gaps above.
-- **Router/log fragment in `coral-semantics/analyze.crl`**: `errWrite`
-  lives here (`void errWrite(str s) { write(2, …) }`) — use it for the
-  pending LSP server-loop `-2` malformed-frame stderr message + exit 1
-  (clean EOF stays silent).
+- ~~File-scope initializers~~ **DONE (2026-10-18f)**: `const` refs fold by
+  value; runtime `var` globals run from `coral_globals_init()` (constructor);
+  non-constant `const`/array initializers are G0001 errors. See
+  `SESSION_STATE.md` 2026-10-18f.
+- ~~Bare `return ;` in a non-void function~~ **DONE (2026-10-18f)**: now
+  T0002 with tailored help.
+- ~~LSP server-loop `-2` stderr message~~ **DONE (2026-10-18f)**: rc 1 +
+  stderr for malformed/oversized frames, clean EOF stays silent.
+- ~~`print.crl` line 22-26~~ **DONE (2026-10-18g)**: the pasted compiler
+  output is commented; `print.crl` compiles and runs (`fooooo, 5`).
+- ~~Doc comments `///`~~ **DONE (2026-10-18g)**: capture + side table +
+  hover render; see `SESSION_STATE.md` 2026-10-18g.
+- ~~Fourth-batch diagnostics~~ **DONE (2026-10-18g)**: T0010/T0011/T0012/
+  T0013/P0012 implemented in Coral's code series; unused locals warn by default (`--warn-unused` removed as redundant).
+- ~~Platform std default + override~~ **DONE (2026-10-18h)**: host platform
+  baked via `flag (host)`; `--platform`/build flags/env override; seg-count
+  bug fixed; windows std sema-clean; see `SESSION_STATE.md` 2026-10-18h.
+- ~~Source build + install + packaging~~ **DONE (2026-10-18h)**:
+  `Makefile`, `install.sh`, `install.ps1`, `package.sh`, `package.md`;
+  `dist/coralc-{linux,windows}.c` generated.
+- ~~`[mono]` debug prints~~ **DONE (2026-10-18h)**: removed from
+  `instantiate.crl`/`collect.crl`.
+- **Next: ERROR-EXPLANATIONS.md** (user request): implement `coral/explain`
+  LSP request reusing the CLI renderer, `codeDescription.href`, code action
+  `coral.diagnosis.explain`, hover Parameters/Returns + `In <Type>` section
+  + hover `range`; update §3b status (doc comments now implemented).
 - **Textbook scan (deferred, user wants later)**: read
   `coral-docs/textbook/` (39 files) against the compiler; missing features
   → todos, invalid syntax → report to user. Verify every candidate against

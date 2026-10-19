@@ -4,7 +4,7 @@ Data Structures: Layout, Cost, and the Choice of Shape
 
 Where the Cost Comes From
 
-A data structure is not a feature you bolt onto a program; it is a decision about how the program's data sits in memory, and almost every performance property of the program follows from that decision. The same values can be arranged a dozen different ways, and each arrangement makes some operations cheap and others expensive. Knowing data structures is not memorising a list of names — a vector, a map, a tree — it is understanding what each arrangement costs and why, so that when a program is slow you can see which arrangement is fighting you.
+A data structure is not a feature you bolt onto a program; it is a decision about how the program's data sits in memory, and almost every performance property of the program follows from that decision. The same values can be arranged a dozen different ways, and each arrangement makes some operations cheap and others expensive. Knowing data structures is not memorising a list of names, a vector, a map, a tree, it is understanding what each arrangement costs and why, so that when a program is slow you can see which arrangement is fighting you.
 
 Here is the picture that makes the whole subject click. Memory is a very long street of numbered houses, one byte each. The processor does not read one house at a time when it fetches; it fetches a whole block of neighbouring houses at once, a cache line of sixty-four bytes. So the cheapest thing you can do is read houses in order, because the block you already fetched contains the next houses you want. The most expensive thing you can do is jump to a house across town for every value, because each jump fetches a fresh block and uses only a few bytes of it. The difference between a program that runs in a millisecond and one that runs in a second is very often nothing more than this: does it walk the street in order, or does it teleport?
 
@@ -12,7 +12,7 @@ Coral's collections are a small family of answers to that problem, and the famil
 
 Coral's collections are also unusually readable, because in Coral a collection is a struct with public fields, and the fields are the layout. You do not have to guess what a vector costs; you look at its declaration and count. This is the type-first principle applied to data: the type shows what the thing is made of, and therefore what it costs. The whole chapter is an exercise in reading those declarations and seeing the costs in them.
 
-This chapter is about the ideas and the trade-offs, with the Coral code that expresses each idea. It is not a catalogue of every method; the catalogue lives in Chapter16, and the text layer — strings and parsing — in Chapter17. What this chapter builds is the mental model: why arrays and linked nodes sit at opposite ends of a spectrum, why hashing trades order for speed, why a heap is a tree that lives in an array, and how to look at a program's access pattern and know which shape it wants.
+This chapter is about the ideas and the trade-offs, with the Coral code that expresses each idea. It is not a catalogue of every method; the catalogue lives in Chapter16, and the text layer, strings and parsing, in Chapter17. What this chapter builds is the mental model: why arrays and linked nodes sit at opposite ends of a spectrum, why hashing trades order for speed, why a heap is a tree that lives in an array, and how to look at a program's access pattern and know which shape it wants.
 
 8.1 What a Data Structure Is
 
@@ -45,7 +45,7 @@ That readability is the point of the chapter: when you can see the fields, you c
 
 Almost every operation on a collection does one or both of two kinds of work, and naming them makes the rest of the chapter easier.
 
-The first is address arithmetic: computing where an element is. If elements are packed consecutively and all the same size, the address of element `i` is the base address plus `i` times the element size — one multiply and one add. The processor does this in a single step. Indexing an array is literally that formula, which is why array indexing is constant time regardless of how large the array is.
+The first is address arithmetic: computing where an element is. If elements are packed consecutively and all the same size, the address of element `i` is the base address plus `i` times the element size, one multiply and one add. The processor does this in a single step. Indexing an array is literally that formula, which is why array indexing is constant time regardless of how large the array is.
 
 The second is movement: copying elements from one place to another. Inserting into the middle of an array means every element after the insertion point must slide one slot to the right. Growing a vector means copying every live element into a new, larger block. Rehashing a hash map means recomputing every key's position in a new table. Movement is the expensive work, and the amount of it is the thing to count when you judge a structure.
 
@@ -70,21 +70,21 @@ You could say it like this: if you want to find things quickly, pack them togeth
 
 The arithmetic-versus-movement trade is the algorithmic half of the story. The memory-system half is locality, and for large collections it is the half that dominates.
 
-When elements are contiguous, iterating them means reading consecutive addresses, and the processor's cache — which fetches a block of neighbouring bytes at once — rewards that. You fetch one cache line, consume all of it, and the next line is likely already on its way. The bytes you paid to fetch are the bytes you use. Coral calls this property locality, and the array is its purest example.
+When elements are contiguous, iterating them means reading consecutive addresses, and the processor's cache, which fetches a block of neighbouring bytes at once, rewards that. You fetch one cache line, consume all of it, and the next line is likely already on its way. The bytes you paid to fetch are the bytes you use. Coral calls this property locality, and the array is its purest example.
 
-When elements are scattered, iterating them means reading a value, following a pointer to a random address, reading another value, following another pointer, and so on. Each hop is a fresh cache line, and you use perhaps eight of its sixty-four bytes. The hardware calls this a cache miss, and a program that misses on every element can be an order of magnitude slower than a program that never misses — even though both do the same number of "steps" in the algorithmic sense.
+When elements are scattered, iterating them means reading a value, following a pointer to a random address, reading another value, following another pointer, and so on. Each hop is a fresh cache line, and you use perhaps eight of its sixty-four bytes. The hardware calls this a cache miss, and a program that misses on every element can be an order of magnitude slower than a program that never misses, even though both do the same number of "steps" in the algorithmic sense.
 
-Programmers call the scattered pattern pointer chasing, or indirection. A pointer is an indirection: instead of holding the thing, you hold its address and go get it. Indirection buys flexibility — a node can live anywhere, and you can connect things in any order — and it costs a cache miss every time you follow one.
+Programmers call the scattered pattern pointer chasing, or indirection. A pointer is an indirection: instead of holding the thing, you hold its address and go get it. Indirection buys flexibility, a node can live anywhere, and you can connect things in any order, and it costs a cache miss every time you follow one.
 
 If a pointer is a new idea, think of it as a slip of paper with an address written on it. The paper is tiny and cheap to pass around, but whenever you actually want the thing, you have to travel to the address. Reading contiguous memory is like reading a book page by page; following pointers is like chasing a trail of notes, each one left in a different building.
 
     i32 value = 42;
     i32* address = &value;    // a pointer: the address of value
-    println("{}", *address);  // 42 — follow the address to reach the value
+    println("{}", *address);  // 42, follow the address to reach the value
 
 This is why the vector is the default in Coral and almost everywhere else, and why the linked list, despite being the structure every beginner finds most intuitive, is the special case. A linked list and a vector both iterate in linear time by the algorithm's reckoning, but the vector's iteration reads memory forward and the list's iteration jumps around it, and on modern hardware that difference is enormous.
 
-Hold on — let me be concrete about the scale, because "orders of magnitude" is easy to say and hard to feel. Suppose each element is eight bytes and a cache line is sixty-four. A vector of a million elements touches about a hundred and twenty-five thousand cache lines and uses every byte of each — a hundred and twenty-five thousand fetches, all sequential, which the hardware predicts and prefetches beautifully. A linked list of a million elements touches one cache line per node — a million fetches, each to a location the prefetcher cannot guess. The list does about eight times as many memory fetches and gets no help from the hardware's ability to anticipate. That is the tax on indirection, and it is why the chapter keeps returning to contiguity.
+Hold on, let me be concrete about the scale, because "orders of magnitude" is easy to say and hard to feel. Suppose each element is eight bytes and a cache line is sixty-four. A vector of a million elements touches about a hundred and twenty-five thousand cache lines and uses every byte of each, a hundred and twenty-five thousand fetches, all sequential, which the hardware predicts and prefetches beautifully. A linked list of a million elements touches one cache line per node, a million fetches, each to a location the prefetcher cannot guess. The list does about eight times as many memory fetches and gets no help from the hardware's ability to anticipate. That is the tax on indirection, and it is why the chapter keeps returning to contiguity.
 
 8.4 The Fixed Array: When the Size Is Part of the Type
 
@@ -106,7 +106,7 @@ The access operations mirror the formula from the previous section. `at` reads a
         println("{}", months.at(i));
     println("first is {}, last is {}", months.front(), months.back());
 
-Because `N` is a compile-time constant, the storage is exact and the bounds are knowable. The array's deal is simple: its size is fixed and its layout is contiguous. The reader knows from the type how much memory an array occupies, and the operations know from the type how many elements they may touch. A lookup table, a fixed conversion table, a small buffer whose size is a constant of the program — these are arrays, and they need no allocation, no growth, and no bookkeeping beyond the storage itself.
+Because `N` is a compile-time constant, the storage is exact and the bounds are knowable. The array's deal is simple: its size is fixed and its layout is contiguous. The reader knows from the type how much memory an array occupies, and the operations know from the type how many elements they may touch. A lookup table, a fixed conversion table, a small buffer whose size is a constant of the program, these are arrays, and they need no allocation, no growth, and no bookkeeping beyond the storage itself.
 
 A tiny example makes the "no allocation, no growth" promise concrete:
 
@@ -116,13 +116,13 @@ A tiny example makes the "no allocation, no growth" promise concrete:
         total += face;
     println("four dice total {}", total);
 
-Why this matters: when a count is truly fixed and known — the twelve months, the four suits, a checksum table — an `Arr` states that fact in the type, so no caller can ever make it larger or forget to grow it. The size lives in the type, and the compiler reads it.
+Why this matters: when a count is truly fixed and known, the twelve months, the four suits, a checksum table, an `Arr` states that fact in the type, so no caller can ever make it larger or forget to grow it. The size lives in the type, and the compiler reads it.
 
 The array is also the base case against which everything else is measured. Every other collection in this chapter is, at bottom, "an array plus a strategy" or "a set of arrays connected by pointers." The vector is an array that can move to a longer street. The hash map is an array whose index is computed from a key. The heap is an array that happens to encode a tree. The bitset is an array of machine words used as a field of bits.
 
 8.5 The Vector: A Contiguous Buffer That Grows
 
-The array's fixed size is its limitation. Programs constantly do not know how many elements they will have until the program runs — how many lines are in a file, how many words are in a document — and a fixed array cannot hold an unknown count. The vector is the array with growth: a contiguous buffer that starts small and expands when it fills. It is the collection C programmers have written a hundred times, made a standard type.
+The array's fixed size is its limitation. Programs constantly do not know how many elements they will have until the program runs, how many lines are in a file, how many words are in a document, and a fixed array cannot hold an unknown count. The vector is the array with growth: a contiguous buffer that starts small and expands when it fills. It is the collection C programmers have written a hundred times, made a standard type.
 
 The layout is exactly the array's storage plus two numbers:
 
@@ -159,7 +159,7 @@ The push method is the vector in miniature, and it is worth reading once:
 
 Check the room, grow if needed, store the value, advance the length. Every growth-triggering operation has that shape, and the constructor sets the baseline: an empty vector has a null buffer, a zero length, and a zero capacity, and grows from there.
 
-The middle operations have their costs written into their shapes. `insert` and `removeAt` move every element after the index one slot over, so they are linear in the tail they shift. Appending is the fast path; the middle is where a vector pays for its contiguity. A vector in use is the most common loop in programming — build, iterate, read:
+The middle operations have their costs written into their shapes. `insert` and `removeAt` move every element after the index one slot over, so they are linear in the tail they shift. Appending is the fast path; the middle is where a vector pays for its contiguity. A vector in use is the most common loop in programming, build, iterate, read:
 
     Vec<u64> squares = Vec<u64>::withCap(10);
     for (usize i = 0; i < 10; i++)
@@ -171,7 +171,7 @@ The middle operations have their costs written into their shapes. `insert` and `
 
 Capacity management is how you turn a vector from convenient into fast. `reserve` grows to a requested capacity ahead of time; `reserveExact` allocates exactly the requested amount; `shrinkToFit` releases spare capacity after a vector has been trimmed; and `clear` resets the length to zero without freeing the buffer, so the next round of pushes reuses the space. The vector is the default choice for "many elements of one type": it reads like an array, it grows like a list, and its elements are contiguous, so it is cache-friendly and cheap to free.
 
-A common beginner mistake is to confuse `count()` with capacity. `count()` reports the live elements; the capacity is the room behind them, which only `withCap`, `reserve`, or a growth changes. A related surprise is that `clear` does not give memory back — it sets the length to zero and keeps the buffer, which is a feature when you plan to refill it and a surprise if you expected the memory to return.
+A common beginner mistake is to confuse `count()` with capacity. `count()` reports the live elements; the capacity is the room behind them, which only `withCap`, `reserve`, or a growth changes. A related surprise is that `clear` does not give memory back, it sets the length to zero and keeps the buffer, which is a feature when you plan to refill it and a surprise if you expected the memory to return.
 
 8.6 Growth, Doubling, and What "Amortized" Means
 
@@ -188,9 +188,9 @@ When the buffer is full, the vector does not grow by one slot; it doubles. The n
         self.cap = newCap;
     }
 
-The doubling is the entire trick. After a growth, the vector has at least as much free room as it had live elements, so the one expensive copy just bought room for a whole run of cheap appends. The cost of the copy is spread — amortized — over the pushes that follow, and each of those pays only a tiny share of it. That is what "amortized constant time" means: not that every push is cheap, but that the total cost of n pushes divided by n stays constant as n grows.
+The doubling is the entire trick. After a growth, the vector has at least as much free room as it had live elements, so the one expensive copy just bought room for a whole run of cheap appends. The cost of the copy is spread, amortized, over the pushes that follow, and each of those pays only a tiny share of it. That is what "amortized constant time" means: not that every push is cheap, but that the total cost of n pushes divided by n stays constant as n grows.
 
-The arithmetic is worth doing once. Start empty and push until the vector holds a million elements. The capacities as it grows are 4, 8, 16, and so on. Each growth copies the current length, and the copies total roughly the final capacity — about a million element moves across all of the growths combined. So the work to push a million elements is around two million element operations, about two per push. A constant. Meanwhile a strategy that grew by one slot per push would copy the whole vector on every push, and the total would be quadratic — the difference between a collection that slows down as it grows and one that does not.
+The arithmetic is worth doing once. Start empty and push until the vector holds a million elements. The capacities as it grows are 4, 8, 16, and so on. Each growth copies the current length, and the copies total roughly the final capacity, about a million element moves across all of the growths combined. So the work to push a million elements is around two million element operations, about two per push. A constant. Meanwhile a strategy that grew by one slot per push would copy the whole vector on every push, and the total would be quadratic, the difference between a collection that slows down as it grows and one that does not.
 
 Here is the same idea as a small trace, starting from an empty vector whose first growth takes it to capacity four:
 
@@ -207,7 +207,7 @@ The strategy also puts the growth in your hands rather than hiding it. When the 
 
 8.7 A Stack Is a Usage, Not a Type
 
-Some structures are not types at all; they are usages of a type, and the stack is the clearest example. A stack is last-in-first-out: remember a value, and get it back in reverse order. It is so fundamental that every program has one running underneath it — the call stack, which records functions in flight and returns to them in reverse order.
+Some structures are not types at all; they are usages of a type, and the stack is the clearest example. A stack is last-in-first-out: remember a value, and get it back in reverse order. It is so fundamental that every program has one running underneath it, the call stack, which records functions in flight and returns to them in reverse order.
 
 In plain words, a stack is a pile of plates. You add a plate to the top and you take a plate from the top, so the last plate you set down is the first one you pick up. That is the whole meaning of last-in, first-out.
 
@@ -244,13 +244,13 @@ The canonical use of a stack is matching pairs of delimiters, because nesting is
         return stack.isEmpty();
     }
 
-The function is linear in the length of the text: every character is examined once, each push and pop is amortized constant, and the nesting is verified by the order in which the stack returns its contents. The same LIFO order is an undo history — push a state on every edit, pop on every undo — and it is the shape of any backtracking search, where you must return to where you came from in reverse order of arrival.
+The function is linear in the length of the text: every character is examined once, each push and pop is amortized constant, and the nesting is verified by the order in which the stack returns its contents. The same LIFO order is an undo history, push a state on every edit, pop on every undo, and it is the shape of any backtracking search, where you must return to where you came from in reverse order of arrival.
 
 The lesson generalizes: when a problem says "use a stack" or "use a queue," look at the access pattern, not for a magic type. The pattern is the data structure; the container is just the storage that supports it. Chapter27 puts this to work on a dozen problems.
 
 8.8 Linked Nodes: The Other Way to Connect
 
-If the array is one end of the spectrum — everything packed, location computed, movement expensive — the linked list is the other. Instead of putting all elements in one block, a linked list gives each element its own block, called a node, and connects the nodes with pointers. To reach the tenth element you start at the first and follow nine pointers. Nothing is ever moved; to insert you rewrite a couple of pointers.
+If the array is one end of the spectrum, everything packed, location computed, movement expensive, the linked list is the other. Instead of putting all elements in one block, a linked list gives each element its own block, called a node, and connects the nodes with pointers. To reach the tenth element you start at the first and follow nine pointers. Nothing is ever moved; to insert you rewrite a couple of pointers.
 
 In plain words, a linked list is a treasure hunt. Each clue tells you where the next clue is hidden, so to reach the tenth clue you must first visit the nine before it. A vector is more like a row of numbered boxes: because the boxes sit side by side, you can walk straight to box ten without opening the others.
 
@@ -300,9 +300,9 @@ You can build the same idea by hand, singly linked, when you want to see the poi
         }
     }
 
-`alloc<T>(count)` reserves `count` elements on the heap; `*` and `->` reach through a pointer; `dealloc<T>` returns the block. `pushFront` allocates one node, writes the value, points it at the old head, and returns the new head — constant time and no movement. Freeing walks the chain, saving each `next` before releasing the node, because the node's memory is gone the moment it is freed.
+`alloc<T>(count)` reserves `count` elements on the heap; `*` and `->` reach through a pointer; `dealloc<T>` returns the block. `pushFront` allocates one node, writes the value, points it at the old head, and returns the new head, constant time and no movement. Freeing walks the chain, saving each `next` before releasing the node, because the node's memory is gone the moment it is freed.
 
-The list's operations are the operations its structure makes natural. In the standard library, `pushFront` and `pushBack` add at the ends, `popFront` and `popBack` remove from them, `insertAfter` and `remove` work on individual nodes, and `each` walks the chain from head to tail calling a function on every value. Each end operation is constant time because the list holds both ends. An element in the middle is reached by walking from the head, one node at a time — linear time — and there is no index operation at all.
+The list's operations are the operations its structure makes natural. In the standard library, `pushFront` and `pushBack` add at the ends, `popFront` and `popBack` remove from them, `insertAfter` and `remove` work on individual nodes, and `each` walks the chain from head to tail calling a function on every value. Each end operation is constant time because the list holds both ends. An element in the middle is reached by walking from the head, one node at a time, linear time, and there is no index operation at all.
 
 The cost profile is the mirror image of the vector's. Insertion and removal at the ends are constant time with no copying, since the list rearranges pointers instead of moving elements. But reaching the middle is linear, and iteration touches a different cache line per element. The list is what you reach for when the work is at the ends and the elements are inserted and removed often, not when the work is indexing.
 
@@ -312,15 +312,15 @@ A common beginner mistake is to assume the linked list is the "proper" or "more 
 
 There is one thing the linked list buys that the vector cannot, and it is the reason the list is not obsolete in an age of caches: stable addresses.
 
-When a vector grows, it allocates a new buffer and copies the elements into it, so a pointer to an element of the vector is invalidated the instant the vector grows — the element it pointed to now lives somewhere else, or has been freed. Every reference into a vector is a bet that the vector will not grow while the reference is held. A linked list makes no such bet: each element lives in a node of its own, and a pointer to a node stays valid no matter how many other nodes are added or removed, as long as that node is not itself removed. The node's identity is its address, and the address survives.
+When a vector grows, it allocates a new buffer and copies the elements into it, so a pointer to an element of the vector is invalidated the instant the vector grows, the element it pointed to now lives somewhere else, or has been freed. Every reference into a vector is a bet that the vector will not grow while the reference is held. A linked list makes no such bet: each element lives in a node of its own, and a pointer to a node stays valid no matter how many other nodes are added or removed, as long as that node is not itself removed. The node's identity is its address, and the address survives.
 
-This pointer stability is what makes intrusive structures possible. An intrusive structure stores its links inside the data itself — a cache entry that is simultaneously a node of the recency list and a value of the lookup map, a task that sits on a scheduler's list while the scheduler holds a pointer to it. The structure can rearrange itself by moving links without ever moving the data, because the data's address is fixed. The standard library's `Cache`, in `std::collections.cache`, is exactly this: a hash map for lookup and a doubly linked list for recency, with each entry doing both jobs at once.
+This pointer stability is what makes intrusive structures possible. An intrusive structure stores its links inside the data itself, a cache entry that is simultaneously a node of the recency list and a value of the lookup map, a task that sits on a scheduler's list while the scheduler holds a pointer to it. The structure can rearrange itself by moving links without ever moving the data, because the data's address is fixed. The standard library's `Cache`, in `std::collections.cache`, is exactly this: a hash map for lookup and a doubly linked list for recency, with each entry doing both jobs at once.
 
 The trade is honest and the choice follows from the access pattern. When the work is iterating and indexing, the vector's locality wins overwhelmingly, and it is the default. When the work is rearranging links and holding pointers to elements that must not move, the list's stable addresses win, and no amount of cache-friendliness buys back what pointer stability gives you. The two structures are not ranked; they are different points on the trade between contiguous-and-movable and scattered-and-stable.
 
 8.10 The Deque and the Ring Buffer: Both Ends
 
-A vector is fast at the back and slow at the front: `push` appends in constant time, but `insert(0, x)` shifts the entire buffer. Many programs need the opposite — a work queue that takes from the front and adds to the back — and for those the standard library provides the deque.
+A vector is fast at the back and slow at the front: `push` appends in constant time, but `insert(0, x)` shifts the entire buffer. Many programs need the opposite, a work queue that takes from the front and adds to the back, and for those the standard library provides the deque.
 
 A deque, short for double-ended queue, supports constant-time insertion and removal at both ends. Its implementation is a ring buffer: one contiguous block with a head index and a tail index that wrap around the end of the block back to the beginning. The declaration shows the machinery:
 
@@ -333,7 +333,7 @@ A deque, short for double-ended queue, supports constant-time insertion and remo
         usize mask;
     }
 
-The `mask` field is the ring trick. The capacity is a power of two, the mask is one less than the capacity, and advancing an index means adding one and masking — the same as wrapping around. `count` subtracts the indices and masks; `_grow` allocates a new buffer and copies the elements from head to tail in order. Because no end is special — both are positions on a circle — both ends are constant time, and unlike a linked list the storage is still contiguous, so iteration is still cache-friendly.
+The `mask` field is the ring trick. The capacity is a power of two, the mask is one less than the capacity, and advancing an index means adding one and masking, the same as wrapping around. `count` subtracts the indices and masks; `_grow` allocates a new buffer and copies the elements from head to tail in order. Because no end is special, both are positions on a circle, both ends are constant time, and unlike a linked list the storage is still contiguous, so iteration is still cache-friendly.
 
 The deque's operations are `pushFront` and `pushBack`, `popFront` and `popBack`, `front` and `back`, and index access through `at` and `set`, which index from the head. The standard library's `Queue` is a thin wrapper over the deque, and many algorithms use the deque directly:
 
@@ -364,7 +364,7 @@ The fixed capacity makes the ring buffer predictable, which is exactly why it ap
 
 8.11 The Queue and the Order of Arrival
 
-The queue is first-in-first-out: the first element added is the first removed. It is the shape of fairness — the first to arrive is the first served — and of any process that must preserve arrival order. The standard library's `Queue` is a thin wrapper over the deque, exposing the queue's one-ended vocabulary instead of the deque's general two-ended one:
+The queue is first-in-first-out: the first element added is the first removed. It is the shape of fairness, the first to arrive is the first served, and of any process that must preserve arrival order. The standard library's `Queue` is a thin wrapper over the deque, exposing the queue's one-ended vocabulary instead of the deque's general two-ended one:
 
     pub struct Queue<T>
     {
@@ -411,7 +411,7 @@ The mark-then-enqueue order is the part to read twice. A node is marked the mome
 
 8.12 Hashing: Turning a Key Into an Address
 
-The collections so far index by position or by walking. The hash map indexes by value: you give it a key, and it finds the associated value. It does this not by searching but by computing — it runs the key through a hash function to get a number, reduces that number to a slot in a table, and looks there. This is the single most important trick in practical data structures, because it turns "search for the key" into "compute where the key must be."
+The collections so far index by position or by walking. The hash map indexes by value: you give it a key, and it finds the associated value. It does this not by searching but by computing, it runs the key through a hash function to get a number, reduces that number to a slot in a table, and looks there. This is the single most important trick in practical data structures, because it turns "search for the key" into "compute where the key must be."
 
 If hashing is new, think of a coat check. You hand over your coat and receive a numbered ticket; when you return, the number takes you straight to the shelf holding your coat, without searching every shelf. The "hash function" is the rule that turns your key into the ticket number, and the table is the wall of shelves. One consequence follows at once: the shelves are arranged by ticket number, not by anything about the coats, so the map makes no promise about the order of its keys.
 
@@ -444,7 +444,7 @@ The two function fields are the crucial part. A hash map cannot hash an arbitrar
     names.insert(7, "seven");
     names.insert(11, "eleven");
 
-A hash function is a deterministic scramble. The same key must always produce the same number, and a good hash spreads different keys across the whole range of the integer type so that they land in different slots. The hash is not an ordering: two keys that hash near each other have no relationship at all. That is why the hash map makes no promise about the order of its entries — the table is arranged by hash, not by key — and why the hash map is the wrong structure when you need the keys in order.
+A hash function is a deterministic scramble. The same key must always produce the same number, and a good hash spreads different keys across the whole range of the integer type so that they land in different slots. The hash is not an ordering: two keys that hash near each other have no relationship at all. That is why the hash map makes no promise about the order of its entries, the table is arranged by hash, not by key, and why the hash map is the wrong structure when you need the keys in order.
 
 A common beginner mistake is to expect a hash map to remember the order in which entries were added. It does not, because it stores each key wherever its hash happens to land. If you need the entries back in insertion order, use a vector; if you need them sorted by key, use the tree map of Section8.15.
 
@@ -464,7 +464,7 @@ Lookup hashes the key and walks the table from the resulting slot:
         return Option<V>::None;
     }
 
-The method hashes, probes the table, and compares with the equality function. It returns an `Option`: the value wrapped in `Some` when the key is present, `None` when it is not. That `Option` is the map's honesty about absence — a lookup either finds something or does not, and the type says so — and it is the same `Option` from Chapter15. `contains` probes and reports membership; `getPtr` returns an `Option` wrapping a pointer to the value so a caller can modify it in place. The `HashMap` module provides `insert`, `get`, `getPtr`, `contains`, `remove`, `clear`, `keys`, `values`, and `each`.
+The method hashes, probes the table, and compares with the equality function. It returns an `Option`: the value wrapped in `Some` when the key is present, `None` when it is not. That `Option` is the map's honesty about absence, a lookup either finds something or does not, and the type says so, and it is the same `Option` from Chapter15. `contains` probes and reports membership; `getPtr` returns an `Option` wrapping a pointer to the value so a caller can modify it in place. The `HashMap` module provides `insert`, `get`, `getPtr`, `contains`, `remove`, `clear`, `keys`, `values`, and `each`.
 
 8.13 Collisions, the Load Factor, and the Rehash
 
@@ -480,7 +480,7 @@ The load factor is how full the table is allowed to get. Coral's hash map checks
         // allocate newCap, re-home every occupied entry by its hash
     }
 
-At or below a load factor of one half, the linear probes stay short — a lookup finds its slot in a few probes on average. The growth is the vector's doubling with one extra step: every occupied entry is re-hashed into the new table, because the slot is the hash modulo the capacity and the capacity changed. The rehash is why the map must remember its hash function, and it is amortized exactly as the vector's growth is: the occasional expensive rehash is paid for by the many cheap inserts the new space accommodates.
+At or below a load factor of one half, the linear probes stay short, a lookup finds its slot in a few probes on average. The growth is the vector's doubling with one extra step: every occupied entry is re-hashed into the new table, because the slot is the hash modulo the capacity and the capacity changed. The rehash is why the map must remember its hash function, and it is amortized exactly as the vector's growth is: the occasional expensive rehash is paid for by the many cheap inserts the new space accommodates.
 
 The load factor is a trade. A denser table uses less memory and probes more; a sparser table uses more memory and probes less. The standard map's threshold is its chosen point on that trade, and the point is visible in the code:
 
@@ -491,7 +491,7 @@ The load factor is a trade. A denser table uses less memory and probes more; a s
 
 The map is the choice for key lookup when order does not matter. Finding a key is constant time on average, independent of how many entries there are, and the words "on average" carry the condition that the hash spreads its keys. A good hash keeps the probes short; a poor hash piles keys into one cluster and turns the map into a linear scan. Section8.14 writes both functions by hand and shows the rules they must obey.
 
-You could say the load factor is a car park that is deliberately kept half empty. If every space were filled, finding a free one would mean circling a long row of occupied slots; keeping half the spaces open means a driver almost always finds a spot in a step or two. The empty spaces cost memory — the very trade the section names — and they are what keeps lookups fast.
+You could say the load factor is a car park that is deliberately kept half empty. If every space were filled, finding a free one would mean circling a long row of occupied slots; keeping half the spaces open means a driver almost always finds a spot in a step or two. The empty spaces cost memory, the very trade the section names, and they are what keeps lookups fast.
 
 8.14 The Frequency Counter: A Map Put to Work
 
@@ -535,9 +535,9 @@ The map's `getPtr` is built for exactly this, because it combines the lookup and
         }
     }
 
-The first time a word appears, the slot is `None` and the word is inserted with a count of one; every later time, the slot holds a `Some` pointer and the count is incremented through it. The reporting loop collects the keys and reads each count back. Notice that the keys come out in hash order, not in the order the words first appeared, because the map promises lookup, not order — if you needed them sorted, you would use the tree map instead.
+The first time a word appears, the slot is `None` and the word is inserted with a count of one; every later time, the slot holds a `Some` pointer and the count is incremented through it. The reporting loop collects the keys and reads each count back. Notice that the keys come out in hash order, not in the order the words first appeared, because the map promises lookup, not order, if you needed them sorted, you would use the tree map instead.
 
-What makes a hash good is what makes any scramble good: it uses the whole key, it varies with every part of the key, and it returns a number spread across the full range. A hash that ignores part of a key, hashing only a record's first field, piles together every record that shares that field. A hash that returns a constant turns the map into a linear search through one giant cluster. A hash that is expensive is also bad, because the map pays it on every operation. The classic string hash above — multiply an accumulator by a small prime, add each byte — is the model.
+What makes a hash good is what makes any scramble good: it uses the whole key, it varies with every part of the key, and it returns a number spread across the full range. A hash that ignores part of a key, hashing only a record's first field, piles together every record that shares that field. A hash that returns a constant turns the map into a linear search through one giant cluster. A hash that is expensive is also bad, because the map pays it on every operation. The classic string hash above, multiply an accumulator by a small prime, add each byte, is the model.
 
 The equality function must be consistent with the hash: two keys that are equal must hash to the same value, or the map will search in one place for a key it stores in another and quietly fail. This is the equality rule, and it is what makes the map work. For a composite key the exercise is to use every field in both functions:
 
@@ -558,7 +558,7 @@ The equality function must be consistent with the hash: two keys that are equal 
 
     HashMap<Point, str> labels = HashMap<Point, str>::new(hashPoint, eqPoint);
 
-The hash combines both coordinates so that a change in either changes the hash, and the equality compares the same two coordinates, so the two functions agree about what a key is. Violate either half — make the equality and the hash disagree — and the map quietly fails.
+The hash combines both coordinates so that a change in either changes the hash, and the equality compares the same two coordinates, so the two functions agree about what a key is. Violate either half, make the equality and the hash disagree, and the map quietly fails.
 
 8.15 Order as a Feature: The Tree Map
 
@@ -594,13 +594,13 @@ The ordering comes from the comparison function `cmpFn`, which the constructor t
     scores.insert("cecile", 19);
     scores.each(printPair);       // delivered in key order: ada, bob, cecile
 
-The operations match the hash map's, with one difference at the heart of it: `get` returns an `Option`, `getPtr` returns an `Option` wrapping a pointer, `contains` reports membership, and `insert`/`remove` modify the tree — but the entries are kept in order, and `each` walks the tree in order (left subtree, node, right subtree), delivering the keys smallest to largest. The hash map can also hand out its pairs, but in hash order; the tree map hands them out in key order, because the tree is the keys' order made visible.
+The operations match the hash map's, with one difference at the heart of it: `get` returns an `Option`, `getPtr` returns an `Option` wrapping a pointer, `contains` reports membership, and `insert`/`remove` modify the tree, but the entries are kept in order, and `each` walks the tree in order (left subtree, node, right subtree), delivering the keys smallest to largest. The hash map can also hand out its pairs, but in hash order; the tree map hands them out in key order, because the tree is the keys' order made visible.
 
 The price is the operations: each lookup, insert, and remove is logarithmic in the number of entries, where the hash map's are constant on average. The tree map and the hash map are the ordered and unordered answers to the same question, and the standard library provides both so that the choice is the program's. Chapter16 calls the hash-based wrapper `UnorderedMap`, which is the same table as `HashMap` behind a name that states "no order" as intent.
 
 8.16 Sets: Membership on Its Own
 
-A set drops the values and keeps the keys. It holds distinct elements and answers one question — is this present? — and it enforces that nothing appears twice. Coral's `Set` is a `HashMap<T, bool>` underneath, storing each element as a key with a throwaway value, and it needs the same two key functions:
+A set drops the values and keeps the keys. It holds distinct elements and answers one question, is this present?, and it enforces that nothing appears twice. Coral's `Set` is a `HashMap<T, bool>` underneath, storing each element as a key with a throwaway value, and it needs the same two key functions:
 
     pub struct Set<T>
     {
@@ -625,7 +625,7 @@ Membership is constant time on average, inherited from the map. `insert` records
         }
     }
 
-The first time a value is seen it is kept and its encounters after that are skipped, and because the membership check is constant on average, the whole pass is linear. The set's distinctive extra operations are the set algebra — `union`, `intersection`, `difference`, and the `isSubset`/`isSuperset` relationships — each built from the collection's own hash and equality so the result is a proper set:
+The first time a value is seen it is kept and its encounters after that are skipped, and because the membership check is constant on average, the whole pass is linear. The set's distinctive extra operations are the set algebra, `union`, `intersection`, `difference`, and the `isSubset`/`isSuperset` relationships, each built from the collection's own hash and equality so the result is a proper set:
 
     Set<u64> common = seen.intersection(&other);   // elements in both
     Set<u64> onlyA  = seen.difference(&other);     // in seen but not other
@@ -676,7 +676,7 @@ The classic demonstration is the sieve of Eratosthenes, whose universe is exactl
         return primes;
     }
 
-The set and the bitset answer the same question — membership — at different scales. The set handles arbitrary values and pays a full hash table for them. The bitset handles a fixed, dense range of small integers and pays one bit each, with the whole universe fixed at construction and every bit operation asserting the bound. Choose by the shape of the question: arbitrary values, choose the set; a dense range, choose the bitset.
+The set and the bitset answer the same question, membership, at different scales. The set handles arbitrary values and pays a full hash table for them. The bitset handles a fixed, dense range of small integers and pays one bit each, with the whole universe fixed at construction and every bit operation asserting the bound. Choose by the shape of the question: arbitrary values, choose the set; a dense range, choose the bitset.
 
 8.18 The Heap: Priority Without a Sort
 
@@ -707,7 +707,7 @@ The priorities come from the `less` function, which the constructor takes. Note 
 
 `pop` takes the root, the highest-priority element, moves the last element into the root's place, and sifts it down. Each sift moves one level down a tree of logarithmic height, so each operation is logarithmic.
 
-The heap's beauty is that the tree lives in the array with no pointers: the children and parent of any node are computed from the node's index, so the heap never allocates a node. The cost of that layout is that the heap is not a sorted structure — the array is not in order, only the heap property holds, that every parent precedes its children in priority. That is enough, because the queue only ever needs the root, and the sift operations restore the property after each push and pop.
+The heap's beauty is that the tree lives in the array with no pointers: the children and parent of any node are computed from the node's index, so the heap never allocates a node. The cost of that layout is that the heap is not a sorted structure, the array is not in order, only the heap property holds, that every parent precedes its children in priority. That is enough, because the queue only ever needs the root, and the sift operations restore the property after each push and pop.
 
     import(lib) std::collections.priorityqueue { PriorityQueue };
 
@@ -719,11 +719,11 @@ The heap's beauty is that the tree lives in the array with no pointers: the chil
     deadlines.push(20);
     u64 next = deadlines.pop();     // 10, the smallest
 
-With `less` as "a is less than b," the queue is a min-heap and yields the smallest; flip the comparator and it is a max-heap. The priority queue is the choice for "always take the most important thing next" — a scheduler taking the earliest deadline, an event loop taking the next event, an algorithm taking the nearest frontier — and its costs are the heap's: push and pop are logarithmic, peek is constant, and the memory is the heap's array.
+With `less` as "a is less than b," the queue is a min-heap and yields the smallest; flip the comparator and it is a max-heap. The priority queue is the choice for "always take the most important thing next", a scheduler taking the earliest deadline, an event loop taking the next event, an algorithm taking the nearest frontier, and its costs are the heap's: push and pop are logarithmic, peek is constant, and the memory is the heap's array.
 
 8.19 The Cache: Two Structures, One Job
 
-The cache remembers a limited number of entries and forgets the rest. Coral's `Cache` is a least-recently-used cache: when it is full and a new entry is inserted, the coldest entry — the one least recently used — is evicted. It is the best illustration in the chapter of choosing a structure for its cost, because it uses two structures and each does the job it is best at.
+The cache remembers a limited number of entries and forgets the rest. Coral's `Cache` is a least-recently-used cache: when it is full and a new entry is inserted, the coldest entry, the one least recently used, is evicted. It is the best illustration in the chapter of choosing a structure for its cost, because it uses two structures and each does the job it is best at.
 
     pub struct CacheEntry<K, V>
     {
@@ -743,7 +743,7 @@ The cache remembers a limited number of entries and forgets the rest. Coral's `C
         bool(K, K) eqFn;
     }
 
-The map finds an entry by key in constant time. The linked list keeps the entries in recency order, with the most recently used at the head and the least recently used at the tail. Every access moves the accessed entry to the head in constant time, because the entry's pointers make the move a few assignments; every insertion beyond the limit evicts the tail. The entry is the node of the list and the value of the map at once, which is why the map stores a pointer to the entry: the map finds it, and the entry carries the recency links. This is the pointer stability of section8.9 made useful — the entry's address never changes, so the map and the list can both refer to it while it moves freely through the recency order.
+The map finds an entry by key in constant time. The linked list keeps the entries in recency order, with the most recently used at the head and the least recently used at the tail. Every access moves the accessed entry to the head in constant time, because the entry's pointers make the move a few assignments; every insertion beyond the limit evicts the tail. The entry is the node of the list and the value of the map at once, which is why the map stores a pointer to the entry: the map finds it, and the entry carries the recency links. This is the pointer stability of section8.9 made useful, the entry's address never changes, so the map and the list can both refer to it while it moves freely through the recency order.
 
     import(lib) std::collections.cache { Cache };
 
@@ -804,7 +804,7 @@ The key property, and the reason the tree is usable, is that the node pointers r
 
 The variable `eng` is a pointer to the engineering node, and every later `addChild` that names `eng` hangs a child under engineering. The build reads like the structure, because parent pointers are named and threaded by hand. `preOrder` visits the value before its children; `postOrder` visits the children first. `depth` measures the deepest chain from a node, `size` counts the nodes, and `toVec` collects every value.
 
-The generic tree's costs are the costs of its pieces: the vector of children gives each node a growable child list, and the nodes are individual allocations linked by pointers, so traversal walks the same scattered memory a linked list does. The tree buys what a flat vector cannot — a place for everything with a well-defined parent — and it is the right collection whenever the hierarchy is the point.
+The generic tree's costs are the costs of its pieces: the vector of children gives each node a growable child list, and the nodes are individual allocations linked by pointers, so traversal walks the same scattered memory a linked list does. The tree buys what a flat vector cannot, a place for everything with a well-defined parent, and it is the right collection whenever the hierarchy is the point.
 
 8.21 Prefixes: The Trie
 
@@ -839,9 +839,9 @@ Every node carries an array of 256 child pointers, one per possible byte value, 
     if (dict.contains("cat"))
         println("'cat' is a word");
 
-The distinguishing property, and the reason to choose a trie at all, is that a lookup costs the key's length in work and exactly zero comparisons against the other stored words: prefix membership is as cheap as the prefix is short, no matter how many thousands of words the dictionary holds. The trie stores a set of keys — it is not an associative map — so if you need a payload per word, use the key to look the payload up in a companion map.
+The distinguishing property, and the reason to choose a trie at all, is that a lookup costs the key's length in work and exactly zero comparisons against the other stored words: prefix membership is as cheap as the prefix is short, no matter how many thousands of words the dictionary holds. The trie stores a set of keys, it is not an associative map, so if you need a payload per word, use the key to look the payload up in a companion map.
 
-The trie's costs are visible in its shape: each node is 256 pointers, so a long word with no shared prefixes builds a chain of wide nodes, and the memory is far heavier than a set of the same words would be. Choose the trie when the program's question is "what begins with this" — autocomplete, spell-check suggestions, routing tables — and choose a set or a map when the question is just "is this whole thing present." The trie is the structure that remembers the journey through the word, and the journey is exactly what prefix search needs.
+The trie's costs are visible in its shape: each node is 256 pointers, so a long word with no shared prefixes builds a chain of wide nodes, and the memory is far heavier than a set of the same words would be. Choose the trie when the program's question is "what begins with this", autocomplete, spell-check suggestions, routing tables, and choose a set or a map when the question is just "is this whole thing present." The trie is the structure that remembers the journey through the word, and the journey is exactly what prefix search needs.
 
 8.22 Choosing Among the Collections
 
@@ -849,7 +849,7 @@ The collections are distinguished by the questions they answer, and choosing amo
 
 When the count is known and fixed, the array is the collection: the count is part of the type, the storage is the struct's storage, and there is nothing to grow or free. When the count is known only at runtime and the work is appending, indexing, and iterating, the vector is the collection: contiguous, local, and amortized constant to append. When both ends matter, the deque; when only arrival order matters, the queue; when the buffer must never grow, the ring buffer.
 
-When the work is finding a value by a key and order does not matter, the hash map, constant on average. When the keys' order matters, the tree map, logarithmic with ordered iteration. When the work is membership — "have I seen this" — the set for arbitrary values and the bitset for a dense range of small integers. When the work is always taking the most important thing next, the priority queue, logarithmic push and pop. When the work is remembering recent results under a bound, the cache.
+When the work is finding a value by a key and order does not matter, the hash map, constant on average. When the keys' order matters, the tree map, logarithmic with ordered iteration. When the work is membership, "have I seen this", the set for arbitrary values and the bitset for a dense range of small integers. When the work is always taking the most important thing next, the priority queue, logarithmic push and pop. When the work is remembering recent results under a bound, the cache.
 
 When the work is rearranging links and holding pointers to elements that must not move, the linked list. When the data is a hierarchy, the generic tree. When the question is about prefixes, the trie. And when the pattern is "remember and return in reverse order," the collection is not a type at all but a vector used at one end: the stack.
 
@@ -861,9 +861,9 @@ The same operation also has different costs in different structures, and the cho
 
 Every collection in this chapter is a generic type, and the way Coral's generics work shapes how the collections are written. A generic type is parameterised by the element or key type, and the compiler generates a concrete version for each concrete type you use. `Vec<i32>` is a real array of `i32`, not a boxed array of `void*`; `HashMap<str, u64>` generates its own table of `str` keys. There is no per-element indirection and no runtime type tag.
 
-There are no bounds on a type parameter. You cannot write `<T : Comparable>`; the language has no such syntax. Instead, the requirement on `T` is exactly the set of operations the body names, and it is checked at each instantiation. A generic function that calls `a < b` compiles for any `T` that supports `<`, and fails — naming the type and the operation — for any `T` that does not. This is why the containers take their key functions as parameters: a generic `K` has no built-in equality or hash, so the map's body needs operations the caller supplies, and the constructor is where they enter.
+There are no bounds on a type parameter. You cannot write `<T : Comparable>`; the language has no such syntax. Instead, the requirement on `T` is exactly the set of operations the body names, and it is checked at each instantiation. A generic function that calls `a < b` compiles for any `T` that supports `<`, and fails, naming the type and the operation, for any `T` that does not. This is why the containers take their key functions as parameters: a generic `K` has no built-in equality or hash, so the map's body needs operations the caller supplies, and the constructor is where they enter.
 
-When the concrete type is genuinely not known until runtime — a heterogeneous collection, a plugin registry, a dispatch table — the right tool is `any Trait`, a trait object. A trait names a set of methods; a type conforms to it with an extend block; and `any Trait` is the dynamic view of any conforming type:
+When the concrete type is genuinely not known until runtime, a heterogeneous collection, a plugin registry, a dispatch table, the right tool is `any Trait`, a trait object. A trait names a set of methods; a type conforms to it with an extend block; and `any Trait` is the dynamic view of any conforming type:
 
     trait Shape
     {
@@ -927,7 +927,7 @@ The string is the owning, growable buffer, and it is a vector of bytes with a ca
     name.pushChar('!');
     println("{}", name.asView());
 
-The two types are one text at two levels of commitment: the view borrows, the string owns, and a program that reads takes views while a program that builds returns strings. That is the observer-versus-builder distinction the collections draw too, and it is why the string's buffer must be contiguous and its views must be cheap — the text layer is the vector idea applied to bytes.
+The two types are one text at two levels of commitment: the view borrows, the string owns, and a program that reads takes views while a program that builds returns strings. That is the observer-versus-builder distinction the collections draw too, and it is why the string's buffer must be contiguous and its views must be cheap, the text layer is the vector idea applied to bytes.
 
 8.25 The Honest Boundaries
 
@@ -935,7 +935,7 @@ Two boundaries are worth stating plainly, because a book that hides them would t
 
 The first is that the standard library has no time or date types at all. There is no `Duration`, no clock, no calendar, no time zone in the tree under `std`. A program that needs to measure elapsed time or read the wall clock must go through the platform layer or a library, and a program that needs civil dates must build them from a raw second count. This chapter's earlier drafts of such a section described machinery that does not exist; the honest statement is the absence. What the language does provide for time is the general machinery of the collections and the integer types, and building a duration on top of them is an exercise in representation, not a call to a library type.
 
-The second concerns formatting. The `fmt` module provides typed formatting functions — `formatInt`, `formatUint`, `formatFloat`, `formatHex`, `formatBin`, `formatChar`, `padLeft`, `padRight`, `repeat`, `join`, and `joinVec` — each taking typed arguments and returning a `String`. The module's general-purpose `format(str f, ...)` is a stub: it does not perform placeholder substitution, so it is not the general formatter its name suggests. For formatted output, use `print` and `println`, which take a comptime format string and the values after it and are checked before the program runs:
+The second concerns formatting. The `fmt` module provides typed formatting functions, `formatInt`, `formatUint`, `formatFloat`, `formatHex`, `formatBin`, `formatChar`, `padLeft`, `padRight`, `repeat`, `join`, and `joinVec`, each taking typed arguments and returning a `String`. The module's general-purpose `format(str f, ...)` is a stub: it does not perform placeholder substitution, so it is not the general formatter its name suggests. For formatted output, use `print` and `println`, which take a comptime format string and the values after it and are checked before the program runs:
 
     import(lib) std::fmt { formatUint, padLeft };
 
@@ -945,7 +945,7 @@ The second concerns formatting. The `fmt` module provides typed formatting funct
 
 The format string in `println` supports `{}` for a value, specifiers such as `{:x}` and `{:b}` for bases, `{:.3}` for precision, `{..}` to spread an iterable, and `{{`/`}}` for literal braces. A mismatch between the format string and its arguments is a build failure, not a surprise at runtime, because the compiler sees both at the call site. The typed functions and the format string are two spellings of the same job, and both are checked.
 
-One more honest note about the collections themselves: everything named in this chapter — `Arr`, `Vec`, `LinkedList`, `Deque`, `Queue`, `RingBuf`, `HashMap`, `UnorderedMap`, `Map`, `Set`, `Bitset`, `PriorityQueue`, `Cache`, `Tree`, `Trie`, and the `sort` and `iter` helpers — exists in the standard library under `std::collections` (with `Vec`, `Arr`, `Option`, and `Result` also reachable through the root shortcuts). The catalogue of every method is Chapter16; this chapter is the reasoning behind it.
+One more honest note about the collections themselves: everything named in this chapter, `Arr`, `Vec`, `LinkedList`, `Deque`, `Queue`, `RingBuf`, `HashMap`, `UnorderedMap`, `Map`, `Set`, `Bitset`, `PriorityQueue`, `Cache`, `Tree`, `Trie`, and the `sort` and `iter` helpers, exists in the standard library under `std::collections` (with `Vec`, `Arr`, `Option`, and `Result` also reachable through the root shortcuts). The catalogue of every method is Chapter16; this chapter is the reasoning behind it.
 
 8.26 Exercises
 
@@ -995,7 +995,7 @@ A stack is a `Vec` used at one end, not a separate type, and the delimiter match
 
 A linked list is a chain of individually allocated nodes connected by pointers; end operations are constant time and no elements move, but access is linear and iteration misses the cache.
 
-A linked list's nodes have stable addresses, so pointers to them survive insertions elsewhere — which is why intrusive structures such as the cache use one.
+A linked list's nodes have stable addresses, so pointers to them survive insertions elsewhere, which is why intrusive structures such as the cache use one.
 
 `Deque<T>` is a ring buffer with constant-time operations at both ends; `Queue<T>` wraps it as the FIFO collection, and `RingBuf<T>` is the fixed-capacity ring that overwrites the oldest element.
 

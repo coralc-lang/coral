@@ -2,6 +2,116 @@
 
 Repo: coralc @ HEAD `5dc32ad` + uncommitted frontend/build changes (below).
 
+## Update — 2026-10-18h: platform defaults, packaging, warnings always on
+
+- **T0012 flag removed**: unused locals warn unconditionally; `--warn-unused`
+  stripped from args/Options/builder/coral.crlb and docs. Verified: one
+  warning for `unused`, none for `_ignored`/`static`/write-only.
+- **std platform default is compile-time baked**: `coral-common/platform.crl`
+  (`hostOs`/`hostArch` use `flag (host)`/`flag (arch)`); analyze + builder
+  default to the host platform instead of hardcoded `x86_64/linux`.
+  Builds pass `--flag {host=...}` (Makefile/package.sh). `--platform <os>`
+  added to the CLI (also accepts `arch/os`) and wins over the default;
+  `--flag {platform=...}` and `CORAL_PLATFORM` still override.
+- **Pre-existing platform-flag bug fixed**: `segsFromPlatformFlag` allocated
+  `slashes+?` segments with a post-increment (`u32 segCount = slashes++; if
+  (slashes == 0)`), so bare OS names allocated 0 and `arch/os` dropped a
+  segment — every override silently fell back to linux. Now selects the
+  real tree (`strace`: windows tree opens for `--platform windows`).
+- **windows std brought to sema parity**: mimalloc casts (6), fs.crl shift
+  types, process.crl SECURITY_ATTRIBUTES length; compiler `runGcc` drain
+  loop rewritten representation-neutral (no fd field assignment/comparison)
+  so `compiler` sources compile against windows std. Full compiler C for
+  windows now emits (`--dry-run --emit-c`, 2.86 MB).
+- **Packaging/install**: root `Makefile` (host build via seed or tracked C
+  bootstrap, `install`, `dist`, `windows`), `install.sh` (clone/checkout →
+  make → install), `install.ps1` (gcc bootstrap from
+  `dist/coralc-windows.c` → selfhost → install), `package.sh` + `package.md`
+  (emits `dist/coralc-{linux,windows}.c` with `host=`/`platform=` baked;
+  Linux binary built `-O0`). Verified packaged Linux binary compiles sha256.
+- **Mono debug noise stripped**: all `[mono]` printf lines removed from
+  `instantiate.crl`/`collect.crl`; error accounting unchanged.
+- **sha256 check**: `lib/std/x86_64/{linux,windows}/crypto/sha256.crl`
+  compiles; probe hashes `abc` to `ba7816bf…15ad` (linux default and
+  windows override; windows prelude now also sema-clean).
+- Selfhost after change: `make` → `./coralc`; two further `build --force`
+  passes byte-identical (`d312a884f0f75c73…`); installed via `./mv`.
+
+## Update — 2026-10-18g: doc comments; fourth-batch diagnostics (Coral codes); --warn-unused
+
+- **Doc comments `///` (end-to-end)**: lexer `getBufStart` backs the parser's
+  `scanDocsAbove` (contiguous `///` run above a decl, 64-line cap, joins with
+  `\n`, interned); `attachDoc` stores it in `AstContext` keyed by file+decl
+  line; hover (`lspDeclCard`) renders it after `Type:` inside the markdown
+  card. `//`, `////`, and a blank line end the block; a blank `///` is a
+  paragraph. Covers funcs, consts, structs/variants/unions/traits and methods
+  (via `parseFuncDeclFlags` + the four direct method sites). Verified with
+  probe37 + new lsp_all section 7.
+- **Fourth batch now uses Coral's own code series** (user directive: no
+  copied Clang E-codes): E0306→**T0010** literal overflow, E0604→**T0011**
+  missing return, E0801→**T0012** unused local (warn), E0307→**T0013** const
+  index OOB, E0806→**P0012** unknown attribute (+ did-you-mean using the
+  edit-distance helper). `explain.crl` entries/index updated (P0001–P0012,
+  T0001–T0013; E0103/E0104/E1301 explanations filled). `errors.txt` entries
+  struck with the mapping in both the second-batch and fourth-batch lists.
+- **P0012 resync fix**: unknown-attribute errors used to be swallowed by
+  `synchronize()` eating the next decl's attributes; `Parser.attrNameError`
+  now suppresses resync for exactly that recovery path.
+- **T0012 implementation**: `--warn-unused` wired CLI→crlb→frontend→sema via
+  a module-global `setWarnUnused` (a 17th `compileUnitTo` parameter would hit
+  the G0002 16-arg cap). Locals are recorded when their VarDecl is checked
+  (skip `_name` and `static`), marked used when any `Ident` resolves to the
+  same interned name, and reported per function at `checkFunction` end.
+  (The earlier node-arena window scan was wrong: body nodes predate checking.)
+- **Bootstrap note**: a debug-probe build polluted `build/coralc`; rebuilt
+  cleanly from the pre-T0011 installed binary, then self-built with the new
+  checks — green.
+- **Verification**: build + self-build green; selfhost `--emit-c` ×2
+  `SELFHOST_IDENTICAL` `91da31ef8a2f…`; `lsp_all` **66/66 ALL PASS**;
+  installed via `./mv` → `~/.coral/bin/coralc` sha `da8f9dcc685f…`.
+
+## Update — 2026-10-18f: LSP frame hygiene; bare return; file-scope initializers
+
+- **Committed** `12d7e0e` (field hover cards, field suggestions, tuple strip,
+  docs, session files; build artifacts included) and re-installed the global
+  compiler. Other in-flight tree edits (textbook, currentstate.md,
+  attributes.md, print.crl) were deliberately left uncommitted.
+- **LSP frame hygiene** (`coral-lsp/server.crl`): the read loop now
+  distinguishes clean EOF (rc 0, stderr silent) from a malformed header
+  (rc 1, `coralc: malformed LSP header; exiting`) and oversized frames
+  (rc 1, `coralc: LSP message too large; exiting`) via a stderr-only
+  `lspStderrLine` (stdout stays protocol-clean). Probed all four shapes;
+  `lsp_all` still 48/0 with its stderr-silent checks.
+- **Bare `return ;`** (`coral-semantics/stmt.crl` + new
+  `Sema.semaErrorNodeHelp` in `sema.crl`): in a value-returning function it
+  is now T0002 "return with no value in function returning 'i32'" with
+  tailored help (`write \`return <expr>;\` or change the function's return
+  type to void`); legal in void functions. Corpus builds unchanged.
+- **File-scope initializers** (`coral-backend/codegen.crl`): the long-known
+  gcc `initializer element is not constant` class is fixed:
+  - `const` refs fold by value (`cgFoldableConstDecl` + Ident arms in
+    `cgConstAtom`/`cgConstExpr`; depth budget 32, cycles become a clean
+    G0001 rather than a loop). `const B = A + 1` now emits the value.
+  - Function-name idents count as address constants (keeps
+    `const A = { .alloc = f }` working).
+  - `var` globals whose initializer is not a C constant (`cgInitConstP`
+    mirrors `cgEmitInitValue`) are zero-initialized and assigned from
+    `__attribute__((constructor)) coral_globals_init()` before main —
+    `var h = g + 1;` and `var r = f() + 4;` now work.
+  - Non-constant `const` initializers and non-constant array initializers
+    are G0001 with pointed locations instead of leaking bad C to gcc.
+  - Verified: gv2 `var h=g+1`→8, gv3 `const B=A+1`→6, gv4 `f()+4`→7,
+    gv6 folded array+struct consts→6, gv7 `var` struct with call→11, all
+    run; gv5 (const=call), gv8 (const cycle), gv9 (var array) each report
+    G0001 at the right spot.
+- **Verification**: build green; proper `--emit-c` selfhost ×2
+  SELFHOST_IDENTICAL `0793d55d3332…`; `lsp_all` 48 PASS / 0 fail; installed
+  via `./mv` → `~/.coral/bin/coralc` sha `956d5200002a…`.
+- **Left for the user**: commit of this wave (not yet sanctioned);
+  `print.crl` still cannot compile (pasted compiler output at 22-26,
+  `println("{}, {}", _a)` E0901) but its non-constant-global blocker is
+  gone; textbook scan still deferred.
+
 ## Update — 2026-10-18e: struct-field hover cards + field suggestions; tuple strip; docs
 
 - **Field hover cards redesigned** (clangd / rust-analyzer shape, user ask):

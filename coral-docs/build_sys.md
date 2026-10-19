@@ -383,7 +383,7 @@ build "coralc" {
     module_map = ".coral/modules.map"
     cache_dir  = ".coral/cache"
 
-    flags = ["--strict", "--warn-unused"]
+    flags = ["--strict"]
 
     modules = [
         "coral-ast",
@@ -771,7 +771,7 @@ build "coralc" {
     module_map = ".coral/modules.map"
     cache_dir  = ".coral/cache"
 
-    flags = ["--strict", "--warn-unused"]
+    flags = ["--strict"]
 
     modules = [
         "coral-ast",
@@ -869,7 +869,7 @@ Named flag sets selected at invocation.
 ```crlb
 profile "dev" {
     opt    = "debug";
-    flags  = ["--warn-unused", "--debug-info"];
+    flags  = ["--debug-info"];
 }
 
 profile "release" {
@@ -1646,7 +1646,7 @@ workspace "coral" {
 
 profile "dev" {
     opt   = "debug";
-    flags = ["--warn-unused", "--debug-info"];
+    flags = ["--debug-info"];
 }
 
 profile "release" {
@@ -1666,7 +1666,7 @@ build "coralc" {
     cache_dir  = ".coral/cache";
     doc        = "The Coral reference compiler.";
 
-    flags = ["--strict", "--warn-unused"];
+    flags = ["--strict"];
 
     modules = [
         "coral-ast",

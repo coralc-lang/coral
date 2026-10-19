@@ -1,4 +1,4 @@
-# Coral Standard Library — Complete API Reference
+# Coral Standard Library, Complete API Reference
 
 This document catalogues every `pub` export of the Coral standard library and the
 core/platform support modules it builds on. It is generated from the actual source
@@ -100,7 +100,7 @@ platform/lib.crl    : libc win32
 
 > **Known inconsistencies in the manifests (not fixed here):**
 > - `text/lib.crl` declares `pub mod crlb = import crlb;`, but no
->   `text/crlb.crl` exists — this import is dangling.
+>   `text/crlb.crl` exists, this import is dangling.
 > - `parser/crlb.crl` exists but is **not** re-exported by `parser/lib.crl`.
 > - `std/lib.crl` does **not** re-export `misc` or `testing`; import those paths
 >   directly.
@@ -109,7 +109,7 @@ platform/lib.crl    : libc win32
 
 ## core
 
-### 1. `core::cchar` — C character type
+### 1. `core::cchar`, C character type
 
 ```coral
 pub distinct cchar = flag (arch)
@@ -121,7 +121,7 @@ pub distinct cchar = flag (arch)
 A `cchar` is a `char`-like C character whose signedness depends on the target
 architecture (signed `i8` on x86_64, unsigned `u8` elsewhere).
 
-### 2. `core::limits` — Integer and float limits
+### 2. `core::limits`, Integer and float limits
 
 ```coral
 pub const INT64_MIN = -9223372036854775808;
@@ -142,7 +142,7 @@ pub const F32_MAX = 3.40282347e+38;
 pub const F32_MIN = 1.17549435e-38;
 ```
 
-### 3. `core::char_util` — Byte and character classification
+### 3. `core::char_util`, Byte and character classification
 
 All `u8`-taking predicates operate on a single byte; the `char*` variants operate
 on a Coral `char` (Unicode scalar value).
@@ -208,7 +208,7 @@ pub u8 const nullu8         = '\0';
 pub u8 const carriageReturn = '\r';
 ```
 
-### 4. `core::str` — Methods on the builtin `str`
+### 4. `core::str`, Methods on the builtin `str`
 
 `str` is a builtin view type:
 ```coral
@@ -252,7 +252,7 @@ pub extend str
 
 ## platform
 
-### 5. `platform::libc` — Libc / pthread / POSIX externs
+### 5. `platform::libc`, Libc / pthread / POSIX externs
 All declarations are `pub extern`. Grouped by area.
 
 ```coral
@@ -389,7 +389,7 @@ u32   htonl(u32 hostlong)
 u16   htons(u16 hostshort)
 ```
 
-### 6. `platform::win32` — Win32 / Winsock / CRT externs
+### 6. `platform::win32`, Win32 / Winsock / CRT externs
 All `pub extern`. This is the Windows counterpart of `platform::libc`.
 
 ```coral
@@ -580,7 +580,7 @@ f64    tgamma(f64 x) lgamma(f64 x)
 Imported via `std::collections`. `Vec<T>` is also re-exported as `std::vec` and
 prelude-imported; `Arr<T, N>` as `std::arr`.
 
-### 7. `std::collections::arr` — `Arr<T, N>`
+### 7. `std::collections::arr`, `Arr<T, N>`
 
 ```coral
 pub struct Arr<T, N>
@@ -602,7 +602,7 @@ pub struct Arr<T, N>
 }
 ```
 
-### 8. `std::collections::vec` — `Vec<T>` (aka `std::vec`)
+### 8. `std::collections::vec`, `Vec<T>` (aka `std::vec`)
 
 ```coral
 pub struct Vec<T>
@@ -645,7 +645,7 @@ pub struct Vec<T>
 pub extend<T> Vec<T> : @drop { void drop(); }
 ```
 
-### 9. `std::collections::bitset` — `Bitset`
+### 9. `std::collections::bitset`, `Bitset`
 
 ```coral
 pub struct Bitset
@@ -678,7 +678,7 @@ pub struct Bitset
 pub extend Bitset : @drop { void drop(); }
 ```
 
-### 10. `std::collections::cache` — LRU `Cache<K, V>`
+### 10. `std::collections::cache`, LRU `Cache<K, V>`
 
 ```coral
 pub struct CacheEntry<K, V>
@@ -715,7 +715,7 @@ pub struct Cache<K, V>
 pub extend<K, V> Cache<K, V> : @drop { void drop(); }
 ```
 
-### 11. `std::collections::deque` — `Deque<T>`
+### 11. `std::collections::deque`, `Deque<T>`
 
 ```coral
 pub struct Deque<T>
@@ -745,7 +745,7 @@ pub struct Deque<T>
 pub extend<T> Deque<T> : @drop { void drop(); }
 ```
 
-### 12. `std::collections::hashmap` — `HashMap<K, V>`
+### 12. `std::collections::hashmap`, `HashMap<K, V>`
 
 ```coral
 pub variant CollectionError { AllocFailed { str msg; } }
@@ -783,7 +783,7 @@ pub struct HashMap<K, V>
 pub extend<K, V> HashMap<K, V> : @drop { void drop(); }
 ```
 
-### 13. `std::collections::iter` — Generic iteration helpers
+### 13. `std::collections::iter`, Generic iteration helpers
 Free functions over `Vec<T>`.
 
 ```coral
@@ -811,7 +811,7 @@ pub struct Pair<T, U> { T first; U second; }
 pub Vec<Pair<T, U>> zip<T, U>(const Vec<T>* a, const Vec<U>* b)
 ```
 
-### 14. `std::collections::linkedlist` — `LinkedList<T>`
+### 14. `std::collections::linkedlist`, `LinkedList<T>`
 
 ```coral
 pub struct ListNode<T>
@@ -844,7 +844,7 @@ pub struct LinkedList<T>
 pub extend<T> LinkedList<T> : @drop { void drop(); }
 ```
 
-### 15. `std::collections::map` — Ordered AVL `Map<K, V>`
+### 15. `std::collections::map`, Ordered AVL `Map<K, V>`
 
 ```coral
 pub variant CollectionError { AllocFailed { str msg; } }
@@ -882,7 +882,7 @@ pub struct Map<K, V>
 pub extend<K, V> Map<K, V> : @drop { void drop(); }
 ```
 
-### 16. `std::collections::priorityqueue` — `PriorityQueue<T>`
+### 16. `std::collections::priorityqueue`, `PriorityQueue<T>`
 
 ```coral
 pub struct PriorityQueue<T>
@@ -905,7 +905,7 @@ pub struct PriorityQueue<T>
 pub extend<T> PriorityQueue<T> : @drop { void drop(); }
 ```
 
-### 17. `std::collections::queue` — FIFO `Queue<T>`
+### 17. `std::collections::queue`, FIFO `Queue<T>`
 
 Wraps `Deque<T>`.
 
@@ -926,7 +926,7 @@ pub struct Queue<T>
 pub extend<T> Queue<T> : @drop { void drop(); }
 ```
 
-### 18. `std::collections::ringbuf` — `RingBuf<T>`
+### 18. `std::collections::ringbuf`, `RingBuf<T>`
 
 ```coral
 pub struct RingBuf<T>
@@ -953,7 +953,7 @@ pub struct RingBuf<T>
 pub extend<T> RingBuf<T> : @drop { void drop(); }
 ```
 
-### 19. `std::collections::set` — `Set<T>`
+### 19. `std::collections::set`, `Set<T>`
 
 ```coral
 pub struct Set<T>
@@ -981,7 +981,7 @@ pub struct Set<T>
 pub extend<T> Set<T> : @drop { void drop(); }
 ```
 
-### 20. `std::collections::sort` — Sorting and searching
+### 20. `std::collections::sort`, Sorting and searching
 Free functions; `*Range`/`partition*` variants are internal helpers.
 
 ```coral
@@ -998,7 +998,7 @@ pub isize binarySearchBy<T>(const Vec<T>* v, T key, i32(T, T) cmp)
 pub void  reverse<T>(Vec<T>* v)
 ```
 
-### 21. `std::collections::tree` — `Tree<T>` (n-ary)
+### 21. `std::collections::tree`, `Tree<T>` (n-ary)
 
 ```coral
 pub struct TreeNode<T>
@@ -1029,7 +1029,7 @@ pub struct Tree<T>
 pub extend<T> Tree<T> : @drop { void drop(); }
 ```
 
-### 22. `std::collections::trie` — `Trie` (byte-keyed)
+### 22. `std::collections::trie`, `Trie` (byte-keyed)
 
 ```coral
 const u32 TRIE_FANOUT = 256;
@@ -1059,7 +1059,7 @@ pub struct Trie
 pub extend Trie : @drop { void drop(); }
 ```
 
-### 23. `std::collections::unordered_map` — `UnorderedMap<K, V>`
+### 23. `std::collections::unordered_map`, `UnorderedMap<K, V>`
 Thin wrapper over `HashMap<K, V>`.
 
 ```coral
@@ -1090,7 +1090,7 @@ pub extend<K, V> UnorderedMap<K, V> : @drop { void drop(); }
 
 `String` is re-exported into the prelude.
 
-### 24. `std::text::ascii` — ASCII / UTF-8 helpers
+### 24. `std::text::ascii`, ASCII / UTF-8 helpers
 
 ```coral
 pub bool isAscii(u8 b)
@@ -1114,7 +1114,7 @@ pub usize utf8CountChars(str s)
 pub bool utf8IsValid(str s)
 ```
 
-### 25. `std::text::string` — `String`
+### 25. `std::text::string`, `String`
 
 ```coral
 pub struct String
@@ -1184,7 +1184,7 @@ pub struct String
 pub extend String : @drop { void drop(); }
 ```
 
-### 26. `std::text::strutil` — String-view utilities
+### 26. `std::text::strutil`, String-view utilities
 
 ```coral
 pub usize  split(str sv, u8 delim, str* out, usize maxParts)
@@ -1205,7 +1205,7 @@ pub str    substr(str sv, usize start, usize len)
 pub bool   equalsIgnoreCase(str a, str b)
 ```
 
-### 27. `std::text::utf8` — UTF-8 codec
+### 27. `std::text::utf8`, UTF-8 codec
 
 ```coral
 pub u8     encodeCodepoint(u32 cp, u8* out)
@@ -1219,7 +1219,7 @@ pub Option<char> nextChar(const u8* s, usize len, usize* consumed)
 pub String encodeChar(char c)
 ```
 
-### 28. `std::text::uri` — `Uri`
+### 28. `std::text::uri`, `Uri`
 
 ```coral
 pub struct Uri
@@ -1240,7 +1240,7 @@ pub struct Uri
 pub extend Uri : @drop { void drop(); }
 ```
 
-### 29. `std::text::regex` — `Regex` (POSIX ERE via libc)
+### 29. `std::text::regex`, `Regex` (POSIX ERE via libc)
 
 ```coral
 const i32 REG_EXTENDED = 1;
@@ -1268,7 +1268,7 @@ pub extend Regex : @drop { void drop(); }
 
 ## std::data
 
-### 30. `std::data::option` — `Option<T>` (aka `std::option`, prelude)
+### 30. `std::data::option`, `Option<T>` (aka `std::option`, prelude)
 
 ```coral
 pub variant Option<T>
@@ -1292,7 +1292,7 @@ pub extend<T> Option<T>
 }
 ```
 
-### 31. `std::data::result` — `Result<T, E>` (aka `std::result`, prelude)
+### 31. `std::data::result`, `Result<T, E>` (aka `std::result`, prelude)
 
 ```coral
 pub variant Result<T, E>
@@ -1321,7 +1321,7 @@ pub extend<T, E> Result<T, E>
 
 ## std::time
 
-### 32. `std::time` — Wall-clock and monotonic time
+### 32. `std::time`, Wall-clock and monotonic time
 
 Ported from the old `std/core/time` module. Each target implements the same
 public surface with its own native clock: the Linux build issues raw x86_64
@@ -1364,7 +1364,7 @@ Timespec t1 = nowMonotonic();
 println(timespecToF64(subTimespec(t1, t0)));
 ```
 
-### 33. `std::duration` — `Duration`
+### 33. `std::duration`, `Duration`
 
 Ported from the old `std/core/duration` module. A `Duration` is a signed span of
 time stored as `(i64 sec, i64 nsec)` and always normalized so
@@ -1428,7 +1428,7 @@ println(total.asMillis());   // 2500
 
 ## std::math
 
-### 34. `std::math::math` — libm bindings, constants, scalar helpers
+### 34. `std::math::math`, libm bindings, constants, scalar helpers
 
 ```coral
 pub extern f64 sin(f64 x)  cos(f64 x)  tan(f64 x)  sqrt(f64 x)  pow(f64 x, f64 y)
@@ -1474,7 +1474,7 @@ pub f64 div(f64 x, f64 y)
 pub i64 truncF(f64 f)
 ```
 
-### 35. `std::math::complex` — `Complex`
+### 35. `std::math::complex`, `Complex`
 
 ```coral
 pub struct Complex
@@ -1505,7 +1505,7 @@ pub struct Complex
 }
 ```
 
-### 36. `std::math::matrix` — `Mat2`, `Mat3`, `Mat4`
+### 36. `std::math::matrix`, `Mat2`, `Mat3`, `Mat4`
 
 ```coral
 pub struct Mat2
@@ -1555,7 +1555,7 @@ pub struct Mat4
 }
 ```
 
-### 37. `std::math::vector` — `Vec2`, `Vec3`, `Vec4`
+### 37. `std::math::vector`, `Vec2`, `Vec3`, `Vec4`
 
 ```coral
 pub struct Vec2
@@ -1583,7 +1583,7 @@ pub struct Vec4
 }
 ```
 
-### 38. `std::math::random` — RNGs
+### 38. `std::math::random`, RNGs
 
 ```coral
 pub u64 nextU64()
@@ -1615,10 +1615,10 @@ pub struct Pcg32
 
 ## std::fmt
 
-### 39. `std::fmt::fmt` — String formatting
+### 39. `std::fmt::fmt`, String formatting
 
 ```coral
-pub String format(str f, ...)                 // NOTE: stub — see below
+pub String format(str f, ...)                 // NOTE: stub, see below
 pub String formatInt(i64 val, u64 radix, bool upper)
 pub String formatUint(u64 val, u64 radix, bool upper)
 pub String formatFloat(f64 val, u64 precision)
@@ -1641,7 +1641,7 @@ pub String joinVec(const Vec<String>* parts, str sep)
 
 ## std::io
 
-### 40. `std::io::ios` — Console I/O and parsing (prelude)
+### 40. `std::io::ios`, Console I/O and parsing (prelude)
 
 ```coral
 // formatting / output
@@ -1676,7 +1676,7 @@ pub void read<comptime T>(T* out)
 pub T    readVal<T>()
 ```
 
-### 41. `std::io::fs` — Filesystem
+### 41. `std::io::fs`, Filesystem
 
 ```coral
 pub variant IoError
@@ -1739,7 +1739,7 @@ pub struct Dirent
 pub bool readDirEntry(Dir dir, Dirent* out)
 ```
 
-### 42. `std::io::bio` — Binary readers/writers
+### 42. `std::io::bio`, Binary readers/writers
 
 ```coral
 const i32 SEEK_SET = 0;
@@ -1785,7 +1785,7 @@ pub u32 bswapU32(u32 v)
 pub u64 bswapU64(u64 v)
 ```
 
-### 43. `std::io::fios` — `FILE*`-based I/O
+### 43. `std::io::fios`, `FILE*`-based I/O
 
 ```coral
 pub distinct FileHandle = rawptr;
@@ -1801,7 +1801,7 @@ pub Result<usize, IoError> fileWriteString(FileHandle fh, const String* s)
 pub Result<bool, IoError>  fileReadAll(str path, String* out)
 ```
 
-### 44. `std::io::log` — `Logger`
+### 44. `std::io::log`, `Logger`
 
 ```coral
 pub variant LogLevel { Debug, Info, Warn, Error, Fatal }
@@ -1824,7 +1824,7 @@ pub struct Logger
 }
 ```
 
-### 45. `std::io::net` — TCP/UDP sockets
+### 45. `std::io::net`, TCP/UDP sockets
 
 ```coral
 const i32 AF_INET = 2;  SOCK_STREAM = 1;  SOCK_DGRAM = 2;
@@ -1852,7 +1852,7 @@ pub Result<isize, IoError>     udpRecvFrom(UdpSocket* s, u8* buf, usize len)
 pub void udpClose(UdpSocket* s)
 ```
 
-### 46. `std::io::path` — Path manipulation
+### 46. `std::io::path`, Path manipulation
 
 ```coral
 const u8 SEP = '/';
@@ -1871,7 +1871,7 @@ pub String absolute(str base, str rel)
 pub String changeExtension(str p, str newExt)
 ```
 
-### 47. `std::io::process` — Subprocesses
+### 47. `std::io::process`, Subprocesses
 
 ```coral
 pub struct Process
@@ -1900,7 +1900,7 @@ pub Result<i32, IoError>           run(str cmd, Vec<str>* args)
 pub void                           exit(i32 code)
 ```
 
-### 48. `std::io::temp` — Temporary files/dirs
+### 48. `std::io::temp`, Temporary files/dirs
 
 ```coral
 pub struct TempFile
@@ -1930,7 +1930,7 @@ pub extend TempFile : @drop { void drop(); }
 pub extend TempDir  : @drop { void drop(); }
 ```
 
-### 49. `std::io::term` — ANSI terminal control
+### 49. `std::io::term`, ANSI terminal control
 
 ```coral
 pub void reset()
@@ -1960,7 +1960,7 @@ pub void showCursor()
 //           u64 _clampN(u64 n)
 ```
 
-### 50. `std::io::cmd` — `ArgParser`
+### 50. `std::io::cmd`, `ArgParser`
 
 ```coral
 pub struct ArgParser
@@ -1982,7 +1982,7 @@ pub struct ArgParser
 pub Option<str> commandLine()
 ```
 
-### 51. `std::io::env` — Environment variables
+### 51. `std::io::env`, Environment variables
 
 ```coral
 pub Option<String> get(str name)
@@ -1996,7 +1996,7 @@ pub usize all(Vec<String>* out)
 
 ## std::memory
 
-### 52. `std::memory::mman` — Allocators and allocation (aka `std::mman`)
+### 52. `std::memory::mman`, Allocators and allocation (aka `std::mman`)
 
 ```coral
 pub variant AllocError { AllocFailed { str msg; } }
@@ -2091,7 +2091,7 @@ pub void zero<T>(T* ptr, usize count)
 pub bool equal<T>(const T* a, const T* b, usize count)
 ```
 
-### 53. `std::memory::intrinsics::memory` — Raw memory primitives
+### 53. `std::memory::intrinsics::memory`, Raw memory primitives
 
 ```coral
 pub void memmove(rawptr dst, const rawptr src, usize n)
@@ -2102,7 +2102,7 @@ pub void memset(rawptr dst, u8 val, usize n)
 pub i32  memcmp(const rawptr a, const rawptr b, usize n)
 ```
 
-### 54. `std::memory::allocators::allocator` — `Allocator` (vtable)
+### 54. `std::memory::allocators::allocator`, `Allocator` (vtable)
 
 ```coral
 pub struct Allocator
@@ -2114,7 +2114,7 @@ pub struct Allocator
 }
 ```
 
-### 55. `std::memory::allocators::tlsf` — `Tlsf` (Two-Level Segregated Fit)
+### 55. `std::memory::allocators::tlsf`, `Tlsf` (Two-Level Segregated Fit)
 
 ```coral
 pub struct Tlsf
@@ -2139,7 +2139,7 @@ pub struct Tlsf
 Constants: `FLI_COUNT = 32`, `SLI_COUNT = 32`, `MIN_BLOCK_SIZE = 32u`,
 `BLOCK_ALIGN = 8u`, `BLOCK_USED = 1u`, `BLOCK_PREV_USED = 2u`.
 
-### 56. `std::memory::allocators::mimalloc` — `MiAlloc`
+### 56. `std::memory::allocators::mimalloc`, `MiAlloc`
 
 ```coral
 pub struct MiAlloc
@@ -2164,7 +2164,7 @@ Constants include `MI_ARENA_SIZE = 64 MiB`, `MI_SEGMENT_SIZE = 4 MiB`,
 `MI_MAX_BLOCK_SIZE = 512 KiB`, `MI_HUGE_THRESHOLD = 128 KiB`,
 `MI_SIZE_CLASS_COUNT = 44`, `MI_SEGMENT_MAP_SIZE = 64`.
 
-### 57. `std::memory::pool` — `Pool<T>` (fixed-size object pool)
+### 57. `std::memory::pool`, `Pool<T>` (fixed-size object pool)
 
 ```coral
 pub struct Pool<T>
@@ -2187,7 +2187,7 @@ pub struct Pool<T>
 }
 ```
 
-### 58. `std::memory::shared_ptr` — `SharedPtr<T>` (refcounted)
+### 58. `std::memory::shared_ptr`, `SharedPtr<T>` (refcounted)
 
 ```coral
 pub struct SharedPtr<T>
@@ -2206,7 +2206,7 @@ pub struct SharedPtr<T>
 void drop()
 ```
 
-### 59. `std::memory::smart_ptr` — `SmartPtr<T>` (unique)
+### 59. `std::memory::smart_ptr`, `SmartPtr<T>` (unique)
 
 ```coral
 pub struct SmartPtr<T>
@@ -2229,7 +2229,7 @@ void drop()
 
 ## std::concurrent
 
-### 60. `std::concurrent::mutex` — `Mutex`
+### 60. `std::concurrent::mutex`, `Mutex`
 
 ```coral
 pub struct Mutex
@@ -2244,7 +2244,7 @@ pub struct Mutex
 }
 ```
 
-### 61. `std::concurrent::rwlock` — `RwLock`
+### 61. `std::concurrent::rwlock`, `RwLock`
 
 ```coral
 pub struct RwLock
@@ -2260,7 +2260,7 @@ pub struct RwLock
 }
 ```
 
-### 62. `std::concurrent::semaphore` — `Semaphore`
+### 62. `std::concurrent::semaphore`, `Semaphore`
 
 ```coral
 pub struct Semaphore
@@ -2275,7 +2275,7 @@ pub struct Semaphore
 }
 ```
 
-### 63. `std::concurrent::signal` — POSIX signals
+### 63. `std::concurrent::signal`, POSIX signals
 
 ```coral
 pub const i32 SIGABRT = 6;  SIGALRM = 14; SIGBUS = 7;  SIGCHLD = 17;
@@ -2294,7 +2294,7 @@ pub i32    sendSig(i32 pid, i32 sig)
 pub i32    raiseSig(i32 sig)
 ```
 
-### 64. `std::concurrent::thread` — Threads, conditions, atomics
+### 64. `std::concurrent::thread`, Threads, conditions, atomics
 
 ```coral
 pub distinct Thread = rawptr;
@@ -2337,7 +2337,7 @@ pub struct AtomicU32
 }
 ```
 
-### 65. `std::concurrent::threadpool` — `ThreadPool`
+### 65. `std::concurrent::threadpool`, `ThreadPool`
 
 ```coral
 pub struct ThreadPool
@@ -2360,7 +2360,7 @@ pub extend ThreadPool : @drop { void drop(); }
 // helper: void _workerEntry(rawptr arg)
 ```
 
-### 66. `std::concurrent::async` — Stackful-fiber async runtime
+### 66. `std::concurrent::async`, Stackful-fiber async runtime
 
 Built on glibc `ucontext`. `spawn` creates a fiber, `await` parks the current
 fiber until a future resolves, and `run`/`runOnce` drive the scheduler.
@@ -2416,7 +2416,7 @@ are non-`pub` and not part of the public surface.
 
 ## std::crypto
 
-### 67. `std::crypto::aes` — AES-256 / AES-128
+### 67. `std::crypto::aes`, AES-256 / AES-128
 
 ```coral
 pub struct Aes256
@@ -2444,7 +2444,7 @@ pub struct Aes128
 Round constants/tables (`SBOX`, `RSBOX`, `RCON`) and the block-step helpers are
 module-private.
 
-### 68. `std::crypto::base64` — Base64 (`+/` alphabet)
+### 68. `std::crypto::base64`, Base64 (`+/` alphabet)
 
 ```coral
 pub usize  encodeB64(const u8* src, usize srcLen, u8* dst, usize dstCap)
@@ -2452,7 +2452,7 @@ pub String encodeToString(const u8* src, usize srcLen)
 pub usize  decode(str src, u8* dst, usize dstCap)
 ```
 
-### 69. `std::crypto::bloom` — Bloom filter
+### 69. `std::crypto::bloom`, Bloom filter
 
 ```coral
 pub struct Bloom
@@ -2471,14 +2471,14 @@ pub struct Bloom
 }
 ```
 
-### 70. `std::crypto::crc` — CRC-32 / CRC-64
+### 70. `std::crypto::crc`, CRC-32 / CRC-64
 
 ```coral
 pub u32 crc32(str data)
 pub u64 crc64(str data)
 ```
 
-### 71. `std::crypto::hash` — Generic hash functions
+### 71. `std::crypto::hash`, Generic hash functions
 
 ```coral
 pub u64 fnv1a(const u8* data, usize len)
@@ -2489,7 +2489,7 @@ pub u64 wyhashStr(str s)
 pub u64 hashCombine(u64 seed, u64 value)
 ```
 
-### 72. `std::crypto::hex` — Hex encoding
+### 72. `std::crypto::hex`, Hex encoding
 
 ```coral
 pub usize  encodeHx(str src, String dst)
@@ -2498,7 +2498,7 @@ pub usize  decode(str src, String dst)
 pub bool   isValid(str src)
 ```
 
-### 73. `std::crypto::hmac` — HMAC-SHA256
+### 73. `std::crypto::hmac`, HMAC-SHA256
 
 ```coral
 const u64 BLOCK_SIZE = 64;
@@ -2517,7 +2517,7 @@ pub struct HmacSha256
 pub void hmacSha256(const u8* key, usize keyLen, const u8* msg, usize msgLen, u8* outDigest)
 ```
 
-### 74. `std::crypto::sha256` — SHA-256
+### 74. `std::crypto::sha256`, SHA-256
 
 ```coral
 pub struct Sha256
@@ -2539,7 +2539,7 @@ pub void hash(const u8* data, usize len, u8* digest)
 
 ## std::parser
 
-### 75. `std::parser::csv` — `CsvReader`
+### 75. `std::parser::csv`, `CsvReader`
 
 ```coral
 pub variant ParseError
@@ -2565,7 +2565,7 @@ pub struct CsvReader
 }
 ```
 
-### 76. `std::parser::ini` — `IniFile` / `IniSection`
+### 76. `std::parser::ini`, `IniFile` / `IniSection`
 
 ```coral
 pub struct IniSection
@@ -2594,7 +2594,7 @@ pub extend IniSection : @drop { void drop(); }
 pub extend IniFile    : @drop { void drop(); }
 ```
 
-### 77. `std::parser::json` — `JsonValue`
+### 77. `std::parser::json`, `JsonValue`
 
 ```coral
 pub variant ParseError
@@ -2631,7 +2631,7 @@ pub String serialize(JsonValue* v)
 pub extend JsonValue : @drop { void drop(); }
 ```
 
-### 78. `std::parser::toml` — `TomlDoc`
+### 78. `std::parser::toml`, `TomlDoc`
 
 ```coral
 pub variant ParseError
@@ -2676,7 +2676,7 @@ pub extend TomlValue : @drop { void drop(); }
 pub extend TomlDoc   : @drop { void drop(); }
 ```
 
-### 79. `std::parser::uuid` — `Uuid`
+### 79. `std::parser::uuid`, `Uuid`
 
 ```coral
 pub variant ParseError
@@ -2700,7 +2700,7 @@ pub String uuidV4()
 pub Result<Uuid, ParseError> parseUuid(str s)
 ```
 
-### 80. `std::parser::xml` — `XmlNode`
+### 80. `std::parser::xml`, `XmlNode`
 
 ```coral
 pub variant ParseError
@@ -2738,7 +2738,7 @@ pub String serializeXml(XmlNode* node)
 pub extend XmlNode : @drop { void drop(); }
 ```
 
-### 81. `std::parser::crlb` — Coral build-manifest parser
+### 81. `std::parser::crlb`, Coral build-manifest parser
 > Exists at `parser/crlb.crl` but is **not** re-exported by `parser/lib.crl`;
 > import it directly.
 
@@ -2797,7 +2797,7 @@ pub extend CrbManifest : @drop
 
 ## misc / testing
 
-### 82. `std::misc::erased` — `Erased` (type erasure)
+### 82. `std::misc::erased`, `Erased` (type erasure)
 
 ```coral
 pub struct Erased
@@ -2810,13 +2810,13 @@ pub struct Erased
 pub Erased wrap(rawptr value)
 ```
 
-### 83. `std::misc::cast` — `cast<T>`
+### 83. `std::misc::cast`, `cast<T>`
 
 ```coral
 pub T cast<T>(Erased val)     // reinterprets the wrapped pointer as T
 ```
 
-### 84. `std::testing::test` — Test harness helpers
+### 84. `std::testing::test`, Test harness helpers
 
 ```coral
 pub struct TestResult { str name; bool passed; str message; }

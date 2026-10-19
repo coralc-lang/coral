@@ -6,7 +6,7 @@ A Program That Cannot Reach Outside Is a Calculator
 
 Every chapter before this one lived inside the process. A `Vec` grows in memory, a `String` builds in memory, a `Result` carries a value between two functions without leaving the program. All of it is computation, and computation alone, however clever, vanishes when the program stops. Real programs do not stop there. They print a line so a human can read it, read a number the human typed, open a file, walk a directory, read an environment variable, launch another program, and write a log for whoever comes after. Each of those operations crosses a boundary between the program and the world, and Coral calls that boundary I/O.
 
-The boundary is why this chapter is different from the others in one specific way. Everything on the far side of it — the disk, the terminal, the operating system, a second process — can fail for reasons your program did not cause and cannot predict. The file was deleted. The permission was never granted. The disk is full. The pipe closed early. Chapter 15 built the tool for exactly this situation: `Result`, a value that says "it worked, and here is the thing" or "it failed, and here is why." You will meet `Result` in nearly every function in this chapter, and that is not an accident. I/O is where the outside world enters, and `Result` is how Coral lets it in without pretending it is safe.
+The boundary is why this chapter is different from the others in one specific way. Everything on the far side of it, the disk, the terminal, the operating system, a second process, can fail for reasons your program did not cause and cannot predict. The file was deleted. The permission was never granted. The disk is full. The pipe closed early. Chapter 15 built the tool for exactly this situation: `Result`, a value that says "it worked, and here is the thing" or "it failed, and here is why." You will meet `Result` in nearly every function in this chapter, and that is not an accident. I/O is where the outside world enters, and `Result` is how Coral lets it in without pretending it is safe.
 
 This chapter is a tour of the `std::io` tree and the closely related `std` modules that support it. It begins with the shape of the tree, then covers console input and output, then files, then the buffered and binary layers, then paths and directories, then the environment, processes, and command-line arguments, then logging and the terminal, and finally error handling and a complete worked program. It sits right after the chapter on text because half of I/O is text: printing a value, reading a line, parsing a number, joining a path. Here the text meets the disk.
 
@@ -26,7 +26,7 @@ Before the tour, a map. The modules below live under `std::io`, and every one is
     std::io::log        structured logging               Logger LogLevel
     std::io::term       ANSI terminal control            reset bold red cursorPos clearScreen
 
-Three facts hold across the whole table, and they are worth stating before the first function. First, `fs` sits at the bottom: it is the one module the others can import without a cycle, and it defines the shared error type `IoError` that every other module returns. Second, the tree is layered. `fs` issues raw system calls; `fios` wraps the C library's buffered `FILE*`; `bio` adds typed binary encoding over an open file descriptor; `ios` sits at the top with the console conveniences a normal program actually calls. Third, the portable surface is the same on every platform — `std::io::fs` on Linux and `std::io::fs` on Windows present the same names and the same signatures — while the module underneath (`platform::libc` on Linux, `platform::win32` on Windows) is what differs. A program written against `std` does not change when it changes platform; only the raw error codes inside an `IoError` do.
+Three facts hold across the whole table, and they are worth stating before the first function. First, `fs` sits at the bottom: it is the one module the others can import without a cycle, and it defines the shared error type `IoError` that every other module returns. Second, the tree is layered. `fs` issues raw system calls; `fios` wraps the C library's buffered `FILE*`; `bio` adds typed binary encoding over an open file descriptor; `ios` sits at the top with the console conveniences a normal program actually calls. Third, the portable surface is the same on every platform, `std::io::fs` on Linux and `std::io::fs` on Windows present the same names and the same signatures, while the module underneath (`platform::libc` on Linux, `platform::win32` on Windows) is what differs. A program written against `std` does not change when it changes platform; only the raw error codes inside an `IoError` do.
 
 18.1 The Shape of the I/O Library
 
@@ -71,7 +71,7 @@ The two braces are escapes. `{{` prints a literal `{`, `}}` prints a literal `}`
     println("value = {:d} hex = {:x} bin = {:b}", 255, 255, 255);
     println("items: {..}", numbers);
 
-The integer specifiers are integer-only — a non-integer argument with `{:d}` is a compile error, and `char` counts as an integer, rendering its codepoint numerically — so the compiler catches the mistake of formatting a float with `{:x}` rather than silently producing nonsense. Likewise `{..}` requires something range-for can walk; a typo is caught at build time.
+The integer specifiers are integer-only, a non-integer argument with `{:d}` is a compile error, and `char` counts as an integer, rendering its codepoint numerically, so the compiler catches the mistake of formatting a float with `{:x}` rather than silently producing nonsense. Likewise `{..}` requires something range-for can walk; a typo is caught at build time.
 
 When you want special rendering without a new specifier, pass a manipulator. A manipulator is a small value that renders specially through the plain `{}` placeholder. The `ios` module defines five:
 
@@ -137,7 +137,7 @@ For a typed value, `read` parses the next line according to the type of its outp
 
 `read` dispatches on `@typeof(T)` at compile time. It handles the signed and unsigned integers and the floats by reading a line and parsing it, `bool` by reading a line and accepting `true`, `1`, or `yes` as true and anything else as false, `cchar` by reading a character, and `String` by reading a line. `readVal<T>` is the convenience form that reads into a local and returns it.
 
-Simply put, `readLine` is a conveyor belt that hands you one line at a time, and `readVal` is the belt followed by a converter that turns the line into a number. If the line is not a number, `readVal` has no good way to tell you — it returns the parse result through the same channel parses go through below — so a program that cares whether the input was well-formed should call `readLine` and then a `parseX` function, where failure is a value rather than a guess.
+Simply put, `readLine` is a conveyor belt that hands you one line at a time, and `readVal` is the belt followed by a converter that turns the line into a number. If the line is not a number, `readVal` has no good way to tell you, it returns the parse result through the same channel parses go through below, so a program that cares whether the input was well-formed should call `readLine` and then a `parseX` function, where failure is a value rather than a guess.
 
 18.4 Parsing Text into Values
 
@@ -154,7 +154,7 @@ The three parsing functions in `ios` turn a `str` into a number and report succe
     i64 n = parseI64("-42", &ok);       // ok is true, n is -42
     i64 bad = parseI64("12x", &ok);     // ok is false, bad is 0
 
-The convention is deliberately simple: on success the function sets `*ok` true and returns the value; on failure it sets `*ok` false and returns zero. `parseI64` accepts an optional leading `+` or `-`, then decimal digits only, and rejects the empty string, a lone sign, any non-digit, and any value that would overflow `i64` — including the boundary case `-9223372036854775808`, which is handled exactly. `parseU64` accepts an optional leading `+` and digits only. `parseF64` defers to the C library's `strtod` on a bounded copy of the input, then insists that only trailing whitespace remains; so `" 3.5"` and `"3.5  "` parse, while `"3.5x"` fails.
+The convention is deliberately simple: on success the function sets `*ok` true and returns the value; on failure it sets `*ok` false and returns zero. `parseI64` accepts an optional leading `+` or `-`, then decimal digits only, and rejects the empty string, a lone sign, any non-digit, and any value that would overflow `i64`, including the boundary case `-9223372036854775808`, which is handled exactly. `parseU64` accepts an optional leading `+` and digits only. `parseF64` defers to the C library's `strtod` on a bounded copy of the input, then insists that only trailing whitespace remains; so `" 3.5"` and `"3.5  "` parse, while `"3.5x"` fails.
 
 This is the lightweight alternative to `Result`, and the shape tells you when to use it. When the caller only needs a yes-or-no, an out-parameter is one line shorter than a `Result` and the failure carries no detail worth propagating. When the caller needs to know why the input was bad, reach for `Result` instead, as Chapter 15 describes. A common beginner mistake is to ignore the `ok` flag and use the returned zero as though it were the parsed value: `parseI64("abc", &ok)` returns `0`, which is indistinguishable from a genuine zero unless you check the flag.
 
@@ -214,7 +214,7 @@ Reading a whole file a chunk at a time is such a common shape that the library p
     (void)writeFileFromString("out.txt", &out).unwrap();
     out.free();
 
-`readFileToString` opens the file read-only, reads it in 4096-byte chunks, and appends each chunk to a growable `String` — so it reads files of any size without a size query first. On any error it closes the handle, frees the partial buffer, and returns the `IoError`. `writeFileFromString` opens the path for writing, truncating whatever was there, and writes the entire buffer, looping until every byte is out; it returns `Ok(true)` on success. Notice the order of the truncation: `"w"` mode destroys the old contents at open time, so a failure partway through a write leaves a truncated file. When that matters, write to a temporary file and rename it over the target, which is atomic on the same filesystem.
+`readFileToString` opens the file read-only, reads it in 4096-byte chunks, and appends each chunk to a growable `String`, so it reads files of any size without a size query first. On any error it closes the handle, frees the partial buffer, and returns the `IoError`. `writeFileFromString` opens the path for writing, truncating whatever was there, and writes the entire buffer, looping until every byte is out; it returns `Ok(true)` on success. Notice the order of the truncation: `"w"` mode destroys the old contents at open time, so a failure partway through a write leaves a truncated file. When that matters, write to a temporary file and rename it over the target, which is atomic on the same filesystem.
 
 You do not have to open, read, and close when all you need is to ask whether a path exists or is accessible, and you do not have to open at all to delete or rename:
 
@@ -259,7 +259,7 @@ The first is `std::io::fios`, which wraps the C library's `FILE*` and therefore 
 
 The reason to use it is the buffering: `fios` accumulates small reads and writes in a user-space buffer and issues far fewer system calls than the raw layer would. For a program that writes many short pieces, or reads a file in very small increments, that difference is the difference between one syscall per piece and one syscall per buffer-full, and the cost per system call is hundreds to thousands of times the cost of a memory copy. When performance matters and the access pattern is many small operations, buffering is the first lever.
 
-The second module is `std::io::bio`, which is not about buffering at all — it is about *encoding*. It provides two wrapper types over an open `File` that read and write typed values in a chosen byte order:
+The second module is `std::io::bio`, which is not about buffering at all, it is about *encoding*. It provides two wrapper types over an open `File` that read and write typed values in a chosen byte order:
 
     pub struct FileReader { i32 fd; ... }   // FileReader::fromFd(f)
     pub struct FileWriter { i32 fd; ... }   // FileWriter::fromFd(f)
@@ -280,9 +280,9 @@ The second module is `std::io::bio`, which is not about buffering at all — it 
 
 There is a reader and a writer method for each scalar width and each byte order: `readU8`/`writeU8`, `readU16Le`/`readU16Be`, `readU32Le`/`readU32Be`, `readU64Le`/`readU64Be`, the signed variants, and `readF32`/`readF64` in both orders. `fromFd` wraps an already-open `File`; the wrapper owns the descriptor's position but not its lifetime, so you still close the `File` yourself. There are also the free byte-swap helpers `bswapU16`, `bswapU32`, and `bswapU64`.
 
-Two honest notes keep this layer from surprising you. First, the *typed* readers and writers do not report errors: `readU32Le` calls `readBytes` and ignores its result, yielding a zero-filled value on a short read, and `writeU32Le` ignores a failed `writeBytes`. Only `readBytes` and `writeBytes` return `Result<bool, IoError>`, and they do the exact-count guarantee — `readBytes` loops until it has `n` bytes or fails with `Eof`, and `writeBytes` loops until all bytes are written. If a truncated or corrupt file is a real possibility, use `readBytes` into your own buffer and check the result, then decode yourself. Second, `bio` does not buffer, so a struct of ten fields costs ten small system calls; combine it with `fios` (or read the whole record with one `readBytes`) when the record is hot.
+Two honest notes keep this layer from surprising you. First, the *typed* readers and writers do not report errors: `readU32Le` calls `readBytes` and ignores its result, yielding a zero-filled value on a short read, and `writeU32Le` ignores a failed `writeBytes`. Only `readBytes` and `writeBytes` return `Result<bool, IoError>`, and they do the exact-count guarantee, `readBytes` loops until it has `n` bytes or fails with `Eof`, and `writeBytes` loops until all bytes are written. If a truncated or corrupt file is a real possibility, use `readBytes` into your own buffer and check the result, then decode yourself. Second, `bio` does not buffer, so a struct of ten fields costs ten small system calls; combine it with `fios` (or read the whole record with one `readBytes`) when the record is hot.
 
-Why this matters: "I/O is slow" is true but imprecise. What is slow is the *crossing* — the system call — and the number of crossings is a property of how you read, not of how much you read. `fs` gives you control, `fios` reduces the crossings for you, and `bio` gives you the encoding. Knowing which problem you have is the whole of choosing between them.
+Why this matters: "I/O is slow" is true but imprecise. What is slow is the *crossing*, the system call, and the number of crossings is a property of how you read, not of how much you read. `fs` gives you control, `fios` reduces the crossings for you, and `bio` gives you the encoding. Knowing which problem you have is the whole of choosing between them.
 
 18.7 Paths, Directories, and Metadata
 
@@ -462,14 +462,14 @@ Now the awkward part, stated honestly. `std::io::cmd` offers an `ArgParser`, but
     }
     pub Option<str> commandLine()
 
-`parse` collects the non-flag arguments as positional values, skipping anything that begins with `-` and stopping at a bare `--`. `hasFlag` tests for a short or long flag, `getOption` reads the value that follows one into a `String` you own, `count` and `get` read back the positionals, and `dispose` frees the owned strings. The catch is the `argc`/`argv` pair: Coral's usual entry point is `void main()` with no parameters, and the startup code passes arguments to the C `main` without the language exposing them as parameters. So `ArgParser` pairs naturally with a C-style entry point — `i32 main(i32 argc, cchar** argv)` — while a program written with `void main()` does not have the pair to hand it.
+`parse` collects the non-flag arguments as positional values, skipping anything that begins with `-` and stopping at a bare `--`. `hasFlag` tests for a short or long flag, `getOption` reads the value that follows one into a `String` you own, `count` and `get` read back the positionals, and `dispose` frees the owned strings. The catch is the `argc`/`argv` pair: Coral's usual entry point is `void main()` with no parameters, and the startup code passes arguments to the C `main` without the language exposing them as parameters. So `ArgParser` pairs naturally with a C-style entry point, `i32 main(i32 argc, cchar** argv)`, while a program written with `void main()` does not have the pair to hand it.
 
 The portable door for the plain entry point is `commandLine()`, which returns the raw process command line as an `Option<str>`. This is exactly what the standard library's own compiler uses to parse its flags. On Linux it is the contents of `/proc/self/cmdline`, with the arguments separated by NUL bytes; on Windows it is the single string from `GetCommandLineA`. Reading `argv[1]` on Linux is therefore a small scan:
 
     import(lib) std::io::cmd { commandLine };
     import(lib) std::option { Option };
 
-    // Linux: argv[0]\0argv[1]\0...\0  — return argv[1], or "" if absent.
+    // Linux: argv[0]\0argv[1]\0...\0, return argv[1], or "" if absent.
     str firstArg() {
         // commandLine returns the raw argv[0]\0argv[1]\0...\0 buffer
         Option<str> cl = commandLine();
@@ -559,7 +559,7 @@ Every function in this chapter that touches the outside world returns a `Result`
         static IoError os(str op)
     }
 
-The three cases split failures by *who* is responsible. `Os` means the operating system refused the operation; `code` is the raw platform error number and `op` names the operation that failed (`"open"`, `"read"`, `"mkdir"`). `Eof` means a stream ended before the requested bytes arrived — the `bio` reader's exact-count guarantee is the main producer. `BadUsage` means the caller asked for something nonsensical, such as an invalid open mode; no system call was made, and the `msg` says what was wrong. `IoError::os(op)` is a constructor used inside the library immediately after a failing call, capturing the calling thread's error number; user code rarely builds one, it inspects them.
+The three cases split failures by *who* is responsible. `Os` means the operating system refused the operation; `code` is the raw platform error number and `op` names the operation that failed (`"open"`, `"read"`, `"mkdir"`). `Eof` means a stream ended before the requested bytes arrived, the `bio` reader's exact-count guarantee is the main producer. `BadUsage` means the caller asked for something nonsensical, such as an invalid open mode; no system call was made, and the `msg` says what was wrong. `IoError::os(op)` is a constructor used inside the library immediately after a failing call, capturing the calling thread's error number; user code rarely builds one, it inspects them.
 
 Inspecting one is an ordinary variant switch:
 
@@ -662,7 +662,7 @@ Here is a complete program that uses console I/O, file reading, argument access,
         return 0;
     }
 
-Read the program from the top. `firstArg` asks for the raw command line, steps over the program name, and returns the first argument as a view into the command-line buffer — a view that is valid for the life of the process, which is why returning it is safe. `reportIoError` is the one place that knows how to turn an `IoError` into a sentence, and it handles all three cases so the caller never sees a raw number if it does not want one. `main` returns `i32` because this tool has meaningful exit codes: zero on success, one when the argument is missing or the file could not be read.
+Read the program from the top. `firstArg` asks for the raw command line, steps over the program name, and returns the first argument as a view into the command-line buffer, a view that is valid for the life of the process, which is why returning it is safe. `reportIoError` is the one place that knows how to turn an `IoError` into a sentence, and it handles all three cases so the caller never sees a raw number if it does not want one. `main` returns `i32` because this tool has meaningful exit codes: zero on success, one when the argument is missing or the file could not be read.
 
 The counting loop is deliberately index-based and byte-based. It walks the file once, incrementing `lines` at every newline and `words` at the transition from whitespace to non-whitespace, which is the same rule `wc` uses for its word count. `text.at(i)` is bounds-checked; since the loop condition already guarantees `i < text.len`, the check never fires, and the code stays readable. The byte count is simply `text.len`, the authoritative length from the text chapter, and there is no `strlen` walk anywhere in the program.
 
@@ -670,7 +670,7 @@ The ownership is explicit at the end: `readFileToString` returned an owned `Stri
 
 Three small extensions would make this a finished tool, and each is an exercise below. Counting lines as newlines is off by one for a file whose last line has no trailing newline; a real `wc` adds one when the file is non-empty and does not end in `\n`. Reading the whole file into memory is fine for a source file and wrong for a log that does not fit; a streaming version uses `fios` and counts as it goes. And reading everything as bytes is correct only for ASCII; counting a UTF-8 file's "words" through a byte view is right, but counting its characters would need the codepoint walk from the text chapter.
 
-Why this matters: this page-sized program is the shape almost every command-line tool takes — parse an argument, read some input, transform it, print a result, and report failure with an exit code. Once the pieces are familiar, the differences between `wc`, `grep`, `cat`, and a hundred other tools are small.
+Why this matters: this page-sized program is the shape almost every command-line tool takes, parse an argument, read some input, transform it, print a result, and report failure with an exit code. Once the pieces are familiar, the differences between `wc`, `grep`, `cat`, and a hundred other tools are small.
 
 18.12 Exercises
 

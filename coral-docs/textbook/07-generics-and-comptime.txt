@@ -4,11 +4,11 @@ Generics and Compile-Time Computation
 
 Write It Once, For Every Type
 
-You have almost certainly written the same function more than once, changing only a type. `maximum` for `i32`, then again for `f64`, then again for `char`. `swap` for pairs of each. A growable array for whatever it happens to hold. The bodies are identical, character for character, except for the type name — and the copying is not just tedious, it is a maintenance hazard. Fix a bug in the `i32` version and the `f64` version keeps the bug.
+You have almost certainly written the same function more than once, changing only a type. `maximum` for `i32`, then again for `f64`, then again for `char`. `swap` for pairs of each. A growable array for whatever it happens to hold. The bodies are identical, character for character, except for the type name, and the copying is not just tedious, it is a maintenance hazard. Fix a bug in the `i32` version and the `f64` version keeps the bug.
 
 Generic programming is the discipline of writing each of those once, parameterised by the thing that varies, and letting the compiler produce the per-type versions. Coral's generics are monomorphised: the compiler generates a concrete version for each concrete type you use, so `max<i32>` and `max<f64>` are two separate functions in the generated program, each with its own machine code, each as fast as if you had written it by hand. There is no runtime cost and no boxing, ever.
 
-But "parameterise by a type" is only the first of three tools this chapter covers, and the other two are where the language gets interesting. Value generics parameterise code by a compile-time constant — a size or a count that becomes part of the type's identity. And `comptime` lets ordinary Coral code run during the build, deducing types, selecting which code to emit, and refusing instantiations that cannot work. Together they are Coral's metaprogramming layer, and they are deliberately built on the language's ordinary syntax rather than on a separate macro language. A comptime block is not a dialect; it is Coral, evaluated early. This chapter teaches all three, and then shows how they combine.
+But "parameterise by a type" is only the first of three tools this chapter covers, and the other two are where the language gets interesting. Value generics parameterise code by a compile-time constant, a size or a count that becomes part of the type's identity. And `comptime` lets ordinary Coral code run during the build, deducing types, selecting which code to emit, and refusing instantiations that cannot work. Together they are Coral's metaprogramming layer, and they are deliberately built on the language's ordinary syntax rather than on a separate macro language. A comptime block is not a dialect; it is Coral, evaluated early. This chapter teaches all three, and then shows how they combine.
 
 7.1 Generic Functions
 
@@ -26,7 +26,7 @@ Read the angle brackets as "for any type T." The function says: give me two valu
 
 In plain words, the `<T>` is a blank labelled T. When you call `max` with two integers, the compiler writes "i32" in every blank and makes an integer version; call it with two floats and it makes a float version. You wrote the body once, and you got one tailored function per type you used.
 
-Nothing here is dynamic. There is no table of types consulted at runtime; when the compiler sees `max(3, 7)`, it knows the arguments are `i32` and it emits `max<i32>`. When it sees `max(1.5, 0.5)`, it emits `max<f64>`. Two functions, two blocks of machine code, chosen before the program exists. This is what "monomorphised" means — "single shape," one generated copy per shape of the type.
+Nothing here is dynamic. There is no table of types consulted at runtime; when the compiler sees `max(3, 7)`, it knows the arguments are `i32` and it emits `max<i32>`. When it sees `max(1.5, 0.5)`, it emits `max<f64>`. Two functions, two blocks of machine code, chosen before the program exists. This is what "monomorphised" means, "single shape," one generated copy per shape of the type.
 
 The call site deduces the type arguments from the arguments, so you rarely write `max<i32>(3, 7)`. But you may spell them out, and sometimes must: when deduction is ambiguous, when a parameter does not appear in the argument list, or when you simply want the code to be explicit about what it is asking for.
 
@@ -38,9 +38,9 @@ Type deduction is a matching problem. The compiler lines up the declared paramet
 
     struct(str, i32) named = makePair("answer", 42);
 
-Here the compiler unifies `A` with `str` from the first argument and `B` with `i32` from the second, and produces `makePair<str, i32>`. When two arguments constrain the same parameter to different types, the call is ambiguous, and the compiler reports it rather than guessing a common supertype. This is worth pausing on, because some languages quietly promote arguments to make the call work, and Coral does not: if you intended a conversion, you write it, with the target type in parentheses — `max<i32>((i32)a, b)` — so that the coercion is visible at the call site rather than buried in a deduction rule.
+Here the compiler unifies `A` with `str` from the first argument and `B` with `i32` from the second, and produces `makePair<str, i32>`. When two arguments constrain the same parameter to different types, the call is ambiguous, and the compiler reports it rather than guessing a common supertype. This is worth pausing on, because some languages quietly promote arguments to make the call work, and Coral does not: if you intended a conversion, you write it, with the target type in parentheses, `max<i32>((i32)a, b)`, so that the coercion is visible at the call site rather than buried in a deduction rule.
 
-Now the honest question: what does `T` actually know how to do? In `max`, the body uses `a > b`, so this function only compiles for types that support `>`. Coral does not let you spell that requirement as a bound on the type parameter — there is no `T : Comparable` syntax. Instead the requirement lives in the body and is checked where the generic is instantiated: call `max` with a concrete type and the compiler generates that instantiation, and if the type has no `>`, it reports the error naming the type, at the line with the comparison. That is usually a good enough answer, and it keeps the surface of the language small. When you want to branch on, or assert, what a type parameter can do up front, you do it explicitly in a `comptime` block, where `@typeof(T)` is available and `@compileError` can state the requirement in your own words; the rest of this chapter develops that. The point to carry forward: a generic's requirements are checked at each instantiation, not declared on the signature.
+Now the honest question: what does `T` actually know how to do? In `max`, the body uses `a > b`, so this function only compiles for types that support `>`. Coral does not let you spell that requirement as a bound on the type parameter, there is no `T : Comparable` syntax. Instead the requirement lives in the body and is checked where the generic is instantiated: call `max` with a concrete type and the compiler generates that instantiation, and if the type has no `>`, it reports the error naming the type, at the line with the comparison. That is usually a good enough answer, and it keeps the surface of the language small. When you want to branch on, or assert, what a type parameter can do up front, you do it explicitly in a `comptime` block, where `@typeof(T)` is available and `@compileError` can state the requirement in your own words; the rest of this chapter develops that. The point to carry forward: a generic's requirements are checked at each instantiation, not declared on the signature.
 
 7.2 Generic Types
 
@@ -71,7 +71,7 @@ Every use of Box with a concrete type parameter produces a concrete Box type. `B
 
 In plain words, a generic type is a container whose contents are not decided until you use it. `Box<T>` says "a box of something"; `Box<i32>` says "a box of integers." The type of what is inside is written in angle brackets, and the compiler makes a matching box for whatever you put there.
 
-The standard library's `Vec` is the canonical generic type, and reading its declaration teaches the pattern in one glance: generic over the element type, with an extend block generic in the same parameter, methods that mention `T` throughout. When you implement a container, you write one generic definition and every element type it is used with becomes a monomorphisation. That is the whole discipline, and it is why a `Vec<f64>` is not a boxed array of `void*` — it is a real array of `f64`, with no per-element indirection.
+The standard library's `Vec` is the canonical generic type, and reading its declaration teaches the pattern in one glance: generic over the element type, with an extend block generic in the same parameter, methods that mention `T` throughout. When you implement a container, you write one generic definition and every element type it is used with becomes a monomorphisation. That is the whole discipline, and it is why a `Vec<f64>` is not a boxed array of `void*`, it is a real array of `f64`, with no per-element indirection.
 
 7.3 Value Generics: When the Size Is Part of the Type
 
@@ -81,7 +81,7 @@ Sometimes the thing that varies is not a type but a number, and that number matt
         T data[Rows * Cols];
     }
 
-The parameters `Rows` and `Cols` are compile-time constants. Because they are constants, the array size `Rows * Cols` is itself a compile-time expression — the compiler can compute the size of a `Matrix` without running anything — and indexing with a literal can be bounds-checked before the program runs:
+The parameters `Rows` and `Cols` are compile-time constants. Because they are constants, the array size `Rows * Cols` is itself a compile-time expression, the compiler can compute the size of a `Matrix` without running anything, and indexing with a literal can be bounds-checked before the program runs:
 
     Matrix<f64, 3, 3> identity = ...;
 
@@ -91,13 +91,13 @@ Two useful things follow. First, the size is exact and known: `Matrix<f64, 3, 3>
 
 The same idea appears throughout the standard library. `Arr<T, N>` is a fixed-size array with `N` in the type. `Bitset<N>` is a bit set with a declared width. A fixed-size matrix carries its dimensions. In each case the size is part of the type rather than a runtime field, which means it cannot disagree with the storage and cannot be discovered as wrong only when the program runs.
 
-Hold on — let me explain why putting a number in a type is worth the fuss, because it can look like ceremony. If the size were an ordinary field, then `Matrix` values of different sizes would be the same type, and the guarantee "the data array has exactly Rows times Cols elements" would be a convention maintained by code rather than a fact enforced by the compiler. A convention can be violated; a type cannot. By lifting the size into the type, the language turns a promise into a check. A 3×3 times a 4×4 is a compile error, not a corrupted matrix discovered three hours later.
+Hold on, let me explain why putting a number in a type is worth the fuss, because it can look like ceremony. If the size were an ordinary field, then `Matrix` values of different sizes would be the same type, and the guarantee "the data array has exactly Rows times Cols elements" would be a convention maintained by code rather than a fact enforced by the compiler. A convention can be violated; a type cannot. By lifting the size into the type, the language turns a promise into a check. A 3×3 times a 4×4 is a compile error, not a corrupted matrix discovered three hours later.
 
-A value generic is checked when the type is instantiated, so an impossible instantiation — zero rows, or an operation the comptime code cannot support — can be rejected at compile time, which is the subject of 7.7.
+A value generic is checked when the type is instantiated, so an impossible instantiation, zero rows, or an operation the comptime code cannot support, can be rejected at compile time, which is the subject of 7.7.
 
 7.4 comptime: Running Ordinary Code Early
 
-`comptime` is the general mechanism for computing at compile time, and its design principle is disarmingly simple: it is the same language you already write, evaluated during the build instead of at runtime. A comptime block contains ordinary Coral — assignments, `if`s, `switch`es, loops, calls — and it runs while the program is being compiled:
+`comptime` is the general mechanism for computing at compile time, and its design principle is disarmingly simple: it is the same language you already write, evaluated during the build instead of at runtime. A comptime block contains ordinary Coral, assignments, `if`s, `switch`es, loops, calls, and it runs while the program is being compiled:
 
     comptime {
         const TABLE_SIZE = 256;
@@ -106,7 +106,7 @@ A value generic is checked when the type is instantiated, so an impossible insta
 
 There is no macro syntax to learn and no expansion output to decode. The block is Coral. The difference is when it runs.
 
-In plain words, `comptime` means "do this while building the program, not while running it." You write the same code you always write — loops, ifs, arithmetic — but the results are ready before the program ever starts, so they cost the running program nothing. If you have used a spreadsheet, it is like a cell that is computed once when you open the file rather than recomputed every moment.
+In plain words, `comptime` means "do this while building the program, not while running it." You write the same code you always write, loops, ifs, arithmetic, but the results are ready before the program ever starts, so they cost the running program nothing. If you have used a spreadsheet, it is like a cell that is computed once when you open the file rather than recomputed every moment.
 
 More powerfully, a comptime block may choose which code is emitted. Because the values and types inside it are known at compile time, a `switch` inside comptime resolves to a single arm, and only that arm survives into the generated program:
 
@@ -120,11 +120,11 @@ More powerfully, a comptime block may choose which code is emitted. Because the 
         }
     }
 
-The type `Token` is a compile-time value; the switch on it is decided during compilation; the arm whose case matches is the only code generated. The others are not merely dropped as dead code after being generated — they are never generated at all. This is how a comptime mechanism can produce specialised code from a type without a runtime branch and without a separate macro system. If you have ever written a code generator in a scripting language and then debugged its output, the appeal is obvious: the generator is the language, and its mistakes are reported with the language's own diagnostics.
+The type `Token` is a compile-time value; the switch on it is decided during compilation; the arm whose case matches is the only code generated. The others are not merely dropped as dead code after being generated, they are never generated at all. This is how a comptime mechanism can produce specialised code from a type without a runtime branch and without a separate macro system. If you have ever written a code generator in a scripting language and then debugged its output, the appeal is obvious: the generator is the language, and its mistakes are reported with the language's own diagnostics.
 
 7.5 comptime Type Parameters and Deduction: How print Works
 
-A generic parameter may be marked `comptime`, and that marker changes something fundamental about who supplies it. An ordinary type parameter is supplied by the caller — deduced from an argument's type. A `comptime` type parameter is deduced by the function itself, from a comptime block in its body:
+A generic parameter may be marked `comptime`, and that marker changes something fundamental about who supplies it. An ordinary type parameter is supplied by the caller, deduced from an argument's type. A `comptime` type parameter is deduced by the function itself, from a comptime block in its body:
 
     void print<comptime T>(T fmt, ...) {
         comptime {
@@ -132,7 +132,7 @@ A generic parameter may be marked `comptime`, and that marker changes something 
         }
     }
 
-Read that again, because it looks strange until you see why it exists. `print` must accept a format string and any number of arguments of any types, and it must know each argument's type in order to convert it to text. The format string is an ordinary parameter — the caller passes it — but the argument types are not written by the caller anywhere. So the function inspects what it was handed and works out the types itself, inside the comptime block. A `comptime` parameter is not supplied at the call site; it is inferred by the function's own logic.
+Read that again, because it looks strange until you see why it exists. `print` must accept a format string and any number of arguments of any types, and it must know each argument's type in order to convert it to text. The format string is an ordinary parameter, the caller passes it, but the argument types are not written by the caller anywhere. So the function inspects what it was handed and works out the types itself, inside the comptime block. A `comptime` parameter is not supplied at the call site; it is inferred by the function's own logic.
 
 This is the mechanism behind the standard library's real `print`. Its signature is
 
@@ -142,7 +142,7 @@ and the `...` is a variadic tail of arguments. When you call `println("x = {}, y
 
 There is a semantic rule that comes with the feature, and it is enforced: a function whose generic list uses a `comptime` parameter must contain a `comptime` block. Without one there is nowhere for the type to be derived, so the function has no way to know what it was handed, and the compiler rejects it. The rule is not arbitrary; it is the feature's precondition.
 
-It is worth being precise about what `println` is not. It is not a C-style variadic function, where the argument types are erased and the format string is trusted at runtime. It is not a C-preprocessor macro, textually substituted. It is an ordinary generic function whose type argument is computed at compile time — which is why a mismatch between a format string and its arguments can be a build failure rather than a crash. That is the payoff, and it is the subject of the next section.
+It is worth being precise about what `println` is not. It is not a C-style variadic function, where the argument types are erased and the format string is trusted at runtime. It is not a C-preprocessor macro, textually substituted. It is an ordinary generic function whose type argument is computed at compile time, which is why a mismatch between a format string and its arguments can be a build failure rather than a crash. That is the payoff, and it is the subject of the next section.
 
 7.6 Format Strings, @isFormatLiteral, and Checked Printing
 
@@ -150,7 +150,7 @@ In C, `printf("%d", "hello")` compiles, runs, and prints garbage, because the fo
 
 In plain words, if you write the format as a literal, Coral can read the `{}` placeholders and compare them to the values you passed right there at build time. That turns a whole class of "printed the wrong thing at runtime" bugs into messages while you are still typing.
 
-The shape of the check is the comptime walk described above, and it produces real diagnostics in the E09xx family. A placeholder with no matching argument, an argument with no matching placeholder, an unknown specifier, or a specifier that demands the wrong kind of argument — each is a compile error with a code and a location:
+The shape of the check is the comptime walk described above, and it produces real diagnostics in the E09xx family. A placeholder with no matching argument, an argument with no matching placeholder, an unknown specifier, or a specifier that demands the wrong kind of argument, each is a compile error with a code and a location:
 
     println("{} {}", a);        // error E0901: too few arguments for 2 placeholders
     println("{q}", value);      // error E0903: unknown specifier `q`; did you mean `{}`?
@@ -163,9 +163,9 @@ And the normal cases simply work:
     println("pi is about {:.3}", 3.14159);
     println("items = {..}", values);      // spread an iterable, separated by ", "
 
-When `@isFormatLiteral` is false — the format string was built at runtime, so the compiler cannot see it — the same call is routed differently: the first argument is treated as an ordinary value and every argument is rendered through its own built-in or `@toStr` path, with no placeholder checking. That is the honest trade. The overwhelming majority of format strings are literals, and for those the check is free; a format string assembled at runtime gives up the check, and the language does not pretend otherwise.
+When `@isFormatLiteral` is false, the format string was built at runtime, so the compiler cannot see it, the same call is routed differently: the first argument is treated as an ordinary value and every argument is rendered through its own built-in or `@toStr` path, with no placeholder checking. That is the honest trade. The overwhelming majority of format strings are literals, and for those the check is free; a format string assembled at runtime gives up the check, and the language does not pretend otherwise.
 
-This is the clearest example in the book of comptime changing what the language can promise. Because the format and the arguments are both visible during the build, a class of error that is a runtime crash in C is a build failure in Coral — and the failure arrives in a minute, at the line, long before the code ships.
+This is the clearest example in the book of comptime changing what the language can promise. Because the format and the arguments are both visible during the build, a class of error that is a runtime crash in C is a build failure in Coral, and the failure arrives in a minute, at the line, long before the code ships.
 
 7.7 Asking the Compiler Questions: @sizeof, @typeof, and alignof
 
@@ -173,7 +173,7 @@ To specialise or reject based on a type, a comptime block needs to ask the compi
 
 In plain words, these are questions you ask the compiler about a type, and the answers are known before the program runs. `@sizeof` asks "how many bytes does this take?", `@typeof` asks "what type is this expression?", and `alignof` asks "what memory boundary does this type prefer?" They let code adapt to the exact machine and the exact types it is given.
 
-`@sizeof(T)` is the size of a type in bytes. It is how you branch on layout — a small type may be passed by value, a large one by pointer — and how you assert a layout assumption:
+`@sizeof(T)` is the size of a type in bytes. It is how you branch on layout, a small type may be passed by value, a large one by pointer, and how you assert a layout assumption:
 
     comptime {
         if (@sizeof(Header) != 16) {
@@ -183,7 +183,7 @@ In plain words, these are questions you ask the compiler about a type, and the a
 
 `@typeof(expr)` is the type of an expression. It is how a comptime block discovers what it was handed, and it is the workhorse of the printing machinery: the dispatch in `print` is a switch over `@typeof(T)`. It only makes sense inside a comptime context, where the type is known.
 
-`alignof(T)` is the alignment the type requires. It matters when you are placing things in memory by hand — a buffer, a memory pool, an allocator — and need to know the boundary the hardware wants:
+`alignof(T)` is the alignment the type requires. It matters when you are placing things in memory by hand, a buffer, a memory pool, an allocator, and need to know the boundary the hardware wants:
 
     usize stride = alignUp(count * @sizeof(Item), alignof(Item));
 
@@ -216,11 +216,11 @@ Use a generic type parameter when the code works for any type and produces a val
 
 Use a value generic when a size or count is part of the type's identity. `Arr<T, N>`, `Matrix<T, R, C>`, and `Bitset<N>` need `N` at compile time, so it belongs in the parameter list as a value. If two different values would make two different types that must not be confused, the value belongs in the type.
 
-Use `comptime` when the function must inspect its type arguments and choose behaviour — especially when the caller does not supply them. `print` and the other variadic formatters are comptime-driven because their type arguments come from the arguments, not from the signature.
+Use `comptime` when the function must inspect its type arguments and choose behaviour, especially when the caller does not supply them. `print` and the other variadic formatters are comptime-driven because their type arguments come from the arguments, not from the signature.
 
 And use `any Trait` (Chapter6) when the type is not known until runtime. A generic is monomorphised and static; a trait object is dynamic. A heterogeneous collection needs `any Trait`; a homogeneous one the compiler can see benefits from a generic.
 
-One question settles almost every case: is this known at compile time or at runtime? If it is known at compile time, prefer a generic — you get specialisation and no indirection. If it is not, it must be `any`, because there is nothing else it could be. The four mechanisms cover the design space, and the choice is usually obvious once that question has been answered.
+One question settles almost every case: is this known at compile time or at runtime? If it is known at compile time, prefer a generic, you get specialisation and no indirection. If it is not, it must be `any`, because there is nothing else it could be. The four mechanisms cover the design space, and the choice is usually obvious once that question has been answered.
 
 7.10 A Worked Example: A Compile-Time Lookup Table
 
@@ -252,11 +252,11 @@ Here is the combination of value generics and comptime at work on a real problem
 
     const HashTable<256> GLOBAL = HashTable<256>::build();
 
-The size `N` is a value generic, so the type carries its own capacity. The table is built in a comptime block, so the loop runs during compilation and the generated program contains a fully populated constant array — no startup cost and no initialisation function. Indexing with a constant is bounds-checked against `N` at compile time. The result is a data structure whose entire contents are known to the compiler, which is the strongest form of "this cannot fail at runtime" the language offers. Notice the `var` in the build function: `var` exists precisely to drive type inference on a local, letting the compiler fill in `HashTable<N>` from the initialiser.
+The size `N` is a value generic, so the type carries its own capacity. The table is built in a comptime block, so the loop runs during compilation and the generated program contains a fully populated constant array, no startup cost and no initialisation function. Indexing with a constant is bounds-checked against `N` at compile time. The result is a data structure whose entire contents are known to the compiler, which is the strongest form of "this cannot fail at runtime" the language offers. Notice the `var` in the build function: `var` exists precisely to drive type inference on a local, letting the compiler fill in `HashTable<N>` from the initialiser.
 
 7.11 A Worked Example: A Generic Ring Buffer
 
-The second example is an ordinary generic container, to show the end-to-end pattern. A ring buffer stores a fixed number of elements and overwrites the oldest when it is full — the shape of a fixed-size event log, an audio delay line, or a bounded work queue.
+The second example is an ordinary generic container, to show the end-to-end pattern. A ring buffer stores a fixed number of elements and overwrites the oldest when it is full, the shape of a fixed-size event log, an audio delay line, or a bounded work queue.
 
     struct Ring<T, usize N> {
         T buffer[N];
@@ -297,7 +297,7 @@ Notice how the value generic and the type generic cooperate. `N` is used in the 
 
 7.12 A Larger Worked Example: Units That Check Themselves
 
-The final example combines all three mechanisms — type generics, value generics, and comptime rejection — into something you have probably wanted and never had the tool for: a physical quantity whose arithmetic is checked at compile time. Picture a physics simulation. You have distances in metres, times in seconds, and speeds in metres per second. Multiply a speed by a time and you get a distance; add a distance to a time and you have made a mistake. Hand-rolled code lets that mistake through until a result looks wrong.
+The final example combines all three mechanisms, type generics, value generics, and comptime rejection, into something you have probably wanted and never had the tool for: a physical quantity whose arithmetic is checked at compile time. Picture a physics simulation. You have distances in metres, times in seconds, and speeds in metres per second. Multiply a speed by a time and you get a distance; add a distance to a time and you have made a mistake. Hand-rolled code lets that mistake through until a result looks wrong.
 
 The idea is to encode the unit as a compile-time structure and let the arithmetic track it. A full treatment uses exponent tuples; here is a compact version that carries one exponent as a value generic and leans on comptime for the operations:
 
@@ -325,7 +325,7 @@ The idea is to encode the unit as a compile-time structure and let the arithmeti
         }
     }
 
-The types do the work. The expression `Length::of(3.0).mul(Time::of(2.0))` has type `Quantity<1, 1>`: multiplying a `Quantity<1, 0>` by a `Quantity<0, 1>` adds the exponents, so the result is a `Quantity<1, 1>`. You would define `typedef Speed = Quantity<1, 1>;` if you wanted a name for it, and a `Speed` multiplied by a `Time` would come back as a `Quantity<1, 2>` — an acceleration — all without a line of arithmetic written by hand. The exponents are value generics, and the addition on them happens during monomorphisation, so no runtime storage is spent on units at all. The `value` field is the only thing in memory.
+The types do the work. The expression `Length::of(3.0).mul(Time::of(2.0))` has type `Quantity<1, 1>`: multiplying a `Quantity<1, 0>` by a `Quantity<0, 1>` adds the exponents, so the result is a `Quantity<1, 1>`. You would define `typedef Speed = Quantity<1, 1>;` if you wanted a name for it, and a `Speed` multiplied by a `Time` would come back as a `Quantity<1, 2>`, an acceleration, all without a line of arithmetic written by hand. The exponents are value generics, and the addition on them happens during monomorphisation, so no runtime storage is spent on units at all. The `value` field is the only thing in memory.
 
 Now the payoff: an illegal operation is a type error, and the compiler says so at the line, before the program runs.
 
@@ -335,9 +335,9 @@ Now the payoff: an illegal operation is a type error, and the compiler says so a
         Length wrong = d.add(t);      // error: add expects Quantity<1, 0>, got Quantity<0, 1>
     }
 
-`d.add(t)` cannot compile, because `add` requires the same `M` and `S` on both sides, and `Length` and `Time` differ in both. That is the whole point: the mistake is not caught by a test, or by a reviewer, or by a wrong number at runtime. It is caught by the type system, because the units are part of the types. And the fix is to write the operation that is actually meaningful — a multiplication, whose exponents are summed — which is the operation you meant.
+`d.add(t)` cannot compile, because `add` requires the same `M` and `S` on both sides, and `Length` and `Time` differ in both. That is the whole point: the mistake is not caught by a test, or by a reviewer, or by a wrong number at runtime. It is caught by the type system, because the units are part of the types. And the fix is to write the operation that is actually meaningful, a multiplication, whose exponents are summed, which is the operation you meant.
 
-Where does comptime come in? In a full implementation, the exponent arithmetic itself is a comptime computation, and the type can reject instantiations that make no physical sense — a negative size, an exponent combination you have declared unsupported. A comptime guard at the point of use states the invariant:
+Where does comptime come in? In a full implementation, the exponent arithmetic itself is a comptime computation, and the type can reject instantiations that make no physical sense, a negative size, an exponent combination you have declared unsupported. A comptime guard at the point of use states the invariant:
 
     void derive<usize M, usize S>(Quantity<M, S> q) {
         comptime {
@@ -348,7 +348,7 @@ Where does comptime come in? In a full implementation, the exponent arithmetic i
         use(q.value);
     }
 
-This is the pattern to carry away from the chapter. Value generics make the shape of the data part of the type; comptime computes over that shape during the build; and `@compileError` turns an impossible instantiation into a sentence at the line that caused it. The result is code whose arithmetic is checked by the compiler, in ordinary Coral, with no separate macro language and no runtime cost — which is about as much as a language can promise.
+This is the pattern to carry away from the chapter. Value generics make the shape of the data part of the type; comptime computes over that shape during the build; and `@compileError` turns an impossible instantiation into a sentence at the line that caused it. The result is code whose arithmetic is checked by the compiler, in ordinary Coral, with no separate macro language and no runtime cost, which is about as much as a language can promise.
 
 7.13 Exercises
 

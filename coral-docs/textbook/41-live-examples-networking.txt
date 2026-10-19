@@ -95,7 +95,7 @@ The implementation.
         Result<TcpSocket, IoError> opened = tcpConnect("127.0.0.1", (u16)8080);
         if (opened.isErr())
         {
-            println("connect failed — is the echo server from 40.1 running?");
+            println("connect failed, is the echo server from 40.1 running?");
             return 1;
         }
         TcpSocket sock = opened.unwrap();
@@ -135,7 +135,7 @@ Edge cases and variations. Connections are refused immediately when the host is 
 
 The problem. TCP gives you a stream of bytes, but protocols are usually built out of units: a line, a request header, a message. You need a function that reads one unit, and you need to understand why the obvious version of that function is wrong.
 
-The idea. Because `tcpRecv(sock, buf, n)` blocks until it has `n` bytes or the stream ends, "read a line into a 256-byte buffer" is not `tcpRecv(sock, buf, 256)` — that call waits for 256 bytes even when the line is five bytes long and the sender is waiting for a reply. The correct primitive is to read one byte at a time and stop at the delimiter. That is slow, and the slowness is a real cost, but it is correct, and it is the only framing tool the API offers without a timeout or a non-blocking mode. The helper below returns the number of bytes read, treating both a newline and a clean close as the end of the unit.
+The idea. Because `tcpRecv(sock, buf, n)` blocks until it has `n` bytes or the stream ends, "read a line into a 256-byte buffer" is not `tcpRecv(sock, buf, 256)`, that call waits for 256 bytes even when the line is five bytes long and the sender is waiting for a reply. The correct primitive is to read one byte at a time and stop at the delimiter. That is slow, and the slowness is a real cost, but it is correct, and it is the only framing tool the API offers without a timeout or a non-blocking mode. The helper below returns the number of bytes read, treating both a newline and a clean close as the end of the unit.
 
 The implementation.
 
@@ -352,17 +352,17 @@ The implementation.
         return 0;
     }
 
-The header reader is a rolling four-byte test for the `\r\n\r\n` that ends the request head. `Content-Length` is computed from the body at runtime with `formatInt`, so the number always matches the bytes that follow it — the single most common way a hand-written server breaks. The response is one `tcpSend`, which the library turns into as many underlying writes as the kernel needs.
+The header reader is a rolling four-byte test for the `\r\n\r\n` that ends the request head. `Content-Length` is computed from the body at runtime with `formatInt`, so the number always matches the bytes that follow it, the single most common way a hand-written server breaks. The response is one `tcpSend`, which the library turns into as many underlying writes as the kernel needs.
 
 Cost and notes. This server handles one client at a time and blocks in `readHeaders` for each; a slow or silent client stalls everyone behind it. The request body, if any, is not read, which is fine for GET and wrong for POST. `formatInt` allocates a small `String` for the length; it is a local and is released automatically at the end of `serveOnce`.
 
-Edge cases and variations. A client that opens a connection and sends nothing holds the server in `readHeaders` until it times out or the cap is hit, and there is no timeout in the API to bound it. A request larger than 4096 bytes has its head truncated, and the connection should really be rejected at that point. Only one request per connection is served, which matches HTTP/1.0's default `close`; keep-alive would require a loop and parsing `Content-Length`. Variation: route on the request line — read the first line, split it on spaces, and choose a different body per path — which turns this into a real, if tiny, web server. Because the address is bound to all interfaces, this example is reachable from the network; binding to `INADDR_LOOPBACK` alone is not exposed by the API, which binds `0.0.0.0` unconditionally.
+Edge cases and variations. A client that opens a connection and sends nothing holds the server in `readHeaders` until it times out or the cap is hit, and there is no timeout in the API to bound it. A request larger than 4096 bytes has its head truncated, and the connection should really be rejected at that point. Only one request per connection is served, which matches HTTP/1.0's default `close`; keep-alive would require a loop and parsing `Content-Length`. Variation: route on the request line, read the first line, split it on spaces, and choose a different body per path, which turns this into a real, if tiny, web server. Because the address is bound to all interfaces, this example is reachable from the network; binding to `INADDR_LOOPBACK` alone is not exposed by the API, which binds `0.0.0.0` unconditionally.
 
 41.6 A UDP Send and Receive Pair
 
 The problem. You want the fire-and-forget style of the datagram sockets: no connection, no handshake, each message independent. A pair of UDP sockets that send and receive one message is the whole idea.
 
-The idea. `udpSocket()` creates an unbound datagram socket. `udpBind(&sock, port)` gives it a local port so that datagrams addressed to that port arrive. `udpSendTo(&sock, buf, len, ip, port)` sends one datagram to an address, and `udpRecvFrom(&sock, buf, len)` receives one datagram. Unlike TCP, a datagram is a unit: the receiver gets exactly the bytes the sender wrote, in one call, and a short read is normal rather than a sign of end-of-stream. The order is not guaranteed, delivery is not guaranteed, and none of that is a bug in the library — it is what UDP is.
+The idea. `udpSocket()` creates an unbound datagram socket. `udpBind(&sock, port)` gives it a local port so that datagrams addressed to that port arrive. `udpSendTo(&sock, buf, len, ip, port)` sends one datagram to an address, and `udpRecvFrom(&sock, buf, len)` receives one datagram. Unlike TCP, a datagram is a unit: the receiver gets exactly the bytes the sender wrote, in one call, and a short read is normal rather than a sign of end-of-stream. The order is not guaranteed, delivery is not guaranteed, and none of that is a bug in the library, it is what UDP is.
 
 The implementation.
 
@@ -432,9 +432,9 @@ The implementation.
 
 The sender socket is never bound; the operating system assigns it an ephemeral source port the first time it sends. The datagram travels over loopback into the receiver's queue, where `udpRecvFrom` collects exactly one message. Because the two sockets are in the same process, the send and receive proceed in order without a second thread: the kernel holds the datagram until the receiver asks for it.
 
-Cost and notes. `udpSendTo` is one system call for one datagram, and `udpRecvFrom` is one for one; there is no library-level retry or buffering, because there is nothing to retry — if the network drops the datagram, no error is reported and nothing happens. That is the entire performance advantage and the entire reliability disadvantage of UDP in the same sentence.
+Cost and notes. `udpSendTo` is one system call for one datagram, and `udpRecvFrom` is one for one; there is no library-level retry or buffering, because there is nothing to retry, if the network drops the datagram, no error is reported and nothing happens. That is the entire performance advantage and the entire reliability disadvantage of UDP in the same sentence.
 
-Edge cases and variations. `udpRecvFrom` does not tell you who sent the datagram: the implementation passes `null` for the source address, so a server built on it cannot reply to the sender, only observe the payload. That is a genuine gap, not a subtlety, and a real UDP service needs the source address, which this module does not expose. Datagrams larger than the receive buffer are truncated by the kernel and the excess is silently lost. The example relies on both sockets being in one process; across machines, a dropped packet means `udpRecvFrom` blocks forever, because there is no timeout. A zero-length datagram is legal and is delivered. Variation: make the receiver a server for one datagram and have it echo the payload back by hard-coding the sender's known address, which works only because the address is known in advance — the limitation above, made concrete.
+Edge cases and variations. `udpRecvFrom` does not tell you who sent the datagram: the implementation passes `null` for the source address, so a server built on it cannot reply to the sender, only observe the payload. That is a genuine gap, not a subtlety, and a real UDP service needs the source address, which this module does not expose. Datagrams larger than the receive buffer are truncated by the kernel and the excess is silently lost. The example relies on both sockets being in one process; across machines, a dropped packet means `udpRecvFrom` blocks forever, because there is no timeout. A zero-length datagram is legal and is delivered. Variation: make the receiver a server for one datagram and have it echo the payload back by hard-coding the sender's known address, which works only because the address is known in advance, the limitation above, made concrete.
 
 41.7 Handling Several Clients with Threads
 
@@ -521,7 +521,7 @@ The worker copies the socket out of the job and frees the job before doing any w
 
 Cost and notes. One thread per connection means one stack and one kernel object per client, which is memory and scheduler pressure that grows with the number of connections; the pool in Chapter35 replaces the per-connection thread with a queue push. The threads genuinely run in parallel, so this server uses every core when the clients are active. The join loop means the server drains every accepted conversation before it exits, which is why the example is bounded.
 
-Edge cases and variations. If a client connects and then stays silent, its worker blocks in `tcpRecv` forever, and the join at the end blocks with it; a timeout would help, and the API has none. If `MAX_CLIENTS` connections are accepted and none closes, the server stops accepting long before its workers finish, which is a poor shape for production but correct for a demonstration. The worker does not synchronise with anything, because each holds its own socket and touches no shared state; the moment they share something — as in the next section — a mutex enters the picture. Variation: replace the fixed accept count with an infinite loop and submit each job to a `ThreadPool` from Chapter35, which bounds the thread count while still accepting without limit; the missing `detach` is then no longer a problem because the pool owns its workers.
+Edge cases and variations. If a client connects and then stays silent, its worker blocks in `tcpRecv` forever, and the join at the end blocks with it; a timeout would help, and the API has none. If `MAX_CLIENTS` connections are accepted and none closes, the server stops accepting long before its workers finish, which is a poor shape for production but correct for a demonstration. The worker does not synchronise with anything, because each holds its own socket and touches no shared state; the moment they share something, as in the next section, a mutex enters the picture. Variation: replace the fixed accept count with an infinite loop and submit each job to a `ThreadPool` from Chapter35, which bounds the thread count while still accepting without limit; the missing `detach` is then no longer a problem because the pool owns its workers.
 
 41.8 A Line-Based Chat Broadcast Server
 
@@ -730,7 +730,7 @@ The switch names all three cases of `IoError`, so it is exhaustive and needs no 
 
 Cost and notes. The failed `tcpConnect` costs one round trip when the host answers with a reset, and the whole kernel timeout when it does not; that asymmetry is the reason a network program feels fast on a healthy network and hangs on a broken one. `sleepMs` sleeps for at least the requested time, so the retry loop's spacing is approximate. Reading `errno` means the code is platform-specific: the same failure has a different number on Windows, which is why the field is reported rather than hard-coded into the logic.
 
-Edge cases and variations. `IoError::BadUsage` is the library's own complaint — a malformed IP address such as `"999.1.2.3"` — and is not a network failure at all. Because there is no timeout parameter, the loop cannot bound the time a single `tcpConnect` spends; the only honest statement is that the attempt will return when the kernel decides, which is typically around a minute for a filtered host. There is no asynchronous cancellation either, so a program cannot abandon an in-progress connect. Variation: drive the retry from the error code, retrying only on `ETIMEDOUT` and giving up immediately on `ECONNREFUSED`, and add a max attempt count as a wall-clock budget rather than a fixed number.
+Edge cases and variations. `IoError::BadUsage` is the library's own complaint, a malformed IP address such as `"999.1.2.3"`, and is not a network failure at all. Because there is no timeout parameter, the loop cannot bound the time a single `tcpConnect` spends; the only honest statement is that the attempt will return when the kernel decides, which is typically around a minute for a filtered host. There is no asynchronous cancellation either, so a program cannot abandon an in-progress connect. Variation: drive the retry from the error code, retrying only on `ETIMEDOUT` and giving up immediately on `ECONNREFUSED`, and add a max attempt count as a wall-clock budget rather than a fixed number.
 
 41.10 Exercises
 
@@ -748,6 +748,6 @@ Edge cases and variations. `IoError::BadUsage` is the library's own complaint �
 
 7. Shared state. In 40.8, `broadcast` holds the mutex while it calls `tcpSend`. Construct a scenario in which this stalls every client in the room, and describe the per-client output queue that would avoid it. What new synchronisation does that queue need?
 
-8. Honesty. List every feature a real HTTP client needs that `std::io::net` does not provide — DNS, TLS, timeouts, chunked transfer decoding, redirects — and for each, say which layer is the right place to add it: this module, a library above it, or the application.
+8. Honesty. List every feature a real HTTP client needs that `std::io::net` does not provide, DNS, TLS, timeouts, chunked transfer decoding, redirects, and for each, say which layer is the right place to add it: this module, a library above it, or the application.
 
 9. Design. You are asked to build a chat service that must support thousands of simultaneous connections. Using only the primitives in this chapter, explain why thread-per-connection fails to scale, and sketch the design that replaces it using a thread pool, a set of non-blocking sockets, or both. Which missing API feature is the hard blocker for the non-blocking design, and why?

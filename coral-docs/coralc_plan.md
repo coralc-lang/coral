@@ -14,7 +14,7 @@ changed here. Specs it refines: `build_sys.md`, `imports.md`.
   coral-build never imports the frontend).
 - Commands: `build` (default), `map`, plus follow-ups (`init`, `run`) later.
 - Flags: build file path (`-f`), `--strict`, `--dry-run` (compile, no output —
-  used for edge collection), `--warn-unused`, opt/debug passthrough.
+  used for edge collection), unused-local warnings (always on), opt/debug passthrough.
 - `test_builder.crl` stays as a plain test file, not part of the binary.
 
 ## 2. `coralc map` — auto module discovery
